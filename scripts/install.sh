@@ -133,6 +133,25 @@ write_compose_secrets() {
     chmod 600 .env 2>/dev/null || true
 }
 
+# The other half of pin_image_tag below, and its absence was the defect. A
+# version was recorded when one was asked for and never removed when one was
+# not, so the .env outlived the run that wrote it: somebody who installed a
+# specific version once and later re-ran the one-liner to upgrade kept pulling
+# the version they pinned, because ${OE_IMAGE_TAG:-latest} found the old
+# value rather than falling back. The pull succeeded, the containers came up,
+# and the script said the installation was complete, which is the worst shape
+# a defect can take: everything reports success and the product is the wrong
+# version. Asking for latest has to mean latest, which means saying so must
+# undo a pin as well as decline to write one.
+unpin_image_tag() {
+    [ -f .env ] || return 0
+    grep -q '^OE_IMAGE_TAG=' .env || return 0
+    grep -v '^OE_IMAGE_TAG=' .env > .env.tmp || true
+    mv .env.tmp .env
+    chmod 600 .env 2>/dev/null || true
+    info "Removed a version pin left by an earlier install, this run takes the latest"
+}
+
 # Record a pinned version in the .env as well, where the two secrets are.
 # Exporting it would only reach this process, and the commands printed at the
 # end of the install are typed later in a fresh shell, where an exported
@@ -177,7 +196,11 @@ install_docker() {
     curl -fsSL "$OE_REPO/raw/$ref/docker-compose.quickstart.image.yml" -o docker-compose.override.yml
 
     write_compose_secrets
-    [ "$OE_VERSION" = "latest" ] || pin_image_tag "$OE_VERSION"
+    if [ "$OE_VERSION" = "latest" ]; then
+        unpin_image_tag
+    else
+        pin_image_tag "$OE_VERSION"
+    fi
 
     # Pulling is spelled out rather than left to `up`, the same way the
     # quickstart-image make target does it, so which artefact runs is stated
@@ -189,7 +212,68 @@ install_docker() {
     info "Starting OpenConstructionERP..."
     docker compose up -d
 
-    ok "OpenConstructionERP is running at http://localhost:${OE_PORT}"
+    # Wait for the application to answer, rather than announcing that it runs
+    # because compose accepted the command. `docker compose up -d` returns once
+    # the containers are created, which is well before anything serves, so the
+    # success line below was printed unverified: an install that never came up
+    # still said it was running, and the person had no reason to look further.
+    # The Windows script has polled this endpoint all along; this one did not
+    # poll it at all, which is the more embarrassing of the two failure modes
+    # because it is the one that never reports a problem.
+    #
+    # Three outcomes, because the endpoint reports three. Healthy. Degraded,
+    # which as of this release includes an enabled module that failed to load,
+    # and which is a usable installation. Or no answer, which is the only one
+    # of the three that means the install did not work.
+    #
+    # Read with grep rather than jq, which a stranger's machine need not have.
+    info "Waiting for health check..."
+    health_attempts=30
+    health_delay=2
+    # Named because the figure printed at the end is computed from it. An
+    # attempt that gets no answer spends the timeout before it sleeps, so a
+    # budget counted as attempts times delay understates the real wait by
+    # three times against a socket that accepts and never replies.
+    health_timeout=2
+    health=""
+    for _ in $(seq 1 "$health_attempts"); do
+        health=$(curl -fsS --max-time "$health_timeout" "http://localhost:${OE_PORT}/api/health" 2>/dev/null | tr -d ' \n' || true)
+        # The closing brace is part of the test, not decoration. curl writes
+        # what it received before a connection died mid-body and -f does not
+        # cover that, so a truncated answer can carry the status and stop.
+        # Matching on the word alone reported a healthy install from a reply
+        # that never finished arriving, which the Windows script rejects,
+        # and two installers disagreeing about the same bytes is itself the
+        # finding. Requiring the brace makes them agree.
+        case "$health" in
+            *'"status":"healthy"'*'}'|*'"status":"degraded"'*'}') break ;;
+            *) health="" ;;
+        esac
+        sleep "$health_delay"
+    done
+
+    case "$health" in
+        *'"status":"healthy"'*)
+            ok "OpenConstructionERP is running at http://localhost:${OE_PORT}"
+            ;;
+        *'"status":"degraded"'*)
+            # The same word covers a missing module, where the product works,
+            # and a database the process cannot reach, where it does not.
+            if printf '%s' "$health" | grep -q '"database":"ok"'; then
+                ok "OpenConstructionERP is running at http://localhost:${OE_PORT}"
+                warn "Reporting degraded: not every enabled module loaded"
+                echo "  The application is usable. A restart usually loads the rest."
+                echo "  Which module is missing is in the log: cd ${OE_INSTALL_DIR} && docker compose logs -f"
+            else
+                warn "OpenConstructionERP started but cannot reach its database"
+                echo "  Check logs: cd ${OE_INSTALL_DIR} && docker compose logs -f"
+            fi
+            ;;
+        *)
+            warn "Service started but health check did not answer within $((health_attempts * (health_delay + health_timeout)))s"
+            echo "  Check logs: cd ${OE_INSTALL_DIR} && docker compose logs -f"
+            ;;
+    esac
     echo ""
     echo "Commands:"
     echo "  cd $OE_INSTALL_DIR && docker compose logs -f   # View logs"

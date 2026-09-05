@@ -51,6 +51,95 @@ except Exception:
     pass
 
 
+# ── Re-execution by multiprocessing in a frozen build ─────────────────────
+#
+# In a PyInstaller build ``sys.executable`` is this binary, so when the
+# standard library starts one of its own helper processes it re-executes us.
+# Two different command lines arrive and they need different handling.
+#
+# ``multiprocessing.spawn.get_command_line`` has a ``sys.frozen`` branch, so a
+# spawned child is started as ``<exe> --multiprocessing-fork ...`` and
+# ``freeze_support()`` answers it. The resource tracker has no such branch:
+# ``multiprocessing/resource_tracker.py`` builds ``[exe] +
+# _args_from_interpreter_flags() + ['-c', code]`` unconditionally, so the
+# frozen binary is handed a command line only an interpreter can answer.
+#
+# Measured on macos-latest in run 33834902654. The sidecar served the cold
+# start, and then on a restart over its own data printed
+#
+#     openconstructionerp: error: argument command: invalid choice:
+#     'from multiprocessing.resource_tracker import main;main(18)'
+#
+# and died with ``Abort trap: 6`` without ever answering /api/health. On a
+# user's machine that is the launcher stopping at "Starting the application
+# server" on the second launch, having worked on the first.
+#
+# ``freeze_support()`` on its own does not cover it, and this is the half that
+# is easy to get wrong: ``spawn.is_forking`` returns True only for
+# ``--multiprocessing-fork``, so the ``-c`` line above walks straight past it
+# into argparse. Both guards are needed. Both are gated on ``sys.frozen``,
+# because outside a frozen build the standard library re-executes the real
+# interpreter it finds through ``sys._base_executable`` and never reaches us.
+#
+# What may precede ``-c`` is whatever ``subprocess._args_from_interpreter_flags``
+# derives from the parent's ``sys.flags``: -O and -OO, repeats of -d -B -S -v
+# -b and -q, -I -E -s -P, -W with its value attached, and -X with its value as
+# a separate argument. A frozen build commonly runs with no_site, so testing
+# ``argv[1] == "-c"`` would pass on a CI runner and fail on a user's machine.
+
+_INTERPRETER_FLAG_LETTERS = frozenset("OdBSvbqIEsP")
+
+
+def interpreter_code_argument(argv: list[str]) -> str | None:
+    """Return the code of an interpreter-style ``-c`` invocation, else None.
+
+    ``argv`` is the argument list with the program name already removed. The
+    scan stops at the first argument that is not an interpreter flag, so an
+    ordinary invocation such as ``serve --port 8741`` is declined and reaches
+    the parser unchanged.
+    """
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "-c":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if arg == "-X":
+            index += 2
+            continue
+        if arg.startswith("-W") and len(arg) > 2:
+            index += 1
+            continue
+        if len(arg) > 1 and arg[0] == "-" and set(arg[1:]) <= _INTERPRETER_FLAG_LETTERS:
+            index += 1
+            continue
+        return None
+    return None
+
+
+def _answer_multiprocessing_re_execution() -> None:
+    """Answer the command lines multiprocessing uses to start its helpers.
+
+    Returns normally for an ordinary invocation. Does not return when the
+    arguments belong to the standard library rather than to a user.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    import multiprocessing
+
+    # Exits the process when the arguments are a spawned child's.
+    multiprocessing.freeze_support()
+
+    code = interpreter_code_argument(sys.argv[1:])
+    if code is None:
+        return
+    # What an interpreter does with -c. This grants nobody anything new:
+    # whoever can choose this process's arguments can already run whatever
+    # they like in the shell they typed them into.
+    exec(compile(code, "<multiprocessing>", "exec"), {"__name__": "__main__"})
+    raise SystemExit(0)
+
+
 def _stdout_supports_unicode() -> bool:
     enc = (getattr(sys.stdout, "encoding", "") or "").lower()
     return "utf" in enc
@@ -1087,6 +1176,50 @@ def run_preflight(
 
 
 # ── Commands ──────────────────────────────────────────────────────────────
+def _run_fatal_preflight(data_dir: Path, host: str, port: int) -> None:
+    """Run the blocking pre-flight checks, or exit 1 with a readable report.
+
+    Only the checks that are cheap and that can be answered without any of the
+    runtime environment ``_setup_env`` builds. Keeping the set to that is what
+    lets the caller run it first; see the note at the call site for why running
+    it first matters.
+
+    Args:
+        data_dir: The resolved data directory the server would use.
+        host: Interface the server would bind.
+        port: Port the server would bind.
+
+    Raises:
+        SystemExit: With code 1 when any check reports ``error``.
+    """
+    fatal_checks = [
+        check_python_version(),
+        check_data_dir(data_dir),
+        check_port_free(host, port),
+        *check_core_tabular_deps(),
+    ]
+    if not any(c.status == "error" for c in fatal_checks):
+        return
+
+    print(
+        _red(
+            _bold(
+                _u(
+                    "Cannot start OpenConstructionERP — pre-flight checks failed:",
+                    "Cannot start OpenConstructionERP - pre-flight checks failed:",
+                )
+            )
+        )
+    )
+    print()
+    for c in fatal_checks:
+        c.print()
+    print()
+    print(_dim("Run 'openconstructionerp doctor' for full diagnostics."))
+    print(_dim(f"Troubleshooting: {TROUBLESHOOTING_URL}"))
+    sys.exit(1)
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     """Start the OpenConstructionERP server."""
     data_dir = _data_dir_from_args(args)
@@ -1110,36 +1243,22 @@ def cmd_serve(args: argparse.Namespace) -> None:
         os.environ["SEED_DEMO"] = "true"
         write_demo_seed_choice(True, data_dir)
 
-    _setup_env(data_dir, args.host, args.port)
+    # The fatal preflight runs BEFORE _setup_env, and the order is the whole
+    # point. _setup_env boots the embedded PostgreSQL cluster, which on a first
+    # run means an initdb: about twenty seconds and forty megabytes under the
+    # data dir. Every one of these four checks is independent of it, and two of
+    # them describe conditions that make the boot pointless. Running them after
+    # meant a first-time user with something else on port 8080 - the single most
+    # common thing to be wrong on a machine we have never seen - waited out the
+    # whole initdb to be told about a conflict that costs microseconds to
+    # detect. Worse, check_data_dir never got to speak at all: _setup_env's own
+    # unguarded data_dir.mkdir() is three lines into the function, so an
+    # unwritable path raised FileNotFoundError there and the user got a pathlib
+    # traceback instead of the sentence naming --data-dir that this check exists
+    # to print.
+    _run_fatal_preflight(data_dir, args.host, args.port)
 
-    # Run only the fatal preflight checks before attempting to start.
-    # If a check fails hard, we stop here with a readable message instead
-    # of letting uvicorn crash with a stack trace.
-    fatal_checks = [
-        check_python_version(),
-        check_data_dir(data_dir),
-        check_port_free(args.host, args.port),
-        *check_core_tabular_deps(),
-    ]
-    blocking = [c for c in fatal_checks if c.status == "error"]
-    if blocking:
-        print(
-            _red(
-                _bold(
-                    _u(
-                        "Cannot start OpenConstructionERP \u2014 pre-flight checks failed:",
-                        "Cannot start OpenConstructionERP - pre-flight checks failed:",
-                    )
-                )
-            )
-        )
-        print()
-        for c in fatal_checks:
-            c.print()
-        print()
-        print(_dim("Run 'openconstructionerp doctor' for full diagnostics."))
-        print(_dim(f"Troubleshooting: {TROUBLESHOOTING_URL}"))
-        sys.exit(1)
+    _setup_env(data_dir, args.host, args.port)
 
     try:
         from app.config import get_settings
@@ -2499,6 +2618,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """CLI entry point."""
+    # Before the parser is built, because the command lines this answers are
+    # not commands and argparse rejects them. See the block near the top.
+    _answer_multiprocessing_re_execution()
+
     parser = _build_parser()
     args = parser.parse_args()
 

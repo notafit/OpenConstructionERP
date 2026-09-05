@@ -17,6 +17,7 @@ Usage:
 """
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,27 @@ GENERIC_FIELDS: tuple[str, ...] = (
 
 _embedder_instance: Any = None
 _embedder_tried: bool = False
+
+# Serialises the construction of the singleton above, and nothing else.
+#
+# ``get_embedder`` is reachable from several threads at once - the embedding
+# pool's worker threads, the default asyncio executor, any request handler that
+# needs a vector - and building the model takes seconds. Without this lock every
+# thread that arrives while the first one is still inside
+# ``SentenceTransformer(...)`` sees ``_embedder_instance is None`` and builds its
+# own copy. They all then assign to the same global, so all but the last are
+# dropped on the floor: the cost is paid, the memory is held until the garbage
+# collector gets to them, and the log shows one "Loaded" line per loser.
+#
+# Measured, macos-latest, desktop-release run 33841183277: three simultaneous
+# constructions, three "Loaded sentence-transformers model" lines 138 ms apart,
+# then SIGSEGV before the pool could report itself initialised. Three is
+# ``min(4, os.cpu_count())`` on that runner, which is the number of warm-up jobs
+# the embedding pool submits at startup.
+#
+# The fast path stays lock-free: once the singleton exists, callers return it
+# without touching the lock at all.
+_embedder_load_lock = threading.Lock()
 
 
 def _has_module(name: str) -> bool:
@@ -122,10 +144,13 @@ def reset_embedder() -> None:
     already answering. It gets picked up on the next restart instead.
     """
     global _embedder_instance, _embedder_tried, _active_model_name
-    if _embedder_instance is not None:
-        return
-    _embedder_tried = False
-    _active_model_name = None
+    # Under the same lock as the load, or a reset that lands while a load is
+    # running is undone by that load's own failure latch a second later.
+    with _embedder_load_lock:
+        if _embedder_instance is not None:
+            return
+        _embedder_tried = False
+        _active_model_name = None
 
 
 def _candidate_sources(name: str) -> list[str]:
@@ -190,13 +215,84 @@ def get_embedder():
     loop ~every second, burning ~10s of CPU per iteration and starving
     the match-elements request path of the GIL.
     """
-    global _embedder_instance, _embedder_tried, _active_model_name
     if _embedder_instance is not None:
         return _embedder_instance
     # Short-circuit: a prior call exhausted both candidate models.
     # Without this guard every caller pays the multi-second retry cost.
     if _embedder_tried:
         return None
+
+    with _embedder_load_lock:
+        # Both checks again, because the thread that held the lock while we
+        # waited for it has usually just answered the question. Repeating them
+        # is what turns N concurrent callers into one load; skipping them is
+        # what made a desktop build die on its second launch.
+        if _embedder_instance is not None:
+            return _embedder_instance
+        if _embedder_tried:
+            return None
+        return _load_embedder()
+
+
+def _resolve_device() -> str | None:
+    """Decide which torch device the encoder is built on.
+
+    ``None`` means say nothing and let sentence-transformers pick, which is what
+    happened everywhere before this function existed and is still what happens
+    on a normal server install.
+
+    A frozen build gets ``"cpu"``, and that is the whole point of this function.
+    Left to itself sentence-transformers selects the best accelerator it can
+    see, which on any Apple Silicon machine is Metal: the log of the run that
+    prompted this reads ``No device provided, using mps``. A frozen bundle
+    dispatching inference to Metal from several threads at once is a
+    combination we neither test nor need, and on macOS it does not survive.
+
+    Measured, desktop-release run 33851623420, macos-latest, the restart leg:
+    the encoder loads exactly once and successfully, the process then raises
+    SIGSEGV before the pool reports itself initialised, and the last line
+    before the crash is the multiprocessing resource tracker complaining about
+    a leaked semaphore. The same leg with ``OE_VECTOR_POOL_WORKERS=0`` serves
+    normally, which is the bisect that puts the fault in the pool or in what it
+    warms rather than in the model load. What the pool does immediately after
+    the load is run several encode calls at once against the one model object.
+
+    The accelerator buys little here in any case. This is a 384 dimensional
+    sentence encoder embedding short strings, and a desktop workspace is not
+    the machine anyone chose for throughput.
+
+    ``OE_VECTOR_DEVICE`` overrides both branches, so a person who wants Metal on
+    their own desktop build can ask for it, and so this can be measured from
+    both sides rather than only asserted.
+    """
+    import os
+    import sys
+
+    override = (os.environ.get("OE_VECTOR_DEVICE") or "").strip()
+    if override:
+        return override
+
+    if getattr(sys, "frozen", False):
+        return "cpu"
+
+    try:
+        from app.config import desktop_mode
+
+        if desktop_mode():
+            return "cpu"
+    except Exception:  # noqa: BLE001 - config is not worth a failed model load
+        pass
+
+    return None
+
+
+def _load_embedder():
+    """Build the singleton. Only ever called with ``_embedder_load_lock`` held.
+
+    Split out of :func:`get_embedder` so the lock scope is one line and reads as
+    one: everything here writes the module globals and must not run twice.
+    """
+    global _embedder_instance, _embedder_tried, _active_model_name
 
     try:
         from sentence_transformers import SentenceTransformer
@@ -205,6 +301,7 @@ def get_embedder():
         _embedder_tried = True
         return None
 
+    device = _resolve_device()
     primary, dim = _resolve_active_model()
     fallback_name = EMBEDDING_MODEL
     try:
@@ -220,13 +317,17 @@ def get_embedder():
         # model rather than a directory on someone's disk.
         for source in _candidate_sources(candidate):
             try:
-                _embedder_instance = SentenceTransformer(source)
+                if device is None:
+                    _embedder_instance = SentenceTransformer(source)
+                else:
+                    _embedder_instance = SentenceTransformer(source, device=device)
                 _active_model_name = candidate
                 logger.info(
-                    "Loaded sentence-transformers model: %s from %s (~%dd)",
+                    "Loaded sentence-transformers model: %s from %s (~%dd) on device %s",
                     candidate,
                     source,
                     dim,
+                    device or "chosen by sentence-transformers",
                 )
                 return _embedder_instance
             except Exception as exc:

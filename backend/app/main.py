@@ -707,6 +707,115 @@ def _persist_demo_credentials(creds: dict[str, str]) -> Path | None:
         return None
 
 
+#: The identity of a data directory, published by ``/api/health``.
+#:
+#: Read by the desktop launcher (``desktop/src-tauri/src/main.rs``) before it
+#: attaches to a backend that is already listening on loopback. A rename here is
+#: a rename there; the two sides share a file name and nothing else.
+_WORKSPACE_ID_FILENAME = "workspace_id.json"
+
+
+def _workspace_id_path() -> Path:
+    """Resolve the workspace-identity file in the active data dir.
+
+    Same resolution as the demo-backfill marker below, and for the same reason:
+    a ``serve --data-dir`` instance is a separate installation and must carry a
+    separate identity, which it does not if the path is computed any other way.
+    """
+    from app.core.partner_pack.state import _resolve_state_dir
+
+    return _resolve_state_dir() / _WORKSPACE_ID_FILENAME
+
+
+def _read_workspace_id(path: Path) -> str | None:
+    """Return the identity recorded at ``path``, or ``None`` if there is none.
+
+    Anything unreadable, unparseable or empty reads as absent. A caller that got
+    ``None`` here either writes the file or publishes no identity at all; there
+    is no third answer, and in particular no answer that is wrong.
+    """
+    import json as _json
+
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = raw.get("workspace_id") if isinstance(raw, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _resolve_workspace_id() -> str | None:
+    """The identity of the installation this process serves, or ``None``.
+
+    Which *data directory* is being served, as against which process is serving
+    it. ``_INSTANCE_ID`` answers the second question and cannot be made to
+    answer the first: it is a fresh uuid4 per process, so it differs across a
+    restart of one install exactly as it differs between two installs, which
+    makes it useless to anyone trying to tell those two cases apart. Hence a
+    second field rather than a reuse of that one.
+
+    Two properties are load bearing, and both are asserted in
+    ``tests/unit/test_a_second_user_on_one_machine_is_a_second_workspace.py``.
+
+    The value is opaque random bytes, never a path and never anything derived
+    from an account name. ``/api/health`` is unauthenticated on purpose, so on
+    any deployment whose port is reachable this value is readable by whoever can
+    reach it, and an id built out of the data directory would publish the disk
+    layout and the operating-system user of the machine serving it.
+
+    And it is persisted, so it survives a restart. A value regenerated per boot
+    would make a launcher refuse to attach to the backend it started itself, and
+    the cost of refusing is not "look elsewhere", it is a second server started
+    against the running one's data directory.
+
+    Created with ``O_EXCL`` rather than written to a temporary file and renamed
+    over. Renaming is the usual idiom here (``_write_demo_backfill_version``
+    below uses it) and is the wrong one for this file: rename replaces what it
+    finds, on POSIX and on Windows alike, so two processes starting together
+    would each write an id and the loser would be left holding one that is no
+    longer on disk. ``O_EXCL`` is create-if-absent in a single syscall, so the
+    first writer wins and every later one reads that same value back.
+
+    Returns ``None`` when the directory cannot be read or written - a read-only
+    mount, a full disk. That omits the field from the health body, which fails
+    closed: a launcher with no identity of its own attaches to nothing, and a
+    candidate that publishes none is refused. Never raises, because a container
+    healthcheck reads this endpoint and a 500 there is a worse outcome than an
+    installation that declines to be attached to.
+    """
+    import json as _json
+
+    try:
+        path = _workspace_id_path()
+    except Exception:  # noqa: BLE001 - an unresolvable data dir has no identity
+        logger.debug("Could not resolve the workspace id path", exc_info=True)
+        return None
+
+    existing = _read_workspace_id(path)
+    if existing:
+        return existing
+
+    candidate = secrets.token_hex(16)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _json.dumps({"workspace_id": candidate}, indent=2) + "\n"
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return candidate
+    except FileExistsError:
+        # Somebody else got there between the read above and the create. Theirs
+        # is the identity of this directory; ours was never published.
+        return _read_workspace_id(path)
+    except OSError:
+        logger.debug("Could not establish the workspace id", exc_info=True)
+        return None
+
+
 _DEMO_BACKFILL_MARKER_FILENAME = "demo_backfill_marker.json"
 
 
@@ -1852,6 +1961,19 @@ def create_app() -> FastAPI:
         import os as _os
         from pathlib import Path as _Path
 
+        # Modules, and three numbers rather than one. ``modules_loaded`` was the
+        # length of ``list_modules()``, which iterates the manifests that
+        # parsed - so the field named for the loaded modules answered with the
+        # discovered figure, counting modules the operator had switched off and
+        # modules that never imported alike. Discovered, enabled and loaded move
+        # independently, and a reader handed only their sum cannot tell which of
+        # them dropped: a module switched off and a module that failed lower it
+        # by exactly the same one, and only the second is a fault.
+        #
+        # Every row carries the two flags these are counted from, so the three
+        # come out of one pass and cost nothing extra on an endpoint the desktop
+        # launcher polls twice a second.
+        _module_rows = module_loader.list_modules()
         result: dict[str, Any] = {
             "status": "healthy",
             "version": settings.app_version,
@@ -1859,9 +1981,60 @@ def create_app() -> FastAPI:
             "instance_id": _INSTANCE_ID,
             "build": f"DDC-{_BUILD_HASH}",
             "signature": build_provenance_tag(settings.app_version),
-            "modules_loaded": len(module_loader.list_modules()),
+            "modules_discovered": len(_module_rows),
+            "modules_enabled": sum(1 for _row in _module_rows if _row.get("enabled")),
+            "modules_loaded": sum(1 for _row in _module_rows if _row.get("loaded")),
             "uptime_seconds": int(time.time() - _startup_time),
         }
+
+        # A module the operator asked for that is not there. Counted per row and
+        # never as ``modules_enabled - modules_loaded``, because those are
+        # different claims: ``resolve_order`` recurses into a module's
+        # dependencies without asking whether the dependency is enabled, so a
+        # disabled module pulled in by an enabled one comes back loaded and not
+        # enabled, and one row of that shape cancels one row of this one. The
+        # subtraction then reads zero across an install that has lost a module.
+        #
+        # The state is reachable at runtime and not at boot: ``load_all``
+        # re-raises, so a module that cannot be imported at startup takes the
+        # process down and never answers this probe. ``enable_module`` is the
+        # path - it marks the manifest enabled and drops the name from the
+        # disabled set BEFORE importing the package, and an import that raises
+        # there leaves the registry holding a module that is enabled and absent
+        # until somebody restarts, with every endpoint it owns answering 404.
+        #
+        # It degrades the status, and it is the only module condition that does.
+        # Told healthy, a person looking for a feature that is missing concludes
+        # their edition does not include it and stops, which is the one wrong
+        # conclusion on offer; told degraded beside the two counts, they restart
+        # or reinstall, which is the fix. A disabled module is a choice and not a
+        # fault, and a count lower than the last release's is not knowable here -
+        # degrading on either would light this permanently, and an aggregate with
+        # a permanently active cause has stopped being a signal, exactly as the
+        # stale alembic stamp below did before it was made a fact. Which module
+        # is missing is not published, for the reason in this endpoint's
+        # docstring; it is in the boot log.
+        #
+        # Not closed by any of this: a manifest that fails to import is swallowed
+        # by ``_discover_in``, so the module leaves all three counts at once and
+        # nothing at runtime holds a baseline to notice against.
+        if any(_row.get("enabled") and not _row.get("loaded") for _row in _module_rows):
+            result["status"] = "degraded"
+
+        # Which installation is answering, as against which process. The desktop
+        # installer is per-machine and loopback on Windows is not per-session, so
+        # a backend one account started answers this probe for every account
+        # logged into the same machine, and version equality above cannot tell
+        # those apart - it is the same install. This is what can. Read from disk
+        # on every request rather than memoised, because the property the
+        # launcher needs is that it survives a restart, and a value cached for
+        # the life of a process would be indistinguishable from instance_id
+        # under the test that checks it. Omitted, not empty, when the data
+        # directory yields no identity: an absent field refuses an attach, and
+        # an empty one would compare equal to another empty one.
+        _workspace_id = _resolve_workspace_id()
+        if _workspace_id:
+            result["workspace_id"] = _workspace_id
 
         # Database connectivity (fast ping)
         try:
