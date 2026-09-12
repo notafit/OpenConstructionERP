@@ -15,7 +15,7 @@ repos:
       - id: detect-private-key
 
   # Python linting & formatting. Pinned to the same ruff the CI gate and
-  # backend/pyproject.toml dev extra use (ruff==0.15.20): the "ruff format
+  # backend/pyproject.toml dev extra use (ruff==0.16.6): the "ruff format
   # --check" gate compares against the formatter's exact output, so a hook on
   # an older ruff would reformat differently and fail CI on code that passed
   # locally. Bump this in lockstep with the pyproject pin.
@@ -38,7 +38,7 @@ repos:
   # trees get the config named explicitly, which is what the CI gate for them
   # does too.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.20
+    rev: v0.16.6
     hooks:
       - id: ruff
         name: ruff (backend, configuration discovered)
@@ -183,6 +183,46 @@ repos:
         entry: python scripts/check_repo_hygiene.py
         language: system
         pass_filenames: false
+
+      # The public origin serves the marketing site and the app from one
+      # hostname, and Caddy picks between them from one allowlist of top-level
+      # path segments. A route the app serves that the list does not carry never
+      # reaches the app: the visitor gets the static site's 404. On 2026-09-09
+      # that was the whole regional BOQ exchange feature, twenty one routes, and
+      # the gate that existed for it passed over every one of them because it
+      # read App.tsx alone and those routes come from a module manifest.
+      #
+      # A hook rather than a lane check alone, because the commit that adds a
+      # route is where the answer is cheapest: the script reads the tree and the
+      # committed allowlist mirror, no network, under a second. It runs whole
+      # tree rather than on staged files, since a route in one file and the
+      # allowlist in another are the two halves being compared.
+      - id: app-route-allowlist-check
+        name: Check app routes against the proxy allowlist mirror
+        entry: python scripts/check_app_route_allowlist.py
+        language: system
+        pass_filenames: false
+
+      # Refuse a commit whose Python imports a module the same commit does not
+      # carry. The module is usually right there on the author's disk, untracked,
+      # so everything imports and every test passes locally and the backend fails
+      # to start on the first machine that reads the commit instead of the disk.
+      #
+      # Scoped to the staged files on purpose, which is the half of the defect a
+      # commit hook can see: you are committing the importer. The other half - a
+      # module leaving the tree while files that import it stay - needs the whole
+      # tree, and that scan runs in .github/workflows/repo-hygiene.yml, where it
+      # can parse all 4800 files with nobody waiting on it.
+      #
+      # Worth knowing before relying on this: nothing here runs until somebody
+      # has run `pre-commit install` in their clone. A clone without it has no
+      # .git/hooks/pre-commit at all, and every hook in this file at the commit
+      # stage is inert - the file is the declared intent, not the enforcement.
+      - id: untracked-import-check
+        name: Block imports of modules the commit does not carry
+        entry: python scripts/check_untracked_imports.py --paths
+        language: system
+        files: ^backend/.*\.py$
 
       # Parse every tracked YAML and JSON file, as a category. check-yaml and
       # check-json above are the per-file version of this and are scoped to
@@ -339,18 +379,25 @@ repos:
         files: ^frontend/src/app/locales/.*\.ts$
 
       # The boot heal runs create_all before anything reads alembic_version, so
-      # every table in the model metadata already exists by the time an operator
-      # runs `alembic upgrade head` by hand. An unguarded op.create_table then
-      # hits DuplicateTable, and because PostgreSQL runs DDL inside a
-      # transaction the failure rolls back the WHOLE run: alembic_version does
-      # not move and every later revision is skipped along with its backfills.
-      # Reported from an install stuck 26 revisions behind across four releases.
-      # 169 of the 173 revisions that create tables already asked an inspector
-      # first, which is exactly the kind of near-universal convention nobody
-      # notices breaking.
-      - id: migration-create-table-guarded
-        name: Block a migration that creates a table without checking for it
-        entry: python scripts/check_migration_create_table_guarded.py
+      # the whole of the model metadata already exists by the time an operator
+      # runs `alembic upgrade head` by hand. Unguarded additive DDL then hits
+      # DuplicateTable, DuplicateColumn or DuplicateObject, and because
+      # PostgreSQL runs DDL inside a transaction the failure rolls back the
+      # WHOLE run: alembic_version does not move and every later revision is
+      # skipped along with its backfills. Reported from an install stuck 26
+      # revisions behind across four releases, and reproduced directly by
+      # replaying the chain over a booted database, which died on
+      # DuplicateColumn for oe_changeorders_order.rejected_by.
+      #
+      # This used to check op.create_table alone, with a matcher that also
+      # required the receiver to be literally `op`. The rejected_by failure got
+      # through both halves: it is add_column, and it is written as
+      # `batch.add_column` inside batch_alter_table, which 60 revisions use. The
+      # gate is receiver-blind now and covers every additive verb the tree
+      # actually uses, raw op.execute DDL included.
+      - id: migration-ddl-guarded
+        name: Block a migration that adds schema without checking for it
+        entry: python scripts/check_migration_ddl_guarded.py
         language: system
         pass_filenames: false
         files: ^backend/alembic/versions/.*\.py$
@@ -510,7 +557,20 @@ repos:
         entry: python scripts/check_case_playbook_catalogue_locales.py
         language: system
         pass_filenames: false
-        files: ^(frontend/src/features/cases/data/.*\.playbook\.ts|frontend/src/app/locales/.*\.ts|scripts/check_case_playbook_catalogue_locales\.py)$
+        files: ^(frontend/src/features/cases/data/.*\.playbook\.ts|frontend/src/app/locales/.*\.ts|frontend/src/features/cases/case-coverage-manifest\.json|scripts/check_case_playbook_catalogue_locales\.py)$
+
+      # The hook above holds the finished languages to the catalogue text.
+      # This one holds every offered language to the step text it already
+      # answers: a floor per locale and per playbook that only moves down,
+      # so a case cannot ship without its strings and a locale cannot lose
+      # a key it had. The manifest is in the pattern because the floor is
+      # part of the check.
+      - id: case-coverage-ratchet
+        name: Gate a case that answers fewer translated keys than the manifest records
+        entry: node frontend/scripts/check-case-coverage.mjs
+        language: system
+        pass_filenames: false
+        files: ^(frontend/src/features/cases/data/.*\.playbook\.ts|frontend/src/app/locales/.*\.ts|frontend/src/app/i18n\.ts|frontend/src/features/cases/case-coverage-manifest\.json|frontend/scripts/check-case-coverage\.mjs)$
 
       # "Payment application" here is a claim for work done, and seventeen
       # locales had it as a phone app. That class of fix does not stay fixed: a

@@ -1127,8 +1127,8 @@ _US_MEDICAL = DemoTemplate(
     boq_metadata={
         "standard": "Division-based work-results classification",
         "phase": "Detailed Estimate",
-        "base_date": "2025-Q2",
-        "price_level": "US National Average 2025",
+        "base_date": "2026-Q3",
+        "price_level": "US National Average 2026",
     },
     sections=[
         # -- 01 General Requirements -------------------------------------------
@@ -1302,21 +1302,21 @@ _US_MEDICAL = DemoTemplate(
         ),
     ],
     schedule_activities=[
-        ("Site Preparation", "2025-06-01", "2025-08-15"),
-        ("Foundation & Slab on Grade", "2025-08-01", "2025-11-30"),
-        ("Structural Steel Erection", "2025-10-15", "2026-03-31"),
-        ("Concrete Elevated Slabs", "2025-12-01", "2026-04-30"),
-        ("Exterior Envelope", "2026-02-01", "2026-07-31"),
-        ("Roofing", "2026-04-01", "2026-06-30"),
-        ("MEP Rough-In", "2026-03-01", "2026-09-30"),
-        ("Interior Partitions", "2026-06-01", "2026-10-31"),
-        ("Finishes", "2026-08-01", "2026-12-31"),
-        ("Elevator Installation", "2026-07-01", "2026-11-30"),
-        ("Fire Protection", "2026-05-01", "2026-10-31"),
-        ("Medical Gas & Plumbing", "2026-04-01", "2026-10-31"),
-        ("Electrical & Controls", "2026-04-01", "2026-11-30"),
-        ("Commissioning & Testing", "2026-11-01", "2027-02-28"),
-        ("Substantial Completion", "2027-01-15", "2027-03-31"),
+        ("Site Preparation", "2026-08-01", "2026-10-15"),
+        ("Foundation & Slab on Grade", "2026-10-01", "2027-01-31"),
+        ("Structural Steel Erection", "2026-12-15", "2027-05-31"),
+        ("Concrete Elevated Slabs", "2027-02-01", "2027-06-30"),
+        ("Exterior Envelope", "2027-04-01", "2027-09-30"),
+        ("Roofing", "2027-06-01", "2027-08-31"),
+        ("MEP Rough-In", "2027-05-01", "2027-11-30"),
+        ("Interior Partitions", "2027-08-01", "2027-12-31"),
+        ("Finishes", "2027-10-01", "2028-02-28"),
+        ("Elevator Installation", "2027-09-01", "2028-01-31"),
+        ("Fire Protection", "2027-07-01", "2027-12-31"),
+        ("Medical Gas & Plumbing", "2027-06-01", "2027-12-31"),
+        ("Electrical & Controls", "2027-06-01", "2028-01-31"),
+        ("Commissioning & Testing", "2028-01-01", "2028-04-30"),
+        ("Substantial Completion", "2028-03-15", "2028-05-31"),
     ],
     planned_budget=25_000_000,
     actual_spend_ratio=0.42,
@@ -2278,7 +2278,7 @@ PACK_DEMO_PROJECT: dict[str, str] = {
     "batimatech-ca": "condo-toronto",
     "bimhessen-de": "residential-berlin",
     "brazil-sinapi": "residential-saopaulo",
-    "china-gbt50500": "office-shanghai",
+    "china-gbt50500": "renovation-guangzhou",
     "doker-formwork": "rc-structure-formwork",
     "hungary-hu": "residential-budapest",
     "india-cpwd": "govt-building-delhi",
@@ -2300,6 +2300,17 @@ PACK_DEMO_PROJECT: dict[str, str] = {
     # rather than a claim about where the project sits.
     "us-texas": "medical-us",
     "us-california": "commercial-denver",
+    # 10 country packs added 2026-09-11. Each maps to its flagship demo.
+    "germany-de": "residential-berlin",
+    "france-fr": "school-paris",
+    "japan-jp": "office-tokyo",
+    "korea-kr": "residential-seoul",
+    "turkey-tr": "mixed-use-istanbul",
+    "italy-it": "residential-rome",
+    "spain-es": "mixed-use-barcelona",
+    "uae-ae": "warehouse-dubai",
+    "netherlands-nl": "office-amsterdam",
+    "poland-pl": "residential-warsaw",
 }
 
 # Country-name → ISO 3166-1 alpha-2, for catalog rows auto-derived from a
@@ -2448,6 +2459,12 @@ _PACK_DEMO_TYPE: dict[str, str] = {
     # as it has been there. A default that is itself a valid answer is the kind
     # a miss hides inside.
     "residential-shenzhen": "Residential",
+    "renovation-guangzhou": "Renovation",
+    "villa-suzhou": "Residential",
+    "residential-berlin": "Residential",
+    "school-paris": "Education",
+    "warehouse-dubai": "Industrial",
+    "medical-us": "Healthcare",
 }
 
 
@@ -2995,11 +3012,17 @@ def _resources_for_position(
 
     Mirrors the ai_estimator apply shape (``_ensure_resources`` /
     ``_resource_rollup``) so a seeded position renders the same M/L/E badge and
-    drill-down as an AI-applied one. The invariant the BOQ relies on is
-    ``Sum(leaf.quantity * leaf.unit_rate) == position.quantity *
-    position.unit_rate`` (the position total): each leaf carries ``quantity =
-    position quantity`` and ``unit_rate = unit_rate * share``. The split is
-    flagged ``estimated`` so it is never presented as catalogue-grounded.
+    drill-down as an AI-applied one. The rows follow the BOQ's per-unit norm
+    convention: each leaf is one allowance per unit of the position, so it
+    carries ``quantity = 1.0`` and ``unit_rate = unit_rate * share``, and
+    ``Sum(leaf.quantity * leaf.unit_rate) == position.unit_rate``. The BOQ
+    service relies on that when an edit re-derives the unit rate from the
+    rows; before 17.1.0 each leaf held the position quantity instead and such
+    an edit multiplied the rate by it. The split is flagged ``estimated`` so
+    it is never presented as catalogue-grounded.
+
+    ``quantity`` decides only whether there is anything to build up: a
+    zero-quantity row gets no buildup, like a zero-priced one.
 
     Returns an empty list for sections / zero-priced rows (nothing to build up).
     """
@@ -3020,8 +3043,8 @@ def _resources_for_position(
     )
     # Distribute the per-unit rate across the three leaves so the leaf rates sum
     # to EXACTLY ``unit_rate`` (no rounding drift): the last leaf takes the
-    # remainder. Each leaf's quantity is the position quantity, so
-    # Sum(qty * leaf_rate) == qty * unit_rate == position total.
+    # remainder. Each leaf's quantity is 1.0, one allowance per unit, so
+    # Sum(quantity * leaf_rate) == unit_rate, the position's unit rate.
     allocated = Decimal("0")
     for idx, (label, rtype, share) in enumerate(specs):
         if idx == len(specs) - 1:
@@ -3037,7 +3060,7 @@ def _resources_for_position(
                 "unit": res_unit,
                 "factor": 1.0,
                 "unit_rate": format(leaf_rate, "f"),
-                "quantity": qty,
+                "quantity": 1.0,
                 "estimated": True,
             }
         )

@@ -70,12 +70,31 @@ jobs:
   build-sidecar:
     name: Build Sidecar (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Measured over v14.3.0, v14.4.0, v14.5.0 and five sidecar-only runs:
-    # Linux 14.4 to 15.2 min, Windows 15.6 to 17.8, macOS 25.6 to 34.4. The cap
-    # is a little over twice the slowest observed leg, so it cannot fire on a
-    # healthy build. Without one the job inherits the six hour default, which is
-    # what a hung PyInstaller run costs across three parallel legs.
-    timeout-minutes: 75
+    # Without a cap the job inherits the six hour default, which is what a hung
+    # PyInstaller run costs across three parallel legs. So there is a cap, and
+    # the only question is where it goes.
+    #
+    # It was 75, from a measurement of v14.3.0 to v14.5.0 that put macOS at 25.6
+    # to 34.4 minutes. That reading is two months old and macOS is nowhere near
+    # it any more. Over the twelve most recent runs the macOS leg took 18.8,
+    # 37.9, 51.2, 52.6, 55.2, 57.7, 60.1, 63.2, 66.6, 68.3, 68.3 and 75.4
+    # minutes, and the last of those is v17.2.0, which the cap killed after
+    # every check in the job had already passed. Nine of the twelve were over
+    # fifty.
+    #
+    # The spread is the point, not the middle. The same commit builds the
+    # frontend on macOS in 18 minutes on one runner and 60 on another, so a cap
+    # anywhere near the median fires on runner luck rather than on a defect. The
+    # other two legs are steady at 30 and 37 and are nowhere near this.
+    #
+    # 120 is the number build-tauri already uses, and it is above every run in
+    # that sample, so a job that reaches it is stuck rather than unlucky.
+    #
+    # What this does not fix: three legs each build the same frontend from the
+    # same commit and get the same bytes, and on macOS that build is most of the
+    # job. Building it once and passing it to the three would take the whole
+    # variance out of two of them.
+    timeout-minutes: 120
     strategy:
       # Build every OS even if one fails, so a single-platform break never
       # cancels the others and we still ship the installers that did build.
@@ -101,14 +120,14 @@ jobs:
           ref: ${{ env.RELEASE_REF }}
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
@@ -224,8 +243,9 @@ jobs:
       # is what makes it safe to gate a release on.
       #
       # Know what this step does NOT prove. A control run built from this
-      # workflow with the spec's codesign_identity reverted started here just
-      # fine, so this runner does not reproduce the user's failure: whether dyld
+      # workflow with the spec's codesign_identity set to None, the value it
+      # carries today after issue #480, started here just fine, so this runner
+      # does not reproduce the user's failure: whether dyld
       # enforces Team ID matching depends on the policy applied to the process,
       # and a binary built locally and never quarantined is judged leniently.
       # This step therefore catches "the build does not start at all", the issue
@@ -544,7 +564,8 @@ jobs:
           # Windows carries backslashes and handing one to bash fails a leg of
           # the matrix for a reason unrelated to what is being checked.
           scratch="oe-serve-check-data"
-          port=8799
+          port_base=8799
+          port=$port_base
           rm -rf "$scratch"
           mkdir -p "$scratch"
 
@@ -565,6 +586,78 @@ jobs:
             return 1
           }
 
+          # The pid of whatever is listening, asked of the socket rather than of
+          # the process table or of an image name. netstat answers with the
+          # owning pid on Windows, which is the one thing bash cannot see there:
+          # the job it started is a shim and the native server outlives it.
+          port_owners() {
+            case "$RUNNER_OS" in
+              Windows)
+                netstat -ano 2>/dev/null | tr -d '\r' \
+                  | awk -v p=":$1\$" '$2 ~ p && $4 == "LISTENING" { print $5 }' \
+                  | sort -u
+                ;;
+              *)
+                lsof -t -i "@127.0.0.1:$1" -s TCP:LISTEN 2>/dev/null | sort -u
+                ;;
+            esac
+          }
+
+          # Stop a leg and do not return until its port is free, which is the
+          # only thing the next leg cares about. Reap the job first, since that
+          # is enough everywhere the runner is not Windows. Then, if the socket
+          # is still held, stop the process that holds it, by pid and with its
+          # children, never by image name.
+          #
+          # Run 33974544673 is why this exists. Both restart legs died on a port
+          # the previous leg had not released, the step reported that the product
+          # does not serve, and four installers did not ship for a release whose
+          # cold start had just answered healthy.
+          # The first port from the base upward that nothing is listening on.
+          # Every leg calls this, so a leg whose predecessor refused to die
+          # steps over it instead of failing behind it.
+          next_free_port() {
+            p=$port_base
+            for _ in $(seq 1 40); do
+              if port_held "$p"; then
+                p=$((p + 1))
+              else
+                port=$p
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          stop_leg() {
+            kill "$1" 2>/dev/null || true
+            wait "$1" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              port_held "$port" || return 0
+              sleep 1
+            done
+            # Best effort, and on windows-latest it is not effective at all.
+            # Run 33985026765 printed "taskkill would not stop pid 364" and the
+            # socket stayed open, which is only visible because this stopped
+            # discarding taskkill's stderr. Kept because it costs a second and
+            # may work off this runner, but nothing here depends on it: the
+            # next leg steps onto a free port either way.
+            for owner in $(port_owners "$port"); do
+              echo "port $port is still held by pid $owner after the job was reaped, stopping that process tree"
+              if [ "$RUNNER_OS" = "Windows" ]; then
+                taskkill //PID "$owner" //T //F 2>&1 || echo "taskkill would not stop pid $owner"
+              else
+                kill -9 "$owner" 2>/dev/null || true
+              fi
+            done
+            for _ in $(seq 1 30); do
+              port_held "$port" || return 0
+              sleep 1
+            done
+            echo "port $port is STILL held after a forced stop; the next leg will report it"
+            return 1
+          }
+
           start_and_wait() {
             label="$1"
             log="serve-${label}.log"
@@ -573,18 +666,22 @@ jobs:
             # down after that, still holding the listening socket. The launcher
             # never does this to a user: it stops the sidecar through
             # /api/system/desktop-shutdown, which stops the cluster cleanly so
-            # the next start has no write-ahead log to replay. So this wait
-            # removes an artifact of the teardown in here, not a defect anybody
-            # can reach by closing the app. Windows lost this race in run
-            # 33860279598 and won it in 33851623420 with identical code.
-            for _ in $(seq 1 60); do
-              port_held "$port" || break
-              sleep 1
-            done
-            if port_held "$port"; then
-              echo "::error title=The serve check could not free port ${port} on ${{ matrix.os }} (${label})::Something was still listening on 127.0.0.1:${port} sixty seconds after the previous leg was stopped, so this leg could never bind it. That is this step's own teardown rather than the sidecar, and it should be read as a defect in the check."
+            # the next start has no write-ahead log to replay.
+            #
+            # So the wait that used to stand here removed an artifact of this
+            # teardown rather than a defect anybody can reach by closing the
+            # app, and it was also the one place every leg queued behind. In
+            # run 33980957412 the Windows server outlived kill, wait and a
+            # taskkill on its own pid, held 8799 to the end of the job, and
+            # took both restart legs with it. Four installers did not ship for
+            # a release whose cold start had just answered healthy on 190
+            # modules. A leg now takes the first port that is actually free, so
+            # an undead predecessor costs nothing.
+            if ! next_free_port; then
+              echo "::error title=The serve check found no free port on ${{ matrix.os }} (${label})::Every port from ${port_base} upward was already listening. That is a defect in this check, or a very unusual runner, rather than anything about the sidecar."
               return 1
             fi
+            echo "(${label}) using port ${port}"
             if [ -n "$leg_env" ]; then
               echo "(${label}) running with: $leg_env"
               # shellcheck disable=SC2086
@@ -640,8 +737,7 @@ jobs:
             echo "(${label}) encoder loads: $(grep -c 'Loaded sentence-transformers model' "$log" 2>/dev/null || echo 0), failed loads: $(grep -c 'Failed to load embedding model' "$log" 2>/dev/null || echo 0), pool: $(grep -h 'Embedding pool initialised' "$log" 2>/dev/null | tail -n 1 || echo 'never reported')"
             device_line=$(sed -n 's/.*Loaded sentence-transformers model.* on device //p' "$log" 2>/dev/null | tail -n 1)
             echo "(${label}) device: ${device_line:-not reported, the model never loaded on this leg}"
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+            stop_leg "$pid" || true
             if [ "$ok" -ne 1 ]; then
               echo "=== the sidecar's own output, which carries the cause ==="
               tail -n 200 "$log" || true
@@ -707,7 +803,7 @@ jobs:
             ps ax -o pid,rss,command 2>/dev/null | grep -iE 'openconstructionerp|postgres' | grep -v grep | head -n 30 || echo "(no matching processes)"
           fi
           if port_held "$port"; then
-            echo "port ${port} is still held here, so the next leg will wait for it"
+            echo "port ${port} is still held here. The next leg will step over it onto a free one, so this is a note about the runner rather than a problem for the check."
           else
             echo "port ${port} is free"
           fi
@@ -724,8 +820,12 @@ jobs:
 
           # The bisect, and the reason the exit above was moved down here.
           #
-          # This leg differs from the one before it in exactly one thing: the
-          # embedding worker pool is off. It runs whether or not that leg
+          # This leg differs from the one before it in one thing that matters:
+          # the embedding worker pool is off. It also lands on a different port,
+          # because each leg takes the first free one, but that is bookkeeping
+          # rather than part of what is being compared; all three legs open the
+          # same data directory and run 33985026765 confirmed it by reporting
+          # one workspace id across all of them. It runs whether or not that leg
           # passed, because a leg that only runs when everything is already
           # green answers a question nobody is asking. If this one serves
           # while the one above dies, the failure is in the pool or in what it
@@ -810,6 +910,22 @@ jobs:
       # exactly the kind that would go missing that way, so --require-member
       # below makes the run fail unless that member was actually opened.
       # Whether 14.4.0 was clean is still an open question, not a settled one.
+      #
+      # The second flag is not a tripwire and reads a different property. Issue
+      # #480: from 14.5.0 to 17.1.0 every member of this archive was signed
+      # ad-hoc AND with the hardened runtime, because the spec named "-" as a
+      # signing identity and PyInstaller reads any truthy identity as a real
+      # Developer ID and adds --options=runtime. That pair enables library
+      # validation in a process with no identity able to pass it, so initdb,
+      # spawned out of the extraction directory, was refused the libpq sitting
+      # beside it and no macOS install could create its database. The Team ID
+      # census was green throughout, correctly: every member agreed with the
+      # wrapper, all of them having no Team ID at all. Agreement was never the
+      # question. The flags word was, and nothing was reading it.
+      #
+      # It is checked here as well as on the bundled copy because the members are
+      # byte-identical at both points, and this is the cheaper and earlier of the
+      # two: a bad spec fails before a Rust build rather than after one.
       - name: Check what the sidecar archive carries
         if: always() && runner.os == 'macOS'
         shell: bash
@@ -818,6 +934,7 @@ jobs:
           set -uo pipefail
           python scripts/inspect_desktop_sidecar_signatures.py \
             --fail-on-foreign-team-id \
+            --fail-on-hardened-adhoc \
             --require-member Python.framework \
             desktop/dist/openconstructionerp-server
 
@@ -855,6 +972,11 @@ jobs:
     # tagName v15.0.0), but nothing except the default state of a checkbox was
     # preventing it. startsWith also refuses a tag box holding a branch name,
     # which is the same mistake typed by hand rather than left unticked.
+    #
+    # Since the move to tauri-action 1.x the action cannot open a release from
+    # here at all: the release is looked up by id in "Find the release" below,
+    # and a branch name finds none. The guard stays because it stops the job
+    # before the frontend build rather than after it.
     if: github.event_name != 'workflow_dispatch' || startsWith(inputs.tag, 'v')
     runs-on: ${{ matrix.os }}
     # Windows 27.8 to 33.2 min, macOS 26.4 to 52.9, Linux 26.5 once the rpm is
@@ -953,10 +1075,53 @@ jobs:
               echo "Not a release ref (${ref:-<empty>}), so the version is not compared against a tag." ;;
           esac
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      # The vendored NSIS template, held against the upstream it was forked from.
+      #
+      # The same script also runs in repo-hygiene.yml, on every push, and that is
+      # not an accident to be tidied away. That lane reports and this one blocks:
+      # no check anywhere is required for a push to main, so the hygiene copy
+      # tells you within minutes and stops nothing, while a red step here
+      # withholds the installer from the tag. Both are wanted. If one is removed,
+      # say in the survivor which one is left.
+      #
+      # Windows only, because Windows is the only leg that bundles NSIS, and this
+      # job rather than a push lane because of how the failure behaves.
+      # desktop/src-tauri/windows/installer.nsi is a Handlebars template and the
+      # bundler renders it with strict mode off, so a name that stops existing
+      # upstream renders as nothing at all and the build stays green. A stale
+      # copy does not break, it produces an installer that is missing files or
+      # missing a language and says so nowhere. The moment that costs us
+      # something is the moment the installer is built, and this is that job.
+      #
+      # What a red check here stops: the Windows leg fails, so no NSIS installer
+      # is built, signed or attached to the tag. fail-fast is false, so macOS and
+      # Linux still publish, which is the right blast radius for a file only
+      # Windows reads. It sits ahead of the frontend and Rust builds so it costs
+      # seconds rather than half an hour when it does fire.
+      #
+      # The check fetches the stock template from raw.githubusercontent.com and
+      # treats an unreachable upstream as a failure rather than a pass. That is
+      # not a new dependency for this job: the Tauri CLI itself arrives over the
+      # network through npx a few steps below.
+      - name: Check the vendored NSIS template is upstream plus our edits
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          py=python3
+          command -v python3 >/dev/null 2>&1 || py=python
+          code=0
+          out=$("$py" scripts/check_nsis_template_drift.py 2>&1) || code=$?
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=The vendored NSIS installer template has drifted::check_nsis_template_drift.py exits ${code}. Either desktop/src-tauri/windows/installer.nsi is no longer the pinned upstream template plus the fork edits that script holds, or tauri.conf.json has stopped naming it and the bundler is using its own built-in copy. An unknown Handlebars name renders as nothing, so the installer this job would build could be missing files or a language with nothing else going red."
+            exit 1
+          fi
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
@@ -1186,72 +1351,53 @@ jobs:
           $totalMb = [math]::Round(((Get-ChildItem -Recurse -File $destRoot | Measure-Object -Property Length -Sum).Sum) / 1MB, 2)
           Write-Host "Bundled IFC converter: IfcExporter.exe = $sizeMb MB, total resource = $totalMb MB (was $beforeMb MB before the graphical-only prune)"
 
+      # tauri-action 1.x manages the release page whenever it is handed a
+      # tagName. It fails when releaseDraft is true and the release is already
+      # published (it was true here, on three steps), and on a published
+      # release it rewrites the name and body with its own inputs, where a step
+      # without a releaseBody lands as an empty body. release.yml owns the page:
+      # it publishes the release with the CHANGELOG notes before any installer
+      # exists, 46 minutes to four hours ahead on the six releases before this
+      # note, and the steps below only have files to attach. The release is taken
+      # by id, the one path through the action that touches nothing but assets.
+      # Polled rather than read once, because both workflows start from the
+      # same tag push and nothing orders them.
+      - name: Find the release release.yml published for this tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for attempt in $(seq 1 20); do
+            id=$(gh release view "$RELEASE_REF" --repo "${{ github.repository }}" --json databaseId --jq .databaseId 2>/dev/null || true)
+            if [ -n "${id:-}" ]; then
+              echo "Release ${RELEASE_REF} is release id ${id}."
+              echo "id=${id}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "No release for ${RELEASE_REF} yet (attempt ${attempt} of 20), waiting 30 seconds."
+            sleep 30
+          done
+          echo "::error title=No release for ${RELEASE_REF}::release.yml has not published a release for this tag after ten minutes, so there is nothing to attach the installers to. Its usual failure is a missing CHANGELOG.md section for the version. Add the section and move the tag so both workflows run again, or dispatch this workflow with the tag input once the release exists."
+          exit 1
+
+      # tauri-action 1.x also names the macOS archive with the version,
+      # OpenConstructionERP_<version>_aarch64.app.tar.gz where 0.x left the
+      # version out. Every reader of that file, here, in the app's update
+      # notice and on the download page, matches the suffix, so nothing cares.
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
           # Run the pinned CLI instead of whichever one the action resolves.
           tauriScript: npx --yes @tauri-apps/cli@${{ env.TAURI_CLI_VERSION }}
-          # Empty on Windows and macOS, "--bundles deb,appimage" on Linux.
+          # Per OS from the matrix: nsis on Windows, empty on macOS, deb on Linux.
           args: ${{ matrix.bundles }}
-          tagName: ${{ env.RELEASE_REF }}
-          releaseName: "OpenConstructionERP ${{ env.RELEASE_REF }}"
-          releaseBody: |
-            ## OpenConstructionERP ${{ env.RELEASE_REF }}
-
-            A real native desktop app. No Python, no pip, no Docker, and no database to set up. Download one file, run it, and you are ready.
-
-            ### Download
-
-            | Platform | File | Notes |
-            | --- | --- | --- |
-            | Windows | `.exe` installer, 64-bit | The web view runtime is inside the installer, so setup needs no internet |
-            | macOS | `.dmg`, Apple Silicon | Drag the app to Applications, then see "Opening on macOS" below |
-            | Linux | `.deb`, `.rpm` or `.AppImage`, 64-bit | `.deb` for Debian and Ubuntu, `.rpm` for Fedora and openSUSE, `.AppImage` runs anywhere |
-
-            The files are attached below under Assets. You can also always get the newest build at https://openconstructionerp.com/download which detects your operating system for you.
-
-            ### Opening on macOS
-
-            This build is ad-hoc signed but not yet notarized by Apple. On the first launch macOS may say the app is "damaged" or block it. The app is fine: macOS quarantines anything downloaded from the web. After you drag the app into Applications, open Terminal and run this once:
-
-            ```
-            xattr -dr com.apple.quarantine /Applications/OpenConstructionERP.app
-            ```
-
-            Then open the app normally. On macOS Sequoia you may also need to approve it once under System Settings, Privacy and Security. You only do this once.
-
-            ### Prefer the command line?
-
-            pip (needs Python 3.12 or later):
-
-            ```
-            pip install --upgrade openconstructionerp
-            openconstructionerp
-            ```
-
-            Docker. The published image carries the application but no database, and the app is PostgreSQL only, so the image needs the small compose stack around it. A bare `docker run` of it stops at the first check with "DATABASE_URL is not set". These lines fetch the stack, write the two secrets it will not start without, and bring it up:
-
-            ```
-            curl -fsSL https://raw.githubusercontent.com/datadrivenconstruction/OpenConstructionERP/main/docker-compose.quickstart.yml       -o docker-compose.yml
-            curl -fsSL https://raw.githubusercontent.com/datadrivenconstruction/OpenConstructionERP/main/docker-compose.quickstart.image.yml -o docker-compose.override.yml
-            echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)" >  .env
-            echo "JWT_SECRET=$(openssl rand -hex 32)"           >> .env
-            docker compose pull app
-            docker compose up -d
-            ```
-
-            The app then answers on http://localhost:8080. Windows has no `openssl` by default, so on PowerShell write the same two secrets with .NET instead, as the Quick Start in the README shows.
-
-            ### Good to know
-
-            The first launch takes 40 to 90 seconds because the app sets up its local database the first time. A loading screen explains the wait, and every launch after that is fast. All your data stays on your own computer. The app is open source under AGPL-3.0. A demo account is ready to explore: demo@openconstructionerp.com / DemoPass1234!
-
-            Docs: https://openconstructionerp.com/docs  .  Report an issue: https://github.com/datadrivenconstruction/OpenConstructionERP/issues
-          releaseDraft: true
-          prerelease: false
+          # By id, not by tagName: see "Find the release" above.
+          releaseId: ${{ steps.release.outputs.id }}
 
       # The AppImage, on its own, and allowed to fail.
       #
@@ -1276,19 +1422,15 @@ jobs:
       - name: Bundle the AppImage
         if: matrix.os == 'ubuntu-22.04'
         continue-on-error: true
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: desktop
           tauriScript: npx --yes @tauri-apps/cli@${{ env.TAURI_CLI_VERSION }}
           args: --bundles appimage
-          # No releaseBody here. The step above already wrote it, and this one
-          # has only an asset to add.
-          tagName: ${{ env.RELEASE_REF }}
-          releaseName: "OpenConstructionERP ${{ env.RELEASE_REF }}"
-          releaseDraft: true
-          prerelease: false
+          # The same release as the step above; this one only has an asset to add.
+          releaseId: ${{ steps.release.outputs.id }}
 
       - name: Say whether the AppImage was produced
         if: matrix.os == 'ubuntu-22.04'
@@ -1338,7 +1480,7 @@ jobs:
       # read, which under a gate is a red release caused by nothing.
       - name: Set up Python for the bundled sidecar census (macOS)
         if: runner.os == 'macOS'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -1450,7 +1592,7 @@ jobs:
           # what this check exists to notice, because the failure it predicts
           # only shows up on a user's Mac.
           if echo "$SIG" | grep -qi 'flags=.*runtime'; then
-            echo "::warning title=The shipped sidecar is ad-hoc and hardened at the same time::The sidecar inside the .app is signed ad-hoc AND with the hardened runtime, and carries no entitlements. That enables library validation with nothing able to satisfy it: the process has no Team ID, every file it unpacks into its _MEI directory has no Team ID, and the loader refuses them with a message about differing Team IDs. A clean member census below does not clear this, because no member is at fault."
+            echo "::warning title=The shipped sidecar is ad-hoc and hardened at the same time::The sidecar inside the .app is signed ad-hoc AND with the hardened runtime, and carries no entitlements. That enables library validation with nothing able to satisfy it: the process has no Team ID, every file it unpacks into its _MEI directory has no Team ID, and the loader refuses them with a message about differing Team IDs. A Team ID census does not clear this, because no member is at fault. It is the census below that fails on it now, under --fail-on-hardened-adhoc, which reads this same pair on the wrapper and on every member."
           else
             echo "The bundled sidecar is not signed with the hardened runtime, so library validation is not in play."
           fi
@@ -1465,6 +1607,7 @@ jobs:
           census_rc=0
           python scripts/inspect_desktop_sidecar_signatures.py \
               --fail-on-foreign-team-id \
+              --fail-on-hardened-adhoc \
               --require-member Python.framework \
               "$SIDECAR" > "$RUNNER_TEMP/census.log" 2>&1 || census_rc=$?
           cat "$RUNNER_TEMP/census.log"
@@ -1476,7 +1619,7 @@ jobs:
           census_n="$(sed -n 's/^census: \([0-9][0-9]*\) member.*/\1/p' "$RUNNER_TEMP/census.log" | tail -1)"
           census_n="${census_n:-0}"
           if [ "$census_rc" -eq 0 ]; then
-            echo "OK: inside the shipped bundle, nothing the sidecar unpacks disagrees with it about a Team ID."
+            echo "OK: inside the shipped bundle, nothing the sidecar unpacks disagrees with it about a Team ID, and nothing is hardened without one."
             echo "Bundled sidecar census: clean over $census_n member(s) inspected." >> "$GITHUB_STEP_SUMMARY"
           elif [ "$census_rc" -eq 2 ]; then
             # Exit 2 is the script saying it read nothing: no codesign on this
@@ -1490,7 +1633,7 @@ jobs:
             echo "Bundled sidecar census: COULD NOT MEASURE, nothing was read, see the Build Desktop (macos-latest) log." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           else
-            echo "::error title=The shipped sidecar disagrees with its own payload about a Team ID::The census above found inside the .app the shape that stops the app at 'Starting the application server' on a user's machine, or could not measure enough of it to rule that out. Compare it against the pre-bundle census in the Build Sidecar job: if that one was clean, bundling is what changed it."
+            echo "::error title=The shipped sidecar cannot load its own payload::The census above found inside the .app one of the two shapes that stop the app on a user's machine, or could not measure enough of it to rule them out. Either a member disagrees with the process about a Team ID, which stops it at 'Starting the application server', or something is signed with the hardened runtime while carrying no Team ID, which stops the children it spawns and shows up as the local database failing to start (issue #480). The log above says which. Compare it against the pre-bundle census in the Build Sidecar job: if that one was clean, bundling is what changed it."
             echo "Bundled sidecar census: MISMATCH or inconclusive over $census_n member(s) inspected, see the Build Desktop (macos-latest) log." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -1612,7 +1755,8 @@ jobs:
     name: Build Linux RPM
     needs: build-sidecar
     # Same condition as build-tauri, and for the same reason: this job also
-    # passes a tagName to tauri-action, so it can also open a release.
+    # attaches a package to the tag's release, and a run started from a branch
+    # has no release to find.
     if: github.event_name != 'workflow_dispatch' || startsWith(inputs.tag, 'v')
     runs-on: ubuntu-22.04
     # Twice the v15.0.0 payload at the measured rate, plus the half hour the
@@ -1624,10 +1768,10 @@ jobs:
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
@@ -1654,8 +1798,29 @@ jobs:
       - name: Make sidecar executable
         run: chmod +x desktop/src-tauri/binaries/*
 
+      # Same lookup as in build-tauri, for the same reason: see the note there.
+      - name: Find the release release.yml published for this tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for attempt in $(seq 1 20); do
+            id=$(gh release view "$RELEASE_REF" --repo "${{ github.repository }}" --json databaseId --jq .databaseId 2>/dev/null || true)
+            if [ -n "${id:-}" ]; then
+              echo "Release ${RELEASE_REF} is release id ${id}."
+              echo "id=${id}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "No release for ${RELEASE_REF} yet (attempt ${attempt} of 20), waiting 30 seconds."
+            sleep 30
+          done
+          echo "::error title=No release for ${RELEASE_REF}::release.yml has not published a release for this tag after ten minutes, so there is nothing to attach the rpm to. See the same step in build-tauri."
+          exit 1
+
       - name: Build the rpm
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -1663,13 +1828,9 @@ jobs:
           # Run the pinned CLI instead of whichever one the action resolves.
           tauriScript: npx --yes @tauri-apps/cli@${{ env.TAURI_CLI_VERSION }}
           args: --bundles rpm
-          # No releaseBody here. The release already exists by the time this
-          # finishes and carries the notes release.yml wrote from the
-          # changelog; this job only has an asset to add to it.
-          tagName: ${{ env.RELEASE_REF }}
-          releaseName: "OpenConstructionERP ${{ env.RELEASE_REF }}"
-          releaseDraft: true
-          prerelease: false
+          # The release carries the notes release.yml wrote from the changelog;
+          # this job only has an asset to add to it, so it takes the release by id.
+          releaseId: ${{ steps.release.outputs.id }}
 
       - name: Say how long the rpm took
         if: always()
@@ -1687,13 +1848,15 @@ jobs:
 
   # Authenticode code signing for the Windows installers.
   #
-  # The tauri-action above uploads the Windows .exe (NSIS) to the
-  # release as a draft, so the assets are never visible to users until the
-  # founder publishes the release by hand. This job runs on the Windows
-  # runner after the build, signs each Windows installer with the founder's
-  # certificate held in Azure Key Vault, and re-uploads the signed files
-  # over the unsigned ones. By the time the draft is published the binaries
-  # users download are the signed binaries.
+  # The tauri-action above attaches the Windows .exe (NSIS) to the release
+  # release.yml has already published, so an unsigned installer is public from
+  # the moment it lands. This job runs on the Windows runner after the build,
+  # signs each Windows installer with the founder's certificate held in Azure
+  # Key Vault, and re-uploads the signed files over the unsigned ones; until it
+  # has, the file on the release page is the unsigned one. This used to say
+  # the release was a draft until the founder published it by hand. It was
+  # not: release.yml publishes the page before the first installer is built,
+  # measured over the six releases before this note.
   #
   # The private key never leaves the Key Vault HSM, so signing calls out to
   # Azure Key Vault through AzureSignTool. The maintainer must set these
@@ -1863,7 +2026,7 @@ jobs:
 
       - name: Set up .NET 8
         if: steps.preflight.outputs.mode == 'sign'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: "8.0.x"
 

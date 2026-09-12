@@ -62,7 +62,7 @@ function americanInstance() {
     keySeparator: false,
     nsSeparator: false,
     resources: {},
-    initImmediate: false,
+    initAsync: false,
   });
   instance.addResourceBundle('en', 'translation', en, false, true);
   instance.addResourceBundle('en-US', 'translation', enUS, false, true);
@@ -148,7 +148,7 @@ describe('en-US carries overrides and English answers the rest', () => {
       keySeparator: false,
       nsSeparator: false,
       resources: {},
-      initImmediate: false,
+      initAsync: false,
     });
     base.addResourceBundle('en', 'translation', en, false, true);
     expect(base.t('nav.boq')).toBe('Bill of Quantities');

@@ -50,7 +50,7 @@ jobs:
           ref: ${{ github.event.inputs.version || github.ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -58,11 +58,12 @@ jobs:
         run: python scripts/check_repo_hygiene.py
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          # Cesium 1.137+ requires Node 22; tsc-on-prebuild needs the full
-          # devDeps set, so the frontend job is locked to 22.
-          node-version: '22'
+          # The line the Docker image and the rest of CI build on. Cesium
+          # 1.137+ needs Node 22 or newer, so this can never drop below 22;
+          # tsc-on-prebuild needs the full devDeps set.
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -98,12 +99,115 @@ jobs:
           cd backend
           python -m build --wheel --outdir ../dist/
 
+      - name: Check the wheel fits, per file and against the project total
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, json, os, sys, urllib.error, urllib.request
+
+          # PyPI rejects any single file over 100 MiB, and it rejects it at
+          # upload, which here is after the tag is already public. Nothing
+          # asserted the size before, so the first release to cross the line
+          # would have found out the expensive way. This step runs immediately
+          # after the build and before anything is published.
+          #
+          # The number: the hard cap is 100 MiB = 104857600 bytes. A wheel built
+          # from a clean tree at 16.8.1 is about 85.8 MiB, and the trend across
+          # 16.1.0 to 16.8.0 was 85.4 MB to 88.2 MB in eight days, roughly
+          # 0.35 MB a day, driven by the bundled frontend and the regional packs.
+          # 95 MiB sits about 9 MiB above today's wheel and 5 MiB below the cap:
+          # at the observed rate that is roughly a month of warning, which is
+          # enough time to shrink something deliberately rather than in a panic
+          # on a tag that cannot be taken back.
+          #
+          # If this fails, do not just raise the number. Look at what grew first:
+          # `python -c "import zipfile,collections;..."` over the wheel usually
+          # shows one directory that doubled. Raising the limit past 100 MiB
+          # cannot work at all, so the headroom is the whole point of it.
+          LIMIT_MIB = 95
+          HARD_CAP_MIB = 100
+
+          whl = sorted(glob.glob("dist/*.whl"))
+          assert len(whl) == 1, f"expected exactly one wheel in dist/, found {whl}"
+          size = os.path.getsize(whl[0])
+          mib = size / 1048576
+          print(f"wheel {whl[0]} is {size:,} bytes ({mib:.1f} MiB)")
+          if mib > LIMIT_MIB:
+              sys.exit(
+                  f"ERROR: wheel is {mib:.1f} MiB, over the {LIMIT_MIB} MiB budget. "
+                  f"PyPI's hard limit is {HARD_CAP_MIB} MiB per file and it is enforced "
+                  f"at upload, after this tag is public. Find what grew and drop it; "
+                  f"raising the budget only moves the wall closer."
+              )
+          print(f"OK: {LIMIT_MIB - mib:.1f} MiB of headroom under the {LIMIT_MIB} MiB budget")
+
+          # Second wall, and the one that actually stopped a release. PyPI caps
+          # the TOTAL stored size of a project as well as each file, and the two
+          # limits share the phrase "size limit" while meaning different things.
+          # Everything above this line measures one wheel. 17.0.1 passed all of
+          # it, built cleanly, and was refused at upload with
+          #   400 Project size too large. Limit for project
+          #   'openconstructionerp' total size is 10 GB.
+          # after 336 versions had accumulated 10164 MiB. The step was green and
+          # honest; the defect was simply not inside what it measured. So this
+          # widens the existing check rather than adding a second one beside it.
+          #
+          # The limit is 10 GiB, not a decimal 10 GB, and that is measured rather
+          # than assumed: 16.9.0's 85.49 MiB upload SUCCEEDED at a stored total of
+          # 10164 MiB, which a 9537 MiB decimal cap would have refused, and
+          # 17.0.1's 85.9 MiB was refused, putting the wall under 10250 MiB.
+          #
+          # Failing here still leaves a public tag with no wheel, which is why the
+          # real fix is to run this before tagging. It is much better than a 400:
+          # it names both numbers and says how much has to come off.
+          PROJECT = "openconstructionerp"
+          LIMIT_BYTES = 10 * 1024**3
+
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/{PROJECT}/json", timeout=60
+              ) as r:
+                  meta = json.load(r)
+          except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+              # Do not fail the release because PyPI was unreachable for a moment.
+              # An unmeasured total is reported as unmeasured, never as fine.
+              print(f"::warning::could not read the PyPI project total ({exc}); "
+                    f"the project-size wall was NOT checked for this release")
+          else:
+              stored = sum(f["size"] for fs in meta["releases"].values() for f in fs)
+              versions = len(meta["releases"])
+              after = stored + size
+              print(
+                  f"PyPI project total: {stored/1048576:,.0f} MiB across {versions} "
+                  f"versions; limit {LIMIT_BYTES/1048576:,.0f} MiB; "
+                  f"headroom {(LIMIT_BYTES - stored)/1048576:,.1f} MiB"
+              )
+              if after > LIMIT_BYTES:
+                  sys.exit(
+                      f"ERROR: this {mib:.1f} MiB wheel does not fit. The project "
+                      f"holds {stored/1048576:,.0f} MiB of a {LIMIT_BYTES/1048576:,.0f} "
+                      f"MiB limit, leaving {(LIMIT_BYTES - stored)/1048576:,.1f} MiB, so "
+                      f"{(after - LIMIT_BYTES)/1048576:,.1f} MiB has to come off the wheel "
+                      f"or space has to be freed on PyPI. Shrinking the wheel is the half "
+                      f"that does not need a PyPI account; raising the project limit or "
+                      f"removing old releases is the half that does."
+                  )
+              left = LIMIT_BYTES - after
+              print(f"OK: fits, with {left/1048576:,.1f} MiB left after this upload")
+              if left < size:
+                  print(
+                      f"::warning::after this release the project has {left/1048576:,.1f} "
+                      f"MiB left, less than one more wheel. The NEXT release will not "
+                      f"publish unless the wheel shrinks or PyPI space is freed."
+                  )
+          PY
+
       - name: Sanity check wheel
         shell: bash
         run: |
           ls -lh dist/
           python - <<'PY'
-          import os, re, zipfile
+          import json, os, re, zipfile
 
           # This check used to ask whether any member's name contained the
           # string "_frontend_dist". It could not fail. The build hook creates
@@ -137,6 +241,45 @@ jobs:
           assert len(revisions) > 100, f'wheel {whl} carries only {len(revisions)} migration revisions'
           locales = [f for f in files if f.startswith('locales/') and f.endswith('.json')]
           assert len(locales) >= 20, f'wheel {whl} carries only {len(locales)} locale files'
+
+          # The PDF.js decoders, which this step is structurally unable to see by
+          # the mechanism above. Everything before this line is reached by
+          # scraping src= and href= out of index.html, and these files are never
+          # named in markup: the viewer builds their URLs at runtime from
+          # PDFJS_ASSET_ROOT (frontend/src/shared/lib/pdfjs.ts:53) and passes
+          # them as wasmUrl and iccUrl parameters. So a wheel carrying none of
+          # them passes every assertion above and then draws a blank page for
+          # exactly the scanned drawings a takeoff receives most often.
+          #
+          # The emitting side is frontend/vite.config.ts:102-159, and its two
+          # silent skips are the failure to guard against. It reads the version
+          # from node_modules/pdfjs-dist/package.json and returns doing nothing
+          # if that is missing, and it does `if (!existsSync(dir)) continue` over
+          # the wasm and iccs directories. Both are correct for 6.2.108, where
+          # those directories sit at the package root. A future pdfjs that moves
+          # them under build/ or legacy/ trips the second guard, emits zero
+          # files, logs nothing and fails no test, because pdfjs.test.ts mocks
+          # the library and fabricates the version rather than reading it.
+          #
+          # This asks the same source of truth the plugin asks, so the two cannot
+          # disagree about which version directory to expect.
+          with open('frontend/node_modules/pdfjs-dist/package.json', encoding='utf-8') as fh:
+              pdfjs_version = json.load(fh)['version']
+          root = f'app/_frontend_dist/assets/pdfjs/{pdfjs_version}/'
+          wasm = [f for f in files if f.startswith(root + 'wasm/')]
+          iccs = [f for f in files if f.startswith(root + 'iccs/')]
+          assert wasm, (
+              f'wheel {whl} carries no PDF.js wasm decoders under {root}wasm/. The viewer builds '
+              f'that path at runtime from the installed pdfjs version, so nothing in index.html '
+              f'names it and no other check here can see it missing. Scanned drawings using JBIG2 '
+              f'or JPEG 2000 would render blank. Check the wasm/iccs directory layout of '
+              f'pdfjs-dist {pdfjs_version} against the plugin in frontend/vite.config.ts.'
+          )
+          assert iccs, (
+              f'wheel {whl} carries no PDF.js ICC profile under {root}iccs/, so CMYK colour in '
+              f'scanned drawings has no profile to resolve against. Same cause as the wasm case.'
+          )
+          print(f'OK: {len(wasm)} wasm and {len(iccs)} icc file(s) at pdfjs {pdfjs_version}')
 
           # The community packs, which for the whole life of the project reached
           # no user at all: the tree was never packaged, and discovery resolved

@@ -46,7 +46,7 @@ const playbook: Playbook = {
       titleDefault: "Decide per province what you recover and what you carry",
       whatKey: "cases.price_one_bill_for_hst_pst_and_qst.step.position.what",
       whatDefault:
-        "For every province the work touches, settle whether the provincial tax on materials is recoverable in your position or a cost you carry, and write the decision down before a single rate is entered.",
+        "For every province the work touches, settle whether the provincial tax on materials is recoverable in your position or a cost you carry, and write the decision down before a single rate is entered. Saskatchewan reverses the picture: since 2017 a contractor charges PST on the whole contract price for work on real property and buys the materials exempt for resale, so there the tax belongs on the tail and not in the rate, and Manitoba does the same for mechanical and electrical work.",
       whyKey: "cases.price_one_bill_for_hst_pst_and_qst.step.position.why",
       whyDefault:
         "This one decision moves the tax between two completely different places in the estimate. Getting it wrong does not produce a wrong total, it produces a right total built the wrong way, which passes review cleanly and then fails at the first cost report when the recovery nobody was entitled to does not arrive.",
@@ -96,9 +96,9 @@ const playbook: Playbook = {
       whyKey: "cases.price_one_bill_for_hst_pst_and_qst.step.tail.why",
       whyDefault:
         "Stacking one tax on a figure that already includes the other is a small percentage of the whole contract, which is more than the margin on most of it. The province decides the base as much as it decides the rate, and a build-up showing which base was used is the difference between a client checking your tax in a glance and a client checking it with their accountant.",
-      moduleLabel: "Markups",
-      moduleLabelKey: "nav.markups",
-      to: "/markups",
+      moduleLabel: "Bill of Quantities",
+      moduleLabelKey: "boq.title",
+      to: "/projects/:projectId/boq",
     },
     {
       id: "dates",

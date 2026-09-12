@@ -17,6 +17,14 @@ export interface BOQ {
   /** Set when this BOQ was created via "Create revision" — points at the
    *  BOQ it was cloned from. Drives the baseline pick in the compare UI. */
   parent_estimate_id?: string | null;
+  /**
+   * Issue #435 - the variation request this bill was raised for, when it is a
+   * variation's own bill rather than a bill of the project at large. The
+   * editor reads it to offer the per-line trace control, which makes no
+   * sense on an estimating bill and is not shown there. Null for every bill
+   * that existed before variation bills did.
+   */
+  variation_request_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -332,6 +340,79 @@ export interface CreatePositionData {
    *  sibling (sort_order = anchor + 1, later rows shift down) instead of
    *  at the end of the section. Ignored on the reuse/linked-instance path. */
   after_position_id?: string | null;
+}
+
+/**
+ * One take-off line: a signed, repeatable partial quantity with its arithmetic
+ * left visible.
+ *
+ * `formula` is what makes a measurement sheet a document rather than a number.
+ * REB 23.003 and OENORM A 2063 both exist because a checker has to be able to
+ * see how a quantity was arrived at, so the expression and the dimensions that
+ * fed it are stored beside the result instead of being collapsed into it.
+ *
+ * The panel writes `L`, `B` and `H` into `variables` and a product of exactly
+ * the ones the user filled in into `formula`, so a line measured by length
+ * alone reads `L` rather than `L * 1 * 1`. The server evaluates the expression
+ * itself, case-insensitively, and accepts anything its safe evaluator accepts,
+ * which is why a sheet written through the API with a formula of its own reads
+ * back here unchanged.
+ */
+export interface MeasurementLineInput {
+  description?: string;
+  formula: string;
+  variables?: Record<string, string | number>;
+  /** How many times this line repeats. The "units" column. */
+  factor?: string | number;
+  /** '+' adds, '-' deducts. Deductions are how openings and voids are measured. */
+  sign?: '+' | '-';
+  ref?: string;
+  unit?: string;
+}
+
+/** One line as the server hands it back, with its own quantity worked out. */
+export interface MeasurementLineResult extends MeasurementLineInput {
+  variables: Record<string, string>;
+  factor: string;
+  sign: '+' | '-';
+  unit: string;
+  /** The signed contribution of this line, already rounded by the preset. */
+  quantity: string;
+  /** Non-empty when this line's formula could not be evaluated. */
+  error: string;
+}
+
+/**
+ * A whole sheet: the lines, their total, and how that total compares with the
+ * quantity the position currently carries.
+ *
+ * Quantities arrive as strings because the server works in decimals and a
+ * round trip through a JavaScript number is exactly where a measured 0.1 + 0.2
+ * stops being 0.3. They are formatted for display and parsed only when one is
+ * about to be written back as the position's quantity.
+ */
+export interface MeasurementSheet {
+  item_ref: string;
+  description: string;
+  unit: string;
+  lines: MeasurementLineResult[];
+  total_quantity: string;
+  line_count: number;
+  has_errors: boolean;
+  /** Only on a read: false when the position has no saved sheet yet. */
+  stored?: boolean;
+  /**
+   * Only on a compute: how the measured total compares with the quantity the
+   * position carries right now. `matches` is true when they agree within
+   * `tolerance`, which the server sets and does not take from the caller.
+   */
+  reconciliation?: {
+    measured_quantity: string;
+    target_quantity: string;
+    difference: string;
+    tolerance: string;
+    matches: boolean;
+  };
 }
 
 export interface UpdatePositionData {
@@ -1190,10 +1271,39 @@ export interface BOQSnapshot {
   id: string;
   boq_id: string;
   name: string;
+  description?: string;
   position_count?: number;
   grand_total?: number;
   created_at: string;
   created_by: string | null;
+}
+
+export interface BOQSnapshotDetail extends BOQSnapshot {
+  snapshot_data: Record<string, unknown>;
+}
+
+export interface SnapshotPositionDiff {
+  ordinal: string;
+  description: string;
+  change_type: 'added' | 'removed' | 'changed';
+  fields: Record<string, unknown>;
+}
+
+export interface SnapshotCompareResponse {
+  snapshot_a: BOQSnapshot;
+  snapshot_b: BOQSnapshot;
+  added: SnapshotPositionDiff[];
+  removed: SnapshotPositionDiff[];
+  changed: SnapshotPositionDiff[];
+  summary: {
+    total_a: string;
+    total_b: string;
+    total_change_amount: string;
+    total_change_percent: number;
+    positions_added: number;
+    positions_removed: number;
+    positions_changed: number;
+  };
 }
 
 /* ── Feature 1: model→BOQ quantity links ─────────────────────────────── */
@@ -1641,6 +1751,36 @@ export const boqApi = {
     apiPatch<Position>(`/v1/boq/positions/${posId}`, data),
 
   /**
+   * Work out a quantity from take-off lines without saving anything.
+   *
+   * The server evaluates each formula, totals the signed contributions and
+   * says how the total compares with the quantity the position holds today.
+   * Nothing is written: saving is a normal position PATCH carrying the new
+   * `quantity` and the lines under `metadata.measurement`, which is why there
+   * is no save endpoint to call here.
+   *
+   * `strict: false` is deliberate and is what makes this usable while typing.
+   * In strict mode one bad formula raises and the whole sheet returns nothing;
+   * non-strict keeps the bad line with its own error and a quantity of zero,
+   * so a typo in row four does not blank rows one to three.
+   *
+   * The preset is left to the server, which resolves it from the project's
+   * country: REB 23.003 in Germany, OENORM A 2063 in Austria, the neutral one
+   * everywhere else. Passing one from here would mean this panel deciding
+   * which market's rules a sheet is written under, which is the project's
+   * property and not the panel's.
+   */
+  computeMeasurement: (posId: string, body: { lines: MeasurementLineInput[]; unit?: string }) =>
+    apiPost<MeasurementSheet>(`/v1/boq/positions/${posId}/measurement/compute/`, {
+      ...body,
+      strict: false,
+    }),
+
+  /** Read the sheet saved on a position. `stored` is false when there is none. */
+  getMeasurement: (posId: string) =>
+    apiGet<MeasurementSheet>(`/v1/boq/positions/${posId}/measurement/`),
+
+  /**
    * v3.12.0 Stream A — bulk update positions.
    * Sends one PATCH covering every selected position id; the server
    * applies the same direct-set / rate-factor / quantity-factor mutation
@@ -1895,8 +2035,17 @@ export const boqApi = {
   /* Snapshot / Version History */
   getSnapshots: (boqId: string) =>
     apiGet<BOQSnapshot[]>(`/v1/boq/boqs/${boqId}/snapshots/`),
-  createSnapshot: (boqId: string, label?: string) =>
-    apiPost<BOQSnapshot>(`/v1/boq/boqs/${boqId}/snapshots/`, { name: label ?? '' }),
+  getSnapshot: (boqId: string, snapshotId: string) =>
+    apiGet<BOQSnapshotDetail>(`/v1/boq/boqs/${boqId}/snapshots/${snapshotId}`),
+  createSnapshot: (boqId: string, label?: string, description?: string) =>
+    apiPost<BOQSnapshot>(`/v1/boq/boqs/${boqId}/snapshots/`, { name: label ?? '', description: description ?? '' }),
+  deleteSnapshot: (boqId: string, snapshotId: string) =>
+    apiDelete<void>(`/v1/boq/boqs/${boqId}/snapshots/${snapshotId}`),
+  compareSnapshots: (boqId: string, snapshotIdA: string, snapshotIdB: string) =>
+    apiPost<SnapshotCompareResponse>(`/v1/boq/boqs/${boqId}/snapshots/compare`, {
+      snapshot_id_a: snapshotIdA,
+      snapshot_id_b: snapshotIdB,
+    }),
   restoreSnapshot: (boqId: string, snapshotId: string) =>
     apiPost<{ ok: boolean }>(`/v1/boq/boqs/${boqId}/restore/${snapshotId}`, {}),
 

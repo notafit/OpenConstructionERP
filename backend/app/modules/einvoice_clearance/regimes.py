@@ -2,27 +2,73 @@
 # Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Country regime registry - what each country does to an invoice.
 
-Three regimes, and they are architecturally different acts, not three flavours
-of one act:
+Three acts, and they are architecturally different acts, not three flavours of
+one act:
+
+Every country named as an example below carries its ISO code in parentheses,
+and a test parses those codes: each must be a ``COUNTRY_REGIMES`` entry whose
+deciding act is the class it illustrates. Name a country here that the
+registry does not hold, or under a class its row does not declare, and the
+suite says so.
 
 ``clearance``
     Pre-issuance. The tax authority validates the document and returns an
-    identifier, and the invoice is not legally valid without it. Mexico returns
-    a UUID for a CFDI, Brazil a chave de acesso for an NF-e, Italy a protocol
-    number from SdI, Poland a KSeF number, Romania an upload index, Saudi Arabia
-    a cryptographic stamp, India an IRN. The document cannot be handed to the
-    buyer until the authority has answered.
+    identifier, and the invoice is not legally valid without it. Mexico (MX)
+    returns a UUID for a CFDI, Brazil (BR) a chave de acesso for an NF-e,
+    Italy (IT) a protocol number from SdI, Poland (PL) a KSeF number, Romania
+    (RO) an upload index, Saudi Arabia (SA) a cryptographic stamp, India (IN)
+    an IRN. The document cannot be handed to the buyer until the authority has
+    answered.
 
 ``reporting``
     Post-issuance. The invoice is valid the moment it is issued and is reported
-    to the authority afterwards, inside a deadline. Spain (SII and Verifactu)
-    and Hungary (RTIR) work this way.
+    to the authority afterwards, inside a deadline. Spain (ES, SII and
+    Verifactu) and Hungary (HU, RTIR) work this way.
 
 ``network``
     No authority at all. The document is routed to the buyer over an agreed
-    network - Peppol BIS Billing 3.0, XRechnung into the German public sector,
-    Chorus Pro into the French public sector. There is nothing to clear, so what
-    this module records for these countries is routing state.
+    network - Peppol BIS Billing 3.0, XRechnung into the German (DE) public
+    sector, Peppol BIS into the Belgian (BE) and Irish (IE) supply chains.
+    There is nothing to clear, so what this module records for these countries
+    is routing state.
+
+Countries that do more than one of them
+=======================================
+A country can do two of these acts at once, and calling such a country by one
+of the three names alone states something false about it. France (FR) routes
+the document to the buyer over a network of accredited platforms and
+separately reports transaction and payment data to the DGFiP, and it is the
+registry's one hybrid entry today. Other countries pair acts the same way -
+Saudi Arabia (SA) reports its simplified invoices after issue where standard
+ones are cleared - but a row is classed by what it declares, and the SA row
+models the standard-invoice clearance path alone, as its notes say. Closing
+that gap is a second act in ``additional_regimes`` on the row, not a sentence
+here; this paragraph names every row the registry classes hybrid.
+
+``regime`` therefore keeps naming the act that decides what a successful answer
+means, and ``additional_regimes`` names the other acts the same country also
+requires. ``regime_class`` reads ``hybrid`` for any entry that names more than
+one, so a country that does two things is not filed under a name that describes
+one of them. It is deliberately a derived value and not a fourth entry in
+``REGIMES``: the terminal state of a submission is decided by the act it was a
+submission under, and "hybrid" would leave that undecidable.
+
+When the obligation starts, and who it starts for
+=================================================
+A regime is not in force everywhere the day it is legislated. The obligation to
+receive and the obligation to issue commonly start years apart, and a mandate
+usually arrives in waves keyed to taxpayer size or turnover rather than all at
+once. ``commencement`` carries those waves as :class:`CommencementPhase` rows,
+one per obligation and wave, and ``scope`` says in words who the regime covers
+today. Without them the registry can say what a country does but not whether it
+does it to this taxpayer yet, which is the question an operator actually asks.
+
+Every phase names its source and the date that source was read, and the fields
+are required rather than optional, because a commencement date without a
+citation is indistinguishable from a remembered one and ages silently.
+``legal_status`` separates a date that is in force from one that is enacted but
+future and from one that is only announced; collapsing those three would let the
+product answer "yes, from January" about a wave that has not been legislated.
 
 Why the distinction is in the data and not in the code
 ======================================================
@@ -54,6 +100,14 @@ REGIME_NETWORK = "network"
 
 REGIMES: tuple[str, ...] = (REGIME_CLEARANCE, REGIME_REPORTING, REGIME_NETWORK)
 
+# Not a fourth act, and deliberately not a fourth member of ``REGIMES``. It is
+# the class of a country that performs more than one of the three, derived from
+# the acts the entry names rather than stored beside them, so the two can never
+# disagree.
+REGIME_HYBRID = "hybrid"
+
+REGIME_CLASSES: tuple[str, ...] = (*REGIMES, REGIME_HYBRID)
+
 # Profile columns a regime can demand. Named here so the completeness rule can
 # report a missing field by the name the operator sees on the form.
 PROFILE_FIELDS: tuple[str, ...] = (
@@ -61,6 +115,78 @@ PROFILE_FIELDS: tuple[str, ...] = (
     "network_participant_id",
     "certificate_reference",
 )
+
+# The three obligations a commencement date can attach to. They are separate
+# because they commence separately: a business is commonly obliged to receive an
+# electronic invoice years before it is obliged to issue one, and one date
+# standing for both would tell half the population the wrong year.
+OBLIGATION_RECEIVE = "receive"
+OBLIGATION_ISSUE = "issue"
+OBLIGATION_REPORT = "report"
+
+OBLIGATIONS: tuple[str, ...] = (OBLIGATION_RECEIVE, OBLIGATION_ISSUE, OBLIGATION_REPORT)
+
+# How firm a dated phase is. ``announced`` is not a weaker ``in_force``, it is a
+# different kind of claim: a plan published by a ministry that no statute yet
+# carries. A model that cannot tell "not yet" from "no" answers confidently and
+# wrongly about every date before the one it holds.
+LEGAL_STATUS_IN_FORCE = "in_force"
+LEGAL_STATUS_ENACTED = "enacted"
+LEGAL_STATUS_ANNOUNCED = "announced"
+
+LEGAL_STATUSES: tuple[str, ...] = (
+    LEGAL_STATUS_IN_FORCE,
+    LEGAL_STATUS_ENACTED,
+    LEGAL_STATUS_ANNOUNCED,
+)
+
+# What the cancellation window is counted against. The default is what the field
+# has always meant; the alternative exists because a rule anchored to the fiscal
+# year of issue is a calendar and not a window, and expressing it as a count of
+# days is wrong by up to a year depending on the month the invoice was issued in.
+CANCELLATION_BASIS_DAYS = "days_from_clearance"
+CANCELLATION_BASIS_FISCAL_YEAR = "fiscal_year_of_issue"
+
+CANCELLATION_BASES: tuple[str, ...] = (CANCELLATION_BASIS_DAYS, CANCELLATION_BASIS_FISCAL_YEAR)
+
+
+@dataclass(frozen=True)
+class CommencementPhase:
+    """One wave of one obligation, with the source it was read from.
+
+    The provenance fields are required arguments and not defaulted ones on
+    purpose. A date in this registry is a date a business will plan around, and
+    an uncited one cannot be rechecked, cannot be aged and cannot be told apart
+    from a date somebody remembered. Requiring them at construction makes an
+    unsourced phase impossible to write rather than merely discouraged.
+    """
+
+    # One of ``OBLIGATIONS``.
+    obligation: str
+    # ISO 8601 ``YYYY-MM-DD``. A string rather than a ``date`` because it travels
+    # through ``regime_as_dict`` into JSON and into the validation context, and a
+    # value that survives that trip unchanged is one fewer conversion to get
+    # wrong. Empty means the wave is known but its date is not yet fixed.
+    effective_date: str
+    # Who this wave reaches, in the words the rule uses.
+    scope: str
+    # One of ``LEGAL_STATUSES``.
+    legal_status: str
+    # The official page the date was taken from.
+    source_url: str
+    # ISO 8601 ``YYYY-MM-DD``: when that page was read. The date ages the claim,
+    # which a URL alone does not.
+    read_date: str
+    # The turnover or size step that opens this wave, currency qualified. Free
+    # text: "SAR 3000000 annual turnover" is a threshold a reader can act on and
+    # a number without its currency is not.
+    threshold: str = ""
+    notes: str = ""
+
+    @property
+    def is_dated(self) -> bool:
+        """Whether this phase has a date at all, as opposed to only a scope."""
+        return bool(self.effective_date)
 
 
 @dataclass(frozen=True)
@@ -90,7 +216,19 @@ class CountryRegime:
     # is a further document - which is a different act with different accounting,
     # so it must not be modelled as a late cancellation.
     cancellation_window_days: int | None = None
+    # What ``cancellation_window_days`` is counted against. One of
+    # ``CANCELLATION_BASES``.
+    cancellation_basis: str = CANCELLATION_BASIS_DAYS
     correction_mechanism: str = "credit note"
+    # The other acts this country also performs, drawn from ``REGIMES``. Empty
+    # for a country that does one thing, which is most of them.
+    additional_regimes: tuple[str, ...] = ()
+    # Who the regime covers today, in words. Separate from the phases below
+    # because the phases say when a wave opens and this says where the waves
+    # have got to, which is the question asked far more often.
+    scope: str = ""
+    # Every wave of every obligation, each carrying its own source.
+    commencement: tuple[CommencementPhase, ...] = ()
     notes: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -98,6 +236,32 @@ class CountryRegime:
     def is_cancellable(self) -> bool:
         """Whether the platform accepts a cancellation of a cleared document."""
         return self.cancellation_window_days is not None
+
+    @property
+    def regimes(self) -> tuple[str, ...]:
+        """Every act this country performs, the deciding one first."""
+        return (self.regime, *self.additional_regimes)
+
+    @property
+    def is_hybrid(self) -> bool:
+        """Whether this country performs more than one of the three acts."""
+        return bool(self.additional_regimes)
+
+    @property
+    def regime_class(self) -> str:
+        """``hybrid`` for a country that does more than one act, else the act.
+
+        Derived rather than stored: a country's class is a fact about the acts
+        it performs, and a second field holding it would be a second place for
+        that fact to be wrong.
+        """
+        return REGIME_HYBRID if self.is_hybrid else self.regime
+
+    def phases_for(self, obligation: str) -> tuple[CommencementPhase, ...]:
+        """Every wave of one obligation, earliest dated first, undated last."""
+        wanted = (obligation or "").strip().lower()
+        matching = [p for p in self.commencement if p.obligation == wanted]
+        return tuple(sorted(matching, key=lambda p: (not p.is_dated, p.effective_date)))
 
 
 # The registry. One entry per country; adding a country is one entry and no code.
@@ -116,10 +280,14 @@ COUNTRY_REGIMES: dict[str, CountryRegime] = {
         document_format="cfdi_4_0",
         profile_fields=("tax_registration_id", "certificate_reference"),
         document_fields=("rfc_issuer", "rfc_receiver", "uso_cfdi", "regimen_fiscal"),
-        # A CFDI may only be cancelled in the fiscal year it was issued in.
-        # Expressed in days because the model is a window, not a calendar; the
-        # year of issue is what the rule really says.
+        # A CFDI may only be cancelled in the fiscal year it was issued in, which
+        # is a calendar and not a window: for a December invoice the deadline is
+        # weeks away and for a January one it is nearly a year, and the same
+        # count of days models both wrongly. ``cancellation_basis`` says which
+        # kind of rule this is, and the day count below is the outside bound the
+        # calendar rule can reach rather than the rule itself.
         cancellation_window_days=365,
+        cancellation_basis=CANCELLATION_BASIS_FISCAL_YEAR,
         correction_mechanism="cancellation with the buyer's acceptance, then a replacement CFDI",
         notes=(
             "The stamp (timbrado) is applied by a certified provider, not by the tax authority "
@@ -135,8 +303,12 @@ COUNTRY_REGIMES: dict[str, CountryRegime] = {
         document_format="nfe_4_0",
         profile_fields=("tax_registration_id", "certificate_reference"),
         document_fields=("cnpj_issuer", "cfop", "ncm"),
-        # 24 hours is the federal window; several states allow longer. The
-        # shorter figure is the safe one to warn on.
+        # The federal window is 24 hours and the states depart from it in both
+        # directions, some allowing longer and some less than a day. This field
+        # cannot hold less than a day and cannot vary by state, so one day here
+        # is the federal figure and not a safe floor: for a state with a shorter
+        # window it is optimistic, and no rounding of it would be conservative
+        # everywhere. Treat it as the federal rule and check the state.
         cancellation_window_days=1,
         correction_mechanism="cancellation inside the SEFAZ window, otherwise a carta de correcao",
         notes="Authorisation is per state. The chave de acesso encodes the state, the issuer and the document.",
@@ -272,11 +444,49 @@ COUNTRY_REGIMES: dict[str, CountryRegime] = {
         document_format="sii_es",
         profile_fields=("tax_registration_id",),
         document_fields=("nif_issuer",),
-        # SII wants the record within four calendar days of issue; the same
-        # window is what an annulment record is expected inside.
+        # Four days is SII's window and describes SII alone, on a row whose
+        # platform names two obligations. Verifactu is a set of integrity rules
+        # for invoicing software and has no equivalent window at all, so a
+        # reader who takes this number as "Spain's window" has been told SII's
+        # answer to a question about the wrong obligation. Splitting the row is
+        # the real fix and is more than a data change.
         cancellation_window_days=4,
         correction_mechanism="annulment record, then a corrected record",
-        notes="The invoice is valid on issue. Late reporting is a penalty, not an invalid invoice.",
+        scope=(
+            "SII is in force for larger taxpayers and reports invoice records within days of issue. Verifactu "
+            "is a separate obligation on invoicing software, and it has not commenced for anyone yet."
+        ),
+        commencement=(
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2027-01-01",
+                scope="Verifactu, contribuyentes del Impuesto sobre Sociedades",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://www.fiscal-impuestos.com/aplazamiento-entrada-vigor-Verifactu-2027",
+                read_date="2026-09-07",
+                notes=(
+                    "Postponed by one year by Real Decreto-ley 15/2025. The widely republished 2026-01-01 date "
+                    "is superseded and is still printed by at least one major public source."
+                ),
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2027-07-01",
+                scope="Verifactu, remaining companies and autonomos",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://www.fiscal-impuestos.com/aplazamiento-entrada-vigor-Verifactu-2027",
+                read_date="2026-09-07",
+                notes="Postponed by one year by Real Decreto-ley 15/2025. The superseded date was 2026-07-01.",
+            ),
+        ),
+        notes=(
+            "The invoice is valid on issue. Late reporting is a penalty, not an invalid invoice. "
+            "Two caveats a reader should carry. The two dates above rest on a specialist tax commentary site "
+            "that names the instrument; the official AEAT page confirms that an extension exists but prints no "
+            "dates and cites different instruments, so the official source corroborates the direction of the "
+            "change and not the numbers. And SII's own commencement is not recorded here at all, because no "
+            "source to hand covers it, so this row states when Verifactu starts and not when SII did."
+        ),
     ),
     "HU": CountryRegime(
         country="HU",
@@ -300,26 +510,128 @@ COUNTRY_REGIMES: dict[str, CountryRegime] = {
         country="DE",
         regime=REGIME_NETWORK,
         platform="XRechnung / Peppol",
-        label="Germany - XRechnung into the public sector over Peppol",
+        label="Germany - domestic B2B e-invoicing, and XRechnung into the public sector over Peppol",
         identifier_label="transmission id",
         document_format="xrechnung_3_0",
         en16931_profile="xrechnung",
         profile_fields=("network_participant_id",),
         document_fields=("buyer_reference",),
         correction_mechanism="credit note",
-        notes="The Leitweg-ID travels as the buyer reference (BT-10) and public-sector receivers reject without it.",
+        scope=(
+            "Every domestic company must already be able to receive a B2B electronic invoice, with no "
+            "turnover threshold. The duty to issue one is the part that is still phasing in, by "
+            "prior-year turnover."
+        ),
+        commencement=(
+            CommencementPhase(
+                obligation=OBLIGATION_RECEIVE,
+                effective_date="2025-01-01",
+                scope="Domestic B2B, all companies",
+                legal_status=LEGAL_STATUS_IN_FORCE,
+                source_url="https://ec.europa.eu/digital-building-blocks/sites/spaces/DIGITAL/pages/467108886/eInvoicing+in+Germany",
+                read_date="2026-09-07",
+                notes="No threshold. The receiving duty landed on everyone at once.",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2027-01-01",
+                scope="Domestic B2B, larger companies",
+                threshold="EUR 800000 prior-year turnover",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://ec.europa.eu/digital-building-blocks/sites/spaces/DIGITAL/pages/467108886/eInvoicing+in+Germany",
+                read_date="2026-09-07",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2028-01-01",
+                scope="Domestic B2B, all remaining companies",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://ec.europa.eu/digital-building-blocks/sites/spaces/DIGITAL/pages/467108886/eInvoicing+in+Germany",
+                read_date="2026-09-07",
+            ),
+        ),
+        notes=(
+            "The Leitweg-ID travels as the buyer reference (BT-10) and public-sector receivers reject without it. "
+            "Germany has no reporting leg: the source above states there is no real-time reporting system, which "
+            "is why this stays a network country and does not become a hybrid one. The label said public sector "
+            "only until the domestic B2B receiving duty had been in force for over a year. Both future phases are "
+            "recorded as enacted on the European Commission's characterisation of the timetable, not on a reading "
+            "of the German statute itself."
+        ),
     ),
     "FR": CountryRegime(
         country="FR",
         regime=REGIME_NETWORK,
-        platform="Chorus Pro / Peppol",
-        label="France - Chorus Pro for the public sector",
+        platform="plateforme agreee / Chorus Pro",
+        label="France - domestic B2B through an accredited platform, Chorus Pro for the public sector",
         identifier_label="transmission id",
         document_format="facturx_1_0",
         en16931_profile="facturx",
         profile_fields=("network_participant_id",),
         document_fields=("service_code",),
+        # France does two acts, not one. The document is routed to the buyer
+        # over a network, which is what decides the terminal state and is why
+        # the deciding act is still network exchange; separately, transaction
+        # and payment data are reported to the DGFiP, which no amount of routing
+        # state describes. Calling France a pure network country was the
+        # taxonomy's own worked example of "no authority at all", and it was
+        # wrong about the country it used to explain itself.
+        additional_regimes=(REGIME_REPORTING,),
         correction_mechanism="credit note",
+        scope=(
+            "Every company, whatever its size, must already be able to receive. Issuing and the e-reporting "
+            "duty reached large and mid-size companies at the same moment and reach the smaller ones a year "
+            "later."
+        ),
+        commencement=(
+            CommencementPhase(
+                obligation=OBLIGATION_RECEIVE,
+                effective_date="2026-09-01",
+                scope="Domestic B2B, all companies regardless of size",
+                legal_status=LEGAL_STATUS_IN_FORCE,
+                source_url="https://www.impots.gouv.fr/professionnel/questions/partir-de-quand-suis-je-concerne-par-la-reforme-de-la-facturation",
+                read_date="2026-09-07",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2026-09-01",
+                scope="Domestic B2B, grandes entreprises and ETI",
+                legal_status=LEGAL_STATUS_IN_FORCE,
+                source_url="https://www.impots.gouv.fr/professionnel/questions/partir-de-quand-suis-je-concerne-par-la-reforme-de-la-facturation",
+                read_date="2026-09-07",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="2027-09-01",
+                scope="Domestic B2B, PME and TPE",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://www.impots.gouv.fr/professionnel/questions/partir-de-quand-suis-je-concerne-par-la-reforme-de-la-facturation",
+                read_date="2026-09-07",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_REPORT,
+                effective_date="2026-09-01",
+                scope="Transaction and payment data to the DGFiP, grandes entreprises and ETI",
+                legal_status=LEGAL_STATUS_IN_FORCE,
+                source_url="https://www.impots.gouv.fr/professionnel/questions/partir-de-quand-suis-je-concerne-par-la-reforme-de-la-facturation",
+                read_date="2026-09-07",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_REPORT,
+                effective_date="2027-09-01",
+                scope="Transaction and payment data to the DGFiP, PME and TPE",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://www.impots.gouv.fr/professionnel/questions/partir-de-quand-suis-je-concerne-par-la-reforme-de-la-facturation",
+                read_date="2026-09-07",
+            ),
+        ),
+        notes=(
+            "The reporting leg is an obligation of its own and not a byproduct of the routing, which is what "
+            "makes France hybrid rather than a network country. Chorus Pro is the public-sector path only; the "
+            "domestic B2B document travels through an accredited platform, so the row named the smaller half of "
+            "the country's arrangement until this was corrected. Corroborated against the European Commission's "
+            "France page, read on the same day."
+        ),
     ),
     "NL": CountryRegime(
         country="NL",
@@ -342,6 +654,47 @@ COUNTRY_REGIMES: dict[str, CountryRegime] = {
         en16931_profile="ehf",
         profile_fields=("network_participant_id",),
         correction_mechanism="credit note",
+        scope=(
+            "The statute covers sales to other bokforingspliktige. It names no network and no format itself, "
+            "leaving both to regulation, and a size-based exemption for the smallest sole proprietorships is "
+            "proposed rather than in force."
+        ),
+        commencement=(
+            # Dateless on purpose, and this is the case the empty date was built
+            # for. The statute is passed and sanctioned, so the obligation is
+            # real and a Norwegian user should be told so; but it commences "fra
+            # den tid Kongen bestemmer", and the decree that would supply the
+            # dates was not published when this was read. Showing no row at all
+            # would say "no regime declared", which is a different and worse
+            # claim than "enacted, commencement decree pending".
+            CommencementPhase(
+                obligation=OBLIGATION_ISSUE,
+                effective_date="",
+                scope="Sales to other bokforingspliktige",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://lovdata.no/dokument/LTI/lov/2026-06-19-39",
+                read_date="2026-09-07",
+                notes="LOV-2026-06-19-39, sanctioned 19 June 2026. Commencement is by royal decree and unpublished.",
+            ),
+            CommencementPhase(
+                obligation=OBLIGATION_RECEIVE,
+                effective_date="",
+                scope="Sales to other bokforingspliktige",
+                legal_status=LEGAL_STATUS_ENACTED,
+                source_url="https://lovdata.no/dokument/LTI/lov/2026-06-19-39",
+                read_date="2026-09-07",
+                notes="Same statute. The King may commence individual provisions at different times.",
+            ),
+        ),
+        notes=(
+            "Norway is the case that shows why a date and its legal status are two separate claims. The statute "
+            "is enacted and carries no dates whatsoever: commencement is left to royal decree, and the decree "
+            "may bring individual provisions into force at different times, which is the legal mechanism that "
+            "produces the split between issuing and receiving in the first place. Commentary sources agree that "
+            "issuing starts in 2027 and receiving in 2030, and that split is believed to be the widest of any "
+            "country here, but no primary document read for this row carries either date, so neither is stated "
+            "as data. Fill them in when the commencement decree is published."
+        ),
     ),
     "AU": CountryRegime(
         country="AU",
@@ -459,13 +812,54 @@ def get_country_regime(country: str) -> CountryRegime | None:
 
 
 def countries_by_regime(regime: str) -> tuple[str, ...]:
-    """Every country registered under one regime, sorted."""
+    """Every country whose deciding act is this one, sorted.
+
+    The deciding act only. A hybrid country appears here under the act that
+    decides what a successful submission means, not under the other acts it also
+    performs; :func:`countries_performing` answers that wider question.
+    """
     wanted = (regime or "").strip().lower()
     return tuple(sorted(code for code, entry in COUNTRY_REGIMES.items() if entry.regime == wanted))
 
 
+def countries_performing(regime: str) -> tuple[str, ...]:
+    """Every country that performs this act at all, deciding or additional."""
+    wanted = (regime or "").strip().lower()
+    return tuple(sorted(code for code, entry in COUNTRY_REGIMES.items() if wanted in entry.regimes))
+
+
+def hybrid_countries() -> tuple[str, ...]:
+    """Every country that performs more than one of the three acts, sorted."""
+    return tuple(sorted(code for code, entry in COUNTRY_REGIMES.items() if entry.is_hybrid))
+
+
+def phase_as_dict(phase: CommencementPhase) -> dict[str, Any]:
+    """Flatten one commencement phase, provenance included.
+
+    The source and the read date travel with the date rather than being dropped
+    at the boundary. A reader who is told "1 January 2027" and not told where
+    that came from cannot check it, and this registry is exactly the kind of
+    data that goes stale between releases.
+    """
+    return {
+        "obligation": phase.obligation,
+        "effective_date": phase.effective_date,
+        "scope": phase.scope,
+        "threshold": phase.threshold,
+        "legal_status": phase.legal_status,
+        "source_url": phase.source_url,
+        "read_date": phase.read_date,
+        "notes": phase.notes,
+    }
+
+
 def regime_as_dict(entry: CountryRegime) -> dict[str, Any]:
-    """Flatten a regime for the validation context and the meta endpoint."""
+    """Flatten a regime for the validation context and the meta endpoint.
+
+    Additive only. Every key this returned before it learned about commencement
+    still means what it meant, because a reader that already parses this shape
+    is a reader we cannot see.
+    """
     return {
         "country": entry.country,
         "regime": entry.regime,
@@ -480,19 +874,44 @@ def regime_as_dict(entry: CountryRegime) -> dict[str, Any]:
         "is_cancellable": entry.is_cancellable,
         "correction_mechanism": entry.correction_mechanism,
         "notes": entry.notes,
+        # Added later. Absent from no entry: the defaults make a country that
+        # does one act and states no commencement read exactly as it always did.
+        "regime_class": entry.regime_class,
+        "is_hybrid": entry.is_hybrid,
+        "additional_regimes": list(entry.additional_regimes),
+        "cancellation_basis": entry.cancellation_basis,
+        "scope": entry.scope,
+        "commencement": [phase_as_dict(p) for p in entry.commencement],
     }
 
 
 __all__ = [
+    "CANCELLATION_BASES",
+    "CANCELLATION_BASIS_DAYS",
+    "CANCELLATION_BASIS_FISCAL_YEAR",
     "COUNTRY_REGIMES",
+    "LEGAL_STATUSES",
+    "LEGAL_STATUS_ANNOUNCED",
+    "LEGAL_STATUS_ENACTED",
+    "LEGAL_STATUS_IN_FORCE",
+    "OBLIGATIONS",
+    "OBLIGATION_ISSUE",
+    "OBLIGATION_RECEIVE",
+    "OBLIGATION_REPORT",
     "PROFILE_FIELDS",
     "REGIMES",
+    "REGIME_CLASSES",
     "REGIME_CLEARANCE",
+    "REGIME_HYBRID",
     "REGIME_NETWORK",
     "REGIME_REPORTING",
     "SUPPORTED_COUNTRIES",
+    "CommencementPhase",
     "CountryRegime",
     "countries_by_regime",
+    "countries_performing",
     "get_country_regime",
+    "hybrid_countries",
+    "phase_as_dict",
     "regime_as_dict",
 ]

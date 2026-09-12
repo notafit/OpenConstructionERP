@@ -34,6 +34,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { formatDistanceToNow } from 'date-fns';
+import { getDateFnsLocale } from '@/shared/lib/dateFnsLocale';
 import clsx from 'clsx';
 import {
   Upload,
@@ -171,6 +172,7 @@ import LinkDocumentToDwgModal from './LinkDocumentToDwgModal';
 import LinkActivityToDwgModal from './LinkActivityToDwgModal';
 import LinkRequirementToDwgModal from './LinkRequirementToDwgModal';
 import { fmtFixed, fmtPrecision } from '@/shared/lib/formatters';
+import { compareNames } from '@/shared/lib/collator';
 // boqApi / Position import removed - BOQ picker now handled via ElementInfoPopover callback
 
 /** The stores "Open from project files" reads in this module. The documents
@@ -272,7 +274,7 @@ function extractLayers(
       visible: true,
       entity_count: count,
     }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .sort((a, b) => compareNames(a.name, b.name));
 }
 
 /** Convert a DxfEntity into the shared ElementInfoPopover payload shape.
@@ -1529,7 +1531,7 @@ export function DwgTakeoffPage() {
       const byName = new Map(prev.map((l) => [l.name, l]));
       for (const l of fetchedLayers) byName.set(l.name, l);
       const merged = Array.from(byName.values()).sort((a, b) =>
-        a.name.localeCompare(b.name),
+        compareNames(a.name, b.name),
       );
       // Skip the state write when nothing changed to avoid a render loop.
       if (
@@ -3285,7 +3287,7 @@ export function DwgTakeoffPage() {
                       'Upload DWG or DXF drawings to view their entities, toggle layers, and measure areas, lengths and counts directly on the plan. Link measurements to BOQ positions so the quantities flow into your cost estimate alongside BIM and the canonical model.',
                   })}
                 </DismissibleInfo>
-                <div className="grid grid-cols-1 md:grid-cols-[1.4fr_1fr] gap-8 items-stretch">
+                <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)] gap-8 items-stretch">
                   {/* LEFT · Upload card (gets the larger half) */}
                   <div className="flex flex-col">
                     <div className="rounded-2xl bg-[#22252b]/90 backdrop-blur-sm border border-[#333842] shadow-2xl shadow-black/30 p-3 flex flex-col h-full">
@@ -5357,7 +5359,12 @@ function DrawingFilmstrip({
                 if (!Number.isNaN(dt.getTime())) {
                   uploadedLabel = t('dwg_takeoff.uploaded_relative', {
                     defaultValue: 'Uploaded {{when}}',
-                    when: formatDistanceToNow(dt, { addSuffix: true }),
+                    // `locale` is required for a localised answer: date-fns
+                    // defaults to en-US rather than to the UI language.
+                    when: formatDistanceToNow(dt, {
+                      addSuffix: true,
+                      locale: getDateFnsLocale(),
+                    }),
                   });
                 }
               } catch {

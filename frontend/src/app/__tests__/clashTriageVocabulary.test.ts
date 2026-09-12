@@ -124,7 +124,7 @@ describe('the vocabulary resolves through the bundle, not just in the file', () 
     };
 
     const instance = i18next.createInstance();
-    void instance.init({ lng: 'de', resources: {}, initImmediate: false });
+    void instance.init({ lng: 'de', resources: {}, initAsync: false });
     instance.addResourceBundle('de', 'translation', resource.translation, false, true);
 
     for (const severity of SEVERITIES) {

@@ -8,7 +8,7 @@ import { usePreferencesStore } from '@/stores/usePreferencesStore';
 // The percent helper reads the live UI language off the i18next singleton,
 // which nothing else in this file needs, so it is initialised here with no
 // resources at all - the language tag is the whole input.
-void i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+void i18next.init({ lng: 'en', resources: {}, initAsync: false });
 const original = i18next.language;
 afterAll(() => {
   void i18next.changeLanguage(original);

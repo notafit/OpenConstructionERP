@@ -18,7 +18,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation } from '@tanstack/react-query';
-import * as pdfjsLib from 'pdfjs-dist';
+import { closePdf, openPdf, type PDFDocumentProxy, type RenderTask } from '@/shared/lib/pdfjs';
 import {
   ChevronLeft,
   ChevronRight,
@@ -34,12 +34,6 @@ import { Button } from '@/shared/ui';
 import { API_BASE, getAuthToken } from '@/shared/lib/api';
 import { useToastStore } from '@/stores/useToastStore';
 import { pinPunchToSheet, type PunchDrawing, type PunchItem, type PunchPriority } from './api';
-
-// Configure the pdf.js worker (idempotent; mirrors the markups annotator).
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url,
-).toString();
 
 const ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const BASE_SCALE = 1.3;
@@ -106,7 +100,7 @@ export function PunchPinBoard({
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const pdfRef = useRef<PDFDocumentProxy | null>(null);
 
   // Keep the selected document in sync when the default resolves later (e.g.
   // drawings load after mount) but never fight a user selection.
@@ -124,7 +118,7 @@ export function PunchPinBoard({
       return;
     }
     let cancelled = false;
-    let loaded: pdfjsLib.PDFDocumentProxy | null = null;
+    let loaded: PDFDocumentProxy | null = null;
     setIsLoading(true);
     setLoadError(false);
     (async () => {
@@ -139,9 +133,9 @@ export function PunchPinBoard({
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = await res.arrayBuffer();
         if (cancelled) return;
-        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+        const doc = await openPdf(buf).promise;
         if (cancelled) {
-          doc.destroy?.();
+          closePdf(doc);
           return;
         }
         loaded = doc;
@@ -160,7 +154,7 @@ export function PunchPinBoard({
     })();
     return () => {
       cancelled = true;
-      loaded?.destroy?.();
+      closePdf(loaded);
     };
   }, [selectedDocId]);
 
@@ -169,7 +163,7 @@ export function PunchPinBoard({
     const doc = pdfRef.current;
     if (!doc || !canvasRef.current || totalPages === 0) return;
     let cancelled = false;
-    let task: ReturnType<pdfjsLib.PDFPageProxy['render']> | null = null;
+    let task: RenderTask | null = null;
     (async () => {
       try {
         const page = await doc.getPage(currentPage);
@@ -177,11 +171,9 @@ export function PunchPinBoard({
         const viewport = page.getViewport({ scale: zoom * BASE_SCALE });
         const canvas = canvasRef.current;
         if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
         canvas.width = viewport.width;
         canvas.height = viewport.height;
-        task = page.render({ canvasContext: ctx, viewport });
+        task = page.render({ canvas, viewport });
         await task.promise;
       } catch (err) {
         if (err && (err as { name?: string }).name !== 'RenderingCancelledException') {

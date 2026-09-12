@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 // import.meta.url is not a file URL, so the source is reached from there.
 const PAGE_SOURCE = 'src/features/finance/FinancePage.tsx';
 import {
+  canMarkPaid,
   invoiceStatusOptions,
   isReceivable,
   INVOICE_SELF_SERVICE_TRANSITIONS,
@@ -23,6 +24,15 @@ import {
  * those go through the manager-gated /approve and /pay endpoints (and /pay
  * writes a binding ledger entry). These tests lock that invariant in.
  */
+/** Every line that rewrites the stored status into a different word for display. */
+function statusRelabelSites(source: string): number[] {
+  const hits: number[] = [];
+  source.split('\n').forEach((line, i) => {
+    if (/=== 'sent'\s*\?\s*'approved'/.test(line)) hits.push(i + 1);
+  });
+  return hits;
+}
+
 /** Every line that opens the e-invoice dialog, and which of them run unguarded. */
 function unguardedEInvoiceOpeners(source: string): { total: number; unguarded: number[] } {
   const lines = source.split('\n');
@@ -135,6 +145,89 @@ describe('invoice status dropdown options', () => {
     // ...and neither may borrow the colour that means the money arrived.
     expect(INVOICE_STATUS_COLORS.sent).not.toBe(INVOICE_STATUS_COLORS.paid);
     expect(INVOICE_STATUS_COLORS.approved).not.toBe(INVOICE_STATUS_COLORS.paid);
+  });
+
+  it('offers Mark Paid in the state approving an invoice actually produces', () => {
+    // Approving writes 'approved': finance.service.approve_invoice
+    // does `self.invoices.update(invoice_id, status="approved")`. An
+    // invoice a manager has just approved must still offer the one action a
+    // person needs next.
+    expect(canMarkPaid('approved')).toBe(true);
+  });
+
+  it('matches the exact status set the pay endpoint accepts', () => {
+    // The cross-layer invariant. finance.service.pay_invoice guards with
+    // `if prior not in ("approved", "sent")`, so the button has to be offered
+    // for both and for nothing else. Offering it more widely produces a 400
+    // the person cannot act on; offering it more narrowly strands the invoice.
+    // 'approved' stays in the set deliberately and must not be pruned as dead:
+    // posting a capture from the invoice inbox still creates its payable with
+    // that status, so it is a state the product reaches today.
+    const offered = INVOICE_STATUS_ORDER.filter((s) => canMarkPaid(s));
+    expect(offered.sort()).toEqual(['approved', 'sent']);
+  });
+
+  it('never offers Mark Paid from a state that has not been approved', () => {
+    for (const status of ['draft', 'pending', 'paid', 'cancelled', 'credit_note_issued']) {
+      expect(canMarkPaid(status)).toBe(false);
+    }
+    // A row that arrives without a status must not get a payment button.
+    expect(canMarkPaid(undefined)).toBe(false);
+    expect(canMarkPaid(null)).toBe(false);
+    expect(canMarkPaid('')).toBe(false);
+  });
+
+  it('keeps offering Mark Paid on the status the invoice inbox still writes', () => {
+    // Guards against a future cleanup pruning 'approved' as a dead legacy
+    // value. It is not dead: finance/invoice_capture_service.py posts a
+    // capture by calling create_invoice(status="approved"), so a payable born
+    // in the inbox arrives in that status on a fully migrated database, and
+    // pay_invoice accepts it. Dropping it would leave every inbox-posted
+    // invoice with no way to be marked paid.
+    expect(canMarkPaid('approved')).toBe(true);
+  });
+
+  it('shows the status the machine wrote, not a second word for it', () => {
+    // The edit modal used to rewrite the stored 'sent' into 'approved' before
+    // displaying it, so the same invoice read Sent in the table and Approved
+    // in the modal. The founder settled this: a person sees the state the
+    // machine actually writes, and approving writes 'approved'.
+    //
+    // Both rewrite sites have to go together. Dropping only the one that fills
+    // the form would leave the save path comparing a stored 'sent' against a
+    // relabelled 'approved', deciding the status had changed, and PATCHing
+    // sent -> sent, which the backend transition table does not allow.
+    const source = readFileSync(resolve(process.cwd(), PAGE_SOURCE), 'utf-8');
+    expect(statusRelabelSites(source)).toEqual([]);
+  });
+
+  it('would notice a relabel site (the scan above is falsifiable)', () => {
+    // A scan that has never come back dirty is not evidence.
+    const planted = ["const a = 1;", "status: inv.status === 'sent' ? 'approved' : inv.status,"].join('\n');
+    expect(statusRelabelSites(planted)).toEqual([2]);
+  });
+
+  it('leaves a sent invoice with no editable next step in the modal', () => {
+    // With the relabelling gone the form carries 'sent', and that value now
+    // reaches invoiceStatusOptions. It has to behave like 'approved' did:
+    // a single option, which the modal renders as read-only text rather than
+    // a dropdown that looks editable but offers nothing.
+    expect(invoiceStatusOptions('sent')).toEqual(['sent']);
+    expect(invoiceStatusOptions('approved')).toEqual(['approved']);
+  });
+
+  it('routes every Mark Paid site through the shared predicate', () => {
+    // The page renders the invoice actions twice, once in the table row and
+    // once in the phone card, and the card also gates its whole action strip
+    // on a repeat of the same condition. The defect was that all of them
+    // tested a status literal the application had stopped writing, so a
+    // correct predicate used at two of three sites would still strand the
+    // invoice on one of them. Read off the source because the sites are inline
+    // in a 3600 line page with no component to mount on its own.
+    const source = readFileSync(resolve(process.cwd(), PAGE_SOURCE), 'utf-8');
+    const strayLiteral = source.match(/inv\.status === 'approved'/g) ?? [];
+    expect(strayLiteral).toEqual([]);
+    expect((source.match(/canMarkPaid\(inv\.status\)/g) ?? []).length).toBe(3);
   });
 
   it('preserves the canonical display order in the option list', () => {

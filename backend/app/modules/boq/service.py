@@ -36,7 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.events import event_bus
+from app.core.events import event_bus, publish_after_commit
 from app.core.i18n import get_locale
 from app.core.validation.messages import translate
 
@@ -229,10 +229,27 @@ logger_events = logging.getLogger(__name__ + ".events")
 _logger_audit = logging.getLogger(__name__ + ".audit")
 
 
-async def _safe_publish(name: str, data: dict[str, Any], source_module: str = "oe_boq") -> None:
-    """Publish event safely - ignores MissingGreenlet errors with SQLite async."""
+async def _safe_publish(
+    name: str,
+    data: dict[str, Any],
+    source_module: str = "oe_boq",
+    *,
+    session: AsyncSession | None = None,
+) -> None:
+    """Publish event safely, deferring until after commit when possible.
+
+    When *session* is provided and a transaction is open, the event is
+    deferred via ``publish_after_commit`` so that subscribers who open
+    their own session can actually see the row the event describes.
+    Without this, notification handlers (and any other subscriber that
+    opens a fresh session) hit an FK violation on the still-uncommitted
+    parent and silently lose the child record.
+    """
     try:
-        event_bus.publish_detached(name, data, source_module=source_module)
+        if session is not None:
+            publish_after_commit(session, name, data, source_module=source_module)
+        else:
+            event_bus.publish_detached(name, data, source_module=source_module)
     except Exception:
         logger_events.debug("Event publish skipped (SQLite async): %s", name)
 
@@ -265,22 +282,13 @@ async def _safe_audit(
 # Re-exported under its own name so ``from app.modules.boq.service import
 # DEFAULT_MARKUP_TEMPLATES`` keeps resolving for the readers that predate the
 # move. The table itself lives in a module the methodology catalogue can import.
+from app.modules.boq.base_date import ACCEPTED_SHAPES, price_base_day
 from app.modules.boq.markup_templates import (
     CONSTRUCTION_TIER_COUNTRIES,
     region_key_for_country,
     resolve_region_lines,
 )
 from app.modules.boq.markup_templates import DEFAULT_MARKUP_TEMPLATES as DEFAULT_MARKUP_TEMPLATES
-from app.modules.i18n_foundation.repository import TaxConfigRepository
-from app.modules.i18n_foundation.tax_rules import TaxRuleError
-from app.modules.i18n_foundation.tax_rules import resolve as resolve_tax
-from app.modules.i18n_foundation.tax_rules import row_from_orm as tax_row_from_orm
-
-#: A full ISO date and nothing else. ``BOQ.base_date`` is a free-text column
-#: and the shipped demo packs fill it with ``"2026-Q1"`` and ``"2026-01"``, so
-#: what it holds has to be tested before it can be used as a date. See
-#: :meth:`BOQService._seeded_vat_rate`.
-_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 from app.modules.boq.models import (
     BOQ,
     BOQActivityLog,
@@ -295,6 +303,11 @@ from app.modules.boq.repository import (
     MarkupRepository,
     PositionRepository,
     QuantityLinkRepository,
+)
+from app.modules.boq.resource_norms import (
+    clear_unit_rate_kept,
+    stamp_unit_rate_kept,
+    untrusted_buildup_reason,
 )
 from app.modules.boq.schemas import (
     ActivityLogList,
@@ -338,6 +351,10 @@ from app.modules.boq.schemas import (
 )
 from app.modules.boq.templates import TEMPLATES
 from app.modules.costs.repository import CostItemRepository
+from app.modules.i18n_foundation.repository import TaxConfigRepository
+from app.modules.i18n_foundation.tax_rules import TaxRuleError
+from app.modules.i18n_foundation.tax_rules import resolve as resolve_tax
+from app.modules.i18n_foundation.tax_rules import row_from_orm as tax_row_from_orm
 
 logger = logging.getLogger(__name__)
 
@@ -946,8 +963,91 @@ def _leaf_total_base_with_resources(
     )
 
 
-def _build_position_response(pos: Position) -> PositionResponse:
-    """Build a PositionResponse from a Position ORM instance."""
+#: Word-shaped ``confidence`` values persisted by older seeds and importers,
+#: which the numeric 0-1 contract has no room for. Read back as representative
+#: floats rather than dropped, because a PATCH that answered 422 on one of these
+#: rows stopped the whole grid saving. ``estimate_basis.derivation`` folds the
+#: same three words and says why it repeats the map instead of importing it.
+_CONFIDENCE_LABELS: dict[str, float] = {"high": 0.9, "medium": 0.6, "med": 0.6, "low": 0.3}
+
+
+def _coerce_confidence(raw: object) -> float | None:
+    """Best-effort coerce a stored confidence value to a float in 0.0-1.0.
+
+    Args:
+        raw: Whatever the column holds - a number, a numeric string, one of the
+            legacy labels, or something unparseable.
+
+    Returns:
+        The confidence as a float, or None when the row claims none and when the
+        stored value cannot be read as one. Non-finite values come back None
+        too: NaN and Infinity are not JSON, and a response that carries them is
+        rejected by the client rather than merely wrong.
+    """
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        text = str(raw).strip().lower()
+        if text in _CONFIDENCE_LABELS:
+            return _CONFIDENCE_LABELS[text]
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+def _cost_item_id_of(pos: object) -> uuid.UUID | None:
+    """Issue #79: the CostItem this line is linked to, from its metadata.
+
+    Args:
+        pos: A Position ORM instance, or any row-shaped object standing in for
+            one.
+
+    Returns:
+        The linked cost item id, or None for rows that pre-date the linkage.
+        A non-UUID string is data rather than a programming error - metadata is
+        written by clients too - so it reads as None instead of breaking a GET.
+    """
+    raw_meta = getattr(pos, "metadata_", None)
+    if not isinstance(raw_meta, dict):
+        return None
+    raw_cid = raw_meta.get("cost_item_id")
+    if not raw_cid:
+        return None
+    try:
+        return uuid.UUID(str(raw_cid))
+    except (ValueError, TypeError):
+        return None
+
+
+def build_position_response(pos: Position) -> PositionResponse:
+    """Build a PositionResponse from a Position ORM instance.
+
+    The single builder for this entity. It used to have a twin in the router,
+    and the twin is how issue #457 shipped half-done in v16.8.1: the whole-bill
+    read answered the norm provenance and every single-position read answered
+    null about the same row. Six fields had drifted, in both directions, so a
+    client's answer depended on which endpoint it asked. Adding a field here now
+    reaches every endpoint that returns a position.
+
+    ``linked_instance_count`` is the one thing deliberately left unset. It needs
+    a project-wide query per row, so the list paths do not pay for it and
+    ``router._position_to_response_with_links`` fills it in for the single-
+    position endpoints that can afford it.
+
+    Args:
+        pos: The position to render. Read with ``getattr`` throughout, because
+            this also runs over rows built by fixtures and by importers that
+            construct a Position without touching every column.
+
+    Returns:
+        The position as the API returns it, from any endpoint.
+    """
     return PositionResponse(
         id=pos.id,
         boq_id=pos.boq_id,
@@ -964,10 +1064,11 @@ def _build_position_response(pos: Position) -> PositionResponse:
         total=pos.total,
         classification=pos.classification,
         source=pos.source,
-        confidence=(_str_to_float(pos.confidence) if pos.confidence is not None else None),
-        # Issue #453. ``getattr`` because this converter also runs over rows
-        # built by fixtures and by importers that construct a Position without
-        # touching the estimating-judgement columns at all.
+        # Label-tolerant: a seed row storing "high" reads back 0.9 rather than
+        # the 0.0 a plain float coercion produced, which is what the single-
+        # position endpoints already answered for the same row.
+        confidence=_coerce_confidence(pos.confidence),
+        # Issue #453.
         risk_dispersion=(
             _str_to_float(pos.risk_dispersion) if getattr(pos, "risk_dispersion", None) is not None else None
         ),
@@ -981,10 +1082,22 @@ def _build_position_response(pos: Position) -> PositionResponse:
         sort_order=pos.sort_order,
         created_at=pos.created_at,
         updated_at=pos.updated_at,
+        # Issue #79: the CostItem linkage, read back out of the metadata the
+        # client sent it in.
+        cost_item_id=_cost_item_id_of(pos),
+        # BUG-CONCURRENCY01: the row's optimistic-concurrency token, so clients
+        # can echo it on the next PATCH.
+        version=int(getattr(pos, "version", 0) or 0),
         # Issue #127: surface the reuse-group fields read-only.
         reference_code=getattr(pos, "reference_code", None),
         link_role=getattr(pos, "link_role", None),
         link_group_id=getattr(pos, "link_group_id", None),
+        # Issue #457: the production norm this line was priced from, read-only.
+        # Written at the storage boundary from the metadata, not accepted from a
+        # client: it is provenance, and a caller that could set it could claim a
+        # norm predicted a price it never saw.
+        norm_id=getattr(pos, "norm_id", None),
+        norm_work_key=getattr(pos, "norm_work_key", None),
     )
 
 
@@ -1252,6 +1365,62 @@ def _coerce_uuid_or_none(value: object) -> uuid.UUID | None:
         return uuid.UUID(value.strip())
     except ValueError:
         return None
+
+
+def _norm_provenance_from_metadata(metadata: object) -> tuple[uuid.UUID | None, str | None]:
+    """Read the production-norm identity out of a position's metadata.
+
+    Issue #457. The path that applies an assembly to a bill already writes
+    ``norm_id`` and ``work_key`` into the metadata when the assembly was itself
+    built from a production norm. Lifting them onto their own columns here, at
+    the one storage boundary every create goes through, means the writer needs
+    no change and every writer benefits: an importer, a template expansion or a
+    module that has not been written yet all get the column for free as soon as
+    they put the identity in the metadata, which is the shape the platform
+    already agreed on.
+
+    Metadata is a free-form dict written by clients as well as by us, so a
+    malformed id is data rather than a programming error and comes back as None
+    instead of raising out of a create. The key is only returned when the id
+    resolved, so the two columns can never disagree about whether this row was
+    priced from a norm.
+    """
+    if not isinstance(metadata, dict):
+        return None, None
+    norm_id = _coerce_uuid_or_none(metadata.get("norm_id"))
+    if norm_id is None:
+        return None, None
+    raw_key = metadata.get("work_key")
+    work_key = raw_key.strip()[:120] if isinstance(raw_key, str) and raw_key.strip() else None
+    return norm_id, work_key
+
+
+def _norm_provenance_of_copy(source: object, metadata: object) -> tuple[uuid.UUID | None, str | None]:
+    """Norm provenance for a position copied from an existing one.
+
+    A copy of a line priced from a norm was priced from that same norm, so the
+    identity travels with the copy. It has to be lifted explicitly at every copy
+    site because these paths build the row field by field rather than going
+    through ``add_position``: without this a duplicated line, a linked instance,
+    a bill revision and a restored snapshot would each carry the identity in
+    their copied metadata against a NULL column. This coalesce is the only one
+    in the feature. The read side has none - both readers take the column and
+    only the column - so a copy that missed it would not merely be untidy: it
+    would report no norm at all, on exactly the bills that have been worked on
+    most, and a GROUP BY over the column would give a fraction of the work as
+    the whole of it.
+
+    The source's own columns come first because they are already normalised;
+    a row written before the column existed carries nothing there and its
+    copied metadata still answers.
+    """
+    norm_id = _coerce_uuid_or_none(getattr(source, "norm_id", None))
+    if norm_id is None:
+        return _norm_provenance_from_metadata(metadata)
+    raw_key = getattr(source, "norm_work_key", None)
+    if isinstance(raw_key, str) and raw_key.strip():
+        return norm_id, raw_key.strip()[:120]
+    return norm_id, _norm_provenance_from_metadata(metadata)[1]
 
 
 def _read_bands(metadata: object) -> list[tuple[Decimal | None, Decimal]]:
@@ -2157,6 +2326,9 @@ class BOQService:
         if link_group_id is not None:
             _root_meta["_link_src"] = str(source.id)
 
+        # Issue #457: a clone of a norm-priced line was priced from that norm.
+        _root_norm_id, _root_norm_key = _norm_provenance_of_copy(source, _root_meta)
+
         root = Position(
             boq_id=boq_id,
             parent_id=new_parent_id,
@@ -2183,6 +2355,8 @@ class BOQService:
             # Issue #347: carry the owning model so a duplicate resolves its BIM
             # links against the same model as the original.
             cad_model_id=getattr(source, "cad_model_id", None),
+            norm_id=_root_norm_id,
+            norm_work_key=_root_norm_key,
             validation_status="pending",
             metadata_=_root_meta,
             sort_order=max_order + 1,
@@ -2207,6 +2381,7 @@ class BOQService:
                 _child_meta = _copy_definition_metadata(child.metadata_)
                 if link_group_id is not None:
                     _child_meta["_link_src"] = str(child.id)
+                _child_norm_id, _child_norm_key = _norm_provenance_of_copy(child, _child_meta)
                 cloned_child = Position(
                     boq_id=boq_id,
                     parent_id=new_parent,
@@ -2224,6 +2399,8 @@ class BOQService:
                     cad_element_ids=(list(child.cad_element_ids) if child.cad_element_ids else []),
                     # Issue #347: carry the owning model onto the cloned child.
                     cad_model_id=getattr(child, "cad_model_id", None),
+                    norm_id=_child_norm_id,
+                    norm_work_key=_child_norm_key,
                     validation_status="pending",
                     metadata_=_child_meta,
                     sort_order=max_order,
@@ -2298,6 +2475,7 @@ class BOQService:
             "boq.boq.created",
             {"boq_id": str(boq.id), "project_id": str(data.project_id)},
             source_module="oe_boq",
+            session=self.session,
         )
 
         await _safe_audit(
@@ -2700,6 +2878,7 @@ class BOQService:
             await _safe_publish(
                 "boq.boq.updated",
                 {"boq_id": str(boq_id), "fields": list(fields.keys())},
+                session=self.session,
             )
 
         # Re-fetch to return fresh data
@@ -2741,6 +2920,7 @@ class BOQService:
             "boq.boq.deleted",
             {"boq_id": str(boq_id), "project_id": project_id},
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info("BOQ deleted: %s", boq_id)
@@ -2923,6 +3103,11 @@ class BOQService:
         # the position is always referenceable.
         resolved_reference_code = await self._resolve_create_reference_code(project_id, supplied_code or None)
 
+        # Issue #457 - lift the production-norm identity out of the metadata
+        # onto its own columns so a per-norm rollup can group by it instead of
+        # matching the serialised JSON by string shape.
+        norm_id, norm_work_key = _norm_provenance_from_metadata(merged_metadata)
+
         position = Position(
             boq_id=data.boq_id,
             parent_id=data.parent_id,
@@ -2940,6 +3125,8 @@ class BOQService:
             price_basis=data.price_basis,
             cad_element_ids=data.cad_element_ids,
             metadata_=merged_metadata,
+            norm_id=norm_id,
+            norm_work_key=norm_work_key,
             # BUG-B-013 (cost-item unit/currency) + BUG-B-014 (duplicate
             # content) both surface on the validation traffic-light.
             validation_status=("warnings" if (_cost_compat_warned or _dup_ordinal is not None) else "pending"),
@@ -2983,6 +3170,7 @@ class BOQService:
                 "ordinal": data.ordinal,
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         await _safe_audit(
@@ -3095,6 +3283,7 @@ class BOQService:
                 "linked": not as_copy,
             },
             source_module="oe_boq",
+            session=self.session,
         )
         await _safe_audit(
             self.session,
@@ -3232,6 +3421,10 @@ class BOQService:
                 position_currency=currency_hint if isinstance(currency_hint, str) else None,
             )
 
+            # Issue #457, same derivation as the single-position create: the
+            # bulk path builds its rows directly rather than calling through it.
+            _bulk_norm_id, _bulk_norm_key = _norm_provenance_from_metadata(merged_metadata)
+
             new_positions.append(
                 Position(
                     boq_id=boq_id,
@@ -3246,6 +3439,8 @@ class BOQService:
                     source=data.source,
                     confidence=(str(data.confidence) if data.confidence is not None else None),
                     cad_element_ids=data.cad_element_ids,
+                    norm_id=_bulk_norm_id,
+                    norm_work_key=_bulk_norm_key,
                     metadata_=merged_metadata,
                     validation_status="warnings" if _bulk_cost_warned else "pending",
                     sort_order=max_order + offset,
@@ -3259,6 +3454,7 @@ class BOQService:
             "boq.positions.bulk_created",
             {"boq_id": str(boq_id), "count": len(inserted)},
             source_module="oe_boq",
+            session=self.session,
         )
         await _safe_audit(
             self.session,
@@ -3338,6 +3534,7 @@ class BOQService:
                 "ordinal": data.ordinal,
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info("Section created: %s in BOQ %s", data.ordinal, boq_id)
@@ -3625,15 +3822,49 @@ class BOQService:
             and _has_contributing_resources(meta.get("resources"))
         ):
             resources = meta["resources"]
-            _fx_base_ccy, _fx_map = await self._resolve_project_fx(position.boq_id)
-            # Sum of per-unit subtotals == position unit_rate (NO division by
-            # qty). Each resource is converted from its own ``currency`` to the
-            # project base via the FX table before summing - never blend
-            # currencies into the stored rate (Issue #88 / #157). Mirrors the
-            # read-side ``_resource_total_in_base`` so the persisted value and
-            # the FX-aware rollup agree.
-            new_unit_rate = _quantize_money_str(_resource_total_in_base(resources, _fx_map, _fx_base_ccy or ""))
-            fields["unit_rate"] = new_unit_rate
+            # ── Rows that are not per-unit norms must not re-price the line ──
+            # The sum below is only a unit rate when every row's quantity is
+            # per ONE unit of the position. The AI estimator stores rows whose
+            # quantity is ``factor * position_quantity`` (a whole-position
+            # total), fallback allowance rows flagged ``estimated`` whose
+            # quantity is the position quantity itself, and rows flagged
+            # ``factor_estimated`` whose norm is an assumed 1.0. Positions
+            # booked before the estimator read the catalogue norm hold the
+            # position quantity on every row. All of them price correctly at
+            # apply time, because the rate is written from the chosen
+            # candidate, and summing them here on an ordinary edit overwrote a
+            # correct rate with roughly quantity times the correct value. So
+            # when the rows cannot be trusted the stored rate stands, the
+            # position is stamped, and a boq_quality warning names the reason
+            # for a person to review; nothing is repaired silently.
+            _stored_meta_for_check = position.metadata_ if isinstance(position.metadata_, dict) else {}
+            _untrusted_reason = untrusted_buildup_reason(
+                source=position.source,
+                metadata={**_stored_meta_for_check, **meta},
+                quantity=new_quantity,
+                resources=resources,
+            )
+            if _untrusted_reason is not None:
+                stamp_unit_rate_kept(meta, reason=_untrusted_reason, unit_rate=new_unit_rate)
+                if "validation_status" not in fields:
+                    fields["validation_status"] = "warnings"
+                logger.info(
+                    "update_position kept unit_rate %s on %s: resource rows %s",
+                    new_unit_rate,
+                    position_id,
+                    _untrusted_reason,
+                )
+            else:
+                clear_unit_rate_kept(meta)
+                _fx_base_ccy, _fx_map = await self._resolve_project_fx(position.boq_id)
+                # Sum of per-unit subtotals == position unit_rate (NO division by
+                # qty). Each resource is converted from its own ``currency`` to the
+                # project base via the FX table before summing - never blend
+                # currencies into the stored rate (Issue #88 / #157). Mirrors the
+                # read-side ``_resource_total_in_base`` so the persisted value and
+                # the FX-aware rollup agree.
+                new_unit_rate = _quantize_money_str(_resource_total_in_base(resources, _fx_map, _fx_base_ccy or ""))
+                fields["unit_rate"] = new_unit_rate
 
         # Recalculate total only when something pricing-related actually changed.
         # A pure metadata patch (e.g. setting a custom column value) leaves the
@@ -4014,6 +4245,7 @@ class BOQService:
                                 "kind": "linked_master_propagation",
                             },
                             source_module="oe_boq",
+                            session=self.session,
                         )
                     await self.session.flush()
                     # The per-instance update_fields() calls wrote through other
@@ -4184,6 +4416,7 @@ class BOQService:
                                     "kind": "linked_master_child_propagation",
                                 },
                                 source_module="oe_boq",
+                                session=self.session,
                             )
                         await self.session.flush()
                         if _mc_affected:
@@ -4264,6 +4497,7 @@ class BOQService:
                 "version": int(position.version or 0),
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         # ── BUG-AUDIT01: direct activity-log write ──────────────────────
@@ -4875,6 +5109,7 @@ class BOQService:
                 "kind": "resource_variant_repick",
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         if actor_id is not None:
@@ -5010,6 +5245,7 @@ class BOQService:
                 "boq.position.deleted",
                 {"position_id": pid_str, "boq_id": boq_id},
                 source_module="oe_boq",
+                session=self.session,
             )
 
         logger.info(
@@ -5408,6 +5644,7 @@ class BOQService:
                 "name": data.name,
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info("Markup added: %s to BOQ %s", data.name, boq_id)
@@ -5491,6 +5728,7 @@ class BOQService:
                     "boq_id": str(markup.boq_id),
                     "fields": list(fields.keys()),
                 },
+                session=self.session,
             )
 
             if refreshed is not None:
@@ -5526,6 +5764,7 @@ class BOQService:
             "boq.markup.deleted",
             {"markup_id": str(markup_id), "boq_id": boq_id},
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info("Markup deleted: %s from BOQ %s", markup_id, boq_id)
@@ -5588,7 +5827,7 @@ class BOQService:
             logger.debug("project lookup failed for boq %s", boq_id, exc_info=True)
             return None
 
-    async def _seeded_vat_rate(self, country_code: str | None, base_date: str | None) -> str | None:
+    async def _seeded_vat_rate(self, country_code: str | None, base_date: str | None, boq_id: uuid.UUID) -> str | None:
         """The country's own standard VAT rate from the shipped tax seed.
 
         The bill used to price a country with no project override off its
@@ -5606,17 +5845,19 @@ class BOQService:
 
         Args:
             country_code: The project's ISO 3166-1 alpha-2 code, or None.
-            base_date: The bill's own base date, used only when it is a full
-                ISO date. The column is ``String(40)`` with no format
-                validation and the shipped demo packs put ``"2026-Q1"`` and
-                ``"2026-01"`` in it, which are not dates. Passing those through
-                would not fail - ``active_rows`` compares date strings, so
-                ``"2026-Q1"`` sorts after ``"2026-02-01"`` because ``"Q"`` is
-                above ``"0"`` while ``"2026-01"`` sorts before it. The two
-                shipped formats therefore select windows in opposite
-                directions, both silently. Anything that is not
-                ``YYYY-MM-DD`` is dropped and the resolver dates the bill
-                today.
+            base_date: The bill's own base date. A bill of quantities is taxed
+                at its own base date, so this is the date the rate is resolved
+                on - not today. The column is ``String(40)`` free text and a
+                price base is legitimately stated as a day, a month, a quarter
+                or a year, so it is read by
+                :func:`app.modules.boq.base_date.price_base_day`, which owns
+                the one rule for which day inside a stated period is meant.
+                Never passed to the resolver raw: ``active_rows`` compares date
+                strings, so ``"2026-Q1"`` sorts above ``"2026-02-01"`` while
+                ``"2026-01"`` sorts below it, so those two shapes would select
+                windows in opposite directions without failing.
+            boq_id: The bill being priced, so that a base date nothing can read
+                names the bill it came from in the log rather than only itself.
 
         Returns:
             The rate as a decimal-string percentage, or None when the country
@@ -5641,7 +5882,24 @@ class BOQService:
             # is 9; the 9 is on the regional stack, so leaving it alone is the
             # answer rather than a gap.
             return None
-        on_date = base_date.strip() if base_date and _ISO_DATE.fullmatch(base_date.strip()) else None
+        stated = (base_date or "").strip()
+        day = price_base_day(stated)
+        on_date = day.isoformat() if day else None
+        if stated and day is None:
+            # A bill that states no base date is ordinary and says nothing
+            # here. A bill that states one nobody can read is a different
+            # event: it is priced at today's rate while its own label says
+            # otherwise, and until this line that happened without a word. The
+            # bill still seeds, for the same reason a broken seed row does not
+            # stop it - refusing to price a project is worse than pricing it at
+            # today's rate - so the log is the only thing that reports it.
+            logger.warning(
+                "BOQ %s states base date %r, which is not a date the platform reads (%s); "
+                "the bill is taxed at today's rate instead of its own",
+                boq_id,
+                stated,
+                ", ".join(ACCEPTED_SHAPES),
+            )
         try:
             configs = await TaxConfigRepository(self.session).list(country_code=country_code)
         except SQLAlchemyError:
@@ -5756,7 +6014,7 @@ class BOQService:
         vat_rate = project_vat_override
         rate_source = "project"
         if vat_rate is None:
-            vat_rate = await self._seeded_vat_rate(country_code, getattr(boq, "base_date", None))
+            vat_rate = await self._seeded_vat_rate(country_code, getattr(boq, "base_date", None), boq_id)
             rate_source = "country_seed"
         if vat_rate is None:
             rate_source = "region_template"
@@ -5800,6 +6058,7 @@ class BOQService:
             "boq.markups.defaults_applied",
             {"boq_id": str(boq_id), "region": region_key, "count": len(created)},
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info(
@@ -5961,6 +6220,10 @@ class BOQService:
             # DELIBERATELY NOT carried: a revision instance must not follow
             # the original BOQ's master definition.
             pos_reference_code = getattr(pos, "reference_code", None)
+            # Issue #457: a revision of a bill is still priced from the same
+            # norms, and the revision is where the outturn comparison is most
+            # often read from.
+            pos_norm_id, pos_norm_work_key = _norm_provenance_of_copy(pos, pos_metadata)
 
             captured_positions.append({"id": pos_id, "parent_id": pos_parent_id})
 
@@ -5978,6 +6241,8 @@ class BOQService:
                 confidence=pos_confidence,
                 cad_element_ids=pos_cad_element_ids,
                 cad_model_id=pos_cad_model_id,
+                norm_id=pos_norm_id,
+                norm_work_key=pos_norm_work_key,
                 validation_status="pending",
                 reference_code=pos_reference_code,
                 metadata_=pos_metadata,
@@ -6046,6 +6311,7 @@ class BOQService:
                 "project_id": str(source_project_id),
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info("BOQ duplicated: %s -> %s", boq_id, new_boq_id)
@@ -6211,6 +6477,7 @@ class BOQService:
                 "boq_id": str(source.boq_id),
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info(
@@ -6309,6 +6576,7 @@ class BOQService:
                 "kind": "linked_position_unlinked",
             },
             source_module="oe_boq",
+            session=self.session,
         )
         if actor_id is not None:
             try:
@@ -6674,6 +6942,7 @@ class BOQService:
                         "kind": "linked_resource_propagation",
                     },
                     source_module="oe_boq",
+                    session=self.session,
                 )
 
             if updated:
@@ -6744,7 +7013,7 @@ class BOQService:
         position_responses = []
         position_count = 0
         for pos in positions:
-            position_responses.append(_build_position_response(pos))
+            position_responses.append(build_position_response(pos))
             if not _is_section(pos) and not is_empty_position(pos):
                 position_count += 1
 
@@ -6881,7 +7150,7 @@ class BOQService:
         for section_id, section_pos in section_map.items():
             child_responses: list[PositionResponse] = []
             for child in children_map.get(section_id, []):
-                child_responses.append(_build_position_response(child))
+                child_responses.append(build_position_response(child))
 
             rolled = _rolled(section_id, set())
             sections.append(
@@ -6902,7 +7171,7 @@ class BOQService:
         ungrouped_responses: list[PositionResponse] = []
         for pos in remaining_ungrouped:
             if not _is_section(pos):
-                ungrouped_responses.append(_build_position_response(pos))
+                ungrouped_responses.append(build_position_response(pos))
                 direct_cost += _leaf_total_base(pos)
 
         # Calculate markups
@@ -7184,6 +7453,7 @@ class BOQService:
         await _safe_publish(
             "boq.cost_breakdown.computed",
             {"boq_id": str(boq_id), "direct_cost": round(direct_cost_val, 2)},
+            session=self.session,
         )
 
         return CostBreakdownResponse(
@@ -7628,6 +7898,7 @@ class BOQService:
                 "area_m2": data.area_m2,
             },
             source_module="oe_boq",
+            session=self.session,
         )
 
         logger.info(
@@ -7829,12 +8100,18 @@ class BOQService:
         return list(result.scalars().all())
 
     async def create_snapshot(
-        self, boq_id: uuid.UUID, *, name: str = "", user_id: uuid.UUID | None = None
+        self,
+        boq_id: uuid.UUID,
+        *,
+        name: str = "",
+        description: str = "",
+        user_id: uuid.UUID | None = None,
     ) -> BOQSnapshot:
         """Create a point-in-time snapshot of the current BOQ state."""
         boq = await self.get_boq(boq_id)
 
         # Serialize positions
+        grand_total = Decimal("0")
         positions_data = []
         for p in boq.positions:
             positions_data.append(
@@ -7853,6 +8130,7 @@ class BOQService:
                     "sort_order": p.sort_order,
                 }
             )
+            grand_total += _to_decimal(p.total)
 
         # Serialize markups
         markups_data = []
@@ -7870,25 +8148,165 @@ class BOQService:
                 }
             )
 
+        pos_count = len(positions_data)
         snapshot_data = {
             "boq_name": boq.name,
             "boq_status": boq.status,
             "positions": positions_data,
             "markups": markups_data,
-            "position_count": len(positions_data),
+            "position_count": pos_count,
         }
 
-        auto_name = name or f"Snapshot ({len(positions_data)} positions)"
+        auto_name = name or f"Snapshot ({pos_count} positions)"
         snap = BOQSnapshot(
             boq_id=boq_id,
             name=auto_name,
+            description=description,
             snapshot_data=snapshot_data,
+            total_value=str(grand_total),
+            position_count=pos_count,
             created_by=user_id,
         )
         self.session.add(snap)
         await self.session.flush()
         await self.session.refresh(snap)
         return snap
+
+    async def get_snapshot(self, boq_id: uuid.UUID, snapshot_id: uuid.UUID) -> BOQSnapshot:
+        """Load a single snapshot with full data payload.
+
+        Raises:
+            HTTPException: 404 if snapshot not found or does not belong to the BOQ.
+        """
+        from sqlalchemy import select
+
+        stmt = select(BOQSnapshot).where(
+            BOQSnapshot.id == snapshot_id,
+            BOQSnapshot.boq_id == boq_id,
+        )
+        result = await self.session.execute(stmt)
+        snap = result.scalar_one_or_none()
+        if not snap:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return snap
+
+    async def delete_snapshot(self, boq_id: uuid.UUID, snapshot_id: uuid.UUID) -> None:
+        """Delete a snapshot.
+
+        Raises:
+            HTTPException: 404 if snapshot not found or does not belong to the BOQ.
+        """
+        from sqlalchemy import delete as sa_delete
+        from sqlalchemy import select
+
+        stmt = select(BOQSnapshot).where(
+            BOQSnapshot.id == snapshot_id,
+            BOQSnapshot.boq_id == boq_id,
+        )
+        result = await self.session.execute(stmt)
+        snap = result.scalar_one_or_none()
+        if not snap:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        await self.session.execute(sa_delete(BOQSnapshot).where(BOQSnapshot.id == snapshot_id))
+        await self.session.flush()
+
+    async def compare_snapshots(
+        self,
+        boq_id: uuid.UUID,
+        snapshot_id_a: uuid.UUID,
+        snapshot_id_b: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Compare two snapshots of the same BOQ.
+
+        Returns a diff of positions: added (in B but not A), removed
+        (in A but not B), and changed (same ordinal, different values).
+        Positions are matched by ordinal.
+
+        Args:
+            boq_id: The BOQ both snapshots belong to.
+            snapshot_id_a: The baseline snapshot.
+            snapshot_id_b: The snapshot to compare against.
+
+        Returns:
+            Dict with keys ``snapshot_a``, ``snapshot_b``, ``added``,
+            ``removed``, ``changed``, and ``summary``.
+        """
+        snap_a = await self.get_snapshot(boq_id, snapshot_id_a)
+        snap_b = await self.get_snapshot(boq_id, snapshot_id_b)
+
+        positions_a = {p["ordinal"]: p for p in snap_a.snapshot_data.get("positions", [])}
+        positions_b = {p["ordinal"]: p for p in snap_b.snapshot_data.get("positions", [])}
+
+        ordinals_a = set(positions_a.keys())
+        ordinals_b = set(positions_b.keys())
+
+        added = []
+        for ordinal in sorted(ordinals_b - ordinals_a):
+            p = positions_b[ordinal]
+            added.append(
+                {
+                    "ordinal": ordinal,
+                    "description": p.get("description", ""),
+                    "change_type": "added",
+                    "fields": {"quantity": p.get("quantity"), "unit_rate": p.get("unit_rate"), "total": p.get("total")},
+                }
+            )
+
+        removed = []
+        for ordinal in sorted(ordinals_a - ordinals_b):
+            p = positions_a[ordinal]
+            removed.append(
+                {
+                    "ordinal": ordinal,
+                    "description": p.get("description", ""),
+                    "change_type": "removed",
+                    "fields": {"quantity": p.get("quantity"), "unit_rate": p.get("unit_rate"), "total": p.get("total")},
+                }
+            )
+
+        changed = []
+        compare_fields = ("description", "unit", "quantity", "unit_rate", "total")
+        for ordinal in sorted(ordinals_a & ordinals_b):
+            pa = positions_a[ordinal]
+            pb = positions_b[ordinal]
+            field_diffs: dict[str, Any] = {}
+            for field in compare_fields:
+                va = pa.get(field)
+                vb = pb.get(field)
+                if va != vb:
+                    field_diffs[field] = {"old": va, "new": vb}
+            if field_diffs:
+                changed.append(
+                    {
+                        "ordinal": ordinal,
+                        "description": pb.get("description", ""),
+                        "change_type": "changed",
+                        "fields": field_diffs,
+                    }
+                )
+
+        # Summary
+        total_a = sum(_to_decimal(p.get("total")) for p in positions_a.values())
+        total_b = sum(_to_decimal(p.get("total")) for p in positions_b.values())
+        change_amount = total_b - total_a
+        change_percent = float(change_amount / total_a * 100) if total_a else 0.0
+
+        return {
+            "snapshot_a": snap_a,
+            "snapshot_b": snap_b,
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "summary": {
+                "total_a": str(total_a),
+                "total_b": str(total_b),
+                "total_change_amount": str(change_amount),
+                "total_change_percent": round(change_percent, 2),
+                "positions_added": len(added),
+                "positions_removed": len(removed),
+                "positions_changed": len(changed),
+            },
+        }
 
     async def restore_snapshot(self, boq_id: uuid.UUID, snapshot_id: uuid.UUID) -> BOQWithPositions:
         """Restore a BOQ to a previous snapshot state.
@@ -7939,6 +8357,10 @@ class BOQService:
         # be re-threaded in a second pass below.
         old_to_new: dict[str, Position] = {}
         for pdata in data.get("positions", []):
+            # Issue #457. Derived from the snapshot's metadata rather than
+            # added to what ``create_snapshot`` captures, which recovers the
+            # provenance from snapshots taken before the column existed too.
+            _snap_norm_id, _snap_norm_key = _norm_provenance_from_metadata(pdata.get("metadata"))
             pos = Position(
                 boq_id=boq_id,
                 ordinal=pdata["ordinal"],
@@ -7949,6 +8371,8 @@ class BOQService:
                 total=pdata.get("total", "0"),
                 classification=pdata.get("classification", {}),
                 source=pdata.get("source", "manual"),
+                norm_id=_snap_norm_id,
+                norm_work_key=_snap_norm_key,
                 metadata_=pdata.get("metadata", {}),
                 sort_order=pdata.get("sort_order", 0),
             )
@@ -8208,6 +8632,7 @@ class BOQService:
                 "position_id": str(position_id),
                 "model_id": str(data.model_id),
             },
+            session=self.session,
         )
         return QuantityLinkResponse.model_validate(link)
 
@@ -8557,6 +8982,7 @@ class BOQService:
         await _safe_publish(
             "boq.quantity_link.applied",
             {"boq_id": str(boq_id), "applied": applied, "skipped": skipped},
+            session=self.session,
         )
         return QuantityLinkApplyResponse(
             boq_id=boq_id,

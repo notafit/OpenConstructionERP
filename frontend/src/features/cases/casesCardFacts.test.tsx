@@ -234,6 +234,11 @@ const companyNames = target.companyTypes.map(
  *  assertion that matters here. */
 let card: HTMLElement;
 
+// Rendering the whole catalogue is the one expensive step in this file and it
+// runs once, here. Vitest gives a hook ten seconds by default, and on a loaded
+// runner that has not been enough: the macOS job on d2c397005 failed this file
+// at collection with "Hook timed out in 10000ms" while every assertion behind
+// it was green. Sixty seconds is what visual-regression gives the same render.
 beforeAll(() => {
   localStorage.clear();
   render(
@@ -247,7 +252,7 @@ beforeAll(() => {
   const root = title.closest<HTMLElement>('[role="button"]');
   if (!root) throw new Error("Case card root (role=button) not found");
   card = root;
-});
+}, 60_000);
 
 describe("the catalogue card names the case's audience and its span", () => {
   it("is testing a case that has both facts to state", () => {
@@ -318,10 +323,14 @@ describe("the catalogue card names the case's audience and its span", () => {
   });
 
   it("keeps the card a single click target - no link or button was added", () => {
-    // The pin and edit controls are the only nested buttons a card may carry,
-    // and neither is mounted here (no pin project, shipped case). A link into
-    // the filtered list - which is what the public case pages put on their
-    // company cell - would steal the click the whole card exists to catch.
+    // The pin, the edit control and the regional-pack strip are the only
+    // nested buttons a card may carry, and none of the three is mounted here:
+    // no pin project, a shipped case, and no pack list because nothing in this
+    // file answers `/partner-pack/installed`. Each of them stops the click it
+    // catches (see casePackStrip.test.tsx for the strip's own proof). What is
+    // banned outright is a link into the filtered list - which is what the
+    // public case pages put on their company cell - because a link steals the
+    // click the whole card exists to catch and gives nothing back.
     expect(card.querySelectorAll("a")).toHaveLength(0);
     expect(card.querySelectorAll("button")).toHaveLength(0);
   });

@@ -331,68 +331,6 @@ async def list_markups(
     return await _markup_to_response_many(session, items)
 
 
-@router.get("/{markup_id}", response_model=MarkupResponse)
-async def get_markup(
-    markup_id: uuid.UUID,
-    session: SessionDep,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    service: MarkupsService = Depends(_get_service),
-) -> MarkupResponse:
-    """Get a single markup."""
-    item = await service.get_markup(markup_id)
-    await verify_project_access(item.project_id, str(user_id), session)
-    return (await _markup_to_response_many(session, [item]))[0]
-
-
-@router.patch("/{markup_id}", response_model=MarkupResponse)
-async def update_markup(
-    markup_id: uuid.UUID,
-    data: MarkupUpdate,
-    session: SessionDep,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("markups.update")),
-    service: MarkupsService = Depends(_get_service),
-) -> MarkupResponse:
-    """Update a markup."""
-    existing = await service.get_markup(markup_id)
-    await verify_project_access(existing.project_id, str(user_id), session)
-    item = await service.update_markup(markup_id, data)
-    return (await _markup_to_response_many(session, [item]))[0]
-
-
-@router.delete("/{markup_id}", status_code=204)
-async def delete_markup(
-    markup_id: uuid.UUID,
-    session: SessionDep,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("markups.delete")),
-    service: MarkupsService = Depends(_get_service),
-) -> None:
-    """Delete a markup."""
-    existing = await service.get_markup(markup_id)
-    await verify_project_access(existing.project_id, str(user_id), session)
-    await service.delete_markup(markup_id)
-
-
-# ── BOQ Link ─────────────────────────────────────────────────────────────────
-
-
-@router.post("/{markup_id}/link-to-boq/", response_model=MarkupResponse)
-async def link_to_boq(
-    markup_id: uuid.UUID,
-    data: BoqLinkRequest,
-    session: SessionDep,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("markups.update")),
-    service: MarkupsService = Depends(_get_service),
-) -> MarkupResponse:
-    """Link a measurement markup to a BOQ position."""
-    existing = await service.get_markup(markup_id)
-    await verify_project_access(existing.project_id, str(user_id), session)
-    item = await service.link_to_boq(markup_id, data.position_id)
-    return (await _markup_to_response_many(session, [item]))[0]
-
-
 # ── Scale Config ─────────────────────────────────────────────────────────────
 
 
@@ -474,8 +412,73 @@ async def delete_scale(
     if existing is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scale config not found")
     if not existing.created_by or existing.created_by != str(user_id):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your scale")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scale config not found")
     await service.delete_scale(config_id)
+
+
+# ── Markup CRUD (parametric) ────────────────────────────────────────────────
+
+
+@router.get("/{markup_id}", response_model=MarkupResponse)
+async def get_markup(
+    markup_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    service: MarkupsService = Depends(_get_service),
+) -> MarkupResponse:
+    """Get a single markup."""
+    item = await service.get_markup(markup_id)
+    await verify_project_access(item.project_id, str(user_id), session)
+    return (await _markup_to_response_many(session, [item]))[0]
+
+
+@router.patch("/{markup_id}", response_model=MarkupResponse)
+async def update_markup(
+    markup_id: uuid.UUID,
+    data: MarkupUpdate,
+    session: SessionDep,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("markups.update")),
+    service: MarkupsService = Depends(_get_service),
+) -> MarkupResponse:
+    """Update a markup."""
+    existing = await service.get_markup(markup_id)
+    await verify_project_access(existing.project_id, str(user_id), session)
+    item = await service.update_markup(markup_id, data)
+    return (await _markup_to_response_many(session, [item]))[0]
+
+
+@router.delete("/{markup_id}", status_code=204)
+async def delete_markup(
+    markup_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("markups.delete")),
+    service: MarkupsService = Depends(_get_service),
+) -> None:
+    """Delete a markup."""
+    existing = await service.get_markup(markup_id)
+    await verify_project_access(existing.project_id, str(user_id), session)
+    await service.delete_markup(markup_id)
+
+
+# ── BOQ Link ─────────────────────────────────────────────────────────────────
+
+
+@router.post("/{markup_id}/link-to-boq/", response_model=MarkupResponse)
+async def link_to_boq(
+    markup_id: uuid.UUID,
+    data: BoqLinkRequest,
+    session: SessionDep,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("markups.update")),
+    service: MarkupsService = Depends(_get_service),
+) -> MarkupResponse:
+    """Link a measurement markup to a BOQ position."""
+    existing = await service.get_markup(markup_id)
+    await verify_project_access(existing.project_id, str(user_id), session)
+    item = await service.link_to_boq(markup_id, data.position_id)
+    return (await _markup_to_response_many(session, [item]))[0]
 
 
 # ── Stamp Templates ──────────────────────────────────────────────────────────
@@ -546,7 +549,7 @@ async def _authorize_stamp_mutation(
         await verify_project_access(existing.project_id, user_id, session)
         return
     if not existing.owner_id or existing.owner_id != user_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your stamp template")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stamp template not found")
 
 
 @router.patch("/stamps/templates/{template_id}", response_model=StampTemplateResponse)

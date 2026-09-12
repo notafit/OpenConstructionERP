@@ -58,7 +58,7 @@
  * src/app/i18n-fallbacks.ts is maintained by hand and Kyrgyz, Greek and
  * Ukrainian each shipped invisible to every test that iterates it.
  *
- * Overlays. es-MX, es-CL, es-CO, pt-BR and en-US carry only the words that
+ * Overlays. es-MX, es-CL, es-CO, pt-BR, en-GB and en-US carry only the words that
  * differ from their base, so a key absent from one of them is not missing, it
  * is inherited. This guard never has to encode that rule, because it asks
  * i18next, and i18next expands a two part code into ['es-MX', 'es', 'en'] on
@@ -235,7 +235,7 @@ async function analyse(dicts, supported) {
     // because every key is a flat string with literal dots; leaving them on
     // makes i18next walk a nested path that does not exist and answer nothing,
     // which would make this guard report the entire tree as broken.
-    initImmediate: false,
+    initAsync: false,
     lng: 'en',
     fallbackLng: 'en',
     keySeparator: false,
@@ -463,7 +463,7 @@ async function selftest() {
   // above is a fact about nothing.
   const unwired = i18next.createInstance();
   await unwired.init({
-    initImmediate: false,
+    initAsync: false,
     lng: 'en',
     fallbackLng: false,
     keySeparator: false,

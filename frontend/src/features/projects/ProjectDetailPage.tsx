@@ -654,7 +654,7 @@ function ProjectLocationPanel({ project }: { project: Project }) {
       className={clsx(
         'grid gap-3 items-stretch',
         mapEnabled && weatherEnabled
-          ? 'grid-cols-1 lg:grid-cols-[3fr_2fr]'
+          ? 'grid-cols-1 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'
           : 'grid-cols-1',
       )}
     >
@@ -673,6 +673,13 @@ function ProjectLocationPanel({ project }: { project: Project }) {
             // to match the (now 3-row) weather block. When the map is
             // shown alone, fall back to a fixed height so it doesn't
             // collapse to zero.
+            //
+            // That fallback only reaches the element because ProjectMap
+            // stands its own ``h-full`` default down when this prop states a
+            // height. For a while it did not, both class names went out
+            // together, the stylesheet order picked ``h-full``, and this map
+            // was 2px tall against an auto-height parent while looking
+            // correct in the JSX. Do not reintroduce a default alongside it.
             weatherEnabled ? 'h-full min-h-[20rem]' : 'h-[32rem]',
           )}
         />
@@ -1786,7 +1793,7 @@ export function ProjectDetailPage() {
         className={clsx(
           'grid gap-3 items-stretch',
           !isWidgetHidden('project-info') && !isWidgetHidden('health-bar')
-            ? 'grid-cols-1 lg:grid-cols-[3fr_2fr]'
+            ? 'grid-cols-1 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'
             : 'grid-cols-1',
         )}
       >

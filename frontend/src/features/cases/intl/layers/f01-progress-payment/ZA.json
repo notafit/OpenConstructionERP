@@ -1,0 +1,307 @@
+{
+  "family": "f01-progress-payment",
+  "jurisdiction": "ZA",
+  "note": "South Africa has no security of payment statute, so the only clock is the contract's. Under the JBCC Principal Building Agreement 6.2 the employer pays within fourteen calendar days of the date FOR issue of the payment certificate fixed in the contract data, not of the day the certificate actually arrives, and the contractor pays subcontractors within seven calendar days of that due date. So the layer opens the clock on the contract-data date for issue and surfaces the deadlines, watch and escalation steps, because the remedy the agreement gives is a five working day notice to comply and the right to suspend.",
+  "slug": "issue-the-interim-payment-certificate-and-get-paid-on-it",
+  "order": 1340,
+  "region": "ZA",
+  "category": "commercial",
+  "companyTypes": [
+    "general-contractor",
+    "subcontractor",
+    "cost-consultant"
+  ],
+  "roles": [
+    "contract-administrator",
+    "commercial-manager",
+    "quantity-surveyor"
+  ],
+  "icon": "CalendarClock",
+  "estMinutes": 12,
+  "title": "Issue the interim payment certificate and get paid on it",
+  "desc": "Measure the period against the bill, value it at the contract rates, hold retention, get the principal agent to issue the interim payment certificate and open the clock on the certificate date, because the window that follows it is measured in days rather than weeks.",
+  "longDesc": "The distinctive thing about this payment regime is how little time it leaves. The principal agent issues an interim payment certificate and the employer pays within a handful of calendar days of the certificate date, which means the certificate is the event that matters and the invoice is administration behind it. Firms that run the clock from their own invoice date consistently discover they were already late, because the days were counting while the paperwork moved internally. Opening the clock on the certificate, and watching it rather than filing it, is the whole difference between a payment that arrives and a default the contract has a remedy for.",
+  "slots": {
+    "priceLine": "bill item",
+    "priceLinePlural": "bill items",
+    "valuationDoc": "payment valuation",
+    "certifier": "principal agent",
+    "excessTerm": "contract instruction",
+    "retentionTerm": "retention",
+    "payDoc": "tax invoice",
+    "payAgainst": "the approved payment valuation",
+    "clockRegime": "the JBCC payment clause",
+    "clockStart": "the date for issue of the payment certificate fixed in the contract data",
+    "payDays": "14 calendar",
+    "escalationRoute": "give the employer the five working days notice to comply that the JBCC agreement requires, and if it passes unpaid suspend the works, exercise the lien or call up the payment guarantee"
+  },
+  "steps": [
+    {
+      "id": "measure",
+      "spine": "measure",
+      "icon": "Ruler",
+      "module": "Progress",
+      "moduleKey": "nav.progress",
+      "to": "/progress",
+      "in": [
+        {
+          "key": "bill",
+          "label": "Contract bill of quantities"
+        },
+        {
+          "key": "works",
+          "label": "Work executed this period"
+        }
+      ],
+      "out": [
+        {
+          "key": "percent",
+          "label": "Percent complete per bill item"
+        },
+        {
+          "key": "quantities",
+          "label": "Earned quantities for the period"
+        }
+      ]
+    },
+    {
+      "id": "value",
+      "spine": "value",
+      "icon": "Calculator",
+      "module": "BOQ",
+      "moduleKey": "boq.title",
+      "to": "/projects/:projectId/boq",
+      "in": [
+        {
+          "key": "quantities",
+          "label": "Earned quantities for the period"
+        },
+        {
+          "key": "rates",
+          "label": "Contract rates"
+        }
+      ],
+      "out": [
+        {
+          "key": "valuation",
+          "label": "Valuation for the period"
+        },
+        {
+          "key": "instructions",
+          "label": "Contract instructions flagged"
+        }
+      ]
+    },
+    {
+      "id": "retention",
+      "spine": "adjust",
+      "icon": "Percent",
+      "module": "Finance",
+      "moduleKey": "nav.finance",
+      "to": "/projects/:projectId/finance",
+      "in": [
+        {
+          "key": "cumulative",
+          "label": "Cumulative valuation"
+        },
+        {
+          "key": "previous",
+          "label": "Previous payments and retention"
+        }
+      ],
+      "out": [
+        {
+          "key": "held",
+          "label": "Retention held to date"
+        },
+        {
+          "key": "net",
+          "label": "Net due for the period"
+        }
+      ],
+      "note": {
+        "what": "Under JBCC 6.2 the money withheld is the payment reduction that comes with the fixed construction guarantee, 5 percent of the value certified up to practical completion and 2.5 percent up to final completion, and under GCC 2015 it is retention in the ordinary sense; either way it is a figure with a release date attached."
+      }
+    },
+    {
+      "id": "certify",
+      "spine": "certify",
+      "icon": "Stamp",
+      "module": "Approval routes",
+      "moduleKey": "approvalRoutes.title",
+      "to": "/governance?tab=approvals",
+      "in": [
+        {
+          "key": "valuation",
+          "label": "Valuation for the period"
+        },
+        {
+          "key": "agent",
+          "label": "Principal agent named for certification"
+        }
+      ],
+      "out": [
+        {
+          "key": "certificate",
+          "label": "Interim payment certificate issued"
+        },
+        {
+          "key": "date",
+          "label": "Date for issue and date issued on record"
+        }
+      ],
+      "note": {
+        "what": "The principal agent's approval is the interim payment certificate itself, issued by the date for issue the contract data fixes each month. Record that date beside the day the certificate actually arrived, because the payment count runs from the first and a certificate issued late does not move it."
+      }
+    },
+    {
+      "id": "invoice",
+      "spine": "invoice",
+      "icon": "ReceiptText",
+      "module": "Finance",
+      "moduleKey": "nav.finance",
+      "to": "/projects/:projectId/finance",
+      "in": [
+        {
+          "key": "certificate",
+          "label": "Interim payment certificate issued"
+        },
+        {
+          "key": "retention",
+          "label": "Retention and deductions"
+        }
+      ],
+      "out": [
+        {
+          "key": "invoice",
+          "label": "Tax invoice issued"
+        },
+        {
+          "key": "carried",
+          "label": "Amount carried into the accounts"
+        }
+      ],
+      "note": {
+        "what": "Quote the certificate number and the certified amount on the invoice, since the employer's accounts pay against the certificate and not against the valuation."
+      }
+    },
+    {
+      "id": "openclock",
+      "spine": "clock",
+      "icon": "Clock",
+      "module": "Payment Clock",
+      "moduleKey": "nav.payment_clock",
+      "to": "/payment-clock",
+      "in": [
+        {
+          "key": "certificate",
+          "label": "Certificate and its date for issue"
+        },
+        {
+          "key": "amount",
+          "label": "Certified amount"
+        }
+      ],
+      "out": [
+        {
+          "key": "clock",
+          "label": "Open payment clock"
+        },
+        {
+          "key": "due",
+          "label": "Due date computed"
+        }
+      ],
+      "note": {
+        "why": "Opening it on the day the certificate arrived, or on your own invoice date, moves every deadline later and does it silently, which is the version of this mistake that never gets caught, because nothing looks overdue until the remedy has already expired. The agreement counts from the date the certificate was due, so a principal agent who issues late has not bought the employer a day."
+      }
+    },
+    {
+      "id": "dates",
+      "spine": "deadlines",
+      "icon": "CalendarClock",
+      "module": "Payment Clock",
+      "moduleKey": "nav.payment_clock",
+      "to": "/payment-clock",
+      "in": [
+        {
+          "key": "clock",
+          "label": "Open payment clock"
+        },
+        {
+          "key": "regime",
+          "label": "Chosen regime"
+        }
+      ],
+      "out": [
+        {
+          "key": "due",
+          "label": "Due date"
+        },
+        {
+          "key": "derivation",
+          "label": "Derivation you can quote"
+        }
+      ],
+      "note": {
+        "what": "There is no statute behind these dates, so the only authority is the agreement: fourteen calendar days from the date for issue under JBCC 6.2, seven more for the money to reach each subcontractor, and GCC 2015 running its own longer count from the engineer's certificate. The row the clock is opened on has to carry the count the agreement gives, and its derivation is what you quote."
+      }
+    },
+    {
+      "id": "watch",
+      "spine": "watch",
+      "icon": "AlertTriangle",
+      "module": "Payment Clock",
+      "moduleKey": "nav.payment_clock",
+      "to": "/payment-clock",
+      "in": [
+        {
+          "key": "clocks",
+          "label": "Open clocks on the project"
+        },
+        {
+          "key": "finaldates",
+          "label": "Final dates for payment"
+        }
+      ],
+      "out": [
+        {
+          "key": "overdue",
+          "label": "Overdue certificates flagged"
+        },
+        {
+          "key": "register",
+          "label": "Breach register rows"
+        }
+      ]
+    },
+    {
+      "id": "escalate",
+      "spine": "escalate",
+      "icon": "Gavel",
+      "module": "Correspondence",
+      "moduleKey": "nav.correspondence",
+      "to": "/projects/:projectId/correspondence",
+      "in": [
+        {
+          "key": "passed",
+          "label": "Due date passed unpaid"
+        },
+        {
+          "key": "record",
+          "label": "Certificate, invoice and dates"
+        }
+      ],
+      "out": [
+        {
+          "key": "notice",
+          "label": "Five working days notice to comply"
+        },
+        {
+          "key": "entitlement",
+          "label": "Right to suspend or call the guarantee preserved"
+        }
+      ]
+    }
+  ]
+}

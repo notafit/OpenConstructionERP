@@ -9,9 +9,8 @@
  *    luminance-threshold diff on offscreen canvases.
  *  - Side-by-side: two panes with synchronised pan & zoom.
  *
- * Reuses the existing pdf.js worker configured in InlinePdfAnnotator
- * (GlobalWorkerOptions.workerSrc set once per module graph — importing
- * pdfjs-dist here is safe; the worker URL is already set).
+ * PDF.js comes from the shared binding in shared/lib/pdfjs, which owns the
+ * worker, the wasm decoders and the ICC profile for every viewer.
  */
 
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
@@ -27,7 +26,7 @@ import {
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import * as pdfjsLib from 'pdfjs-dist';
+import { closePdf, openPdf, type PDFDocumentProxy, type PDFPageProxy } from '@/shared/lib/pdfjs';
 import {
   ArrowLeft,
   ZoomIn,
@@ -78,7 +77,7 @@ const DIFF_THRESHOLD = 30; // luminance delta to be considered "changed"
 
 // ── PDF loading helper ────────────────────────────────────────────────────────
 
-async function loadPdfFromDocId(documentId: string): Promise<pdfjsLib.PDFDocumentProxy> {
+async function loadPdfFromDocId(documentId: string): Promise<PDFDocumentProxy> {
   const token = useAuthStore.getState().accessToken;
   const res = await fetch(`/api/v1/documents/${documentId}/download/`, {
     headers: {
@@ -88,16 +87,16 @@ async function loadPdfFromDocId(documentId: string): Promise<pdfjsLib.PDFDocumen
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   const buf = await res.arrayBuffer();
-  return pdfjsLib.getDocument({ data: buf }).promise;
+  return openPdf(buf).promise;
 }
 
 // ── usePdfDoc hook ────────────────────────────────────────────────────────────
 
 function usePdfDoc(documentId: string | null) {
-  const [doc, setDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
+  const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const docRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const docRef = useRef<PDFDocumentProxy | null>(null);
 
   useEffect(() => {
     if (!documentId) {
@@ -113,11 +112,11 @@ function usePdfDoc(documentId: string | null) {
     loadPdfFromDocId(documentId).then(
       (loaded) => {
         if (cancelled) {
-          loaded.destroy?.();
+          closePdf(loaded);
           return;
         }
         // Destroy previous doc to release native resources
-        docRef.current?.destroy?.();
+        closePdf(docRef.current);
         docRef.current = loaded;
         setDoc(loaded);
         setLoading(false);
@@ -138,7 +137,7 @@ function usePdfDoc(documentId: string | null) {
   // Destroy on unmount
   useEffect(() => {
     return () => {
-      docRef.current?.destroy?.();
+      closePdf(docRef.current);
     };
   }, []);
 
@@ -152,7 +151,7 @@ function usePdfDoc(documentId: string | null) {
  * Returns the canvas (or null if cancelled) plus a cancel function.
  */
 function renderPageToOffscreen(
-  page: pdfjsLib.PDFPageProxy,
+  page: PDFPageProxy,
   zoom: number,
 ): { promise: Promise<OffscreenCanvas | null>; cancel: () => void } {
   let cancelled = false;
@@ -170,7 +169,14 @@ function renderPageToOffscreen(
     };
   }
 
-  const task = page.render({ canvasContext: ctx as unknown as CanvasRenderingContext2D, viewport });
+  // An OffscreenCanvas is not the HTMLCanvasElement the `canvas` parameter
+  // takes, so hand PDF.js the context and set `canvas` to null, the form the
+  // API documents for rendering straight into a context.
+  const task = page.render({
+    canvas: null,
+    canvasContext: ctx as unknown as CanvasRenderingContext2D,
+    viewport,
+  });
 
   const promise: Promise<OffscreenCanvas | null> = task.promise.then(
     () => (cancelled ? null : canvas),
@@ -199,7 +205,7 @@ function renderPageToOffscreen(
 // ── Per-pane canvas renderer ──────────────────────────────────────────────────
 
 interface PaneCanvasProps {
-  pdfDoc: pdfjsLib.PDFDocumentProxy | null;
+  pdfDoc: PDFDocumentProxy | null;
   page: number;
   zoom: number;
   pan: { x: number; y: number };
@@ -330,8 +336,8 @@ function PaneCanvas({
 // ── DiffCanvas ────────────────────────────────────────────────────────────────
 
 interface DiffCanvasProps {
-  docA: pdfjsLib.PDFDocumentProxy | null;
-  docB: pdfjsLib.PDFDocumentProxy | null;
+  docA: PDFDocumentProxy | null;
+  docB: PDFDocumentProxy | null;
   page: number;
   zoom: number;
   pan: { x: number; y: number };
@@ -539,8 +545,8 @@ function DiffCanvas({
 // ── OverlayCanvas ─────────────────────────────────────────────────────────────
 
 interface OverlayCanvasProps {
-  docA: pdfjsLib.PDFDocumentProxy | null;
-  docB: pdfjsLib.PDFDocumentProxy | null;
+  docA: PDFDocumentProxy | null;
+  docB: PDFDocumentProxy | null;
   page: number;
   zoom: number;
   opacity: number; // 0–100, opacity of B over A

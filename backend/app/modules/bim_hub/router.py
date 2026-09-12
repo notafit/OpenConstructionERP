@@ -2146,7 +2146,19 @@ async def _generate_pdf_in_background(
         logger.exception("PDF generation failed for model %s: %s", model_id, exc)
 
 
-@router.post("/upload-cad/", status_code=201)
+@router.post(
+    "/upload-cad/",
+    status_code=201,
+    responses={
+        202: {
+            "description": (
+                "The upload is stored but the converter binary for this format is not installed on "
+                "this server. The body carries status='converter_required', the model id of the saved "
+                "placeholder and an install endpoint; Retry-After and Link headers point at both."
+            ),
+        },
+    },
+)
 async def upload_cad_file(
     background_tasks: BackgroundTasks,
     project_id: str = Query(..., description="Project UUID"),
@@ -2160,7 +2172,14 @@ async def upload_cad_file(
             " or 'complete' (all RVT parameters, ~1000+ columns, slowest)"
         ),
     ),
-    file: UploadFile = File(..., description="CAD file (RVT, IFC, DWG, DGN, FBX, OBJ, 3DS)"),
+    file: UploadFile = File(
+        ...,
+        description=(
+            "Raw CAD upload. Accepted extensions: .rvt, .ifc, .dwg, .dgn. Geometry-only mesh files "
+            "are read in the browser by the BIM Hub 3D uploader and posted back as GLB, so they are "
+            "refused here."
+        ),
+    ),
     user_id: CurrentUserId = None,  # type: ignore[assignment]
     _perm: None = Depends(RequirePermission("bim.create")),
     service: BIMHubService = Depends(_get_service),
@@ -2171,8 +2190,25 @@ async def upload_cad_file(
     and a BIMModel record is created with status="processing". A real CAD converter
     service would pick it up asynchronously; for now the model stays in processing state.
 
-    Accepted extensions: .rvt, .ifc, .dwg, .dgn, .fbx, .obj, .3ds
+    Accepted extensions: .rvt, .ifc, .dwg, .dgn
+
+    Geometry-only mesh files (OBJ, STL, PLY, DAE, glTF/GLB, FBX, 3DS, LWO, USD)
+    are refused with a 400 that points at the BIM Hub 3D uploader, which reads
+    them in the browser and posts a normalized GLB back through the ordinary
+    data + geometry upload.
+
+    Returns 201 once the model row exists. When the format needs an external
+    converter that is not installed, the upload is still stored and the answer
+    is 202 with ``status="converter_required"``.
     """
+    # The two descriptions above and the constant below reach three different
+    # readers - the Swagger UI, the refusal message and the handler - and they
+    # drifted apart once already: the published metadata went on naming FBX,
+    # OBJ and 3DS for months after the handler stopped accepting them, so an
+    # API consumer who read the contract got a 400 on every upload. The 202
+    # branch was undeclared in the same way. Both sides are now compared by
+    # ``tests/unit/test_upload_endpoints_advertise_what_they_enforce.py``;
+    # edit the prose and the constant in the same commit or it goes red.
     # --- Verify project access (IDOR guard) ---
     try:
         project_uuid = uuid.UUID(project_id)
@@ -3865,6 +3901,535 @@ async def update_asset_info(
     return BIMElementResponse.model_validate(updated)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOQ Links
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _verify_boq_position_access(
+    service: "BIMHubService",
+    position_id: uuid.UUID,
+    user_id: str,
+) -> None:
+    """Resolve a BOQ position → its BOQ → project and verify the caller owns it.
+
+    `Position` has no direct `project_id` column - the project lives on the
+    parent `BOQ` row reached via `position.boq_id`.  We do a single-row
+    SELECT joining position → boq so this stays one round-trip.
+    """
+    # ``BOQ`` is the class name exposed by ``boq.models`` and it refers to
+    # the Bill-of-Quantities aggregate, not a module-level constant - the
+    # ``N811`` noqa below suppresses ruff's all-caps-is-a-constant heuristic.
+    from app.modules.boq.models import BOQ as BOQModel  # noqa: N811
+    from app.modules.boq.models import Position
+
+    stmt = select(BOQModel.project_id).join(Position, Position.boq_id == BOQModel.id).where(Position.id == position_id)
+    result = await service.session.execute(stmt)
+    project_id = result.scalar_one_or_none()
+    if project_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BOQ position not found",
+        )
+    await _verify_project_access(service.session, project_id, user_id)
+
+
+@router.get("/links/", response_model=BOQElementLinkListResponse)
+async def list_links(
+    boq_position_id: uuid.UUID = Query(...),
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.read")),
+    service: BIMHubService = Depends(_get_service),
+) -> BOQElementLinkListResponse:
+    """List BIM element links for a BOQ position."""
+    await _verify_boq_position_access(service, boq_position_id, user_id or "")
+    items = await service.list_links_for_position(boq_position_id)
+    return BOQElementLinkListResponse(
+        items=[BOQElementLinkResponse.model_validate(lnk) for lnk in items],
+        total=len(items),
+    )
+
+
+@router.get(
+    "/models/{model_id}/boq-links/",
+    response_model=BIMModelBOQLinksResponse,
+)
+async def list_model_boq_links(
+    model_id: uuid.UUID,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.read")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMModelBOQLinksResponse:
+    """Aggregate BOQ links for every element in a model.
+
+    Used by the "Linked BOQ" side-panel in the BIM viewer: the viewer
+    itself loads elements in ``skeleton`` mode (no boq_links) for speed,
+    so the panel needs a dedicated roll-up across the whole model.
+    """
+    await _verify_model_access(service, model_id, user_id or "")
+    rows = await service.list_links_for_model(model_id)
+    return BIMModelBOQLinksResponse(
+        items=[BIMModelBOQLinkAggregate.model_validate(r) for r in rows],
+        total=len(rows),
+    )
+
+
+@router.post("/links/", response_model=BOQElementLinkResponse, status_code=201)
+async def create_link(
+    data: BOQElementLinkCreate,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("bim.create")),
+    service: BIMHubService = Depends(_get_service),
+) -> BOQElementLinkResponse:
+    """Create a link between a BOQ position and a BIM element."""
+    # Verify both sides: the BOQ position's project AND the BIM element's
+    # model/project. Prevents cross-project link forgery.
+    await _verify_boq_position_access(service, data.boq_position_id, user_id)
+    element = await service.get_element(data.bim_element_id)
+    if element is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BIM element not found",
+        )
+    await _verify_model_access(service, element.model_id, user_id)
+    link = await service.create_link(data, user_id=user_id)
+    return BOQElementLinkResponse.model_validate(link)
+
+
+@router.delete("/links/{link_id}", status_code=204)
+async def delete_link(
+    link_id: uuid.UUID,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("bim.delete")),
+    service: BIMHubService = Depends(_get_service),
+) -> None:
+    """Delete a BOQ-BIM link."""
+    # Resolve the link → element → model → project and verify access.
+    from app.modules.bim_hub.models import BOQElementLink
+
+    link = await service.session.get(BOQElementLink, link_id)
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Link not found",
+        )
+    element = await service.get_element(link.bim_element_id)
+    if element is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Link not found",
+        )
+    await _verify_model_access(service, element.model_id, user_id)
+    await service.delete_link(link_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Quantity Maps
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/quantity-maps/", response_model=BIMQuantityMapListResponse)
+async def list_quantity_maps(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.read")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMQuantityMapListResponse:
+    """List quantity mapping rules visible to the caller.
+
+    Scopes to the caller's accessible projects so a project-scoped rule from
+    another tenant never leaks. Global templates (``project_id IS NULL``)
+    stay visible to everyone; admins see every rule.
+    """
+    scope = await accessible_project_ids(service.session, user_id)
+    items, total = await service.list_quantity_maps(project_ids=scope, offset=offset, limit=limit)
+    return BIMQuantityMapListResponse(
+        items=[BIMQuantityMapResponse.model_validate(m) for m in items],
+        total=total,
+    )
+
+
+@router.post("/quantity-maps/", response_model=BIMQuantityMapResponse, status_code=201)
+async def create_quantity_map(
+    data: BIMQuantityMapCreate,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("bim.create")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMQuantityMapResponse:
+    """Create a new quantity mapping rule."""
+    # If the rule is scoped to a specific project, enforce ownership.
+    if data.project_id is not None:
+        await _verify_project_access(service.session, data.project_id, user_id)
+    qmap = await service.create_quantity_map(data)
+    return BIMQuantityMapResponse.model_validate(qmap)
+
+
+@router.patch("/quantity-maps/{map_id}", response_model=BIMQuantityMapResponse)
+async def update_quantity_map(
+    map_id: uuid.UUID,
+    data: BIMQuantityMapUpdate,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("bim.update")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMQuantityMapResponse:
+    """Update a quantity mapping rule.
+
+    A project-scoped rule requires access to its project. A global rule
+    (``project_id IS NULL``) is a cross-tenant shared template, so only an
+    admin may mutate it - a project-level editor in any tenant must not be
+    able to silently rewrite a template every tenant sees. The 404 (not 403)
+    on the non-admin global case keeps the IDOR surface consistent.
+    """
+    from app.modules.bim_hub.models import BIMQuantityMap
+
+    existing = await service.session.get(BIMQuantityMap, map_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quantity map not found",
+        )
+    if existing.project_id is not None:
+        await _verify_project_access(service.session, existing.project_id, user_id)
+    else:
+        # Global/template rule: admins only. ``accessible_project_ids``
+        # returns ``None`` for admins (its "no filter" sentinel); any
+        # non-admin caller gets a set and is rejected as not-found.
+        scope = await accessible_project_ids(service.session, user_id)
+        if scope is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Quantity map not found",
+            )
+    qmap = await service.update_quantity_map(map_id, data)
+    return BIMQuantityMapResponse.model_validate(qmap)
+
+
+@router.post("/quantity-maps/apply/", response_model=QuantityMapApplyResult)
+async def apply_quantity_maps(
+    data: QuantityMapApplyRequest,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("bim.create")),
+    service: BIMHubService = Depends(_get_service),
+) -> QuantityMapApplyResult:
+    """Apply quantity mapping rules to all elements in a model."""
+    await _verify_model_access(service, data.model_id, user_id)
+    return await service.apply_quantity_maps(data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Element Groups (saved selections)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _verify_group_access(
+    service: "BIMHubService",
+    group_id: uuid.UUID,
+    user_id: str,
+) -> Any:
+    """Load a BIM element group and verify the caller owns its project.
+
+    Returns the loaded group so the caller can reuse it. Raises 404 on both
+    "not found" and "no access" to avoid UUID enumeration.
+    """
+    from app.modules.bim_hub.models import BIMElementGroup
+
+    group = await service.session.get(BIMElementGroup, group_id)
+    if group is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BIM element group not found",
+        )
+    await _verify_project_access(service.session, group.project_id, user_id)
+    return group
+
+
+@router.get("/element-groups/", response_model=list[BIMElementGroupResponse])
+async def list_element_groups(
+    project_id: uuid.UUID = Query(...),
+    model_id: uuid.UUID | None = Query(default=None),
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.read")),
+    service: BIMHubService = Depends(_get_service),
+) -> list[BIMElementGroupResponse]:
+    """List BIM element groups for a project, optionally scoped to one model."""
+    await _verify_project_access(service.session, project_id, user_id or "")
+    return await service.list_element_groups(project_id, model_id=model_id)
+
+
+@router.post(
+    "/element-groups/",
+    response_model=BIMElementGroupResponse,
+    status_code=201,
+)
+async def create_element_group(
+    data: BIMElementGroupCreate,
+    project_id: uuid.UUID = Query(...),
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.create")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMElementGroupResponse:
+    """Create a new BIM element group (saved selection) in a project."""
+    await _verify_project_access(service.session, project_id, user_id or "")
+    # If the group is scoped to a specific model, verify the model belongs
+    # to the same project the caller is creating the group in.
+    if data.model_id is not None:
+        model = await _verify_model_access(service, data.model_id, user_id or "")
+        if model.project_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="model_id does not belong to the supplied project_id",
+            )
+    user_uuid: uuid.UUID | None = None
+    if user_id:
+        try:
+            user_uuid = uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            user_uuid = None
+    return await service.create_element_group(project_id, data, user_uuid)
+
+
+@router.patch(
+    "/element-groups/{group_id}",
+    response_model=BIMElementGroupResponse,
+)
+async def update_element_group(
+    group_id: uuid.UUID,
+    data: BIMElementGroupUpdate,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.update")),
+    service: BIMHubService = Depends(_get_service),
+) -> BIMElementGroupResponse:
+    """Partially update a BIM element group."""
+    group = await _verify_group_access(service, group_id, user_id or "")
+    # If the caller is moving the group to a different model, validate that
+    # model belongs to the same project.
+    if data.model_id is not None:
+        model = await _verify_model_access(service, data.model_id, user_id or "")
+        if model.project_id != group.project_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="model_id does not belong to the group's project",
+            )
+    return await service.update_element_group(group_id, data)
+
+
+@router.delete("/element-groups/{group_id}", status_code=204)
+async def delete_element_group(
+    group_id: uuid.UUID,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("bim.delete")),
+    service: BIMHubService = Depends(_get_service),
+) -> None:
+    """Delete a BIM element group."""
+    await _verify_group_access(service, group_id, user_id or "")
+    await service.delete_element_group(group_id)
+
+
+# ── Cross-module coverage summary ────────────────────────────────────────
+
+
+@router.get(
+    "/coverage-summary/",
+    dependencies=[Depends(RequirePermission("bim.read"))],
+)
+async def bim_coverage_summary(
+    session: SessionDep,
+    _user_id: CurrentUserId,
+    project_id: uuid.UUID = Query(..., description="Project to summarize"),
+) -> dict[str, Any]:
+    """Aggregate cross-module coverage stats for every BIM element in a project.
+
+    Returns a single envelope used by the project dashboard's BIM
+    coverage card and the AI advisor's structured project state.
+
+    Counts:
+        elements_total           - every BIMElement across every model
+        elements_linked_to_boq   - at least one BOQElementLink
+        elements_with_documents  - at least one DocumentBIMLink
+        elements_with_tasks      - referenced from at least one Task.bim_element_ids
+        elements_with_activities - at least one Activity.bim_element_ids
+        elements_validated       - at least one ValidationResult row
+        elements_costed          - linked to a BOQ position with non-zero unit_rate
+
+    Percentages are derived from ``elements_total`` and clipped to [0, 1].
+
+    Implementation note: every count is a single SELECT issued in the
+    same async session.  No N+1.  Tested on a 33k-element model:
+    completes in ~80ms on PostgreSQL with the indices defined on the
+    join columns.
+    """
+    from sqlalchemy import distinct, func
+    from sqlalchemy import select as _select
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.modules.bim_hub.models import BIMElement, BIMModel, BOQElementLink
+
+    # Total elements in the project - joined via BIMModel.
+    total_stmt = (
+        _select(func.count(BIMElement.id))
+        .join(BIMModel, BIMElement.model_id == BIMModel.id)
+        .where(BIMModel.project_id == project_id)
+    )
+    elements_total = int((await session.execute(total_stmt)).scalar() or 0)
+
+    # Distinct elements that have at least one BOQ link.
+    boq_linked_stmt = (
+        _select(func.count(distinct(BOQElementLink.bim_element_id)))
+        .join(BIMElement, BOQElementLink.bim_element_id == BIMElement.id)
+        .join(BIMModel, BIMElement.model_id == BIMModel.id)
+        .where(BIMModel.project_id == project_id)
+    )
+    elements_linked_to_boq = int((await session.execute(boq_linked_stmt)).scalar() or 0)
+
+    # Documents - uses DocumentBIMLink if the table exists.  Wrapped in
+    # try/except so that a missing/optional module doesn't 500 the call.
+    elements_with_documents = 0
+    try:
+        from app.modules.documents.models import DocumentBIMLink
+
+        docs_stmt = (
+            _select(func.count(distinct(DocumentBIMLink.bim_element_id)))
+            .join(
+                BIMElement,
+                DocumentBIMLink.bim_element_id == BIMElement.id,
+            )
+            .join(BIMModel, BIMElement.model_id == BIMModel.id)
+            .where(BIMModel.project_id == project_id)
+        )
+        elements_with_documents = int((await session.execute(docs_stmt)).scalar() or 0)
+    except (ImportError, AttributeError, SQLAlchemyError):
+        elements_with_documents = 0
+
+    # Tasks - Task.bim_element_ids is a JSON array, so the cleanest
+    # cross-dialect approach is to load the column for the project's
+    # tasks and count distinct ids in Python.  N is the number of tasks
+    # in the project (typically << elements), so this stays cheap.
+    elements_with_tasks = 0
+    try:
+        from app.modules.tasks.models import Task
+
+        task_stmt = _select(Task.bim_element_ids).where(Task.project_id == project_id)
+        bim_id_set: set[str] = set()
+        for row in (await session.execute(task_stmt)).all():
+            ids = row[0] or []
+            if isinstance(ids, list):
+                for raw in ids:
+                    if isinstance(raw, str) and raw:
+                        bim_id_set.add(raw)
+        elements_with_tasks = len(bim_id_set)
+    except (ImportError, AttributeError, SQLAlchemyError):
+        elements_with_tasks = 0
+
+    # Schedule activities - same pattern as tasks.
+    elements_with_activities = 0
+    try:
+        from app.modules.schedule.models import Activity, Schedule
+
+        act_stmt = (
+            _select(Activity.bim_element_ids)
+            .join(Schedule, Activity.schedule_id == Schedule.id)
+            .where(Schedule.project_id == project_id)
+        )
+        bim_id_set = set()
+        for row in (await session.execute(act_stmt)).all():
+            ids = row[0] or []
+            if isinstance(ids, list):
+                for raw in ids:
+                    if isinstance(raw, str) and raw:
+                        bim_id_set.add(raw)
+        elements_with_activities = len(bim_id_set)
+    except (ImportError, AttributeError, SQLAlchemyError):
+        elements_with_activities = 0
+
+    # Validated elements - we count distinct rows in the validation
+    # results table whose target_type='bim_element' and project_id matches.
+    elements_validated = 0
+    try:
+        from app.modules.validation.models import ValidationReport
+
+        val_stmt = _select(ValidationReport.results).where(
+            ValidationReport.project_id == project_id,
+            ValidationReport.target_type == "bim",
+        )
+        bim_id_set = set()
+        for row in (await session.execute(val_stmt)).all():
+            results_blob = row[0] or []
+            if isinstance(results_blob, list):
+                for entry in results_blob:
+                    if isinstance(entry, dict):
+                        ref = entry.get("element_ref") or entry.get("element_id")
+                        if isinstance(ref, str) and ref:
+                            bim_id_set.add(ref)
+        elements_validated = len(bim_id_set)
+    except (ImportError, AttributeError, SQLAlchemyError):
+        elements_validated = 0
+
+    # Costed = subset of boq-linked elements where the linked position
+    # has non-zero unit_rate.  Skip if BOQ module is not loaded.
+    elements_costed = 0
+    try:
+        from app.modules.boq.models import Position
+
+        costed_stmt = (
+            _select(func.count(distinct(BOQElementLink.bim_element_id)))
+            .join(BIMElement, BOQElementLink.bim_element_id == BIMElement.id)
+            .join(BIMModel, BIMElement.model_id == BIMModel.id)
+            .join(Position, BOQElementLink.boq_position_id == Position.id)
+            .where(BIMModel.project_id == project_id)
+            .where(Position.unit_rate != "0")
+            .where(Position.unit_rate != "")
+        )
+        elements_costed = int((await session.execute(costed_stmt)).scalar() or 0)
+    except (ImportError, AttributeError, SQLAlchemyError):
+        elements_costed = 0
+
+    def _pct(numerator: int) -> float:
+        if elements_total <= 0:
+            return 0.0
+        return round(min(1.0, numerator / elements_total), 4)
+
+    return {
+        "project_id": str(project_id),
+        "elements_total": elements_total,
+        "elements_linked_to_boq": elements_linked_to_boq,
+        "elements_costed": elements_costed,
+        "elements_validated": elements_validated,
+        "elements_with_documents": elements_with_documents,
+        "elements_with_tasks": elements_with_tasks,
+        "elements_with_activities": elements_with_activities,
+        "percent_linked_to_boq": _pct(elements_linked_to_boq),
+        "percent_costed": _pct(elements_costed),
+        "percent_validated": _pct(elements_validated),
+        "percent_with_documents": _pct(elements_with_documents),
+        "percent_with_tasks": _pct(elements_with_tasks),
+        "percent_with_activities": _pct(elements_with_activities),
+    }
+
+
+@router.get(
+    "/federations/",
+    response_model=FederationListResponse,
+    dependencies=[Depends(RequirePermission("bim.read"))],
+)
+async def list_federations(
+    session: SessionDep,
+    _user_id: CurrentUserId,
+    project_id: uuid.UUID = Query(..., description="Project to list federations for"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> FederationListResponse:
+    """List federations belonging to a project."""
+    await _verify_project_access(session, project_id, _user_id)
+    service = BIMHubService(session)
+    items, total = await service.list_federations(
+        project_id,
+        offset=offset,
+        limit=limit,
+    )
+    return FederationListResponse(items=items, total=total)
+
+
 @router.get("/{model_id}", response_model=BIMModelResponse)
 async def get_model(
     model_id: uuid.UUID,
@@ -4411,13 +4976,6 @@ def _summarise_asset(element, model) -> AssetSummary:
     )
 
 
-# Note: the @router.get("/assets") and @router.patch("/assets/{element_id}/asset-info")
-# route definitions were moved up before "/{model_id}" so FastAPI's path
-# matcher resolves the literal "assets" segment instead of mistaking it
-# for a UUID. The handlers live above; the `_summarise_asset` helper just
-# above is still referenced from there at request time.
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # COBie Export (v2.3.0)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4582,222 +5140,6 @@ async def download_model(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BOQ Links
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-async def _verify_boq_position_access(
-    service: "BIMHubService",
-    position_id: uuid.UUID,
-    user_id: str,
-) -> None:
-    """Resolve a BOQ position → its BOQ → project and verify the caller owns it.
-
-    `Position` has no direct `project_id` column - the project lives on the
-    parent `BOQ` row reached via `position.boq_id`.  We do a single-row
-    SELECT joining position → boq so this stays one round-trip.
-    """
-    # ``BOQ`` is the class name exposed by ``boq.models`` and it refers to
-    # the Bill-of-Quantities aggregate, not a module-level constant - the
-    # ``N811`` noqa below suppresses ruff's all-caps-is-a-constant heuristic.
-    from app.modules.boq.models import BOQ as BOQModel  # noqa: N811
-    from app.modules.boq.models import Position
-
-    stmt = select(BOQModel.project_id).join(Position, Position.boq_id == BOQModel.id).where(Position.id == position_id)
-    result = await service.session.execute(stmt)
-    project_id = result.scalar_one_or_none()
-    if project_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="BOQ position not found",
-        )
-    await _verify_project_access(service.session, project_id, user_id)
-
-
-@router.get("/links/", response_model=BOQElementLinkListResponse)
-async def list_links(
-    boq_position_id: uuid.UUID = Query(...),
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.read")),
-    service: BIMHubService = Depends(_get_service),
-) -> BOQElementLinkListResponse:
-    """List BIM element links for a BOQ position."""
-    await _verify_boq_position_access(service, boq_position_id, user_id or "")
-    items = await service.list_links_for_position(boq_position_id)
-    return BOQElementLinkListResponse(
-        items=[BOQElementLinkResponse.model_validate(lnk) for lnk in items],
-        total=len(items),
-    )
-
-
-@router.get(
-    "/models/{model_id}/boq-links/",
-    response_model=BIMModelBOQLinksResponse,
-)
-async def list_model_boq_links(
-    model_id: uuid.UUID,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.read")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMModelBOQLinksResponse:
-    """Aggregate BOQ links for every element in a model.
-
-    Used by the "Linked BOQ" side-panel in the BIM viewer: the viewer
-    itself loads elements in ``skeleton`` mode (no boq_links) for speed,
-    so the panel needs a dedicated roll-up across the whole model.
-    """
-    await _verify_model_access(service, model_id, user_id or "")
-    rows = await service.list_links_for_model(model_id)
-    return BIMModelBOQLinksResponse(
-        items=[BIMModelBOQLinkAggregate.model_validate(r) for r in rows],
-        total=len(rows),
-    )
-
-
-@router.post("/links/", response_model=BOQElementLinkResponse, status_code=201)
-async def create_link(
-    data: BOQElementLinkCreate,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("bim.create")),
-    service: BIMHubService = Depends(_get_service),
-) -> BOQElementLinkResponse:
-    """Create a link between a BOQ position and a BIM element."""
-    # Verify both sides: the BOQ position's project AND the BIM element's
-    # model/project. Prevents cross-project link forgery.
-    await _verify_boq_position_access(service, data.boq_position_id, user_id)
-    element = await service.get_element(data.bim_element_id)
-    if element is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="BIM element not found",
-        )
-    await _verify_model_access(service, element.model_id, user_id)
-    link = await service.create_link(data, user_id=user_id)
-    return BOQElementLinkResponse.model_validate(link)
-
-
-@router.delete("/links/{link_id}", status_code=204)
-async def delete_link(
-    link_id: uuid.UUID,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("bim.delete")),
-    service: BIMHubService = Depends(_get_service),
-) -> None:
-    """Delete a BOQ-BIM link."""
-    # Resolve the link → element → model → project and verify access.
-    from app.modules.bim_hub.models import BOQElementLink
-
-    link = await service.session.get(BOQElementLink, link_id)
-    if link is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Link not found",
-        )
-    element = await service.get_element(link.bim_element_id)
-    if element is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Link not found",
-        )
-    await _verify_model_access(service, element.model_id, user_id)
-    await service.delete_link(link_id)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Quantity Maps
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@router.get("/quantity-maps/", response_model=BIMQuantityMapListResponse)
-async def list_quantity_maps(
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=100, ge=1, le=500),
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.read")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMQuantityMapListResponse:
-    """List quantity mapping rules visible to the caller.
-
-    Scopes to the caller's accessible projects so a project-scoped rule from
-    another tenant never leaks. Global templates (``project_id IS NULL``)
-    stay visible to everyone; admins see every rule.
-    """
-    scope = await accessible_project_ids(service.session, user_id)
-    items, total = await service.list_quantity_maps(project_ids=scope, offset=offset, limit=limit)
-    return BIMQuantityMapListResponse(
-        items=[BIMQuantityMapResponse.model_validate(m) for m in items],
-        total=total,
-    )
-
-
-@router.post("/quantity-maps/", response_model=BIMQuantityMapResponse, status_code=201)
-async def create_quantity_map(
-    data: BIMQuantityMapCreate,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("bim.create")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMQuantityMapResponse:
-    """Create a new quantity mapping rule."""
-    # If the rule is scoped to a specific project, enforce ownership.
-    if data.project_id is not None:
-        await _verify_project_access(service.session, data.project_id, user_id)
-    qmap = await service.create_quantity_map(data)
-    return BIMQuantityMapResponse.model_validate(qmap)
-
-
-@router.patch("/quantity-maps/{map_id}", response_model=BIMQuantityMapResponse)
-async def update_quantity_map(
-    map_id: uuid.UUID,
-    data: BIMQuantityMapUpdate,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("bim.update")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMQuantityMapResponse:
-    """Update a quantity mapping rule.
-
-    A project-scoped rule requires access to its project. A global rule
-    (``project_id IS NULL``) is a cross-tenant shared template, so only an
-    admin may mutate it - a project-level editor in any tenant must not be
-    able to silently rewrite a template every tenant sees. The 404 (not 403)
-    on the non-admin global case keeps the IDOR surface consistent.
-    """
-    from app.modules.bim_hub.models import BIMQuantityMap
-
-    existing = await service.session.get(BIMQuantityMap, map_id)
-    if existing is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Quantity map not found",
-        )
-    if existing.project_id is not None:
-        await _verify_project_access(service.session, existing.project_id, user_id)
-    else:
-        # Global/template rule: admins only. ``accessible_project_ids``
-        # returns ``None`` for admins (its "no filter" sentinel); any
-        # non-admin caller gets a set and is rejected as not-found.
-        scope = await accessible_project_ids(service.session, user_id)
-        if scope is not None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Quantity map not found",
-            )
-    qmap = await service.update_quantity_map(map_id, data)
-    return BIMQuantityMapResponse.model_validate(qmap)
-
-
-@router.post("/quantity-maps/apply/", response_model=QuantityMapApplyResult)
-async def apply_quantity_maps(
-    data: QuantityMapApplyRequest,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("bim.create")),
-    service: BIMHubService = Depends(_get_service),
-) -> QuantityMapApplyResult:
-    """Apply quantity mapping rules to all elements in a model."""
-    await _verify_model_access(service, data.model_id, user_id)
-    return await service.apply_quantity_maps(data)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Diffs
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4835,115 +5177,6 @@ async def get_diff(
     # Verify access via the new (or old) model's project.
     await _verify_model_access(service, diff.new_model_id, user_id or "")
     return BIMModelDiffResponse.model_validate(diff)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Element Groups (saved selections)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-async def _verify_group_access(
-    service: "BIMHubService",
-    group_id: uuid.UUID,
-    user_id: str,
-) -> Any:
-    """Load a BIM element group and verify the caller owns its project.
-
-    Returns the loaded group so the caller can reuse it. Raises 404 on both
-    "not found" and "no access" to avoid UUID enumeration.
-    """
-    from app.modules.bim_hub.models import BIMElementGroup
-
-    group = await service.session.get(BIMElementGroup, group_id)
-    if group is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="BIM element group not found",
-        )
-    await _verify_project_access(service.session, group.project_id, user_id)
-    return group
-
-
-@router.get("/element-groups/", response_model=list[BIMElementGroupResponse])
-async def list_element_groups(
-    project_id: uuid.UUID = Query(...),
-    model_id: uuid.UUID | None = Query(default=None),
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.read")),
-    service: BIMHubService = Depends(_get_service),
-) -> list[BIMElementGroupResponse]:
-    """List BIM element groups for a project, optionally scoped to one model."""
-    await _verify_project_access(service.session, project_id, user_id or "")
-    return await service.list_element_groups(project_id, model_id=model_id)
-
-
-@router.post(
-    "/element-groups/",
-    response_model=BIMElementGroupResponse,
-    status_code=201,
-)
-async def create_element_group(
-    data: BIMElementGroupCreate,
-    project_id: uuid.UUID = Query(...),
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.create")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMElementGroupResponse:
-    """Create a new BIM element group (saved selection) in a project."""
-    await _verify_project_access(service.session, project_id, user_id or "")
-    # If the group is scoped to a specific model, verify the model belongs
-    # to the same project the caller is creating the group in.
-    if data.model_id is not None:
-        model = await _verify_model_access(service, data.model_id, user_id or "")
-        if model.project_id != project_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="model_id does not belong to the supplied project_id",
-            )
-    user_uuid: uuid.UUID | None = None
-    if user_id:
-        try:
-            user_uuid = uuid.UUID(str(user_id))
-        except (ValueError, TypeError):
-            user_uuid = None
-    return await service.create_element_group(project_id, data, user_uuid)
-
-
-@router.patch(
-    "/element-groups/{group_id}",
-    response_model=BIMElementGroupResponse,
-)
-async def update_element_group(
-    group_id: uuid.UUID,
-    data: BIMElementGroupUpdate,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.update")),
-    service: BIMHubService = Depends(_get_service),
-) -> BIMElementGroupResponse:
-    """Partially update a BIM element group."""
-    group = await _verify_group_access(service, group_id, user_id or "")
-    # If the caller is moving the group to a different model, validate that
-    # model belongs to the same project.
-    if data.model_id is not None:
-        model = await _verify_model_access(service, data.model_id, user_id or "")
-        if model.project_id != group.project_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="model_id does not belong to the group's project",
-            )
-    return await service.update_element_group(group_id, data)
-
-
-@router.delete("/element-groups/{group_id}", status_code=204)
-async def delete_element_group(
-    group_id: uuid.UUID,
-    user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("bim.delete")),
-    service: BIMHubService = Depends(_get_service),
-) -> None:
-    """Delete a BIM element group."""
-    await _verify_group_access(service, group_id, user_id or "")
-    await service.delete_element_group(group_id)
 
 
 # ── Smart Views - canonical-format rule builder ──────────────────────────
@@ -5218,187 +5451,6 @@ async def bim_element_similar(
     }
 
 
-# ── Cross-module coverage summary ────────────────────────────────────────
-
-
-@router.get(
-    "/coverage-summary/",
-    dependencies=[Depends(RequirePermission("bim.read"))],
-)
-async def bim_coverage_summary(
-    session: SessionDep,
-    _user_id: CurrentUserId,
-    project_id: uuid.UUID = Query(..., description="Project to summarize"),
-) -> dict[str, Any]:
-    """Aggregate cross-module coverage stats for every BIM element in a project.
-
-    Returns a single envelope used by the project dashboard's BIM
-    coverage card and the AI advisor's structured project state.
-
-    Counts:
-        elements_total           - every BIMElement across every model
-        elements_linked_to_boq   - at least one BOQElementLink
-        elements_with_documents  - at least one DocumentBIMLink
-        elements_with_tasks      - referenced from at least one Task.bim_element_ids
-        elements_with_activities - at least one Activity.bim_element_ids
-        elements_validated       - at least one ValidationResult row
-        elements_costed          - linked to a BOQ position with non-zero unit_rate
-
-    Percentages are derived from ``elements_total`` and clipped to [0, 1].
-
-    Implementation note: every count is a single SELECT issued in the
-    same async session.  No N+1.  Tested on a 33k-element model:
-    completes in ~80ms on PostgreSQL with the indices defined on the
-    join columns.
-    """
-    from sqlalchemy import distinct, func
-    from sqlalchemy import select as _select
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from app.modules.bim_hub.models import BIMElement, BIMModel, BOQElementLink
-
-    # Total elements in the project - joined via BIMModel.
-    total_stmt = (
-        _select(func.count(BIMElement.id))
-        .join(BIMModel, BIMElement.model_id == BIMModel.id)
-        .where(BIMModel.project_id == project_id)
-    )
-    elements_total = int((await session.execute(total_stmt)).scalar() or 0)
-
-    # Distinct elements that have at least one BOQ link.
-    boq_linked_stmt = (
-        _select(func.count(distinct(BOQElementLink.bim_element_id)))
-        .join(BIMElement, BOQElementLink.bim_element_id == BIMElement.id)
-        .join(BIMModel, BIMElement.model_id == BIMModel.id)
-        .where(BIMModel.project_id == project_id)
-    )
-    elements_linked_to_boq = int((await session.execute(boq_linked_stmt)).scalar() or 0)
-
-    # Documents - uses DocumentBIMLink if the table exists.  Wrapped in
-    # try/except so that a missing/optional module doesn't 500 the call.
-    elements_with_documents = 0
-    try:
-        from app.modules.documents.models import DocumentBIMLink
-
-        docs_stmt = (
-            _select(func.count(distinct(DocumentBIMLink.bim_element_id)))
-            .join(
-                BIMElement,
-                DocumentBIMLink.bim_element_id == BIMElement.id,
-            )
-            .join(BIMModel, BIMElement.model_id == BIMModel.id)
-            .where(BIMModel.project_id == project_id)
-        )
-        elements_with_documents = int((await session.execute(docs_stmt)).scalar() or 0)
-    except (ImportError, AttributeError, SQLAlchemyError):
-        elements_with_documents = 0
-
-    # Tasks - Task.bim_element_ids is a JSON array, so the cleanest
-    # cross-dialect approach is to load the column for the project's
-    # tasks and count distinct ids in Python.  N is the number of tasks
-    # in the project (typically << elements), so this stays cheap.
-    elements_with_tasks = 0
-    try:
-        from app.modules.tasks.models import Task
-
-        task_stmt = _select(Task.bim_element_ids).where(Task.project_id == project_id)
-        bim_id_set: set[str] = set()
-        for row in (await session.execute(task_stmt)).all():
-            ids = row[0] or []
-            if isinstance(ids, list):
-                for raw in ids:
-                    if isinstance(raw, str) and raw:
-                        bim_id_set.add(raw)
-        elements_with_tasks = len(bim_id_set)
-    except (ImportError, AttributeError, SQLAlchemyError):
-        elements_with_tasks = 0
-
-    # Schedule activities - same pattern as tasks.
-    elements_with_activities = 0
-    try:
-        from app.modules.schedule.models import Activity, Schedule
-
-        act_stmt = (
-            _select(Activity.bim_element_ids)
-            .join(Schedule, Activity.schedule_id == Schedule.id)
-            .where(Schedule.project_id == project_id)
-        )
-        bim_id_set = set()
-        for row in (await session.execute(act_stmt)).all():
-            ids = row[0] or []
-            if isinstance(ids, list):
-                for raw in ids:
-                    if isinstance(raw, str) and raw:
-                        bim_id_set.add(raw)
-        elements_with_activities = len(bim_id_set)
-    except (ImportError, AttributeError, SQLAlchemyError):
-        elements_with_activities = 0
-
-    # Validated elements - we count distinct rows in the validation
-    # results table whose target_type='bim_element' and project_id matches.
-    elements_validated = 0
-    try:
-        from app.modules.validation.models import ValidationReport
-
-        val_stmt = _select(ValidationReport.results).where(
-            ValidationReport.project_id == project_id,
-            ValidationReport.target_type == "bim",
-        )
-        bim_id_set = set()
-        for row in (await session.execute(val_stmt)).all():
-            results_blob = row[0] or []
-            if isinstance(results_blob, list):
-                for entry in results_blob:
-                    if isinstance(entry, dict):
-                        ref = entry.get("element_ref") or entry.get("element_id")
-                        if isinstance(ref, str) and ref:
-                            bim_id_set.add(ref)
-        elements_validated = len(bim_id_set)
-    except (ImportError, AttributeError, SQLAlchemyError):
-        elements_validated = 0
-
-    # Costed = subset of boq-linked elements where the linked position
-    # has non-zero unit_rate.  Skip if BOQ module is not loaded.
-    elements_costed = 0
-    try:
-        from app.modules.boq.models import Position
-
-        costed_stmt = (
-            _select(func.count(distinct(BOQElementLink.bim_element_id)))
-            .join(BIMElement, BOQElementLink.bim_element_id == BIMElement.id)
-            .join(BIMModel, BIMElement.model_id == BIMModel.id)
-            .join(Position, BOQElementLink.boq_position_id == Position.id)
-            .where(BIMModel.project_id == project_id)
-            .where(Position.unit_rate != "0")
-            .where(Position.unit_rate != "")
-        )
-        elements_costed = int((await session.execute(costed_stmt)).scalar() or 0)
-    except (ImportError, AttributeError, SQLAlchemyError):
-        elements_costed = 0
-
-    def _pct(numerator: int) -> float:
-        if elements_total <= 0:
-            return 0.0
-        return round(min(1.0, numerator / elements_total), 4)
-
-    return {
-        "project_id": str(project_id),
-        "elements_total": elements_total,
-        "elements_linked_to_boq": elements_linked_to_boq,
-        "elements_costed": elements_costed,
-        "elements_validated": elements_validated,
-        "elements_with_documents": elements_with_documents,
-        "elements_with_tasks": elements_with_tasks,
-        "elements_with_activities": elements_with_activities,
-        "percent_linked_to_boq": _pct(elements_linked_to_boq),
-        "percent_costed": _pct(elements_costed),
-        "percent_validated": _pct(elements_validated),
-        "percent_with_documents": _pct(elements_with_documents),
-        "percent_with_tasks": _pct(elements_with_tasks),
-        "percent_with_activities": _pct(elements_with_activities),
-    }
-
-
 # =============================================================================
 # Dataframe endpoints (Parquet + DuckDB analytical queries)
 # =============================================================================
@@ -5596,29 +5648,6 @@ async def create_federation(
     await _verify_project_access(session, payload.project_id, _user_id)
     service = BIMHubService(session)
     return await service.create_federation(payload)
-
-
-@router.get(
-    "/federations/",
-    response_model=FederationListResponse,
-    dependencies=[Depends(RequirePermission("bim.read"))],
-)
-async def list_federations(
-    session: SessionDep,
-    _user_id: CurrentUserId,
-    project_id: uuid.UUID = Query(..., description="Project to list federations for"),
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=100, ge=1, le=500),
-) -> FederationListResponse:
-    """List federations belonging to a project."""
-    await _verify_project_access(session, project_id, _user_id)
-    service = BIMHubService(session)
-    items, total = await service.list_federations(
-        project_id,
-        offset=offset,
-        limit=limit,
-    )
-    return FederationListResponse(items=items, total=total)
 
 
 @router.get(

@@ -39,6 +39,7 @@ Endpoints:
     GET    /boqs/{boq_id}/export/gaeb          - Export BOQ as GAEB XML 3.3 (X83)
     POST   /boqs/{boq_id}/import/excel         - Import positions from Excel/CSV
     POST   /boqs/{boq_id}/import/smart         - Smart import: any file via AI (incl. CAD/BIM)
+    POST   /import/preview                     - Preview a BOQ file without importing
     GET    /boqs/{boq_id}/resource-summary    - Aggregated resource summary across positions
     GET    /boqs/{boq_id}/cost-breakdown     - Cost breakdown by resource category
     GET    /boqs/{boq_id}/sensitivity       - Sensitivity analysis (tornado chart)
@@ -72,6 +73,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from app.modules.boq.copilot_service import BOQCopilotService
     from app.modules.boq.importers import ImportedBOQ
+    from app.modules.boq.models import BOQSnapshot
 
 from fastapi import (
     APIRouter,
@@ -108,7 +110,9 @@ from app.modules.boq.copilot_schemas import (
     CopilotChatResponse,
     CopilotMessageOut,
 )
+from app.modules.boq.exchange_formats import ExchangeCatalogue, build_catalogue
 from app.modules.boq.markup_templates import DEFAULT_MARKUP_TEMPLATES
+from app.modules.boq.resource_review_router import resource_review_router
 from app.modules.boq.roundtrip import (
     ID_COLUMN_ALIASES,
     ID_COLUMN_HEADER,
@@ -190,7 +194,11 @@ from app.modules.boq.schemas import (
     SectionCreate,
     SensitivityItem,
     SensitivityResponse,
+    SnapshotCompareRequest,
+    SnapshotCompareResponse,
     SnapshotCreate,
+    SnapshotDetail,
+    SnapshotPositionDiff,
     SnapshotResponse,
     SuggestPrerequisitesRequest,
     SuggestPrerequisitesResponse,
@@ -203,6 +211,7 @@ from app.modules.boq.service import (
     MAX_NESTING_DEPTH,
     SECTION_UNITS,
     BOQService,
+    build_position_response,
     exportable_positions,
     resource_fx_factor,
 )
@@ -212,6 +221,10 @@ from app.modules.measurement.presets import PRESETS as MEASUREMENT_PRESETS
 from app.modules.price_breakdown.presets import PRESETS as PRICE_BREAKDOWN_PRESETS
 
 router = APIRouter(tags=["boq"])
+
+# The module loader mounts exactly one router per module, this one. Sub-routers
+# that live in their own files answer nowhere until they are included here.
+router.include_router(resource_review_router)
 _log = logging.getLogger(__name__)
 
 
@@ -229,7 +242,8 @@ async def _verify_boq_owner(
 
     Admins bypass the check. Grants access to the project owner and to
     any user who is a team member of the project (added via add_project_member).
-    Raises 403 if none of those conditions are met.
+    Raises 404 (not 403) on denial to keep 'missing' and 'denied'
+    indistinguishable, matching verify_project_access.
     """
     if payload and payload.get("role") == "admin":
         return
@@ -257,8 +271,8 @@ async def _verify_boq_owner(
     if uid is not None and await is_project_member(session, boq.project_id, uid):
         return
     raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="You do not have access to this BOQ",
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="BOQ not found",
     )
 
 
@@ -336,82 +350,30 @@ async def _log_activity(
         _log.debug("Activity log write failed (non-critical)", exc_info=True)
 
 
-_CONFIDENCE_LABELS = {"high": 0.9, "medium": 0.6, "med": 0.6, "low": 0.3}
-
-
-def _coerce_confidence(raw: object) -> float | None:
-    """Best-effort coerce a stored confidence value to float (0.0-1.0).
-
-    Some legacy / seed rows persisted ``confidence`` as a label
-    (``'high'``/``'medium'``/``'low'``) rather than the numeric 0–1
-    contract.  The PATCH endpoint must keep responding 200 for those
-    rows or the whole grid stops saving - so we map known labels to
-    representative floats and drop anything else to ``None``.
-    """
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    text = str(raw).strip().lower()
-    if text in _CONFIDENCE_LABELS:
-        return _CONFIDENCE_LABELS[text]
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def _position_to_response(position: object) -> PositionResponse:
-    """Build a PositionResponse from a Position ORM object."""
-    # Issue #79: read back the CostItem linkage stored under
-    # ``metadata.cost_item_id``.  Older rows that pre-date the linkage
-    # simply return None.  We tolerate any non-UUID string defensively
-    # - bad data should not break the GET response.
-    raw_meta = getattr(position, "metadata_", None)  # type: ignore[attr-defined]
-    cost_item_id_val: uuid.UUID | None = None
-    if isinstance(raw_meta, dict):
-        raw_cid = raw_meta.get("cost_item_id")
-        if raw_cid:
-            try:
-                cost_item_id_val = uuid.UUID(str(raw_cid))
-            except (ValueError, TypeError):
-                cost_item_id_val = None
+    """Build a PositionResponse from a Position ORM object.
 
-    return PositionResponse(
-        id=position.id,  # type: ignore[attr-defined]
-        boq_id=position.boq_id,  # type: ignore[attr-defined]
-        parent_id=position.parent_id,  # type: ignore[attr-defined]
-        ordinal=position.ordinal,  # type: ignore[attr-defined]
-        description=position.description,  # type: ignore[attr-defined]
-        unit=position.unit,  # type: ignore[attr-defined]
-        # BUG-B-011: forward the exact stored decimal string; the schema
-        # now keeps it as Decimal and serialises a plain string, so a
-        # 999,999,999.99 × 999,999.99 total no longer loses its tail.
-        quantity=position.quantity,  # type: ignore[attr-defined]
-        unit_rate=position.unit_rate,  # type: ignore[attr-defined]
-        total=position.total,  # type: ignore[attr-defined]
-        classification=position.classification,  # type: ignore[attr-defined]
-        source=position.source,  # type: ignore[attr-defined]
-        confidence=_coerce_confidence(position.confidence),  # type: ignore[attr-defined]
-        cad_element_ids=position.cad_element_ids,  # type: ignore[attr-defined]
-        # Issue #347: owning BIM model of the linked elements (multi-model picker).
-        cad_model_id=getattr(position, "cad_model_id", None),
-        validation_status=position.validation_status,  # type: ignore[attr-defined]
-        metadata=position.metadata_,  # type: ignore[attr-defined]
-        sort_order=position.sort_order,  # type: ignore[attr-defined]
-        created_at=position.created_at,  # type: ignore[attr-defined]
-        updated_at=position.updated_at,  # type: ignore[attr-defined]
-        cost_item_id=cost_item_id_val,
-        # BUG-CONCURRENCY01: surface the row's optimistic-concurrency
-        # token so clients can echo it on the next PATCH.
-        version=int(getattr(position, "version", 0) or 0),  # type: ignore[attr-defined]
-        # Issue #127: reuse-group fields (read-only). ``linked_instance_count``
-        # needs a project-wide query so it is left None here and populated
-        # explicitly by the links endpoint / propagation paths.
-        reference_code=getattr(position, "reference_code", None),  # type: ignore[attr-defined]
-        link_role=getattr(position, "link_role", None),  # type: ignore[attr-defined]
-        link_group_id=getattr(position, "link_group_id", None),  # type: ignore[attr-defined]
-    )
+    Issue #457. This was a second builder that constructed the response itself,
+    and it and the service's builder had drifted apart in both directions: this
+    one alone set ``cost_item_id`` and ``version``, the service's alone set
+    ``risk_dispersion``, ``price_basis``, ``norm_id`` and ``norm_work_key``. So
+    ``GET /boqs/{boq_id}`` and ``GET /positions/{position_id}`` gave different
+    answers about the same row, and the norm provenance shipped answering null
+    on every endpoint a client would ask it from. It now delegates, and there is
+    one builder again: the union of what the two of them used to set.
+
+    Kept as a function rather than replaced at its thirteen call sites because
+    the router's name for it reads at those sites and because the router, not
+    the service, is where a response is a response.
+
+    Args:
+        position: The position to render, typed loosely because several call
+            sites pass rows built by importers rather than by the ORM.
+
+    Returns:
+        The position as the API returns it.
+    """
+    return build_position_response(position)  # type: ignore[arg-type]
 
 
 async def _position_to_response_with_links(
@@ -569,6 +531,43 @@ async def list_boqs(
         )
         results.append(item)
     return results
+
+
+# ── Exchange formats ─────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/boqs/exchange-formats/",
+    response_model=ExchangeCatalogue,
+    summary="List the BOQ exchange formats by market, with what we can do with each",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def list_exchange_formats(
+    country: str | None = Query(
+        None,
+        description=(
+            "ISO 3166-1 alpha-2 code of the market the caller is working in. "
+            "Decides default_format_id and nothing else: the format list is "
+            "the same for everybody, because a surveyor in one country is "
+            "regularly sent a file from another."
+        ),
+        max_length=8,
+    ),
+) -> ExchangeCatalogue:
+    """The catalogue of market documents this product can read or write.
+
+    Every row says which countries it belongs to, so a client can fly the
+    right flags, and how well we handle it in each direction. Those two
+    verdicts are computed from the importer and exporter registries on
+    each call rather than stored, so a row cannot outlive the code that
+    justified it.
+
+    ``country`` is optional. Supplying it does not filter anything, it
+    only picks the row the caller should start on, which is that market's
+    own document where we can read one and their document anyway where we
+    cannot yet, so the answer is never silently a different market's.
+    """
+    return build_catalogue(country)
 
 
 # ── Templates ────────────────────────────────────────────────────────────────
@@ -2883,6 +2882,26 @@ async def compare_boqs(
 # ── Snapshots (Version History) ───────────────────────────────────────────────
 
 
+def _snap_to_response(s: "BOQSnapshot") -> SnapshotResponse:
+    """Build a SnapshotResponse from a BOQSnapshot ORM instance."""
+    grand_total: float | None = None
+    if s.total_value is not None:
+        try:
+            grand_total = float(s.total_value)
+        except (ValueError, TypeError):
+            grand_total = None
+    return SnapshotResponse(
+        id=s.id,
+        boq_id=s.boq_id,
+        name=s.name,
+        description=s.description or "",
+        position_count=s.position_count,
+        grand_total=grand_total,
+        created_at=s.created_at,
+        created_by=s.created_by,
+    )
+
+
 @router.get(
     "/boqs/{boq_id}/snapshots/",
     response_model=list[SnapshotResponse],
@@ -2901,16 +2920,7 @@ async def list_snapshots(
     # caller may access this BOQ's project before listing its version history.
     await _verify_boq_owner(session, boq_id, user_id, payload)
     snapshots = await service.list_snapshots(boq_id)
-    return [
-        SnapshotResponse(
-            id=s.id,
-            boq_id=s.boq_id,
-            name=s.name,
-            created_at=s.created_at,
-            created_by=s.created_by,
-        )
-        for s in snapshots
-    ]
+    return [_snap_to_response(s) for s in snapshots]
 
 
 @router.post(
@@ -2932,13 +2942,77 @@ async def create_snapshot(
     # IDOR guard: the global boq.update role is not project-scoped - verify the
     # caller may access this BOQ's project before snapshotting it.
     await _verify_boq_owner(session, boq_id, user_id, payload)
-    snap = await service.create_snapshot(boq_id, name=data.name, user_id=user_id)
-    return SnapshotResponse(
-        id=snap.id,
-        boq_id=snap.boq_id,
-        name=snap.name,
-        created_at=snap.created_at,
-        created_by=snap.created_by,
+    snap = await service.create_snapshot(boq_id, name=data.name, description=data.description, user_id=user_id)
+    return _snap_to_response(snap)
+
+
+@router.get(
+    "/boqs/{boq_id}/snapshots/{snapshot_id}",
+    response_model=SnapshotDetail,
+    summary="Get snapshot detail",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def get_snapshot(
+    boq_id: uuid.UUID,
+    snapshot_id: uuid.UUID,
+    user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> SnapshotDetail:
+    """Return a single snapshot with the full data payload."""
+    await _verify_boq_owner(session, boq_id, user_id, payload)
+    snap = await service.get_snapshot(boq_id, snapshot_id)
+    base = _snap_to_response(snap)
+    return SnapshotDetail(
+        **base.model_dump(),
+        snapshot_data=snap.snapshot_data,
+    )
+
+
+@router.delete(
+    "/boqs/{boq_id}/snapshots/{snapshot_id}",
+    status_code=204,
+    summary="Delete snapshot",
+    dependencies=[Depends(RequirePermission("boq.update"))],
+)
+async def delete_snapshot(
+    boq_id: uuid.UUID,
+    snapshot_id: uuid.UUID,
+    user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> None:
+    """Delete a snapshot permanently."""
+    await _verify_boq_owner(session, boq_id, user_id, payload)
+    await service.delete_snapshot(boq_id, snapshot_id)
+
+
+@router.post(
+    "/boqs/{boq_id}/snapshots/compare",
+    response_model=SnapshotCompareResponse,
+    summary="Compare two snapshots",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def compare_snapshots(
+    boq_id: uuid.UUID,
+    data: SnapshotCompareRequest,
+    user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> SnapshotCompareResponse:
+    """Compare two snapshots of the same BOQ and return a position-level diff."""
+    await _verify_boq_owner(session, boq_id, user_id, payload)
+    result = await service.compare_snapshots(boq_id, data.snapshot_id_a, data.snapshot_id_b)
+    return SnapshotCompareResponse(
+        snapshot_a=_snap_to_response(result["snapshot_a"]),
+        snapshot_b=_snap_to_response(result["snapshot_b"]),
+        added=[SnapshotPositionDiff(**p) for p in result["added"]],
+        removed=[SnapshotPositionDiff(**p) for p in result["removed"]],
+        changed=[SnapshotPositionDiff(**p) for p in result["changed"]],
+        summary=result["summary"],
     )
 
 
@@ -6815,6 +6889,131 @@ async def import_boq_auto(
     }
 
 
+# ── Import preview endpoint ─────────────────────────────────────────────────
+
+_PREVIEW_MAX_POSITIONS = 500
+
+
+@router.post(
+    "/import/preview/",
+    summary="Preview a BOQ file without importing",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def import_preview(
+    file: UploadFile = File(
+        ...,
+        description=(
+            "Any BOQ file. The dispatcher tries native importers (GAEB XML, "
+            "BC3 / FIEBDC-3, Excel/CSV) and returns parsed positions as "
+            "JSON without persisting anything."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Parse a BOQ upload and return positions without persisting to the database.
+
+    Walks :data:`REGISTERED_IMPORTERS` in order, calling ``detect()`` on
+    each with the first 4 KB of the upload + the filename. The first
+    importer whose ``detect()`` returns ``True`` wins; its ``parse()`` is
+    invoked on the full buffer. Unlike ``/import/auto/``, this endpoint
+    never writes to the database and never falls back to the LLM path.
+
+    The response is capped at 500 positions. When the parsed file contains
+    more, ``truncated`` is set to ``True`` and the aggregate counts still
+    reflect the entire file.
+
+    Returns:
+        :class:`~app.modules.boq.schemas.ImportPreviewResponse` as a dict.
+    """
+    from app.modules.boq.importers import REGISTERED_IMPORTERS, ImportedBOQ, ImporterParseError
+    from app.modules.boq.schemas import ImportPreviewPosition, ImportPreviewResponse
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+    file_name = file.filename or "upload"
+
+    head = content[:4096]
+    chosen: type | None = None
+    for importer in REGISTERED_IMPORTERS:
+        try:
+            if importer.detect(head, file_name):
+                chosen = importer
+                break
+        except Exception as exc:  # noqa: BLE001 - detect() must never raise
+            logger.warning(
+                "Preview: importer %s.detect() raised on %s: %s",
+                importer.__name__,
+                file_name,
+                exc,
+            )
+            continue
+
+    if chosen is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No native importer recognised this file format. "
+                "Supported formats: GAEB XML, BC3 / FIEBDC-3, Excel (.xlsx/.xls), CSV."
+            ),
+        )
+
+    try:
+        imported_boq: ImportedBOQ = await chosen.parse(content, locale=get_locale())
+    except ImporterParseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not parse file as {chosen.display_name}: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - log + sanitise
+        logger.exception(
+            "Preview: importer %s.parse() unexpected failure: %s",
+            chosen.__name__,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not parse file as {chosen.display_name}: unexpected error.",
+        ) from exc
+
+    all_positions = imported_boq.positions
+    total_positions = len(all_positions)
+    total_sections = sum(1 for p in all_positions if p.is_section)
+    truncated = total_positions > _PREVIEW_MAX_POSITIONS
+
+    preview_positions = [
+        ImportPreviewPosition(
+            ordinal=p.ordinal,
+            description=p.description,
+            unit=p.unit,
+            quantity=p.quantity,
+            unit_rate=p.unit_rate,
+            total=p.quantity * p.unit_rate,
+            is_section=p.is_section,
+            classification=p.classification,
+            metadata=p.metadata,
+        )
+        for p in all_positions[:_PREVIEW_MAX_POSITIONS]
+    ]
+
+    response = ImportPreviewResponse(
+        source_format=imported_boq.source_format,
+        currency=imported_boq.currency,
+        total_positions=total_positions,
+        total_sections=total_sections,
+        skipped=imported_boq.skipped,
+        positions=preview_positions,
+        warnings=imported_boq.warnings,
+        errors=imported_boq.errors,
+        metadata=imported_boq.metadata,
+        truncated=truncated,
+    )
+
+    return response.model_dump()
+
+
 # ── Smart import helpers ─────────────────────────────────────────────────────
 
 
@@ -7025,6 +7224,18 @@ async def _extract_from_cad(content: bytes, ext: str, filename: str) -> dict[str
 
 # ── Smart import endpoint ────────────────────────────────────────────────────
 
+# The extensions the smart-import dispatch below really handles, grouped by the
+# extractor that reads each one. The refusal message joins the union instead of
+# restating it: it used to be a hand-written list that had lost xls, jpeg and
+# bmp, so three formats this endpoint happily accepts were named as unsupported
+# to whoever uploaded something else.
+_SMART_IMPORT_EXCEL_EXTS: tuple[str, ...] = ("xlsx", "xls")
+_SMART_IMPORT_IMAGE_EXTS: tuple[str, ...] = ("jpg", "jpeg", "png", "tiff", "bmp")
+_SMART_IMPORT_CAD_EXTS: tuple[str, ...] = ("rvt", "ifc", "dwg", "dgn")
+_SMART_IMPORT_EXTS: frozenset[str] = frozenset(
+    _SMART_IMPORT_EXCEL_EXTS + ("csv", "pdf") + _SMART_IMPORT_IMAGE_EXTS + _SMART_IMPORT_CAD_EXTS
+)
+
 
 @router.post(
     "/boqs/{boq_id}/import/smart/",
@@ -7038,7 +7249,10 @@ async def smart_import(
     response: Response,
     file: UploadFile = File(
         ...,
-        description="Any document file (Excel, CSV, PDF, image, or CAD/BIM: .rvt, .ifc, .dwg, .dgn)",
+        description=(
+            "Any document file (Excel, CSV, PDF, image, or CAD/BIM). Accepted extensions: "
+            ".xlsx, .xls, .csv, .pdf, .jpg, .jpeg, .png, .tiff, .bmp, .rvt, .ifc, .dwg, .dgn"
+        ),
     ),
     service: BOQService = Depends(_get_service),
     session: SessionDep = None,  # type: ignore[assignment]
@@ -7053,9 +7267,10 @@ async def smart_import(
         supported for backwards compatibility but emits a
         ``Deprecation: true`` response header.
 
-    Accepts Excel (.xlsx), CSV (.csv), PDF (.pdf), image files
-    (.jpg, .jpeg, .png, .tiff, .bmp), and CAD/BIM files
-    (.rvt, .ifc, .dwg, .dgn). For structured Excel/CSV with
+    Accepted extensions: .xlsx, .xls, .csv, .pdf, .jpg, .jpeg, .png, .tiff,
+    .bmp, .rvt, .ifc, .dwg, .dgn
+
+    For structured Excel/CSV with
     recognisable column headers, performs a direct import. For CAD/BIM
     files, runs a DDC converter to extract element data. Otherwise,
     sends the extracted text (or image) to the user's configured AI
@@ -7096,7 +7311,7 @@ async def smart_import(
     # No upload size cap - per product policy.
 
     # ── 1. Extract text/data based on file type ────────────────────────
-    if ext in ("xlsx", "xls"):
+    if ext in _SMART_IMPORT_EXCEL_EXTS:
         # BUG-UPLOAD01b: smart-import path used to skip the xlsx-bomb
         # guard that import_boq_excel calls - same DoS surface via this
         # endpoint. Apply the same defence here before parsing.
@@ -7108,14 +7323,14 @@ async def smart_import(
         extracted = _extract_from_csv_for_smart(content)
     elif ext == "pdf":
         extracted = _extract_from_pdf(content)
-    elif ext in ("jpg", "jpeg", "png", "tiff", "bmp"):
+    elif ext in _SMART_IMPORT_IMAGE_EXTS:
         extracted = _extract_from_image(content, ext)
-    elif ext in ("rvt", "ifc", "dwg", "dgn"):
+    elif ext in _SMART_IMPORT_CAD_EXTS:
         extracted = await _extract_from_cad(content, ext, file.filename or f"model.{ext}")
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(f"Unsupported file type: .{ext}. Supported: xlsx, csv, pdf, jpg, png, tiff, rvt, ifc, dwg, dgn."),
+            detail=(f"Unsupported file type: .{ext}. Supported: {', '.join(sorted(_SMART_IMPORT_EXTS))}."),
         )
 
     # ── 1b. Handle missing CAD converter (return early) ────────────────

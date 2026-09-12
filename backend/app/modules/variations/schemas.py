@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
@@ -184,6 +184,10 @@ class VariationRequestResponse(BaseModel):
     # having to reconstruct any of it from the bill as it stands now.
     submitted_boq_id: UUID | None = None
     submitted_boq_total: Decimal | None = None
+    #: The bill as it stood at submission, as a snapshot in the bill's own
+    #: version history. NULL for a request with no bill and for one
+    #: submitted before the snapshot was taken.
+    submitted_boq_snapshot_id: UUID | None = None
     agreed_cost_impact: Decimal | None = None
     agreed_basis: str = ""
     agreed_variance_note: str = ""
@@ -228,6 +232,20 @@ class VariationRequestResponse(BaseModel):
 # back to.
 
 
+#: What a variation line does to the source it traces to. ``added`` is scope
+#: the contract never held; ``removed`` is contracted scope the variation
+#: omits, carried as a negative quantity against the schedule of values;
+#: ``modified`` is the same contract line kept at a different quantity or
+#: rate. Stated by the estimator, never inferred from the numbers: the
+#: validator reports a contradiction between the two, it does not resolve it.
+VariationChangeKind = Literal["added", "removed", "modified"]
+
+#: The kind a line has when nobody has said. A variation bill holds only the
+#: scope the variation changes, so a line that names no contracted item is by
+#: construction not omitting or modifying one.
+DEFAULT_CHANGE_KIND: VariationChangeKind = "added"
+
+
 class VariationBOQSourcePosition(BaseModel):
     """An estimating-BOQ position the variation scope is taken from."""
 
@@ -238,6 +256,7 @@ class VariationBOQSourcePosition(BaseModel):
     #: one - a variation usually re-measures part of a line. Omit to carry
     #: the source position's quantity across unchanged.
     quantity: Decimal | None = None
+    change_kind: VariationChangeKind = DEFAULT_CHANGE_KIND
     note: str = Field(default="", max_length=2000)
 
 
@@ -248,6 +267,11 @@ class VariationBOQSourceContractLine(BaseModel):
 
     contract_line_id: UUID
     quantity: Decimal | None = None
+    #: Still ``added`` by default, even though the line names a contracted
+    #: item: extra quantity of a contracted item at the contract rate is the
+    #: commonest variation there is, and it is an addition. An omission or a
+    #: re-measure is said in so many words.
+    change_kind: VariationChangeKind = DEFAULT_CHANGE_KIND
     note: str = Field(default="", max_length=2000)
 
 
@@ -268,6 +292,34 @@ class VariationBOQCreate(BaseModel):
     source_contract_lines: list[VariationBOQSourceContractLine] = Field(default_factory=list, max_length=500)
 
 
+class VariationBOQLineTraceUpdate(BaseModel):
+    """Where one line of an existing variation bill came from.
+
+    Seeding a bill records this for every line it copies, but a bill is an
+    ordinary bill and grows the ordinary way: a surveyor adds lines to it
+    through the BOQ editor long after it was opened, and those lines arrive
+    with no provenance at all. This is how one acquires it afterwards.
+
+    Both references are optional and independent, exactly as they are on the
+    seeded path. Naming neither is not the same as declining to answer - it
+    is the answer "this line derives from nothing", which is a legitimate
+    thing for a variation line to be and is recorded as ``origin='manual'``.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    #: The contract schedule-of-values line this line changes.
+    contract_line_id: UUID | None = None
+    #: The estimating bill position the scope was taken from.
+    source_position_id: UUID | None = None
+    #: What this line does to the source. Sent with every write, because a
+    #: trace is one answer and half of it cannot be left over from the last
+    #: time: a line re-traced from an omission to an addition that kept
+    #: ``removed`` would read as omitting scope it adds.
+    change_kind: VariationChangeKind = DEFAULT_CHANGE_KIND
+    note: str = Field(default="", max_length=2000)
+
+
 class VariationBOQTraceResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -280,8 +332,46 @@ class VariationBOQTraceResponse(BaseModel):
     source_position_id: UUID | None = None
     contract_id: UUID | None = None
     contract_line_id: UUID | None = None
+    change_kind: str = DEFAULT_CHANGE_KIND
     note: str = ""
     created_at: datetime
+
+
+class VariationBOQKindSubtotal(BaseModel):
+    """The lines of one change kind and what they add up to."""
+
+    line_count: int = 0
+    #: Base-currency direct cost of the lines of this kind, valued line by
+    #: line the way ``BOQService.compute_boq_totals`` values them, so the
+    #: three subtotals sum to the bill's ``direct_cost`` rather than to a
+    #: number beside it. Negative for an omission carried as such.
+    total: Decimal = Decimal("0")
+
+    @field_serializer("total", when_used="json")
+    @classmethod
+    def _ser_total(cls, v: Decimal) -> str:
+        return _serialize_money_string(v) or "0"
+
+
+class VariationBOQChangeSummary(BaseModel):
+    """The bill's direct cost split by what each line does to the contract.
+
+    ``net_total`` is the sum of the three, which is the point: an omission
+    is a negative line, so the net is what the variation actually does to
+    the contract sum before markups, and it reads as a sum a person can
+    check rather than a figure that has to be trusted. A line with no trace
+    row counts as ``added``, the same reading the validator gives it.
+    """
+
+    added: VariationBOQKindSubtotal = Field(default_factory=VariationBOQKindSubtotal)
+    removed: VariationBOQKindSubtotal = Field(default_factory=VariationBOQKindSubtotal)
+    modified: VariationBOQKindSubtotal = Field(default_factory=VariationBOQKindSubtotal)
+    net_total: Decimal = Decimal("0")
+
+    @field_serializer("net_total", when_used="json")
+    @classmethod
+    def _ser_net(cls, v: Decimal) -> str:
+        return _serialize_money_string(v) or "0"
 
 
 class VariationBOQCheck(BaseModel):
@@ -326,6 +416,9 @@ class VariationBOQResponse(BaseModel):
     #: priced figure has been adopted and the two do not disagree.
     estimate_matches_boq: bool = False
     traces: list[VariationBOQTraceResponse] = Field(default_factory=list)
+    #: Direct cost split by added / removed / modified. ``None`` when there
+    #: is no bill, for the same reason the money fields are.
+    change_summary: VariationBOQChangeSummary | None = None
     checks: list[VariationBOQCheck] = Field(default_factory=list)
 
     @field_serializer("direct_cost", "markups_total", "grand_total", when_used="json")

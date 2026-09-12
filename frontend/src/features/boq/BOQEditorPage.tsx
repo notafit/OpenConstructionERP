@@ -65,6 +65,11 @@ import { ResourceSummary } from './ResourceSummary';
 import { CommentDrawer, type CommentEntry } from './CommentDrawer';
 import { PriceAnalysisPanel } from './PriceAnalysisPanel';
 import { PositionActualsDrawer } from '@/features/costmodel/PositionActualsDrawer';
+import { MeasurementDrawer } from './MeasurementDrawer';
+import { VariationTraceDrawer } from './VariationTraceDrawer';
+import type { VariationLineTraceBadge } from './grid/cellRenderers';
+import { getVariationRequestBOQ, type VariationBOQTrace } from '@/features/variations/api';
+import { changeKindLabel } from '@/features/variations/VariationSourcePicker';
 import { SensitivityChart } from './SensitivityChart';
 import { CostRiskPanel } from './CostRiskPanel';
 import { MarkupPanel } from './MarkupPanel';
@@ -76,6 +81,7 @@ import { allResourcesExpanded, type ResourceExpansionState } from './resourceExp
 import { BatchActionBar } from './BatchActionBar';
 import { ScenarioDialog } from './ScenarioDialog';
 import { SendToTenderDialog } from './SendToTenderDialog';
+import { ImportPreviewDialog } from './ImportPreviewDialog';
 import { BOQFilterBar, type BoqFilterKind } from './BOQFilterBar';
 import { BOQOutline } from './BOQOutline';
 import type { TenderPackageRef } from './api';
@@ -552,6 +558,12 @@ export function BOQEditorPage() {
     mutationFn: (data: CreatePositionData) => boqApi.addPosition(data),
     onSuccess: (addedPosition) => {
       invalidateAll();
+      // Issue #139 — make the freshly added row the active insert anchor
+      // so the NEXT "Add Position" chains below it without requiring an
+      // explicit click. beginEditDescription sets focus (and thus the
+      // anchor) for the normal path, but the linked-instance and undo/redo
+      // paths skip it — this explicit update covers all branches.
+      setActivePositionId(addedPosition.id);
       // Highlight new position and scroll to it
       setNewPositionId(addedPosition.id);
       setTimeout(() => setNewPositionId(null), 3000);
@@ -2043,7 +2055,7 @@ export function BOQEditorPage() {
       if (isCmd && !e.shiftKey && (k === 'i' || codeLetter === 'i')) {
         e.preventDefault();
         e.stopPropagation();
-        importInputRef.current?.click();
+        setShowImportPreview(true);
         return;
       }
       // Ctrl+L = Toggle lock/unlock
@@ -4289,6 +4301,7 @@ export function BOQEditorPage() {
 
   const importInputRef = useRef<HTMLInputElement>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [showImportPreview, setShowImportPreview] = useState(false);
 
   const handleImportFile = useCallback(
     async (file: File) => {
@@ -4597,6 +4610,79 @@ export function BOQEditorPage() {
    */
   const [actualsPositionId, setActualsPositionId] = useState<string | null>(null);
 
+  /** Take-off sheet state. The panel reads and computes on its own; this
+   *  page keeps the id because it owns the position mutation the sheet is
+   *  saved through, and a second mutation over the same cache would be one
+   *  writer too many. */
+  const [measurementPositionId, setMeasurementPositionId] = useState<string | null>(null);
+
+  /* ── Issue #435: provenance of the lines of a variation's bill ─────────
+   * Only a bill raised for a variation request carries traces, so the query
+   * is off on every other bill and the grid gets no trace map, which is what
+   * hides the chip and the menu entry there. The map is the request's own
+   * trace rows keyed by position; saving one in the drawer invalidates it,
+   * and the grid repaints the ordinal column when it changes. */
+  const variationRequestId = boq?.variation_request_id ?? null;
+  const variationBoqQ = useQuery({
+    queryKey: ['variations', 'request-boq', variationRequestId],
+    queryFn: () => getVariationRequestBOQ(variationRequestId as string),
+    enabled: Boolean(variationRequestId),
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
+  const variationTraceByPosition = useMemo(() => {
+    const map = new Map<string, VariationBOQTrace>();
+    for (const trace of variationBoqQ.data?.traces ?? []) map.set(trace.position_id, trace);
+    return map;
+  }, [variationBoqQ.data?.traces]);
+  const variationTraceBadges = useMemo<Record<string, VariationLineTraceBadge> | undefined>(() => {
+    if (!variationRequestId) return undefined;
+    const shortFor = (kind: string) =>
+      kind === 'removed'
+        ? t('boq.variation_kind_short_removed', { defaultValue: 'R' })
+        : kind === 'modified'
+          ? t('boq.variation_kind_short_modified', { defaultValue: 'M' })
+          : t('boq.variation_kind_short_added', { defaultValue: 'A' });
+    const out: Record<string, VariationLineTraceBadge> = {};
+    for (const trace of variationTraceByPosition.values()) {
+      const traced = Boolean(trace.contract_line_id || trace.source_position_id);
+      const source = trace.contract_line_id
+        ? t('boq.variation_trace_to_contract_line', { defaultValue: 'a contract line' })
+        : t('boq.variation_trace_to_position', { defaultValue: 'an estimate position' });
+      out[trace.position_id] = {
+        kind: trace.change_kind,
+        traced,
+        short: traced ? shortFor(trace.change_kind) : '?',
+        title: traced
+          ? t('boq.variation_trace_badge_traced', {
+              defaultValue: 'Traced to {{source}} as {{kind}}. Right-click to change.',
+              source,
+              kind: changeKindLabel(trace.change_kind, t).toLowerCase(),
+            })
+          : t('boq.variation_trace_badge_untraced', {
+              defaultValue: 'Not traced to a contract line or estimate position yet. Right-click to trace.',
+            }),
+      };
+    }
+    return out;
+  }, [variationRequestId, variationTraceByPosition, t]);
+  const variationUntracedBadge = useMemo<VariationLineTraceBadge | undefined>(
+    () =>
+      variationRequestId
+        ? {
+            kind: 'added',
+            traced: false,
+            short: '?',
+            title: t('boq.variation_trace_badge_untraced', {
+              defaultValue: 'Not traced to a contract line or estimate position yet. Right-click to trace.',
+            }),
+          }
+        : undefined,
+    [variationRequestId, t],
+  );
+  /** The line whose provenance drawer is open. */
+  const [tracePositionId, setTracePositionId] = useState<string | null>(null);
+
   /** Comment drawer state */
   const [commentPositionId, setCommentPositionId] = useState<string | null>(null);
   const userEmail = useAuthStore((s) => s.userEmail) ?? '';
@@ -4866,7 +4952,7 @@ export function BOQEditorPage() {
           onAddSection={handleAddSection}
           onOpenCostDb={() => setCostDbModalOpen(true)}
           onOpenAssembly={() => setAssemblyModalOpen(true)}
-          onImportClick={() => importInputRef.current?.click()}
+          onImportClick={() => setShowImportPreview(true)}
           isImporting={isImporting}
           importInputRef={importInputRef}
           onImportInputChange={handleImportInputChange}
@@ -5017,6 +5103,10 @@ export function BOQEditorPage() {
           onOpenAICopilot={handleOpenAICopilot}
           onPriceAnalysis={setPriceAnalysisPositionId}
           onShowPositionActuals={setActualsPositionId}
+          onShowMeasurement={setMeasurementPositionId}
+          onTraceLine={variationRequestId ? setTracePositionId : undefined}
+          variationTraces={variationTraceBadges}
+          variationUntracedBadge={variationUntracedBadge}
           aiCopilotPositionId={aiCopilotOpen ? aiCopilotPositionId : null}
           renderInlineCopilot={renderInlineCopilot}
           onAddManualResource={handleAddManualResource}
@@ -5634,6 +5724,59 @@ export function BOQEditorPage() {
         );
       })()}
 
+      {/* ── Measurement sheet ───────────────────────────────────────────
+          Hand measurement with no drawing and no model: units, length, width,
+          height, add or deduct, subtotals and a total. Saving is a normal
+          position update carrying the new quantity and the lines under
+          `metadata.measurement`, which is what the backend documented and why
+          there is no save endpoint for the panel to call. It goes through this
+          page's own mutation rather than one of its own, so the grid's cache
+          is written by a single writer, exactly as the comment drawer does. */}
+      {measurementPositionId && (() => {
+        const pos = boq?.positions.find((p) => p.id === measurementPositionId);
+        if (!pos) return null;
+        return (
+          <MeasurementDrawer
+            position={pos}
+            readOnly={Boolean(boq?.is_locked)}
+            saving={updateMutation.isPending}
+            onClose={() => setMeasurementPositionId(null)}
+            onSave={(quantity, lines) => {
+              updateMutation.mutate({
+                id: pos.id,
+                data: {
+                  quantity,
+                  metadata: {
+                    ...pos.metadata,
+                    measurement: { unit: pos.unit, lines },
+                  },
+                },
+              });
+              setMeasurementPositionId(null);
+            }}
+          />
+        );
+      })()}
+
+      {/* ── Issue #435: provenance of one line of a variation's bill ────
+          Keyed by the position so reopening on another line starts from
+          that line's stored trace rather than the last drawer's edits. */}
+      {tracePositionId && variationRequestId && boq && (() => {
+        const pos = boq.positions.find((p) => p.id === tracePositionId);
+        if (!pos) return null;
+        return (
+          <VariationTraceDrawer
+            key={tracePositionId}
+            variationRequestId={variationRequestId}
+            projectId={boq.project_id}
+            position={pos}
+            trace={variationTraceByPosition.get(pos.id)}
+            readOnly={Boolean(boq.is_locked)}
+            onClose={() => setTracePositionId(null)}
+          />
+        );
+      })()}
+
       {/* ── Comment Drawer ──────────────────────────────────────────── */}
       {commentPositionId && (() => {
         const pos = boq?.positions.find((p) => p.id === commentPositionId);
@@ -5811,6 +5954,12 @@ export function BOQEditorPage() {
         </div>
       )}
       <ConfirmDialog {...confirmProps} />
+      <ImportPreviewDialog
+        open={showImportPreview && !!boqId}
+        onClose={() => setShowImportPreview(false)}
+        boqId={boqId!}
+        onImported={invalidateAll}
+      />
     </div>
   );
 }

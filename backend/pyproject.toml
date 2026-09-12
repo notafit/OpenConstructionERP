@@ -1,6 +1,6 @@
 [project]
 name = "openconstructionerp"
-version = "16.8.0"
+version = "17.4.1"
 description = "Open-source construction cost estimation, multi-currency BOQ, AI vector matching, CAD/BIM takeoff without IfcOpenShell, resource-based cost DB import with example templates, 48 regional catalogues, 29 locales. AGPL-3.0. After install, run: openconstructionerp"
 license = "AGPL-3.0-or-later"
 # The verbatim AGPL-3.0 text, so the wheel conveys the licence it declares.
@@ -120,11 +120,15 @@ dependencies = [
     "structlog>=24.4.0",
     "pyyaml>=6.0",
     "defusedxml>=0.7.1",
-    # Capped below 3.0: pandas 3.0 changed string-column type inference (a
-    # numeric-looking string column now infers as "string" not "numeric"),
-    # which the dashboards integrity detector and its tests were written
-    # against. Revisit and lift the cap when adopting pandas 3 deliberately.
-    "pandas>=2.2.0,<3",
+    # pandas 3 is allowed. It was capped below 3.0 while the dashboards
+    # integrity detector sniffed values only for object columns, which pandas 3
+    # no longer produces for text (it gives the str dtype), so a CSV whose
+    # numbers arrived as text went unflagged. The detector accepts both dtypes
+    # now (see _dtype_says_nothing_about_the_values in dashboards/integrity.py)
+    # and the pandas-touching suites were run green under 3.0.5 before the cap
+    # was lifted on 2026-09-08. Keep the <4 ceiling: a new major gets the same
+    # deliberate run before it is let in.
+    "pandas>=2.2.0,<4",
     "pyarrow>=23.0.1,<26",
     "trimesh>=4.0.0",
     # trimesh's COLLADA loader is a thin wrapper over pycollada (imported as
@@ -372,7 +376,7 @@ dev = [
     # formatter's output, which can shift between ruff releases. A floating
     # spec let CI pick a newer ruff than contributors ran locally, so formatted
     # code still failed the check. Bump this deliberately when adopting a new ruff.
-    "ruff==0.15.20",
+    "ruff==0.16.6",
     "mypy>=1.13.0",
     "pre-commit>=4.0.0",
     "pyinstaller>=6.0.0",
@@ -402,18 +406,76 @@ packages = ["app", "openconstructionerp"]
 # package walk so a stray one under ``app/`` can never reach the wheel even
 # when it is still on disk. scripts/check_repo_hygiene.py enforces the same
 # rule on the built wheel via ``--zip`` as a backstop.
-exclude = ["**/_*.md", "**/_*.txt", "**/__pycache__/**", "**/*.pyc"]
+#
+# The two showcase artefacts below are excluded for size, and the reason they
+# can go is that nothing runs them. PyPI enforces a 10 GiB limit on the TOTAL
+# stored size of a project, separately from the 100 MiB per-file cap that the
+# publish workflow already checks, and 17.0.1 was refused at upload with
+# "Project size too large" against 336 versions and 10164 MiB stored. Roughly
+# 10 MiB had to come off the wheel and these two are 13.23 MiB of it.
+#
+# showcase_snapshot.json.gz is 10.18 MiB and is the single largest file in the
+# wheel. It is the committed output of app/scripts/export_showcase_snapshot.py,
+# a developer tool. Its reader, seed_showcase_from_snapshot, is imported by
+# nothing under app/ and nothing under tests/, is not registered in cli.py, and
+# its own docstring calls it a manual one-off.
+#
+# showcase_geometry/ is 3.05 MiB and its reader seed_showcase_geometry() has no
+# caller anywhere in the repo. This line first said that was a live bug against
+# issue #168, the 404 geometry_missing. Measured since, and it is not: #168 is
+# closed and was fixed by a different route in 5.9.0. seed_flagship.py writes
+# the real geometry blob and marks a model ready only when the blob saved, and
+# the bim_hub router became status aware, so it now returns geometry_missing
+# only when a model really is ready with its blob gone, and the honest
+# geometry_absent otherwise. Users do not hit the original 404 through this path.
+#
+# So this function is dead code paired with dead data, not an unfinished repair.
+# The dataset it would populate comes from showcase_snapshot.json.gz through
+# seed_showcase_from_snapshot, which is equally unwired, so the rows it would
+# attach geometry to are never created on a live install either. Resurrecting
+# the localised showcase means wiring BOTH into boot beside install_demo_project
+# and install_flagship, and that is a product decision rather than a bug fix.
+# Deleting both files is the lower risk option. Until one of those happens, keep
+# the bytes out of the wheel and the sources in the tree.
+#
+# These are excluded from the WHEEL, not deleted from the repo. They are
+# showcase raw material and the input for whoever fixes #168.
+#
+# app/scripts/flagship_assets/ deliberately stays. seed_flagship.py:39 resolves
+# it and main.py:1524 imports install_flagship in the boot sequence, so it is
+# read on every server start, and seed_demo_assets.py reads the same directory
+# from main.py:13441. Both guard with .exists() and swallow failures, so
+# dropping it would not crash anything, it would quietly ship a flagship demo
+# with no geometry and no plan-set PDF. Do not add it to this list to save the
+# other 4.87 MiB.
+exclude = [
+    "**/_*.md",
+    "**/_*.txt",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "app/scripts/showcase_snapshot.json.gz",
+    "app/scripts/showcase_geometry/**",
+]
 
 # The twelve bundled demo site photos are real shipped seed assets, and the
-# package walk was dropping every one of them. .gitignore carries a global
-# ``*.jpg`` for dev screenshots and negates it for exactly this directory with
-# ``!backend/app/scripts/flagship_assets/site_photos/*.jpg``. Git honours that
-# negation, so all twelve are tracked and a CI checkout has them; hatchling's
-# VCS walker reads the same file and does NOT honour negation, so it dropped
-# the photos while ``captions.json`` survived by not matching the glob. The
-# result was a wheel that shipped the captions for twelve pictures it did not
-# carry, and a first run that logged sixty "photos seed: asset missing" lines
-# and left the demo galleries empty.
+# package walk was dropping every one of them. The repo-root .gitignore carries
+# a global ``*.jpg`` for dev screenshots and negates it for exactly this
+# directory. Git honours that negation, so all twelve are tracked and a CI
+# checkout has them; hatchling's VCS walker read the same file and does NOT
+# honour negation, so it dropped the photos while ``captions.json`` survived by
+# not matching the glob. The result was a wheel that shipped the captions for
+# twelve pictures it did not carry, and a first run that logged sixty "photos
+# seed: asset missing" lines and left the demo galleries empty.
+#
+# Since backend/.gitignore exists, that is no longer the live mechanism.
+# hatchling stops its upward search at the nearest .gitignore, so it now reads
+# backend/.gitignore and never sees the repo-root ``*.jpg`` at all, and the
+# photos would survive the walk on their own. This line stays anyway, for two
+# reasons: it costs nothing, and it keeps the wheel correct if anyone ever adds
+# an image rule to backend/.gitignore without knowing these twelve are cargo
+# rather than screenshots. Treat it as belt-and-braces, not as the load-bearing
+# part. The negation itself moved to backend/.gitignore with the rest of the
+# backend rules, where git still honours it.
 #
 # ``artifacts`` is hatchling's mechanism for exactly this: files the VCS
 # ignores that the build must ship anyway. Not force-include, which bypasses

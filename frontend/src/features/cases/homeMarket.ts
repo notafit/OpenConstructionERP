@@ -4,7 +4,7 @@
 // Cases - the market a UI language speaks for, and the ordering that follows.
 //
 // A language is not a country, and this file exists to keep that sentence true
-// rather than to paper over it. Of the languages the product ships, five reach
+// rather than to paper over it. Of the languages the product ships, ten reach
 // a market the catalogue actually has cases for; the rest reach none, and the
 // honest answer for them is the order the catalogue already had.
 //
@@ -21,8 +21,12 @@
 import { SUPPORTED_LANGUAGES } from '@/app/i18n';
 
 /** A language tag as i18next writes it: lower-case base, upper-case region
- *  subtag, at most two parts. Anything unparseable comes back empty. */
-function normalizeLanguageTag(lang: string | null | undefined): string {
+ *  subtag, at most two parts. Anything unparseable comes back empty.
+ *
+ *  Exported for `marketCases.ts`, which reads the same tag through the same
+ *  rule so its nearest-market table and this file's registry lookup can never
+ *  disagree about what `EN-us` or ` de ` means. */
+export function normalizeLanguageTag(lang: string | null | undefined): string {
   if (!lang) return '';
   const parts = lang.trim().split('-');
   const base = (parts[0] ?? '').toLowerCase();
@@ -45,17 +49,27 @@ function normalizeLanguageTag(lang: string | null | undefined): string {
  * never drift apart. It also settles the sharp cases on its own:
  *
  *   - `es` declares `es`, so Spanish reaches the Spanish cases. `es-MX`,
- *     `es-CL` and `es-CO` declare `mx`, `cl` and `co`, none of which the
- *     catalogue has cases for, so they reach none. That is the point rather
- *     than a gap: the Spanish cases implement Spanish public procurement,
- *     FIEBDC-3 and Spanish site paperwork, and leading with them for a Mexican
- *     reader would not merely be unhelpful, it would name a law that does not
- *     apply where they work.
- *   - `pt` and `pt-BR` declare `pt` and `br`, neither of which has cases, so
- *     both reach none. The shape is the same as Spanish; only the counts
+ *     `es-CL` and `es-CO` declare `mx`, `cl` and `co`, and what each of them
+ *     reaches follows the catalogue rather than the language: Mexico has a
+ *     case of its own now, so `es-MX` leads with that, while `es-CL` and
+ *     `es-CO` still reach none. What none of the three reaches is Spain, and
+ *     that is the point rather than a gap: the Spanish cases implement Spanish
+ *     public procurement, FIEBDC-3 and Spanish site paperwork, and leading
+ *     with them for a Mexican reader would not merely be unhelpful, it would
+ *     name a law that does not apply where they work.
+ *   - `pt` and `pt-BR` declare `pt` and `br`. Brazil has a case and Portugal
+ *     does not, so the two have parted company: `pt-BR` reaches Brazil and
+ *     `pt` reaches none. The shape is the same as Spanish; only the counts
  *     differ.
- *   - `en` declares `gb` and `en-US` declares `us`, and the catalogue has both
- *     British and American cases, so the two English entries separate cleanly.
+ *   - `en-GB` declares `gb` and `en-US` declares `us`, and the catalogue has
+ *     both British and American cases, so the two regional English entries
+ *     separate cleanly. Plain `en` declares `xx`, the code for a language not
+ *     tied to a market, and so reaches none: a reader who has said only that
+ *     they read English has not said which country's procurement they work
+ *     under, and leading with either country's cases would answer a question
+ *     they did not ask. This is the one place where reaching no market is the
+ *     deliberate answer for a language rather than the consequence of the
+ *     catalogue having nothing for it.
  *
  * A tag the registry does not list is read through its region subtag instead,
  * and the subtag wins outright rather than falling back to the base language's

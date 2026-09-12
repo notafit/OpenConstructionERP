@@ -445,6 +445,7 @@ teach identifiers that were never rule sets at all.
 | `estimate_audit` | Estimate-level audit checks |
 | `schedule_quality` | Programme quality |
 | `sheet_completeness` | Drawing index against issue register |
+| `project_completeness` | The project record itself: country and currency set, a priced bill in that currency, a base date on every bill, a classification standard, planned dates in order, a client, and a contract or tender once past estimating |
 | `classification_nudge` | Suggests a classification when none is set |
 | `ai_estimator` | Guards on machine-produced estimate lines |
 | `field_time` | Site time capture |
@@ -474,9 +475,9 @@ teach identifiers that were never rule sets at all.
 | `hungary` | Hungarian item orders, material and fee split (HU) |
 
 Modules add more. Anything with a `validators.py` registers its own sets when it
-loads, `formwork` and `carbon_6d` and `project_completeness` among them, and
-several of them register additional rules into sets that already exist. So the
-list an installation actually has is longer than the one above and depends on
+loads, `formwork` and `carbon_6d` among them, and several of them register
+additional rules into sets that already exist. So the list an installation
+actually has is longer than the one above and depends on
 which modules are enabled. Read it from the installation rather than from here
 when it matters, and note that no rule count is published in this table for the
 same reason: the number changes with what is loaded, so it would describe the
@@ -554,14 +555,17 @@ git clone https://github.com/DataDrivenConstruction/openconstructionerp
 cd openconstructionerp
 
 # 2. Editable install of the core + your pack
-pip install -e .
+# The distribution lives in backend/, there is no pyproject.toml at the clone root.
+pip install -e backend
 pip install -e packs/your-pack
 
 # 3. Activate it
 export OE_PARTNER_PACK=your-pack   # PowerShell: $env:OE_PARTNER_PACK="your-pack"
 
-# 4. Run the backend
-openconstructionerp serve --reload
+# 4. Run the backend with autoreload. Autoreload is a uvicorn flag, not one of
+#    ours: the CLI has no --reload, and it serves on 8080 rather than 8000.
+cd backend
+uvicorn app.main:create_app --factory --reload --port 8000
 # Expect log line: "Active partner pack (env-selected): your-pack"
 
 # 5. Hit the API

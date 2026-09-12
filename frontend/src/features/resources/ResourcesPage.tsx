@@ -102,6 +102,8 @@ import { resourcesGuide } from './resourcesGuide';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildResourcesInsights } from './resourcesInsights';
 import { fmtPercent } from '@/shared/lib/formatters';
+import { compareNames } from '@/shared/lib/collator';
+import { useWeekStartsOn, type WeekStartsOn } from '@/shared/lib/weekStart';
 
 type Tab = 'resources' | 'requests' | 'assignments';
 
@@ -155,7 +157,7 @@ function resourceSelectOptions(t: TFn, list: Resource[]): SearchableSelectOption
   return [...list]
     .sort((a, b) => {
       const byKind = (order[a.resource_type] ?? 9) - (order[b.resource_type] ?? 9);
-      return byKind !== 0 ? byKind : a.name.localeCompare(b.name);
+      return byKind !== 0 ? byKind : compareNames(a.name, b.name);
     })
     .map((r) => ({
       value: r.id,
@@ -255,17 +257,26 @@ function resourceErrorMessage(err: unknown): string {
 const inputCls =
   'h-9 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue';
 
-function startOfWeek(): string {
+/**
+ * Midnight on the first day of the current week, in the reader's locale.
+ *
+ * This used to hardcode Monday. It is worth stating why the locale wins here
+ * rather than a fixed company week: the value bounds a "this week" query, so
+ * a reader in Cairo or Tehran asking for this week's conflicts was being
+ * shown a Monday-to-Sunday window their working calendar does not have, and
+ * a conflict on their actual first working day fell outside it. Which days
+ * are worked is a separate question from which day the week starts on, and
+ * this answers only the second.
+ */
+function startOfWeek(weekStartsOn: WeekStartsOn): string {
   const d = new Date();
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  d.setDate(diff);
+  d.setDate(d.getDate() - ((d.getDay() - weekStartsOn + 7) % 7));
   d.setHours(0, 0, 0, 0);
   return d.toISOString();
 }
 
-function endOfWeek(): string {
-  const d = new Date(startOfWeek());
+function endOfWeek(weekStartsOn: WeekStartsOn): string {
+  const d = new Date(startOfWeek(weekStartsOn));
   d.setDate(d.getDate() + 7);
   return d.toISOString();
 }
@@ -499,10 +510,11 @@ export function ResourcesPage() {
     queryFn: () => listResources({ limit: 200 }),
   });
 
+  const weekStartsOn = useWeekStartsOn();
   const conflictsQ = useQuery({
-    queryKey: ['resources', 'conflicts'],
+    queryKey: ['resources', 'conflicts', weekStartsOn],
     queryFn: () =>
-      listBoardConflicts({ start: startOfWeek(), end: endOfWeek() }).catch(
+      listBoardConflicts({ start: startOfWeek(weekStartsOn), end: endOfWeek(weekStartsOn) }).catch(
         () => [] as BoardConflict[],
       ),
     enabled: tab === 'assignments',
@@ -2958,12 +2970,16 @@ function AssignmentsTab({
   // Conflicts panel over the same population. The window starts at the
   // beginning of the current week and extends ~6 months out to cover the
   // "upcoming" assignments the header advertises.
+  // The week start only anchors a six-month window here, so rotating it by a
+  // day changes nothing a reader can see. It follows the locale anyway so
+  // there is one answer in this file rather than two.
+  const boardWeekStartsOn = useWeekStartsOn();
   const boardWindow = useMemo(() => {
-    const start = startOfWeek();
+    const start = startOfWeek(boardWeekStartsOn);
     const end = new Date(start);
     end.setMonth(end.getMonth() + 6);
     return { start, end: end.toISOString() };
-  }, []);
+  }, [boardWeekStartsOn]);
 
   const boardQ = useQuery({
     queryKey: ['resources', 'assignments', 'board', boardWindow.start, boardWindow.end],
@@ -4142,6 +4158,7 @@ function CreateResourceModal({ onClose }: { onClose: () => void }) {
   const addToast = useToastStore((s) => s.addToast);
   const prefCurrency = usePreferencesStore((s) => s.currency);
   const [busy, setBusy] = useState(false);
+  const [touched, setTouched] = useState(false);
   const [form, setForm] = useState({
     code: '',
     name: '',
@@ -4151,16 +4168,18 @@ function CreateResourceModal({ onClose }: { onClose: () => void }) {
     currency: prefCurrency,
   });
 
+  const codeError =
+    touched && !form.code.trim()
+      ? t('validation.required', { defaultValue: 'This field is required' })
+      : undefined;
+  const nameError =
+    touched && !form.name.trim()
+      ? t('validation.required', { defaultValue: 'This field is required' })
+      : undefined;
+
   async function submit() {
-    if (!form.code || !form.name) {
-      addToast({
-        type: 'error',
-        title: t('resources.required_missing', {
-          defaultValue: 'Code and name are required.',
-        }),
-      });
-      return;
-    }
+    setTouched(true);
+    if (!form.code.trim() || !form.name.trim()) return;
     setBusy(true);
     try {
       await createResource({
@@ -4207,7 +4226,7 @@ function CreateResourceModal({ onClose }: { onClose: () => void }) {
       }
     >
       <WideModalSection columns={2}>
-        <WideModalField label={t('resources.code', { defaultValue: 'Code' })} required>
+        <WideModalField label={t('resources.code', { defaultValue: 'Code' })} required error={codeError}>
           <input
             value={form.code}
             onChange={(e) => setForm({ ...form, code: e.target.value })}
@@ -4215,7 +4234,7 @@ function CreateResourceModal({ onClose }: { onClose: () => void }) {
             placeholder="e.g. CR-001"
           />
         </WideModalField>
-        <WideModalField label={t('resources.name', { defaultValue: 'Name' })} required>
+        <WideModalField label={t('resources.name', { defaultValue: 'Name' })} required error={nameError}>
           <input
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -4281,6 +4300,7 @@ function EditResourceModal({
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const [busy, setBusy] = useState(false);
+  const [touched, setTouched] = useState(false);
   const [form, setForm] = useState({
     code: resource.code,
     name: resource.name,
@@ -4291,26 +4311,27 @@ function EditResourceModal({
     notes: resource.notes ?? '',
   });
 
-  async function submit() {
-    if (!form.code.trim() || !form.name.trim()) {
-      addToast({
-        type: 'error',
-        title: t('resources.required_missing', {
-          defaultValue: 'Code and name are required.',
-        }),
-      });
-      return;
-    }
-    const rateNum = Number(form.default_cost_rate);
-    if (Number.isNaN(rateNum) || rateNum < 0) {
-      addToast({
-        type: 'error',
-        title: t('resources.rate_invalid', {
+  const codeError =
+    touched && !form.code.trim()
+      ? t('validation.required', { defaultValue: 'This field is required' })
+      : undefined;
+  const nameError =
+    touched && !form.name.trim()
+      ? t('validation.required', { defaultValue: 'This field is required' })
+      : undefined;
+  const rateNum = Number(form.default_cost_rate);
+  const rateError =
+    touched && (Number.isNaN(rateNum) || rateNum < 0)
+      ? t('resources.rate_invalid', {
           defaultValue: 'Rate must be a non-negative number.',
-        }),
-      });
-      return;
-    }
+        })
+      : undefined;
+
+  const invalid = !form.code.trim() || !form.name.trim() || Number.isNaN(rateNum) || rateNum < 0;
+
+  async function submit() {
+    setTouched(true);
+    if (invalid) return;
     setBusy(true);
     try {
       await updateResource(resource.id, {
@@ -4361,7 +4382,7 @@ function EditResourceModal({
       }
     >
       <WideModalSection columns={2}>
-        <WideModalField label={t('resources.code', { defaultValue: 'Code' })} required>
+        <WideModalField label={t('resources.code', { defaultValue: 'Code' })} required error={codeError}>
           <input
             value={form.code}
             onChange={(e) => setForm({ ...form, code: e.target.value })}
@@ -4370,7 +4391,7 @@ function EditResourceModal({
             data-testid="edit-resource-code"
           />
         </WideModalField>
-        <WideModalField label={t('resources.name', { defaultValue: 'Name' })} required>
+        <WideModalField label={t('resources.name', { defaultValue: 'Name' })} required error={nameError}>
           <input
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -4419,7 +4440,7 @@ function EditResourceModal({
             </option>
           </select>
         </WideModalField>
-        <WideModalField label={t('resources.rate', { defaultValue: 'Rate' })}>
+        <WideModalField label={t('resources.rate', { defaultValue: 'Rate' })} error={rateError}>
           <input
             type="number"
             min={0}

@@ -24,7 +24,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import * as pdfjsLib from 'pdfjs-dist';
+import { closePdf, openPdf, type PageViewport, type PDFDocumentProxy, type RenderTask } from '@/shared/lib/pdfjs';
 import {
   ChevronLeft,
   ChevronRight,
@@ -47,15 +47,6 @@ import {
   type OverlaysResponse,
 } from './api';
 import { pinColor, statusBadgeVariant, type LayerKey } from './layers';
-
-// Configure the pdf.js worker (idempotent; mirrors the punch pin board and the
-// markups annotator so all three share one worker asset).
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url,
-).toString();
-
-type PageViewport = ReturnType<pdfjsLib.PDFPageProxy['getViewport']>;
 
 const ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const BASE_SCALE = 1.3;
@@ -119,7 +110,7 @@ export function PlanRoomViewer({
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
-  const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const pdfRef = useRef<PDFDocumentProxy | null>(null);
 
   const zoom = ZOOM_LEVELS[zoomIdx] ?? 1.0;
 
@@ -131,7 +122,7 @@ export function PlanRoomViewer({
       return;
     }
     let cancelled = false;
-    let loaded: pdfjsLib.PDFDocumentProxy | null = null;
+    let loaded: PDFDocumentProxy | null = null;
     setIsLoading(true);
     setLoadError(false);
     (async () => {
@@ -146,9 +137,9 @@ export function PlanRoomViewer({
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = await res.arrayBuffer();
         if (cancelled) return;
-        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+        const doc = await openPdf(buf).promise;
         if (cancelled) {
-          doc.destroy?.();
+          closePdf(doc);
           return;
         }
         loaded = doc;
@@ -169,7 +160,7 @@ export function PlanRoomViewer({
     })();
     return () => {
       cancelled = true;
-      loaded?.destroy?.();
+      closePdf(loaded);
     };
     // page is intentionally excluded: a page change must not reload the PDF.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -180,7 +171,7 @@ export function PlanRoomViewer({
     const doc = pdfRef.current;
     if (!doc || !canvasRef.current || numPages === 0) return;
     let cancelled = false;
-    let task: ReturnType<pdfjsLib.PDFPageProxy['render']> | null = null;
+    let task: RenderTask | null = null;
     (async () => {
       try {
         const safePage = Math.min(Math.max(1, page), numPages);
@@ -190,11 +181,9 @@ export function PlanRoomViewer({
         const viewport = pdfPage.getViewport({ scale });
         const canvas = canvasRef.current;
         if (!canvas) return;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
         canvas.width = viewport.width;
         canvas.height = viewport.height;
-        task = pdfPage.render({ canvasContext: ctx, viewport });
+        task = pdfPage.render({ canvas, viewport });
         await task.promise;
         if (!cancelled) {
           setPageView({ scale, width: viewport.width, height: viewport.height, viewport });

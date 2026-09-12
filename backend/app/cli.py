@@ -321,17 +321,24 @@ def print_startup_banner(
 ) -> None:
     """Print a friendly multi-line startup banner.
 
-    Shown after the server has bound its socket and is ready to accept
-    connections. Designed to be scanned in under three seconds: what URL
-    to open, how to log in, where the data lives, how to stop.
+    Designed to be scanned in under three seconds: what URL to open, how to log
+    in, where the data lives, how to stop.
+
+    Shown BEFORE uvicorn starts, which is the only place it is called from, so
+    that a boot taking minutes still puts the address and the credentials in
+    front of the user straight away. That is also why the heading says the
+    application is starting rather than that it is running, under no tick: on a
+    first run the server does not answer for a good while yet, and a green tick
+    over "is running" beside an address is an instruction to click now. Somebody
+    who follows it gets a browser error from an install that is working
+    perfectly.
     """
     url = f"http://{host}:{port}"
     bar = _bar()
-    check = _green(_u("✔", "OK"))
     print()
     print(_amber(_BANNER_ART))
     print()
-    print(f"  {bar}  {check} {_bold('OpenConstructionERP is running')}  {_dim('v' + version)}")
+    print(f"  {bar}  {_bold('OpenConstructionERP is starting')}  {_dim('v' + version)}")
     print(f"  {bar}")
     print(f"  {bar}  {_bold('Open in your browser')}")
     print(f"  {bar}     {_amber(url)}")
@@ -537,8 +544,49 @@ def check_data_dir(data_dir: Path) -> Check:
             "Data directory",
             "error",
             f"cannot write to {data_dir}: {exc}",
-            f"Use --data-dir to pick a writable path, e.g. --data-dir {Path.home() / 'openconstructionerp-data'}",
+            # Names the command and not only the flag. A hint that says "use
+            # --data-dir" is read as a command line, and typed as one it is
+            # `openconstructionerp --data-dir ...`, which exits 2: the flag is
+            # declared on the subcommands, never on the top-level parser.
+            f"Start with a writable path, e.g. openconstructionerp serve "
+            f"--data-dir {Path.home() / 'openconstructionerp-data'}",
         )
+
+
+def check_path_length(data_dir: Path) -> Check | None:
+    """Report a Windows install too deep for the bundled PostgreSQL to read itself.
+
+    ``None`` away from Windows, where paths run into the thousands and this line
+    would be noise in a report people read top to bottom. The platform answer
+    comes from ``embedded_pg`` rather than being spelled again here, so the
+    doctor and the boot refusal can never disagree about who they apply to.
+
+    Ungated on the cluster, unlike the refusal in
+    :func:`app.core.embedded_pg.boot`. That one drops to a warning once the
+    cluster exists, because creating the cluster is the step that needs the
+    deepest names and an existing one is not about to be created again. Doctor is
+    where somebody looks after it stops working, and reinstalling into a deeper
+    directory while keeping the data directory lands exactly there, so this one
+    always measures.
+
+    Imported inside the function because this file keeps its top-level imports to
+    the standard library so the CLI starts fast.
+    """
+    from app.core.embedded_pg import path_limit_applies, windows_path_limit_problem
+
+    if not path_limit_applies():
+        return None
+
+    problem = windows_path_limit_problem(data_dir / "pgdata")
+    if problem is None:
+        return Check("Path length", "ok", "Windows can open the bundled PostgreSQL files")
+    return Check(
+        "Path length",
+        "error",
+        f"{problem.directory} is {problem.length} characters, and creating the local database "
+        f"needs {problem.limit} or shorter",
+        problem.message,
+    )
 
 
 def check_port_free(host: str, port: int) -> Check:
@@ -556,7 +604,8 @@ def check_port_free(host: str, port: int) -> Check:
                         "Port available",
                         "error",
                         f"port {port} on {host} is already in use",
-                        f"Stop the other process or use --port {port + 1}",
+                        f"Stop the other process, or start on another port with "
+                        f"openconstructionerp serve --port {port + 1}",
                     )
                 except (OSError, ConnectionRefusedError):
                     pass
@@ -569,7 +618,8 @@ def check_port_free(host: str, port: int) -> Check:
                         "Port available",
                         "error",
                         f"port {port} on {host} is already in use ({exc})",
-                        f"Stop the other process or use --port {port + 1}",
+                        f"Stop the other process, or start on another port with "
+                        f"openconstructionerp serve --port {port + 1}",
                     )
         return Check("Port available", "ok", f"port {port} is free")
     except Exception as exc:
@@ -1166,6 +1216,10 @@ def run_preflight(
         check_locales_bundled(),
         check_env_overrides(),
     ]
+    # Windows only, and the check itself decides that: see check_path_length.
+    path_length = check_path_length(data_dir)
+    if path_length is not None:
+        checks.append(path_length)
     # Base tabular deps (pandas, pyarrow) are ERROR-level: the onboarding
     # load-cwicr endpoint hard-requires them. Run on every preflight so
     # `serve` also catches a broken install before uvicorn spins up.
@@ -1280,14 +1334,25 @@ def cmd_serve(args: argparse.Namespace) -> None:
             data_dir=data_dir,
             serve_frontend=True,
         )
-        print(
-            _dim(
-                _u(
-                    "  Starting server… first run may take up to 30 seconds.",
-                    "  Starting server... first run may take up to 30 seconds.",
-                )
-            )
-        )
+        # No fixed number here, on purpose. This line used to promise thirty
+        # seconds. Timed on a real first boot of the release candidate, GET /
+        # answered after 50.55s and /api/health after about 490s, most of that
+        # last figure being the demo seed, so the promise was out by an order of
+        # magnitude and a stranger who took us at our word sat in front of a
+        # hanging tab for minutes on an install that was working perfectly.
+        #
+        # Replacing it with 490 would only move the lie. Those numbers came off
+        # one Windows machine, the demo seed that dominates them is skipped
+        # under --no-demo, and the next box is a different number again. What
+        # somebody watching a blank tab actually wants is evidence that
+        # something is happening, which the startup log gives them a step at a
+        # time - app.main logs a section header per stage and uvicorn announces
+        # the port when it binds. So this says what the wait is for and points
+        # at the thing that is already telling the truth, and commits only to
+        # the order of magnitude both measurements agree on.
+        print(_dim("  The address above does not answer yet. A first run builds the database, loads the"))
+        print(_dim("  modules and writes the seed data first, which takes minutes rather than seconds."))
+        print(_dim("  Each step is logged below as it finishes. Open the browser once startup is complete."))
         print()
 
     if args.open:
@@ -1310,6 +1375,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     try:
         from app.core.embedded_pg import emit_stage
 
+        emit_stage("migrate", "done", "Database ready")
         emit_stage("server", "start", "Starting the application server")
     except Exception:  # noqa: BLE001
         pass

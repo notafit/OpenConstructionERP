@@ -35,6 +35,7 @@ import hashlib as _hashlib
 import logging
 import os
 import secrets
+import threading
 import time
 import uuid
 import uuid as _instance_uuid
@@ -50,6 +51,8 @@ _INSTANCE_ID = str(_instance_uuid.uuid4())
 _BUILD_PEPPER = bytes(b ^ 0x55 for b in (b"\x11\x11\x16\x78\x16\x02\x1c\x16\x07\x78\x1a\x10\x78\x67\x65\x67\x63"))
 _BUILD_HASH = _hashlib.sha256(_BUILD_PEPPER + f"DDC-CWICR-OE-{_INSTANCE_ID}".encode()).hexdigest()[:16]
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC
 from pathlib import Path
 
@@ -64,6 +67,7 @@ from app.config import (
     get_settings,
     jwt_secret_is_known_weak,
     jwt_secret_is_too_short,
+    load_or_create_dev_jwt_secret,
 )
 from app.core.demo_read_only import (
     DemoReadOnlyError,
@@ -71,7 +75,24 @@ from app.core.demo_read_only import (
     read_only_refusal,
 )
 from app.core.deployment_posture import build_data_security_posture
+from app.core.host_disclosure import without_host_fields
 from app.core.module_loader import module_loader
+
+# How many CHECK and FOREIGN KEY constraints in this schema have never been
+# verified against the rows that were already in the table when they arrived.
+# Imported rather than spelled here, and re-exported under this name because
+# that is where the test suite reads it: the sweep in that module is what drains
+# this population and ``/api/health`` counts what is left of it, and two
+# hand-kept copies of one predicate is how a green field ends up counting a
+# different set from the one the fix empties.
+#
+# Kept as a named constant, not a literal at the call site, because the call
+# site's failure is swallowed by design: a query that stopped parsing would
+# leave the health field at ``None`` on every boot, and ``None`` is a value that
+# field is supposed to have. The thing that would hide the breakage is exactly
+# the thing this constant exists to remove, so the statement is somewhere a test
+# can execute it.
+from app.core.postgres_migrator import UNVALIDATED_CONSTRAINTS_SQL
 from app.core.self_upgrade import (
     FROZEN_REFUSAL,
     claim_upgrade,
@@ -80,9 +101,11 @@ from app.core.self_upgrade import (
     repair_hint,
     run_upgrade,
 )
-from app.dependencies import RequireRole, get_current_user_id, rls_request_context
+from app.dependencies import OptionalUserPayload, RequireRole, get_current_user_id, rls_request_context
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from app.core.data_repairs import DataRepairReport
 
 logger = logging.getLogger(__name__)
@@ -210,6 +233,355 @@ def _expected_alembic_head(ini_path: os.PathLike[str] | str) -> str | None:
     # next call tries again instead of reporting a permanent unknown.
     _ALEMBIC_HEAD_CACHE = (key, head)
     return head
+
+
+#: The environment variable that asks a boot to pre-build the OpenAPI document.
+#: Named here so the boot and the test that pins the default read the same
+#: string; a gate whose spelling lives only at its call site is a gate that gets
+#: tested against a variable nobody sets.
+PRIME_OPENAPI_SCHEMA_ENV = "OE_PRIME_OPENAPI_SCHEMA"
+
+
+def should_prime_openapi_schema(
+    *,
+    fast_startup: bool,
+    openapi_url: str | None,
+    env: "Mapping[str, str] | None" = None,
+) -> bool:
+    """Should this boot build the OpenAPI document before anybody asks for it?
+
+    Off unless asked, and that is the answer this function exists to state
+    rather than bury. Building the document takes 73.0s on this stand for 2923
+    paths, and it is CPU-bound Python on a worker thread, which is not the same
+    as being out of the way: measured on a boot with the prime opted back in and
+    nothing else running, the first request to arrive after the port opened took
+    64.6s, and the two after it 2.3s and 2.2s, before latency settled at 0.15s.
+    The process is starved for most of the build and eases only at its end.
+
+    Its only consumers are ``/api/docs``, ``/api/redoc`` and
+    ``/api/openapi.json``, none of which a desktop user or a
+    ``openconstructionerp serve`` operator opens on the way in. So the old
+    default spent a minute of a core, in the window where somebody is watching a
+    splash screen, filling a cache that install would never read.
+
+    Nothing about the build changed. ``_custom_openapi`` still caches it, still
+    holds one builder at a time, and still rebuilds when the route table moves,
+    so the first visitor to the reference pages pays for it there instead - the
+    behaviour this deployment had before the prime existed. An operator who
+    serves those pages to other people sets the variable and gets the prime back
+    exactly as it was, including the starved minute; that is what opting in
+    buys, and it is worth buying only where the reference pages have readers.
+
+    Args:
+        fast_startup: Whether ``OE_TEST_FAST_STARTUP`` is on. The suite builds
+            this application repeatedly and has never wanted the document.
+        openapi_url: ``app.openapi_url``. ``None`` in production, where
+            BUG-394 keeps the route map off a public deployment and takes
+            ``/api/docs`` and ``/api/redoc`` with it, leaving the document
+            without a single consumer that could serve it.
+        env: The environment to read, for tests. Defaults to the real one.
+
+    Returns:
+        ``True`` only when an operator asked for it AND something in this
+        process could serve the result.
+    """
+    environ = os.environ if env is None else env
+    asked = environ.get(PRIME_OPENAPI_SCHEMA_ENV, "").strip().lower() in {"1", "true", "yes"}
+    return asked and not fast_startup and bool(openapi_url)
+
+
+def serve_openapi_document_off_the_event_loop(app: FastAPI) -> bool:
+    """Replace FastAPI's own document route with one that builds on a worker thread.
+
+    The route FastAPI adds for ``openapi_url`` in ``FastAPI.setup()`` is an
+    ``async`` handler that calls ``app.openapi()`` inline. So the first
+    request for the document, which is what opening /api/docs or /api/redoc
+    sends, runs the whole build on the event loop, and the process answers
+    nothing else until it is done. Measured on the published 17.0.2 wheel on
+    this stand: the build took 52.5s on an idle 16.9.0 install and 113.6s and
+    139.7s on two 17.0.2 installs, and a ``GET /api/health`` issued during one
+    of those builds came back after 71.5s, exactly when the build ended,
+    against 0.05s at any other time. The health endpoint is what the desktop
+    shell polls to decide whether a backend is alive, so one visitor opening
+    the API reference could make the shell conclude the backend had hung.
+
+    The replacement hands the build to a worker thread and serialises the
+    6.75 MB body there too, then swaps into the same position in the route
+    table, because the frontend's catch-all is mounted later and a route
+    appended after it would never be reached. ``_custom_openapi`` keeps its
+    cache and its lock, so concurrent first callers still share one build and
+    every later request is served from the cache. A thread does not escape the
+    GIL: while a build runs the loop is slowed, not stopped, and a request
+    queued behind it no longer waits for the build to end. Whoever asked for
+    the document waits as before, and the build is logged with its duration.
+
+    Args:
+        app: The application whose ``openapi_url`` route is to be replaced.
+
+    Returns:
+        ``True`` when a route was replaced, ``False`` when the app has no
+        ``openapi_url`` (production, BUG-394) or FastAPI registered none.
+    """
+    import json
+
+    from starlette.concurrency import run_in_threadpool
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    openapi_url = app.openapi_url
+    if not openapi_url:
+        return False
+    for index, route in enumerate(app.router.routes):
+        if getattr(route, "path", None) == openapi_url and getattr(route, "include_in_schema", True) is False:
+            break
+    else:
+        return False
+
+    async def _openapi_document(request: Request) -> Response:
+        root_path = request.scope.get("root_path", "").rstrip("/")
+
+        def _build_body() -> tuple[bytes, float, int]:
+            started = time.perf_counter()
+            schema = app.openapi()
+            elapsed = time.perf_counter() - started
+            # The same root_path handling FastAPI's own handler does, on a
+            # copy, so the cached document is not changed by one request.
+            if root_path and app.root_path_in_servers:
+                server_urls = {server.get("url") for server in schema.get("servers", [])}
+                if root_path not in server_urls:
+                    schema = dict(schema)
+                    schema["servers"] = [{"url": root_path}, *schema.get("servers", [])]
+            # JSONResponse's exact rendering, so the bytes are the ones FastAPI
+            # would have sent; done here rather than on the loop because the
+            # body is 6.75 MB.
+            body = json.dumps(
+                schema,
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=None,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return body, elapsed, len(schema.get("paths", {}))
+
+        body, elapsed, path_count = await run_in_threadpool(_build_body)
+        # A cache hit returns in milliseconds; a build takes tens of seconds.
+        if elapsed >= 1.0:
+            logger.info("OpenAPI document built in %.1fs (%d paths), off the event loop", elapsed, path_count)
+        return Response(content=body, media_type="application/json")
+
+    app.router.routes[index] = Route(openapi_url, _openapi_document, include_in_schema=False)
+    return True
+
+
+#: The path the route-table warm-up asks for. It has to match nothing, because
+#: matching nothing is what forces the router to consider every route it holds.
+#: Named rather than spelled at the call site so the test that pins this can ask
+#: for the same thing the boot does.
+ROUTE_TABLE_WARMUP_PATH = "/__oe_route_table_warmup__"
+
+#: How often the startup heartbeat repeats which phase the boot is in.
+#:
+#: Matches ``_RECOVERY_HEARTBEAT_SECONDS`` in ``app/core/embedded_pg.py``, which
+#: does the same job for the phase before this process configures logging. The
+#: two are deliberately the same number: together they are one claim, that no
+#: phase of a working boot is silent for longer than this.
+_BOOT_HEARTBEAT_SECONDS = 15.0
+
+#: How long a single startup phase may keep reporting itself before the
+#: heartbeat stops vouching for it.
+#:
+#: This is the part that keeps the repair from becoming a worse bug than the one
+#: it fixes. The desktop launcher gives up on a sidecar that has written nothing
+#: for four minutes, and that rule is the only thing that catches a boot wedged
+#: with no error to report; a heartbeat with no end would disable it outright.
+#:
+#: The budget is per phase and not per boot, because a boot that keeps reaching
+#: new phases is demonstrably working and should be waited for however long it
+#: takes. A phase that is still running after this long is not slow, it is
+#: stuck: the whole quiet-machine boot reaches the open port in about 143s, and
+#: the longest phase measured under load is the route-table build at 58.6s. So
+#: reporting stops, the launcher's own limit fires four minutes later, and the
+#: total stays well inside the twenty-minute ceiling the launcher enforces
+#: separately.
+_BOOT_PHASE_BUDGET_SECONDS = 600.0
+
+#: The startup phase running right now, and when it started.
+#:
+#: Written by :func:`_set_boot_phase` from the section headers the boot log
+#: already prints, so the heartbeat names the same step the operator reads
+#: rather than inventing a second vocabulary for it.
+_boot_phase: str = ""
+_boot_phase_started: float = 0.0
+
+
+def _set_boot_phase(name: str) -> None:
+    """Record which startup phase is running, and restart its clock.
+
+    Also emits a ``STAGE:server:progress`` marker so the desktop splash
+    screen shows which startup sub-phase is active. By the time
+    ``_startup_impl`` runs inside uvicorn the active splash stage is
+    ``server`` (``cli.py`` has already emitted ``server:start``), so every
+    emission here must name ``server``, not ``migrate``.
+    """
+    global _boot_phase, _boot_phase_started
+    _boot_phase = name
+    _boot_phase_started = time.monotonic()
+    try:
+        from app.core.embedded_pg import emit_stage
+
+        emit_stage("server", "progress", name)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@contextmanager
+def _heartbeat_through_startup() -> Iterator[None]:
+    """Say which phase startup is in, for as long as startup is running.
+
+    The desktop launcher decides a backend has stopped when nothing has been
+    written for four minutes. It cannot use the listening port for this, because
+    uvicorn binds only after this lifespan returns, so for the whole of startup
+    the only evidence that anything is happening is what this process writes.
+
+    Several startup phases are long and internally silent. Building the route
+    table takes 32.1s on a quiet machine and 58.6s under load, and it writes one
+    line when it finishes; the module load, the migrations and first-run seeding
+    are the same shape. None of those is close to four minutes today, so this is
+    not a fix for a failure that is happening. It is the general form of one
+    that did happen, in the phase before this process configures logging: any
+    phase that outgrows the limit takes a working boot down with it, and the
+    honest requirement is that no phase is silent for longer than the interval,
+    not that the phases we have measured are short enough.
+
+    A thread, not an ``asyncio`` task, and the difference is not stylistic. The
+    route-table build runs on the event loop and does not yield: a health check
+    issued alongside it answered 33.9 seconds later, which is the measurement
+    that made it worth moving. Anything scheduled on the loop is therefore
+    starved for exactly the phase that most needs reporting, so the reporter has
+    to sit outside the loop entirely.
+
+    It reports and does not do: one log line every fifteen seconds adds no work
+    to the boot and does not delay the port by any amount. That is deliberate,
+    because the reason the route table moved here in the first place was to make
+    the first page fast.
+    """
+    stop = threading.Event()
+    _set_boot_phase("startup")
+
+    def tick() -> None:
+        while True:
+            # Read the interval each turn rather than binding it once, and wait
+            # on the event rather than sleeping, so startup finishing ends this
+            # at once instead of after one more full interval.
+            if stop.wait(_BOOT_HEARTBEAT_SECONDS):
+                return
+            elapsed = time.monotonic() - _boot_phase_started
+            # Over budget means stuck, and a stuck boot has to be allowed to
+            # look stuck. Skipping the turn rather than ending the thread is
+            # what lets a phase that does eventually move on be reported again,
+            # while a phase that never moves stays silent for good.
+            if elapsed >= _BOOT_PHASE_BUDGET_SECONDS:
+                continue
+            phase_msg = f"{_boot_phase or 'startup'} ({int(elapsed)}s)"
+            logger.info("Still working: %s", phase_msg)
+            try:
+                from app.core.embedded_pg import emit_stage
+
+                emit_stage("server", "progress", phase_msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    worker = threading.Thread(target=tick, name="oe-boot-heartbeat", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        # Bounded so a wedged reporter can never hold up the boot it reports on.
+        worker.join(timeout=5.0)
+
+
+async def warm_route_table(app: FastAPI) -> float:
+    """Build the router's per-route state, and report how long it took.
+
+    FastAPI does not build a route's dependant tree, its response field or its
+    operation id when the route is registered. It builds them the first time a
+    request reaches route matching, for every route at once, under a lock -
+    ``_EffectiveRouteContext.from_api_route`` on each candidate, which compiles
+    a regex per operation id and runs ``get_dependant`` over every signature.
+    With ~190 module routers mounted that is a large one-off cost, and until
+    this existed it was paid inside the first request to arrive.
+
+    Measured on this stand, warm data directory, OpenAPI priming off: the first
+    request after boot took 32.1s and the second took 0.04s. The path did not
+    matter - ``GET /`` is a static ``index.html`` that touches no database and
+    no dependency, and it paid the full 32s exactly as ``/api/health`` did when
+    it happened to arrive first. The work runs on the event loop, so everything
+    else queued behind it: a health check issued at the same moment as that
+    first request answered 33.9s later, five times the desktop launcher's own
+    12s probe deadline. From outside, a port that accepts a connection and then
+    says nothing for half a minute is indistinguishable from a hung process,
+    which is precisely what a watchdog is built to kill.
+
+    Doing it here does not make the work cheaper and is not meant to. It moves
+    it to the one place where nobody is waiting on a socket: uvicorn binds the
+    listening socket only after the startup lifespan returns, so a client either
+    cannot connect yet - which every launcher and healthcheck already handles,
+    and which the boot log is narrating a step at a time - or connects to a
+    process that answers immediately.
+
+    The warm-up is a synthetic ASGI request rather than a call into FastAPI's
+    internals, so it exercises whatever the real first visitor would exercise
+    and keeps working if the private names behind it are renamed. It is aimed at
+    :data:`ROUTE_TABLE_WARMUP_PATH`, which matches nothing, because a request
+    that matches nothing is the one that forces every candidate to be built. It
+    is sent to ``app.router`` and not to ``app``: the middleware stack has
+    nothing to warm and would only put a fictitious request in the slow-request
+    log and the access log.
+
+    Args:
+        app: The application whose router to warm. Every router this process
+            will mount must be mounted already, or the ones that follow pay
+            their own share on the first request that arrives after them.
+
+    Returns:
+        Seconds spent. Never raises: a warm-up that fails leaves exactly the
+        behaviour that existed before it, which is that the first request pays.
+    """
+    started = time.perf_counter()
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": ROUTE_TABLE_WARMUP_PATH,
+        "raw_path": ROUTE_TABLE_WARMUP_PATH.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [],
+        "client": None,
+        "server": None,
+    }
+
+    async def _receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def _send(message: dict[str, Any]) -> None:
+        # The 404 this produces is the point of the exercise, not a result
+        # anybody wants. Dropping it keeps the warm-up off the wire entirely.
+        return None
+
+    try:
+        await app.router(scope, _receive, _send)
+    except Exception:
+        # Never fail a boot over a warm-up. The cost simply goes back where it
+        # was, onto whoever knocks first.
+        logger.warning("Route table warm-up did not finish; the first request will pay for it", exc_info=True)
+
+    return time.perf_counter() - started
 
 
 def _database_target() -> str:
@@ -1385,8 +1757,24 @@ def create_app() -> FastAPI:
             "name": "AGPL-3.0-or-later · DDC-CWICR-OE-2026",
             "url": "https://www.gnu.org/licenses/agpl-3.0.html",
         },
-        docs_url="/api/docs" if not settings.is_production else None,
-        redoc_url="/api/redoc" if not settings.is_production else None,
+        # Both reference pages are registered by hand further down instead of
+        # by FastAPI, so they can load their CSS and JS from this install
+        # rather than from a CDN. Everything else about the routes is
+        # unchanged - the replacements call the same ``get_swagger_ui_html``
+        # and ``get_redoc_html`` with the same arguments and only swap the
+        # asset URLs.
+        docs_url=None,
+        redoc_url=None,
+        # Swagger UI draws whatever the document holds, and this document holds
+        # 2923 paths, 3938 operations and 3601 component schemas. Left on the
+        # stock settings the page expands every operation and the whole model
+        # list on load: measured in headless Chromium against this app, 130.5s
+        # from navigation to the first operation appearing, which is the "blank
+        # page" an operator actually experiences and is not something caching
+        # the schema on the server can fix. Collapsed, the browser lays out 365
+        # tag headers instead of 3938 operation bodies, and the models section
+        # is built when somebody asks for it rather than on every load.
+        swagger_ui_parameters={"docExpansion": "none", "defaultModelsExpandDepth": -1},
         # BUG-394: don't expose the full OpenAPI schema in production - it
         # hands attackers a route/parameter enumeration map of every endpoint,
         # including rarely-exercised admin surfaces. Dev still gets it for
@@ -1462,6 +1850,63 @@ def create_app() -> FastAPI:
     app.state.schema_matches_models = None
     app.state.schema_divergent_columns = ()
 
+    # ── And whether that question was ever answered ──────────────────────
+    # The field above has three states and two of them were sharing a value.
+    # Its ``None`` said "never asked", and the check that fills it catches
+    # everything it can raise and leaves the field alone - so a diagnostic that
+    # crashed published exactly what a deployment with no PostgreSQL publishes,
+    # and no reader could tell "this database is not one I check" from "I tried
+    # to look and could not". That is the whole failure this file keeps finding
+    # in other shapes: an absent answer wearing a reassuring one's clothes.
+    #
+    # Three states of its own, polarity of the ``_failed`` fields beside it:
+    # ``True`` the check raised, ``False`` it ran to a verdict, ``None`` it was
+    # never reached. Read with ``is True``. It does not degrade the status - a
+    # diagnostic whose own bug takes it down says nothing about the deployment,
+    # and degrading on it would report our defects as the operator's.
+    app.state.schema_match_check_failed = None
+
+    # ── Constraints the boot could not get verified ──────────────────────
+    # The divergence check above asks about nullability and only about
+    # nullability, while the heal has two other ways to leave the database
+    # short of what the models declare: it adds every CHECK and FOREIGN KEY as
+    # ``NOT VALID``, and until the validation pass landed nothing ever ran
+    # ``VALIDATE CONSTRAINT``. So ``schema_matches_models`` could answer
+    # ``True`` on a database holding rows that violate a constraint the models
+    # declare - and worse than unverified, those rows are unwritable, because
+    # a CHECK is re-evaluated on every UPDATE of a row whatever column the
+    # update names. This says so.
+    #
+    # Published as a fact of its own and NOT folded into
+    # ``schema_matches_models``: one field answers one question, and this one
+    # is answered by a catalog column rather than by a model comparison.
+    #
+    # Three states: ``True`` every CHECK and FOREIGN KEY in this schema is
+    # validated, ``False`` at least one is not, ``None`` nobody asked. A
+    # determinable ``False`` degrades - see the endpoint for why that only
+    # became defensible once the boot started validating.
+    app.state.schema_constraints_validated = None
+
+    # ── Did this database arrive holding tables it never recorded ────────
+    # Asked before any DDL, because ``create_all`` makes it unanswerable, and
+    # until now the answer was a local variable that reached the stamp and
+    # nothing else. What that cost: this cohort records no revision, so
+    # ``alembic_head_matches`` publishes ``None`` for it, and ``None`` is what a
+    # desktop bundle carrying no migration tree publishes too - the one
+    # population that cannot vouch for its schema reads identical to the one
+    # that was never asked to.
+    #
+    # Three states: ``True`` it held application tables and named no revision,
+    # ``False`` it did not, ``None`` the question could not be put. It does NOT
+    # degrade, and the reason is a cohort the predicate cannot separate out:
+    # ``True`` is equally what an install gets whose schema ``create_all`` built
+    # correctly and whose stamp write then failed - that failure is caught and
+    # logged further down, and the boot after it sees tables with no revision
+    # and refuses the stamp, permanently. Degrading here would pin a current
+    # schema to degraded for the life of the database on the strength of one
+    # lost write.
+    app.state.arrived_populated_unstamped = None
+
     # ── Boot-time data-repair verdict ────────────────────────────────────
     # Same three states, for the same reason, about the other half of an
     # upgrade. The heal above moves the SCHEMA; it rewrites no rows, so a
@@ -1500,29 +1945,191 @@ def create_app() -> FastAPI:
     # are valid per the OpenAPI spec and ignored by every generator /
     # client (incl. openapi-typescript), so the API surface is unchanged.
     # The token bytes XOR-decode (key 0x55) to the authorship marker.
+    import threading as _threading
+
     from fastapi.openapi.utils import get_openapi as _get_openapi
 
+    # Building this document walks every mounted route and every model behind
+    # it, and with the module loader mounting ~190 routers that is not a small
+    # job: 2922 paths and 3601 component schemas, and 140.97s to assemble on
+    # the 16.8.0 stand, measured from the server's own slow-request log. It
+    # runs on the event loop, so the process answers nothing at all while it
+    # happens. The result was already cached here, but only lazily, by whoever
+    # asked for it first, which meant the first visitor to /api/docs after
+    # every restart paid the whole 141s and froze the app for everyone else
+    # meanwhile. Every later request was served from the cache in about half a
+    # second, so generation outweighed serialising the 6.75 MB body by roughly
+    # 235 to 1. The prime at the end of the startup lifespan fills the cache
+    # off the event loop so that first request is never the one that pays.
+    _openapi_build_lock = _threading.Lock()
+
+    def _routes_version() -> int | None:
+        """Return the router's route-table counter, or ``None`` if unavailable.
+
+        FastAPI keys its own schema cache on this counter and rebuilds when it
+        moves. Here that invalidation is load-bearing rather than decorative:
+        modules mount their routers during the startup lifespan, and
+        ``enable_module`` mounts one at runtime, long after boot. A cache keyed
+        on nothing but "is it populated" pins the first document forever, so a
+        module enabled later never appears in the docs at all.
+
+        Private FastAPI API, hence the getattr. If a future release drops it
+        this returns ``None`` on both sides of the comparison, which degrades
+        to "serve the cache until something clears it" - exactly what this
+        override did before, so the fallback is the old behaviour rather than
+        a new failure.
+        """
+        getter = getattr(app.router, "_get_routes_version", None)
+        return getter() if callable(getter) else None
+
     def _custom_openapi() -> dict[str, Any]:
-        if app.openapi_schema:
+        version = _routes_version()
+        if app.openapi_schema is not None and app._openapi_routes_version == version:
             return app.openapi_schema
-        schema = _get_openapi(
-            title=app.title,
-            version=app.version,
-            description=app.description,
-            routes=app.routes,
-            contact=app.contact,
-            license_info=app.license_info,
-        )
-        _oa_tok = bytes(
-            b ^ 0x55 for b in b"\x11\x11\x16\x78\x16\x02\x1c\x16\x07\x78\x1a\x10\x78\x67\x65\x67\x63"
-        ).decode("ascii")
-        schema.setdefault("info", {})
-        schema["info"]["x-ddc-origin"] = "OpenConstructionERP · DataDrivenConstruction · " + _oa_tok
-        schema["info"]["x-ddc-author"] = "Artem Boiko <info@datadrivenconstruction.io>"
-        app.openapi_schema = schema
-        return schema
+        # One builder at a time. The startup prime runs on a worker thread, so
+        # without this a request arriving mid-build starts a second, equally
+        # expensive build beside it: two 141s passes competing for the same
+        # core on a 2 GB VPS. Whoever loses the race re-checks under the lock
+        # and takes the document the winner just cached.
+        with _openapi_build_lock:
+            version = _routes_version()
+            if app.openapi_schema is not None and app._openapi_routes_version == version:
+                return app.openapi_schema
+            schema = _get_openapi(
+                title=app.title,
+                version=app.version,
+                description=app.description,
+                routes=app.routes,
+                contact=app.contact,
+                license_info=app.license_info,
+            )
+            _oa_tok = bytes(
+                b ^ 0x55 for b in b"\x11\x11\x16\x78\x16\x02\x1c\x16\x07\x78\x1a\x10\x78\x67\x65\x67\x63"
+            ).decode("ascii")
+            schema.setdefault("info", {})
+            schema["info"]["x-ddc-origin"] = "OpenConstructionERP · DataDrivenConstruction · " + _oa_tok
+            schema["info"]["x-ddc-author"] = "Artem Boiko <info@datadrivenconstruction.io>"
+            app.openapi_schema = schema
+            app._openapi_routes_version = version
+            return schema
 
     app.openapi = _custom_openapi  # type: ignore[method-assign]
+    # The route FastAPI registered for that document calls it on the event
+    # loop, which is the 71.5s health stall measured on the 17.0.2 wheel; see
+    # the function for the numbers. Swapped here, right after the builder it
+    # wraps, so the two are read together.
+    serve_openapi_document_off_the_event_loop(app)
+
+    # ── The API reference pages, served from this install ────────────────
+    # FastAPI's stock /api/docs pulls swagger-ui-bundle.js and swagger-ui.css
+    # from cdn.jsdelivr.net, and its stock /api/redoc pulls
+    # redoc.standalone.js from the same place, so both pages render as an
+    # empty shell anywhere without outbound internet. A self-hosted VPS is
+    # what this platform is for and an air-gapped site is a normal deployment,
+    # so the files ship in the wheel instead: 2.84 MB on disk, about 765 KB of
+    # the archive once deflated, and no new dependency. Versions are pinned -
+    # swagger-ui-dist 5.32.15 and redoc 2.5.3 - because the stock templates
+    # ask for "@5" and "@2", which are moving targets.
+    #
+    # One route serves both pages, so "docs" in the asset path means the API
+    # reference rather than the Swagger page specifically. The subdirectory
+    # comes from the table rather than from the URL, which is what keeps the
+    # caller from choosing a directory.
+    _DOCS_DIR = Path(__file__).parent / "static"
+    _DOCS_ASSETS = {
+        "swagger-ui-bundle.js": ("swagger", "application/javascript"),
+        "swagger-ui.css": ("swagger", "text/css"),
+        "redoc.standalone.js": ("redoc", "application/javascript"),
+    }
+
+    if not settings.is_production:
+        from fastapi import Request as _Request
+        from fastapi.openapi.docs import get_redoc_html as _get_redoc_html
+        from fastapi.openapi.docs import get_swagger_ui_html as _get_swagger_ui_html
+        from fastapi.openapi.docs import (
+            get_swagger_ui_oauth2_redirect_html as _get_swagger_ui_oauth2_redirect_html,
+        )
+        from fastapi.responses import FileResponse as _FileResponse
+        from fastapi.responses import HTMLResponse as _HTMLResponse
+        from fastapi.responses import Response as _Response
+
+        async def _docs_asset(req: _Request) -> _Response:
+            # Matched against the three names by hand rather than mounted as a
+            # directory: a StaticFiles mount would put path traversal between
+            # the network and the installed package for the sake of three files.
+            # Returned rather than raised, so an unknown name stays a 404
+            # instead of reaching the SPA handler and coming back as index.html.
+            entry = _DOCS_ASSETS.get(req.path_params.get("filename", ""))
+            if entry is None:
+                return _Response(status_code=404)
+            subdir, media_type = entry
+            return _FileResponse(
+                _DOCS_DIR / subdir / req.path_params["filename"],
+                media_type=media_type,
+                # Version-pinned bytes that only change when the wheel does.
+                headers={"Cache-Control": "public, max-age=31536000, immutable"},
+            )
+
+        async def _swagger_ui_html(req: _Request) -> _HTMLResponse:
+            # The same call FastAPI's own route makes, with the same root_path
+            # handling, differing only in where the two assets come from.
+            root_path = req.scope.get("root_path", "").rstrip("/")
+            oauth2_redirect_url = app.swagger_ui_oauth2_redirect_url
+            if oauth2_redirect_url:
+                oauth2_redirect_url = root_path + oauth2_redirect_url
+            return _get_swagger_ui_html(
+                openapi_url=root_path + (app.openapi_url or "/api/openapi.json"),
+                title=f"{app.title} - Swagger UI",
+                oauth2_redirect_url=oauth2_redirect_url,
+                init_oauth=app.swagger_ui_init_oauth,
+                swagger_ui_parameters=app.swagger_ui_parameters,
+                swagger_js_url=f"{root_path}/api/docs/assets/swagger-ui-bundle.js",
+                swagger_css_url=f"{root_path}/api/docs/assets/swagger-ui.css",
+                # The stock default is fastapi.tiangolo.com, a third outbound
+                # request on a page that is meant to work without a network.
+                swagger_favicon_url=f"{root_path}/favicon.svg",
+            )
+
+        async def _redoc_html(req: _Request) -> _HTMLResponse:
+            # Same shape as the Swagger replacement above, and the same
+            # root_path handling FastAPI's own ReDoc route does, so the page
+            # keeps working behind a prefix.
+            root_path = req.scope.get("root_path", "").rstrip("/")
+            return _get_redoc_html(
+                openapi_url=root_path + (app.openapi_url or "/api/openapi.json"),
+                title=f"{app.title} - ReDoc",
+                redoc_js_url=f"{root_path}/api/docs/assets/redoc.standalone.js",
+                # The stock default is fastapi.tiangolo.com.
+                redoc_favicon_url=f"{root_path}/favicon.svg",
+                # Dropped rather than vendored. The stock page also pulls a
+                # Montserrat and Roboto stylesheet from fonts.googleapis.com,
+                # which then pulls the faces themselves from fonts.gstatic.com;
+                # off, ReDoc falls back to the system sans-serif. Shipping the
+                # two families to keep the headings on brand would cost more
+                # than the application bundle does and buy a font.
+                with_google_fonts=False,
+            )
+
+        async def _swagger_ui_redirect(req: _Request) -> _HTMLResponse:
+            return _get_swagger_ui_oauth2_redirect_html()
+
+        # ``add_route`` rather than ``@app.get``, because that is what FastAPI
+        # itself uses for these four and it is the difference between a plain
+        # Starlette route and one carrying the app-level dependencies declared
+        # above. Documentation should not be running the read-only guard or
+        # binding an RLS tenant, and the route it replaces never did.
+        app.add_route("/api/docs/assets/{filename}", _docs_asset, methods=["GET"], include_in_schema=False)
+        app.add_route("/api/docs", _swagger_ui_html, methods=["GET"], include_in_schema=False)
+        app.add_route("/api/redoc", _redoc_html, methods=["GET"], include_in_schema=False)
+        if app.swagger_ui_oauth2_redirect_url:
+            # FastAPI registers this one inside the same block as its docs
+            # route, so taking that route over means taking this one with it.
+            app.add_route(
+                app.swagger_ui_oauth2_redirect_url,
+                _swagger_ui_redirect,
+                methods=["GET"],
+                include_in_schema=False,
+            )
 
     # ── Middleware ───────────────────────────────────────────────────────
     cors_origins = settings.cors_origins
@@ -2095,6 +2702,32 @@ def create_app() -> FastAPI:
             logger.warning("Alembic head check failed: %s", _exc)
             result["alembic_head_matches"] = None
 
+        # Why that answer is ``null`` here, which the field above cannot say.
+        # It goes ``null`` for three unrelated populations - no migration tree
+        # shipped, no revision ever recorded, the check itself blew up - and one
+        # of the three is a database that held application tables and named no
+        # revision when this process started. That cohort is the one whose
+        # schema nothing can vouch for: ``create_all`` builds the tables that
+        # are wholly absent and alters none of the ones already there, so it is
+        # left part-migrated, and the missing revision was the only thing that
+        # ever said so. The boot refuses to stamp it for exactly that reason.
+        # Until this key existed the refusal was recorded nowhere a reader could
+        # reach and the install answered ``null`` and ``healthy`` like any other.
+        #
+        # Three answers: ``true`` it arrived populated and unstamped, ``false``
+        # it did not, ``null`` the question could not be put - which includes
+        # every deployment whose database is not PostgreSQL, and the window
+        # before startup answers it. Read with ``is True``.
+        #
+        # It does not degrade, and the reason is worth stating rather than
+        # leaving as a choice: ``true`` is also what an install reports whose
+        # schema was built correctly and whose stamp write then failed, because
+        # the boot after that failure finds tables with no revision and cannot
+        # tell the two apart - and, having refused the stamp, will find the same
+        # thing on every boot afterwards. Degrading would hold a current schema
+        # at degraded for the life of the database over one lost write.
+        result["arrived_populated_unstamped"] = getattr(app.state, "arrived_populated_unstamped", None)
+
         # Did the boot-time schema heal finish? This is the one signal an
         # external-PostgreSQL operator has that their role cannot issue DDL.
         # Without it that install runs with a schema frozen at whichever release
@@ -2129,15 +2762,87 @@ def create_app() -> FastAPI:
         #
         # Three answers, and the polarity of ``alembic_head_matches`` rather
         # than of the two ``_failed`` fields: ``true`` they agree, ``false``
-        # they do not, ``null`` never asked, which over HTTP means a deployment
-        # whose database is not PostgreSQL or a check that could not run. Only
-        # a determinable ``false`` degrades. Which columns diverge is not
-        # published, for the same reason the heal's cause is not - see this
-        # endpoint's docstring - and is on ``app.state.schema_divergent_columns``
-        # and in the boot log.
+        # they do not, ``null`` nobody reached a verdict. Only a determinable
+        # ``false`` degrades. Which columns diverge is not published, for the
+        # same reason the heal's cause is not - see this endpoint's docstring -
+        # and is on ``app.state.schema_divergent_columns`` and in the boot log.
+        #
+        # What ``true`` does and does not claim, because the name is wider than
+        # the measurement: it is the answer to a nullability question and to no
+        # other. The heal has two further ways to leave the database short of
+        # the models, and the field beside this one covers one of them. The
+        # other it does not cover at all: a unique constraint is pre-flighted
+        # with a duplicate probe and skipped outright when the table already
+        # holds duplicates, which is the case where bad data is already in and
+        # nothing will stop more, and no runtime check in this process looks for
+        # it. Closing that means a declined-unique query living beside
+        # ``not_null_divergences`` in ``app.core.postgres_migrator``; it is not
+        # in this change, and until it lands ``true`` here is narrower than it
+        # reads.
         _schema_matches = getattr(app.state, "schema_matches_models", None)
         result["schema_matches_models"] = _schema_matches
         if _schema_matches is False:
+            result["status"] = "degraded"
+
+        # Whether anyone got as far as an answer above. The check that fills
+        # that field catches everything it can raise and deliberately leaves the
+        # field alone, so a crashed diagnostic published the same ``null`` a
+        # deployment with no PostgreSQL publishes, and the payload had no way to
+        # separate "not a database I check" from "I looked and could not tell".
+        # Those are not the same claim and a reader acts differently on each:
+        # the first is nothing to do, the second is a bug on this machine, in a
+        # check whose whole job is to notice the schema drifting.
+        #
+        # Three answers, polarity of the ``_failed`` fields: ``true`` the check
+        # raised, ``false`` it ran to a verdict, ``null`` it was never reached.
+        # Read with ``is True``. It does not degrade: a diagnostic that fails
+        # says nothing about the deployment, and reporting our own defect as the
+        # operator's fault would send them looking at a database that is fine.
+        # The cause is in the boot log, not here, for the reason in this
+        # endpoint's docstring.
+        result["schema_match_check_failed"] = getattr(app.state, "schema_match_check_failed", None)
+
+        # And the half of "does the schema match the models" that nullability
+        # cannot see. The heal adds every CHECK and FOREIGN KEY as ``NOT VALID``,
+        # and the boot now runs the validation scan it defers. What is left over
+        # is the set PostgreSQL was asked to verify and refused, which is a much
+        # narrower thing than this field used to report.
+        #
+        # Three answers, polarity of ``schema_matches_models``: ``true`` every
+        # CHECK and FOREIGN KEY in this schema is validated, ``false`` at least
+        # one is not, ``null`` nobody asked. It is published beside that field
+        # rather than folded into it - one field, one question - and a
+        # determinable ``false`` degrades.
+        #
+        # That degrade is new and it is only defensible because the validation
+        # pass exists; the two cannot be separated and a later reader must not
+        # remove one and keep the other. Before the pass, ``false`` was the
+        # standing state of every install the heal had ever added a constraint
+        # to, and it never cleared, so degrading on it would have lit a
+        # permanent cause across that whole population - which is how the stale
+        # alembic stamp stopped being a signal. After it, ``false`` means
+        # PostgreSQL was asked to verify a constraint and the rows refused, and
+        # that is not an unverified constraint but an unwritable row: a CHECK is
+        # re-evaluated on every UPDATE of a row whatever column the update
+        # names, so whichever screen edits that row answers 500 until somebody
+        # corrects it. An install carrying one is not healthy in any sense its
+        # operator would recognise. It is also actionable and it clears itself:
+        # correct the rows and the next start validates the constraint.
+        #
+        # And it is narrow. The pass runs after this boot's declared data
+        # repairs, so a ``false`` here is never a row the platform knows how to
+        # fix and has not got to yet - it is one only this deployment can answer
+        # for. That is what makes it worth an operator's morning.
+        #
+        # The cause it cannot separate out is a validation that could not run at
+        # all - a lock timeout on a busy table, a role without rights. That
+        # reads ``false`` too, and degrades too, on the argument that "this
+        # schema could not be verified" is worth an operator's attention on its
+        # own and that the case retries on the next boot rather than sticking.
+        # How many, and on which tables, is in the boot log.
+        _constraints_validated = getattr(app.state, "schema_constraints_validated", None)
+        result["schema_constraints_validated"] = _constraints_validated
+        if _constraints_validated is False:
             result["status"] = "degraded"
 
         # Did the boot-time data repairs run? The field above is about the
@@ -2815,8 +3520,17 @@ def create_app() -> FastAPI:
         return job.as_dict()
 
     @app.get("/api/system/converters/version-check", tags=["System"])
-    async def check_converter_versions() -> dict[str, Any]:
+    async def check_converter_versions(user: OptionalUserPayload = None) -> dict[str, Any]:
         """Compare each installed DDC converter against the build we would install.
+
+        Reachable without credentials, and ``installed_path`` is emptied for a
+        caller who has not signed in. That field is the absolute location of
+        the exe on the server's own disk, which on a default install sits under
+        the operator's home directory and so names their account. What the
+        endpoint is for - is the installed build the one the Update button
+        would fetch - is answered by the two SHAs and ``is_outdated``, none of
+        which say where anything lives. The Settings panel still prints the
+        path, and its reader is signed in.
 
         Computes the git-blob SHA-1 of every locally-installed converter and
         compares it to the SHA returned by GitHub's Contents API for the same
@@ -2901,9 +3615,29 @@ def create_app() -> FastAPI:
         }
         TTL = 6 * 3600
 
+        def visible_to_caller(payload: dict[str, Any]) -> dict[str, Any]:
+            """The answer as this caller may read it.
+
+            Redaction is done on a copy rather than on the payload, and this is
+            the reason the helper exists at all: the dict below is kept on
+            ``app.state`` for six hours and handed to every later reader, so
+            emptying it in place for one anonymous request would empty it for
+            the operator who asks next. One canonical body is cached; each
+            response is redacted on its way out.
+
+            ``converters`` and ``results`` are the same list under two names
+            (the second is a back-compat alias), so the redacted rows are built
+            once and shared, keeping the two views identical the way the
+            unredacted ones are.
+            """
+            if user is not None:
+                return payload
+            rows = [without_host_fields(row, {"installed_path": None}) for row in payload.get("converters", [])]
+            return {**payload, "converters": rows, "results": rows}
+
         cached = getattr(app.state, "_converter_version_cache", None)
         if cached and (time.time() - cached.get("checked_at_ts", 0)) < TTL:
-            return cached["data"]
+            return visible_to_caller(cached["data"])
 
         def git_blob_sha1(content: bytes) -> str:
             header = f"blob {len(content)}\0".encode()
@@ -2982,7 +3716,7 @@ def create_app() -> FastAPI:
         }
         if network_ok:
             app.state._converter_version_cache = {"data": response, "checked_at_ts": time.time()}
-        return response
+        return visible_to_caller(response)
 
     @app.get("/api/system/modules", tags=["System"])
     async def list_modules(
@@ -3234,7 +3968,13 @@ def create_app() -> FastAPI:
         Makes it possible to scan a 60-line startup log and see at a glance
         where the server got stuck. Keeps output machine-readable because
         logger.info is still used.
+
+        Also the one place the startup heartbeat learns which phase it is in, so
+        a section header and the heartbeat can never name different steps. Every
+        header has to come through here for that to hold; a header written
+        inline would leave the heartbeat reporting the phase before it.
         """
+        _set_boot_phase(title)
         logger.info("=== %s ===", title)
 
     @app.on_event("startup")
@@ -3246,7 +3986,12 @@ def create_app() -> FastAPI:
         # the embedded-PostgreSQL shutdown noise that follows. uvicorn still
         # handles the re-raised error exactly as before.
         try:
-            await _startup_impl()
+            # Wraps the whole sequence rather than any one step in it, because
+            # the phase that goes quiet next is not one we get to choose. It
+            # names the phase it is in and stops vouching for one that has run
+            # past its budget; see _heartbeat_through_startup.
+            with _heartbeat_through_startup():
+                await _startup_impl()
         except Exception as exc:
             _emit_server_fail(exc)
             raise
@@ -3306,67 +4051,50 @@ def create_app() -> FastAPI:
             # to a dev box could forge tokens. Rotate to a strong random
             # secret so forged "open-source-secret" tokens stop working.
             #
-            # The secret is **persisted** to ``~/.openestimator/.jwt-secret``
-            # (chmod 600) and re-used across boots so the user's browser
-            # session survives a ``Ctrl+C`` + relaunch of the CLI. Previously
-            # this rotated on every boot, which silently invalidated every
-            # active token and dumped PWA users back to the OS desktop on
-            # the next request (auth → 401 → window.location to /login,
-            # which for a standalone-installed PWA looks like a "crash").
-            import secrets as _secrets
-            from pathlib import Path as _Path
-
-            # The CLI's default data dir is ``~/.openestimate`` (no "r")
-            # per cli.py:51. The historical brand namespace ``.openestimator``
-            # is honoured only as a read fallback for legacy installs.
-            primary_dir = _Path.home() / ".openestimate"
-            legacy_dir = _Path.home() / ".openestimator"
-            secret_path = primary_dir / ".jwt-secret"
-            legacy_secret_path = legacy_dir / ".jwt-secret"
-            persisted: str | None = None
-            for path in (secret_path, legacy_secret_path):
-                try:
-                    if path.is_file():
-                        candidate = path.read_text(encoding="utf-8").strip()
-                        if len(candidate.encode("utf-8")) >= 32:
-                            persisted = candidate
-                            break
-                except OSError:
-                    continue
-
-            if persisted is None:
-                persisted = _secrets.token_urlsafe(48)
-                try:
-                    secret_path.parent.mkdir(parents=True, exist_ok=True)
-                    secret_path.write_text(persisted, encoding="utf-8")
-                    # Best-effort chmod 600 (POSIX). On Windows the file
-                    # inherits user-only ACLs from the home directory.
-                    try:
-                        secret_path.chmod(0o600)
-                    except OSError:
-                        pass
-                    logger.info(
-                        "JWT_SECRET was default/short - generated a fresh dev secret "
-                        "and persisted it to %s. Sessions now survive restarts. "
-                        "Set JWT_SECRET env var for a stable team-wide secret.",
-                        secret_path,
-                    )
-                except OSError as _persist_err:
-                    logger.warning(
-                        "JWT_SECRET persistence to %s failed (%s) - falling back "
-                        "to a per-process random secret. Sessions WILL be invalidated "
-                        "on every restart. Set JWT_SECRET env var (>=32 bytes) "
-                        "to keep sessions alive.",
-                        secret_path,
-                        _persist_err,
-                    )
-            else:
+            # The secret is **persisted** (chmod 600) and re-used across boots
+            # so the user's browser session survives a ``Ctrl+C`` + relaunch
+            # of the CLI. Previously this rotated on every boot, which silently
+            # invalidated every active token and dumped PWA users back to the
+            # OS desktop on the next request (auth → 401 → window.location to
+            # /login, which for a standalone-installed PWA looks like a
+            # "crash").
+            #
+            # Where it is persisted is the data directory, resolved by the same
+            # function the zero-config provisioning in ``app.config`` uses, so
+            # ``--data-dir``, ``OE_DATA_DIR`` and ``DATA_DIR`` move the secret
+            # with the data. This block used to spell its own path,
+            # ``~/.openestimate``, which is the CLI's default and therefore
+            # right for a default install and wrong for every other one: two
+            # instances started from two data directories on one machine
+            # signed with one key, and a data directory carried to another
+            # machine arrived without its secret. A secret left under the
+            # pre-rename ``~/.openestimator`` is adopted once and written into
+            # the data directory; that legacy file is only ever read.
+            persisted, secret_path, secret_source = load_or_create_dev_jwt_secret()
+            if secret_source == "generated":
+                logger.info(
+                    "JWT_SECRET was default/short - generated a fresh dev secret "
+                    "and persisted it to %s. Sessions now survive restarts. "
+                    "Set JWT_SECRET env var for a stable team-wide secret.",
+                    secret_path,
+                )
+            elif secret_source == "adopted":
+                logger.info(
+                    "JWT_SECRET was default/short - adopted the dev secret from the "
+                    "legacy ~/.openestimator folder and persisted it to %s. Existing "
+                    "sessions remain valid. Set JWT_SECRET env var for a stable "
+                    "team-wide secret.",
+                    secret_path,
+                )
+            elif secret_source == "loaded":
                 logger.info(
                     "JWT_SECRET was default/short - loaded persisted dev secret from %s. "
                     "Existing sessions remain valid. Set JWT_SECRET env var for a "
                     "stable team-wide secret.",
                     secret_path,
                 )
+            # "ephemeral" is reported where it happens, in app.config, with the
+            # OSError that caused it.
 
             try:
                 # pydantic-settings blocks direct assignment when frozen,
@@ -3393,7 +4121,7 @@ def create_app() -> FastAPI:
 
         report_email_config_at_startup(settings)
 
-        # Load translations (28 languages)
+        # Load translations (37 languages)
         _section("i18n")
         from app.core.i18n import load_translations
 
@@ -3521,12 +4249,22 @@ def create_app() -> FastAPI:
             # is unanswerable, so the answer has to be taken here and carried
             # down to the stamp. Defaults to False, so any failure to tell
             # leaves the previous behaviour exactly as it was.
+            #
+            # It is also carried onto ``app.state``, and that is not the same
+            # sentence. This was a local reaching the stamp and nothing else, so
+            # the one population that cannot vouch for its own schema published
+            # ``alembic_head_matches: null`` - indistinguishable from a desktop
+            # bundle that ships no migration tree - and called itself healthy.
+            # The local keeps the default on failure, which is what the stamp
+            # reads; ``app.state`` keeps its ``None``, because a question that
+            # could not be put has no answer and must not borrow ``False``.
             _arrived_populated_unstamped = False
             try:
                 from app.core.alembic_version_table import database_is_populated_but_unstamped
 
                 async with engine.connect() as conn:
                     _arrived_populated_unstamped = await conn.run_sync(database_is_populated_but_unstamped)
+                app.state.arrived_populated_unstamped = _arrived_populated_unstamped
                 if _arrived_populated_unstamped:
                     logger.warning(
                         "This database holds application tables but records no migration revision, so it "
@@ -3605,6 +4343,7 @@ def create_app() -> FastAPI:
                 _divergent = await not_null_divergences(engine, Base)
                 app.state.schema_divergent_columns = _divergent
                 app.state.schema_matches_models = not _divergent
+                app.state.schema_match_check_failed = False
                 if _divergent:
                     # Every name, not the first few. This line used to print
                     # ``_divergent[:5]``, which made a nine-column divergence
@@ -3624,10 +4363,14 @@ def create_app() -> FastAPI:
                         ", ".join(_divergent),
                     )
             except Exception as exc:  # noqa: BLE001
-                # A diagnostic must never be able to stop a boot. Leaving the
-                # field None says "could not tell", which is honest and does
-                # not degrade; claiming agreement here would be the one answer
-                # that is worse than no answer.
+                # A diagnostic must never be able to stop a boot, and claiming
+                # agreement here would be the one answer worse than no answer.
+                # But leaving ONLY the None was not honest either: that is the
+                # value a deployment with no PostgreSQL carries for its whole
+                # life, so a crashed check was published as "not applicable" and
+                # nobody could see that a check meant to run here had failed.
+                # The verdict stays unknown and the failure is now sayable.
+                app.state.schema_match_check_failed = True
                 logger.warning("Schema divergence check could not run: %s", exc)
 
             # The heal above adds oe_progress_entry.seq to a pre-v3258 table as
@@ -3779,6 +4522,113 @@ def create_app() -> FastAPI:
                     exc,
                     exc_info=True,
                 )
+
+            # The scan the heal deferred. Every CHECK and FOREIGN KEY it adds
+            # goes on ``NOT VALID``, which is the only way onto a populated table
+            # that cannot fail on the rows already there, and until this ran
+            # nothing ever validated one. That left more than an unverified
+            # constraint behind: ``NOT VALID`` exempts an existing row from the
+            # validation scan and from nothing afterwards, so a row that violates
+            # the constraint is refused by every later UPDATE of it, on any
+            # column - measured on oe_i18n_tax_config, where ``SET tax_name =
+            # tax_name || '!'`` comes back CheckViolation on a column the
+            # constraint does not mention. The screen editing that row answered
+            # 500 for the life of the install, on a deployment reporting healthy.
+            #
+            # Runs at the end of the schema work rather than beside the heal, for
+            # two separate reasons.
+            #
+            # Not inside the heal's transaction: that transaction spans the whole
+            # schema and holds ACCESS EXCLUSIVE from each ADD CONSTRAINT until it
+            # ends, so validating in there would put a table scan under that lock.
+            #
+            # And after the data repairs above rather than before them, which is
+            # the ordering that matters. The repairs exist to rewrite exactly the
+            # rows a constraint like this refuses: the shipped Canadian HST rows
+            # carry a sub-national ``combination`` with no ``subdivision_code``,
+            # because the seed wrote the one three days before the other column
+            # existed, and tax_subdivision_backfill corrects them on this same
+            # boot. Run ahead of that repair, the pass indicts a database the
+            # boot is about to fix, degrades it for one start and clears on the
+            # next, which is reporting our own defect as the operator's. Nothing
+            # is lost by asking last: an unvalidated constraint is enforced on
+            # every write either way, so validating late costs nothing a reader
+            # or a writer can observe.
+            #
+            # Non-fatal like its neighbours, and it repairs nothing itself. What
+            # a violating row should have contained instead is a question about
+            # this deployment's data, and a guess would be worse than the defect.
+            try:
+                from app.core.postgres_migrator import validate_pending_constraints
+
+                _validated, _refused = await validate_pending_constraints(engine)
+                if _validated:
+                    logger.info(
+                        "PostgreSQL schema: validated %d constraint(s) the heal had left unchecked "
+                        "against rows already in their tables",
+                        _validated,
+                    )
+                if _refused:
+                    logger.error(
+                        "PostgreSQL schema: %d constraint(s) could not be validated: %s. Rows already "
+                        "in those tables violate them, which makes those rows unwritable rather than "
+                        "merely unverified, and every request that edits one fails. Correct the rows "
+                        "and the next start clears this. /api/health reports "
+                        "schema_constraints_validated=false and degrades the status.",
+                        len(_refused),
+                        ", ".join(_refused),
+                    )
+            except Exception:
+                logger.warning("Constraint validation pass skipped (non-fatal)", exc_info=True)
+
+            # The standing state once the pass has done what it can, and the
+            # other half of a question the nullability check further up is blind
+            # to by construction: constraints that exist and have never been
+            # verified. Not a rediscovery of what the pass just reported. That
+            # return value describes one boot; this describes the database, which
+            # is what a reader needs. A constraint left here is one PostgreSQL
+            # was asked to verify and would not, either because rows violate it
+            # or because the statement could not run, and rows under a CHECK in
+            # the first case are unwritable rather than merely unverified.
+            #
+            # Asked as a standing question rather than read off the pass's return
+            # value for the same reason the divergence check above is: an install
+            # that took the constraint on an earlier release, on a boot whose log
+            # nobody kept, still has to answer for it. A boot where the pass is
+            # skipped or fails whole is exactly the boot whose in-memory result
+            # would be least worth trusting.
+            #
+            # It sits here rather than up with the divergence check it reads like,
+            # because it counts what the pass leaves behind. Moving one of the two
+            # without the other publishes the state of the database as it stood
+            # before this same boot corrected it.
+            #
+            # One catalog query, no model introspection: PostgreSQL records the
+            # answer itself in ``pg_constraint.convalidated``. Restricted to the
+            # current schema, and to the two constraint types the heal can leave
+            # unvalidated, which is the same population the pass drains - one
+            # predicate, defined once, in ``postgres_migrator``. Non-fatal like
+            # its neighbour, and its own failure leaves the field None rather
+            # than claiming everything is verified.
+            try:
+                from sqlalchemy import text as _pg_text
+
+                async with engine.connect() as conn:
+                    _unvalidated = (await conn.execute(_pg_text(UNVALIDATED_CONSTRAINTS_SQL))).scalar_one()
+                app.state.schema_constraints_validated = not _unvalidated
+                if _unvalidated:
+                    logger.warning(
+                        "Schema constraints: %d CHECK/FOREIGN KEY constraint(s) in this database are still "
+                        "NOT VALID after the validation pass, so rows already present when they were added "
+                        "do not satisfy them or could not be checked. Under a CHECK those rows cannot be "
+                        "written at all: PostgreSQL re-evaluates the constraint on every UPDATE of a row, "
+                        "whatever column the update touches. Correct them and the next start validates the "
+                        "constraint. /api/health reports schema_constraints_validated=false and degrades "
+                        "the status.",
+                        _unvalidated,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Schema constraint validation check could not run: %s", exc)
 
             # Provision multi-tenant row-level security (opt-in). Runs after
             # create_all so every tenant table exists on both fresh and upgraded
@@ -4424,6 +5274,127 @@ def create_app() -> FastAPI:
             logger.info("Press Ctrl+C to stop. Docs: https://openconstructionerp.com/docs")
         else:
             logger.info("Application started successfully")
+
+        # ── Build the route table before the port opens ──────────────────
+        # See :func:`warm_route_table` for what this pays for and why it is
+        # paid here. Short version: FastAPI builds each route's dependant tree
+        # on the first request that reaches matching, for every route at once,
+        # on the event loop. With ~190 module routers that measured 32.1s, and
+        # it was charged to whichever request arrived first - a static
+        # index.html or a health check, indifferently - while everything else
+        # queued behind it. Nothing about that cost is avoidable; what is
+        # avoidable is charging it to a user with an open socket in front of
+        # them.
+        #
+        # Logged either side, and not only for the operator. The desktop
+        # launcher gives up on a sidecar that has written nothing for four
+        # minutes (STARTUP_QUIET_TIMEOUT in desktop/src-tauri/src/main.rs), so
+        # a silent half-minute here is a step towards a watchdog killing a boot
+        # that is working. The line before the wait restarts that clock and
+        # names the step; the line after it reports what the step cost, because
+        # a number in the boot log is how the next person measures this without
+        # rebuilding the instrument.
+        #
+        # Skipped under OE_TEST_FAST_STARTUP for the same reason every other
+        # boot-time warm-up is: the suite builds this application over and over
+        # and pays the first-request cost only in the tests that send one.
+        if not _fast_startup:
+            # Through _section rather than logged inline, so the startup
+            # heartbeat names this phase while it runs instead of still naming
+            # the one before it. This is the longest silent phase there is now
+            # that the database has its own heartbeat, so it is the phase the
+            # heartbeat most needs to be right about.
+            _section("Routing")
+            logger.info("Building the route table (one-off, before the port opens)")
+            _warm_seconds = await warm_route_table(app)
+            logger.info("Route table ready in %.1fs", _warm_seconds)
+
+        # ── Publish the OpenAPI document ─────────────────────────────────
+        # Every router this process will ever mount is mounted by now, which
+        # is why the prime is here and not in create_app(). How I know: the
+        # module loader runs inside this same handler, above, and the handful
+        # of alias mounts that follow it are the last include_router calls in
+        # the file. Priming from create_app() would cache a document built
+        # before ~190 module routers existed, and a schema that is missing
+        # most of the API is worse than a schema that is slow.
+        #
+        # Deliberately not awaited. Starlette accepts no requests until this
+        # handler returns, so awaiting a ~141s build would move the stall off
+        # the first docs visitor and onto every user of the app, including the
+        # health check.
+        #
+        # The thread is worth being precise about, because this is CPU-bound
+        # Python and a thread does not escape the GIL: it does not make the
+        # build free, it makes it interruptible. Building on the event loop
+        # blocks every request for the whole build. A visitor who arrives
+        # before it finishes waits on the same lock rather than starting a
+        # second build. The task is parked on app.state because asyncio keeps
+        # only a weak reference to a bare task and would otherwise be free to
+        # collect it mid-build.
+        #
+        # What the thread does NOT buy is a responsive process, and the line
+        # that used to stand here said it did: "requests are served throughout,
+        # just slower while it runs - health answered in 17.1s, 0.7s and 2.2s".
+        # Re-measured against a boot whose route table was already warm, so the
+        # build is the only thing running: the first request after the port
+        # opened took 64.6s of a 73.0s build, and the two after it 2.3s and
+        # 2.2s before latency came back to 0.15s. So the loop is starved
+        # outright for most of the build and eases only at the end, and 17.1s
+        # was a sample from that tail rather than the worst of it. The old
+        # figure is left quoted here rather than deleted because it is the
+        # premise this prime was justified on, and the correction is the reason
+        # the prime is now off by default.
+        #
+        # Runtime module toggles stay correct without help here: enabling or
+        # disabling a module moves the route counter that _custom_openapi
+        # checks, so the next request rebuilds rather than serving a document
+        # that describes the wrong set of modules.
+        # Only where something can actually serve the result. ``openapi_url``
+        # is None in production - BUG-394 keeps the route map off a public
+        # deployment - and /api/docs and /api/redoc go with it, so a production
+        # boot has no consumer for this document at all. Priming there would
+        # spend the whole build on a 2 GB VPS to fill a cache nothing reads,
+        # and spend it in the window where requests are already answering
+        # slowly, which is how a healthcheck timeout turns into a restart loop.
+        #
+        # And it is now off unless somebody asks for it, which is a change of
+        # default and not a change of mechanism. Everything the paragraphs above
+        # say about the build is still true and still measured: 118.2s on a warm
+        # data directory before the route table was warmed at boot, 73.0s after
+        # it, 133.9s on a first run, 2923 paths every time. What the measurement
+        # added is who pays. The document has exactly three consumers -
+        # /api/docs, /api/redoc, /api/openapi.json - and none of them is on the
+        # startup path, so every desktop launch and every
+        # ``openconstructionerp serve`` was spending over a minute of a core, in
+        # the window where the user is staring at a splash screen, to fill a
+        # cache that install would never read.
+        #
+        # Whoever does open the reference pages pays the build on that request,
+        # cached and locked by _custom_openapi exactly as before, which is what
+        # this deployment did until the prime was added. An operator serving the
+        # documentation to other people can pre-pay it with
+        # OE_PRIME_OPENAPI_SCHEMA=1 and get the old behaviour back verbatim.
+        if should_prime_openapi_schema(fast_startup=_fast_startup, openapi_url=app.openapi_url):
+
+            async def _prime_openapi_schema() -> None:
+                try:
+                    started = time.perf_counter()
+                    schema = await asyncio.to_thread(app.openapi)
+                    logger.info(
+                        "OpenAPI schema cached: %d paths in %.1fs",
+                        len(schema.get("paths", {})),
+                        time.perf_counter() - started,
+                    )
+                except Exception:
+                    # Never fail a boot over the documentation. Without the
+                    # cache the first /api/docs visitor pays for the build,
+                    # which is exactly the old behaviour.
+                    logger.warning(
+                        "OpenAPI schema priming failed; the docs will build on first request",
+                        exc_info=True,
+                    )
+
+            app.state.openapi_prime_task = asyncio.create_task(_prime_openapi_schema())
 
         # NOTE: frontend static mounting moved to create_app() (below, before
         # the startup event runs). Registering the SPA 404 exception handler

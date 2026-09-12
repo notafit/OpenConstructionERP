@@ -72,6 +72,34 @@ export function fmtFixed(value: number, decimals = 2): string {
 }
 
 /**
+ * A number written for a field a person is still editing, not for reading.
+ *
+ * `fmtFixed` and every other formatter in this module answer "how does this
+ * reader write a number", and the answer is a separator. That is right on a
+ * screen and wrong inside a control: `<input type="number">` accepts exactly
+ * one spelling, digits with a point, and silently empties itself when handed
+ * anything else. Issue #466 was a total that vanished from a thousand upwards
+ * because it had been grouped, and the same grouped string was what the form
+ * read back when it built the request, so `parseFloat` truncated the invoice
+ * at the separator. Under a comma-decimal reader the same call dropped the
+ * cents off every amount at any size.
+ *
+ * So an editable number stays in the canonical form, which has no locale and
+ * therefore cannot be right for one convention and wrong for the other. Where
+ * the same figure also has to be read, that is a second, read-only element
+ * formatted by the functions above.
+ *
+ * A non-finite value comes back as an empty field rather than as the text
+ * `NaN`, which is the one place this parts company with `fmtFixed`: there is
+ * no editing a NaN, the control empties itself on it anyway, and a blank field
+ * says "nothing here yet" where `NaN` says the software is confused. Still no
+ * invented zero, for the reason `fmtFixed` gives.
+ */
+export function fmtNumberForInput(value: number, decimals = 2): string {
+  return Number.isFinite(value) ? value.toFixed(decimals) : '';
+}
+
+/**
  * `toPrecision` with the reader's separators: a count of significant digits
  * rather than of decimal places.
  *
@@ -201,6 +229,7 @@ export function fmtCurrency(value: number | string | null | undefined, currency?
     return new Intl.NumberFormat(getNumberLocale(), {
       style: 'currency',
       currency: trimmed,
+      minimumFractionDigits: 0,
       maximumFractionDigits: 0,
     }).format(safe);
   } catch {
@@ -250,11 +279,46 @@ function joinByPreference(
 }
 
 /**
+ * Kyrgyz is the one supported language whose all-numeric date order no reader
+ * can parse, so `'auto'` does not follow the language there.
+ *
+ * CLDR's Kyrgyz data is not wrong. Written out, `ky` renders 3 November 2026 as
+ * `2026-ж., 3-ноябрь`: year marker, then day-month, which is idiomatic. The
+ * damage is confined to the all-numeric short form, where the same field order
+ * prints `2026-03-11` and every reader parses that as ISO year-month-day, so 3
+ * November silently becomes 11 March. A date that looks wrong is safe; a date
+ * that looks right and is not is the expensive kind.
+ *
+ * No Kyrgyz tag avoids it: `ky`, `ky-KG`, `ky-Cyrl`, `ky-Cyrl-KG` and
+ * `ky-u-ca-gregory` all resolve to year-day-month. Swapping the tag for `ru-KG`
+ * fixes the digits by taking the Kyrgyz month names away, which is why the
+ * exception is scoped to the numeric form and leaves every words-based format
+ * completely alone. Day-first is the order Kyrgyzstan writes numeric dates in,
+ * and the one `ru-KG`, `kk` and `uz` all resolve to.
+ *
+ * Measured across all 42 languages in `SUPPORTED_LANGUAGES`, formatting one
+ * date and naming each field with `formatToParts`: 33 day-first, 3 month-first,
+ * 5 ISO, and this one. The exception is of exactly one language, and it is
+ * checked against that census rather than assumed.
+ */
+const NUMERIC_MONTH_FORMATS: ReadonlySet<string> = new Set(['2-digit', 'numeric']);
+
+function autoNumericOrderFor(locale: string | undefined, options: Intl.DateTimeFormatOptions): DateFormat {
+  if (!options.month || !NUMERIC_MONTH_FORMATS.has(options.month)) return 'auto';
+  const language = (locale ?? '').toLowerCase().split('-')[0];
+  return language === 'ky' ? 'DD.MM.YYYY' : 'auto';
+}
+
+/**
  * Format `date` in `locale` with `options`, applying the date-format
  * preference `pref`.
  *
  * Under `'auto'` this is `Intl.DateTimeFormat(locale, options).format(date)`
- * and nothing else — the equivalence the unset default depends on.
+ * and nothing else — the equivalence the unset default depends on. The single
+ * exception is an all-numeric date in Kyrgyz, which `autoNumericOrderFor` above
+ * turns day-first because the language's own order is unreadable in digits. It
+ * is named there, checked against a census of all 42 languages, and reaches no
+ * other locale and no words-based format.
  *
  * Under an explicit preference the day/month/year fields are re-emitted in the
  * requested order, and everything the locale produced around them (the time,
@@ -275,7 +339,8 @@ export function formatDateWithPreference(
   options: Intl.DateTimeFormatOptions,
   pref: DateFormat,
 ): string {
-  if (pref === 'auto' || !options.day || !options.month || !options.year) {
+  const effective = pref === 'auto' ? autoNumericOrderFor(locale, options) : pref;
+  if (effective === 'auto' || !options.day || !options.month || !options.year) {
     return new Intl.DateTimeFormat(locale, options).format(date);
   }
   const parts = new Intl.DateTimeFormat(locale, { ...options, ...NUMERIC_DATE_FIELDS }).formatToParts(date);
@@ -291,7 +356,7 @@ export function formatDateWithPreference(
   const pick = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
   return [
     ...parts.slice(0, first).map((p) => p.value),
-    joinByPreference(pick('day'), pick('month'), pick('year'), pref),
+    joinByPreference(pick('day'), pick('month'), pick('year'), effective),
     ...parts.slice(last + 1).map((p) => p.value),
   ].join('');
 }

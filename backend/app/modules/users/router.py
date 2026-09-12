@@ -40,6 +40,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
+from app.core.demo_accounts import DEMO_ACCOUNT_EMAILS
 from app.core.rate_limiter import client_identifier, login_limiter
 from app.dependencies import (
     CurrentUserId,
@@ -222,16 +223,10 @@ class DemoLoginRequest(BaseModel):
     email: str
 
 
-# Whitelist of seeded demo accounts. Mirrors the spec list in
-# ``app.main._seed_demo_account``; both must stay in sync - the test
-# ``backend/tests/integration/test_demo_login_endpoint.py`` asserts this.
-_DEMO_EMAIL_WHITELIST: frozenset[str] = frozenset(
-    {
-        "demo@openconstructionerp.com",
-        "estimator@openconstructionerp.com",
-        "manager@openconstructionerp.com",
-    }
-)
+# Whitelist of seeded demo accounts, taken from the one module that names
+# them. It still has to match the spec list in ``app.main._seed_demo_account``,
+# and ``backend/tests/integration/test_demo_login_endpoint.py`` asserts that.
+_DEMO_EMAIL_WHITELIST: frozenset[str] = DEMO_ACCOUNT_EMAILS
 
 
 @router.post("/auth/demo-login/", response_model=TokenResponse)
@@ -1253,6 +1248,34 @@ async def complete_onboarding(
 
     return OnboardingResponse(
         completed=True,
+        company_type=onboarding.get("company_type"),
+        company_size=onboarding.get("company_size"),
+        enabled_modules=onboarding.get("enabled_modules", []),
+        interface_mode=onboarding.get("interface_mode"),
+    )
+
+
+@router.delete("/me/onboarding/complete/", response_model=OnboardingResponse)
+async def reset_onboarding(
+    user_id: CurrentUserId,
+    service: UserService = Depends(_get_service),
+) -> OnboardingResponse:
+    """Reset onboarding to incomplete so the wizard can be re-run.
+
+    Called from the Settings "restart onboarding" action and from the
+    update-welcome dialog's "re-run setup" button.  Clears the per-user
+    ``completed`` flag on the server while leaving all other onboarding
+    choices (company_type, enabled_modules, etc.) intact.
+    """
+    user = await service.get_user(uuid.UUID(user_id))
+    metadata: dict[str, Any] = dict(user.metadata_ or {})
+    onboarding: dict[str, Any] = dict(metadata.get("onboarding") or {})
+    onboarding["completed"] = False
+    metadata["onboarding"] = onboarding
+    await service.update_profile(uuid.UUID(user_id), metadata_=metadata)
+
+    return OnboardingResponse(
+        completed=False,
         company_type=onboarding.get("company_type"),
         company_size=onboarding.get("company_size"),
         enabled_modules=onboarding.get("enabled_modules", []),

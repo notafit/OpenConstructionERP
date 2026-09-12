@@ -18,6 +18,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import event_bus, publish_after_commit
@@ -352,6 +353,71 @@ def _resolve_base_currency(
     return distinct.pop() if len(distinct) == 1 else ""
 
 
+def plot_currency_mismatches(
+    plots: Iterable[Any],
+    matrix_currency: Any,
+    fallback_currency: Any = "",
+) -> list[tuple[str, str]]:
+    """Name the plots a price matrix cannot price because they are other money.
+
+    A plot's money is denominated in its own ``currency`` stamp, else in the
+    development's (``fallback_currency``, already resolved through the parent
+    project the way :func:`_resolve_base_currency` does it). A matrix computes
+    ``area_m2 * base_price_per_m2 * multipliers`` in *its* currency, and the
+    bulk recompute writes that figure into ``Plot.computed_price`` beside
+    ``Plot.price_base``, where both are read under the plot's one currency
+    stamp. A matrix in another currency therefore has nowhere to put its
+    number truthfully, and the recompute refuses rather than writing it.
+
+    A blank on either side is not a mismatch. The escrow transaction check in
+    this module compares only two stated codes, and so does this one: a plot
+    with no currency anywhere is priced and stays as unlabelled as every
+    other money figure in that development, which this run did not cause.
+
+    Args:
+        plots: Rows exposing ``plot_number`` and ``currency``.
+        matrix_currency: ``PriceMatrix.currency`` as stored.
+        fallback_currency: The development's resolved currency, or ``""``.
+
+    Returns:
+        ``[(plot_number, plot_currency), ...]`` in input order; empty when
+        every plot can take the matrix's price.
+    """
+    matrix_code = _currency_code(matrix_currency)
+    if not matrix_code:
+        return []
+    fallback = _currency_code(fallback_currency)
+    mismatched: list[tuple[str, str]] = []
+    for plot in plots:
+        code = _currency_code(getattr(plot, "currency", "")) or fallback
+        if code and code != matrix_code:
+            mismatched.append((str(getattr(plot, "plot_number", "") or ""), code))
+    return mismatched
+
+
+def _plot_currency_mismatch_detail(
+    matrix_name: Any,
+    matrix_currency: Any,
+    mismatched: list[tuple[str, str]],
+    total_plots: int,
+    *,
+    listed: int = 20,
+) -> str:
+    """Build the 422 detail for a recompute refused over currency.
+
+    Names both currencies and the plots, capped so a development of ten
+    thousand plots does not put ten thousand names on the wire.
+    """
+    names = ", ".join(f"{number} ({code})" for number, code in mismatched[:listed])
+    if len(mismatched) > listed:
+        names = f"{names} and {len(mismatched) - listed} more"
+    return (
+        f"PriceMatrix {str(matrix_name or '')!r} is denominated in {_currency_code(matrix_currency)}; "
+        f"{len(mismatched)} of {total_plots} plots are recorded in another currency, "
+        f"so no plot was repriced: {names}"
+    )
+
+
 def compute_kanban_column_money(
     values_by_currency: dict[str, Decimal],
     *,
@@ -495,6 +561,81 @@ async def _load_project_currency_meta(session: AsyncSession, project_id: uuid.UU
         return result.scalar_one_or_none()
     except Exception:  # noqa: BLE001 -- a roll-up must never 500 on FX metadata
         return None
+
+
+async def _development_currency(svc: Any, development_id: uuid.UUID | None) -> str:
+    """The currency a development's money is read in when a row carries none.
+
+    ``Development.currency`` first, else the parent project's, else ``""``,
+    which is the fallback the model declares for a blank stamp. The lookups
+    are defensive because the stub repositories the unit suite drives the
+    service with answer ``None`` for anything they were not given, and a
+    missing parent is "no stamp", not an error.
+
+    Args:
+        svc: The service, for its repositories and session.
+        development_id: ``Development.id``, or ``None``.
+
+    Returns:
+        The upper-case code, or ``""``.
+    """
+    if development_id is None:
+        return ""
+    dev = await svc.developments.get_by_id(development_id)
+    if dev is None:
+        return ""
+    project = await _load_project_currency_meta(svc.session, getattr(dev, "project_id", None))
+    return _resolve_base_currency(getattr(dev, "currency", ""), getattr(project, "currency", ""), ())
+
+
+async def _buyer_currency(svc: Any, buyer: Any) -> str:
+    """The currency a buyer's option selection is priced in.
+
+    The buyer's own stamp, because the contract is signed in it; else the
+    plot's; else the development's; else the project's; else ``""``.
+
+    Args:
+        svc: The service, for its repositories and session.
+        buyer: A ``Buyer`` row or anything exposing ``currency``,
+            ``plot_id`` and ``development_id``.
+
+    Returns:
+        The upper-case code, or ``""``.
+    """
+    code = _currency_code(getattr(buyer, "currency", ""))
+    if code:
+        return code
+    plot_id = getattr(buyer, "plot_id", None)
+    if plot_id is not None:
+        plot = await svc.plots.get_by_id(plot_id)
+        code = _currency_code(getattr(plot, "currency", ""))
+        if code:
+            return code
+    return await _development_currency(svc, getattr(buyer, "development_id", None))
+
+
+async def _option_currency(svc: Any, option: Any) -> str:
+    """The currency an option's ``price_delta`` is quoted in.
+
+    The option's own stamp, else its group's development's, else that
+    development's project's, else ``""``.
+
+    Args:
+        svc: The service, for its repositories and session.
+        option: A ``BuyerOption`` row or anything exposing ``currency`` and
+            ``group_id``.
+
+    Returns:
+        The upper-case code, or ``""``.
+    """
+    code = _currency_code(getattr(option, "currency", ""))
+    if code:
+        return code
+    group_id = getattr(option, "group_id", None)
+    if group_id is None:
+        return ""
+    group = await svc.option_groups.get_by_id(group_id)
+    return await _development_currency(svc, getattr(group, "development_id", None))
 
 
 # ── State machines ──────────────────────────────────────────────────────
@@ -2126,10 +2267,17 @@ class PropertyDevService:
     # ── Selection ───────────────────────────────────────────────────────
 
     async def create_selection(self, data: BuyerSelectionCreate) -> BuyerSelection:
+        buyer = await self.buyers.get_by_id(data.buyer_id)
+        if buyer is None:
+            raise HTTPException(status_code=422, detail="buyer not found")
         obj = BuyerSelection(
             buyer_id=data.buyer_id,
             status=data.status,
             notes=data.notes,
+            # Settled once, here, from the buyer's chain (see _buyer_currency).
+            # Blank when that chain is blank; the first stamped line then
+            # settles it, in add_selection_item.
+            currency=await _buyer_currency(self, buyer),
             metadata_=data.metadata,
         )
         return await self.selections.create(obj)
@@ -2166,6 +2314,21 @@ class PropertyDevService:
                 status_code=409,
                 detail="Option is no longer available",
             )
+        # The option's price is quoted in its own currency, else its
+        # development's; the selection's total is in the selection's. Two
+        # stated codes that disagree are refused, the way an escrow
+        # transaction in the wrong money is, because a total that added them
+        # would be money in neither. A blank selection is settled by its
+        # first stamped line, once, so a blank is never what two lines are
+        # said to have in common.
+        option_code = await _option_currency(self, option)
+        selection_code = _currency_code(getattr(sel, "currency", ""))
+        if option_code and selection_code and option_code != selection_code:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"Option {option.code!r} is priced in {option_code}; this selection is in {selection_code}"),
+            )
+        line_code = option_code or selection_code
         unit_price = data.unit_price_snapshot if data.unit_price_snapshot is not None else option.price_delta
         item = BuyerSelectionItem(
             selection_id=selection_id,
@@ -2173,11 +2336,14 @@ class PropertyDevService:
             quantity=data.quantity,
             unit_price_snapshot=unit_price,
             total_price=Decimal(str(unit_price)) * Decimal(str(data.quantity)),
+            currency=line_code,
             included_in_production=False,
             metadata_=data.metadata,
         )
         item = await self.selection_items.create(item)
         item_id = item.id
+        if line_code and not selection_code:
+            await self.selections.update_fields(selection_id, currency=line_code)
         # Re-fetch after the recompute so the router serialises the item
         # alongside the selection total ``_recompute_selection_total`` just
         # wrote, rather than lazy-loading it and raising MissingGreenlet.
@@ -5722,6 +5888,18 @@ def compute_plot_price_breakdown(
 
 
 async def _svc_create_broker(svc: PropertyDevService, data: Any) -> Broker:
+    # A licence number is unique within a tenant and unique among brokers
+    # that have no tenant. The (tenant_id, license_number) constraint only
+    # covers the first cohort, because NULL never collides in SQL; the second
+    # is covered by a partial unique index, and on installs that predate that
+    # index by this lookup alone. Refuse here with a clear 409 rather than
+    # let the database answer with an IntegrityError.
+    taken = await svc.brokers.find_by_license_number(data.tenant_id, data.license_number)
+    if taken is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A broker with licence number '{data.license_number}' already exists",
+        )
     obj = Broker(
         tenant_id=data.tenant_id,
         name=data.name,
@@ -5734,7 +5912,17 @@ async def _svc_create_broker(svc: PropertyDevService, data: Any) -> Broker:
         active=data.active,
         metadata_=data.metadata,
     )
-    return await svc.brokers.create(obj)
+    try:
+        return await svc.brokers.create(obj)
+    except IntegrityError as exc:
+        # Two concurrent creates can both pass the lookup; the unique index
+        # stops the second at flush. Brokers carry no foreign keys, so the
+        # only integrity rule an insert can break is the licence one.
+        await svc.session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A broker with licence number '{data.license_number}' already exists",
+        ) from exc
 
 
 async def _svc_get_broker(svc: PropertyDevService, broker_id: uuid.UUID) -> Broker:
@@ -6265,6 +6453,22 @@ async def _svc_bulk_recompute_dev_prices(
         offset=0,
         limit=10_000,
     )
+    # A plot's price is read under the plot's own currency stamp, else the
+    # development's, else the project's. A matrix in other money cannot fill
+    # ``computed_price`` without the figure landing under the wrong label, so
+    # the run is refused here, before the first write, naming both currencies
+    # and every plot concerned. Refusing the whole run rather than skipping
+    # the odd plots keeps the 200 honest: ``plots_updated + plots_unchanged``
+    # is read as the whole development, and a skipped plot would sit behind
+    # it at a stale price with nothing in the response saying so.
+    project = await _load_project_currency_meta(svc.session, dev.project_id)
+    fallback_code = _resolve_base_currency(dev.currency, getattr(project, "currency", ""), ())
+    mismatched = plot_currency_mismatches(rows, matrix.currency, fallback_code)
+    if mismatched:
+        raise HTTPException(
+            status_code=422,
+            detail=_plot_currency_mismatch_detail(matrix.name, matrix.currency, mismatched, len(rows)),
+        )
     # Snapshot all needed attributes BEFORE the first update_fields call so
     # every plot is repriced from the values this run started with, rather than
     # reloading a row an earlier iteration rewrote - that read raises
@@ -7677,6 +7881,7 @@ __all__ = [
     "compute_plot_price_breakdown",
     "compute_withholding",
     "derive_plot_construction_progress",
+    "plot_currency_mismatches",
     "supported_jurisdictions",
     "validate_option_compatibility",
 ]

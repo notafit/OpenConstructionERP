@@ -1,6 +1,6 @@
 # Repo hygiene gate.
 #
-# Guards: 70. They run on every push and pull request, grouped into three
+# Guards: 81. They run on every push and pull request, grouped into three
 # jobs. A guard is a named step that is not a tooling install, and that rule is
 # not a matter of taste: it is the one that reproduces both counts this header
 # carried when it was written on 2026-08-24 - twenty-one guards, over jobs of
@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -118,22 +118,69 @@ jobs:
         if: ${{ !cancelled() }}
         run: python scripts/check_version_sync.py
 
-      # desktop/src-tauri/windows/installer.nsi is a fork of the stock Tauri
-      # NSIS template, and the single line it changes is what keeps an upgrade
-      # from hanging forever. Upstream starts "Uninstall before installing"
-      # selected, which ExecWaits the uninstaller already on the machine, and
-      # every uninstaller from v11.7.1 to v15.8.0 calls nsExec with no timeout,
-      # so a PowerShell that never returns stops the upgrade dead. The fork
-      # pre-selects "Do not uninstall" on the upgrade branch instead.
+      # A committed file importing a module that only exists as an untracked
+      # file in somebody's working tree. It imports fine on the disk it was
+      # written on and nowhere else, and this is the first machine that reads
+      # the commit rather than the disk, so this is where it has to be caught.
+      # Two instances were live in the tree on 2026-09-05; both authors
+      # committed the missing module before anything shipped, which is luck
+      # rather than a gate. Nothing else here looks at that seam: every other
+      # commit-scoped guard reads the commit and every build reads the disk,
+      # and the two agree right up until one file is committed without its
+      # neighbour.
       #
-      # The script was written months ago and nothing ever ran it. A fork
-      # nobody compares against upstream stops being a fork and becomes a copy
-      # that drifts, and the drift that matters here is silent: bumping the
+      # The self-test runs first and on its own fixture. It costs nothing and
+      # it is the difference between a green step that refuses a bad tree and a
+      # green step that has stopped reading: exit 2 says the check can no
+      # longer catch the defect it exists for, which is not the same failure as
+      # exit 1 and should not look like one. The scan itself parses every
+      # tracked Python file under backend/, about 4800 of them, and that parse
+      # is essentially the whole cost. No timing is quoted here on purpose: the
+      # only measurements taken were on a Windows workstation, where the same
+      # scan ran anywhere between 81 seconds and five minutes depending on
+      # nothing but how warm the file cache was. A number carried over from
+      # there would be a figure about a laptop wearing the clothes of a figure
+      # about this runner.
+      - name: Prove the untracked-import check still refuses
+        if: ${{ !cancelled() }}
+        run: python scripts/check_untracked_imports.py --self-test
+
+      - name: Check no tracked file imports a module git does not have
+        if: ${{ !cancelled() }}
+        run: python scripts/check_untracked_imports.py
+
+      # desktop/src-tauri/windows/installer.nsi is a fork of the stock Tauri
+      # NSIS template, and everything it changes is on the page a user meets
+      # when a previous version is already installed. There are three edits now,
+      # not the one this comment used to name.
+      #
+      # The first keeps an upgrade from hanging forever. Upstream starts
+      # "Uninstall before installing" selected, which ExecWaits the uninstaller
+      # already on the machine, and every uninstaller from v11.7.1 to v15.8.0
+      # calls nsExec with no timeout, so a PowerShell that never returns stops
+      # the upgrade dead. The fork pre-selects "Do not uninstall" on the upgrade
+      # branch instead. The second makes the WiX migration branch obey whichever
+      # button was selected rather than uninstalling either way. The third stops
+      # a file the old uninstaller left behind, after reporting success, from
+      # aborting an install that would have written over it anyway, and puts the
+      # exit code and the path into the message when the abort is real.
+      #
+      # The script was written months ago and nothing ran it until this step. A
+      # fork nobody compares against upstream stops being a fork and becomes a
+      # copy that drifts, and the drift that matters here is silent: bumping the
       # Tauri CLI regenerates the template with different Handlebars
       # expressions, our block survives textually, and the installer builds
       # green while the page it patches has moved. This fetches the template at
       # the CLI version pinned in desktop-release.yml, reconstructs the file
       # from it, and fails when the two stop agreeing.
+      #
+      # This lane reports, it does not block: nothing here is a required status
+      # check, so a red run does not stop the push that caused it. The same
+      # script therefore runs a second time in desktop-release.yml, on the
+      # Windows leg, ahead of the bundle. That copy is the one that blocks,
+      # because a tag is the only place in this repository where a red check
+      # withholds something. Two placements, one script, on purpose; if either
+      # is ever removed, say in the other which one is left.
       - name: Check the installer template against the Tauri version it forks
         if: ${{ !cancelled() }}
         run: python scripts/check_nsis_template_drift.py
@@ -154,6 +201,25 @@ jobs:
       - name: Check case step targets against the route table
         if: ${{ !cancelled() }}
         run: python scripts/check_case_routes.py
+
+      # The public origin serves the marketing site and the app from one
+      # hostname, and Caddy decides which a URL belongs to from one allowlist of
+      # top-level segments. A route the app serves that the list does not carry
+      # never reaches the app at all: the visitor gets the static site's 404. On
+      # 2026-09-09 that was the whole regional BOQ exchange feature, the hub plus
+      # twenty country screens, and the gate that exists for this was run that
+      # same day and passed over every one of them, because it read App.tsx and
+      # those routes come from a module manifest that builds them from a table.
+      #
+      # This compares against the committed mirror, not the host: the runner has
+      # no access to the VPS. That catches the common case, a route added with
+      # nothing added to the proxy, on the commit that adds it. The mirror is
+      # extracted from a real Caddyfile and never generated from the routes, and
+      # `--compare-mirror --caddyfile <live file>` is the manual step that checks
+      # the mirror against the host. See the script header.
+      - name: Check app routes against the proxy allowlist mirror
+        if: ${{ !cancelled() }}
+        run: python scripts/check_app_route_allowlist.py
 
       # frontend/src/features/cases/countryPortraits.generated.ts is derived
       # from the filenames under frontend/public/assets/people and imported at
@@ -424,8 +490,8 @@ jobs:
       #
       # What this reads: 116 files, against 121 tracked .py under these two
       # directories. The seven-file difference is worth knowing about, because
-      # it is not an exclusion anybody wrote for ruff. `.gitignore` line 394
-      # carries `scripts/translate_mn_*.py`; git exempts a file it already
+      # it is not an exclusion anybody wrote for ruff. `.gitignore` carries
+      # `scripts/translate_mn_*.py`; git exempts a file it already
       # tracks from its own ignore rules, so those seven stay in the repository
       # and look perfectly normal, while ruff applies the same patterns with no
       # notion of an index and never opens them. A pattern meant to keep new
@@ -454,8 +520,12 @@ jobs:
       #   every file excluded        identical to the line above, and
       #                              --show-files agrees, so counting catches it
       # A typo was never the risk. A widened .gitignore pattern, a broadened
-      # exclude or a renamed directory is, and `.gitignore` line 394 already
-      # empties part of this scope by exactly that mechanism.
+      # exclude or a renamed directory is, and the `scripts/translate_mn_*.py`
+      # line in `.gitignore` already empties part of this scope by exactly that
+      # mechanism.
+      #
+      # Cited by pattern rather than by line number on purpose: the number was
+      # already 13 lines stale before anyone noticed, and .gitignore moves.
       #
       # Both halves are counted, not just the lint half, because the two have
       # separate exclude lists and this repository already sets one of them:
@@ -768,12 +838,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
 
       # Two libraries, not the application's dependency tree. The guards below
       # need a parser and the translation runtime, and pinning both to the
@@ -935,6 +1005,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: python scripts/check_i18n_orphan_keys.py
 
+      # The language count in README.md sat at 42 while two more were added, and
+      # the paragraph in DEVELOPING.md whose entire subject is how to count them
+      # correctly was itself wrong about both of its numbers and still said
+      # Uzbek was commented out of the picker months after Uzbek was offered.
+      # Nothing could have noticed: a number in prose is not a symbol, so no
+      # import, no render and no type check has any opinion about it, and the
+      # count a reader takes for the size of the product is the one thing here
+      # with no owner. The guard recounts all three from the tree, checks every
+      # claim it can find, and refuses when a rule stops finding the claim it
+      # exists to check, because a sentence reworded out of reach of its own
+      # check is the state this was written to prevent.
+      - name: Prove the public language count guard can fail
+        if: ${{ !cancelled() }}
+        run: python scripts/check_public_language_counts.py --selftest
+
+      - name: Check the public documents still count the languages correctly
+        if: ${{ !cancelled() }}
+        run: python scripts/check_public_language_counts.py
+
       - name: Check computed t() keys against the English bundle
         if: ${{ !cancelled() }}
         run: python scripts/check_i18n_computed_keys.py
@@ -995,6 +1084,53 @@ jobs:
         if: ${{ !cancelled() }}
         run: python scripts/check_case_playbook_catalogue_locales.py
 
+      # The gate above holds the finished languages to the catalogue text:
+      # title, description and long description. Nothing held anyone to the
+      # step text, which is where the gap is. 220 playbooks name 7037 keys
+      # and most offered locales do not answer about 3000 of them, a number
+      # that grew with every new case because no gate could see it grow: the
+      # orphan gate reads literal t() calls and here the key is a variable,
+      # and the drift check skips a key that was never translated. This
+      # ratchet records, per locale and per playbook, what each locale does
+      # not answer, and fails when any count is higher than recorded, which
+      # is a key a locale had and lost or a case that shipped without its
+      # strings. --update only ever lowers a number, so the floor moves one
+      # way. It also owns the card_complete list the gate above reads, and
+      # promotes a language into it the day the language gets there.
+      #
+      # The proof step runs first, for the reason the render guard's does: a
+      # ratchet that had stopped firing would report a clean tree.
+      - name: Prove the case coverage ratchet can fail
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-coverage.mjs --selftest
+        working-directory: frontend
+
+      - name: Check no case answers fewer translated keys than the manifest records
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-coverage.mjs
+        working-directory: frontend
+
+
+      # A case string whose English was rewritten under an unchanged key. The
+      # key still resolves, so nothing else in this file reports it: the page
+      # publishes in every language carrying a faithful translation of a
+      # sentence that no longer exists. The ratchet form tolerates the debt
+      # already written down in case-en-manifest.json and fails on anything
+      # added today, which is the only part anybody can still do something
+      # about. Until now the check lived only in an npm script nothing calls.
+      #
+      # The proof step runs first, for the same reason the coverage ratchet's
+      # does: a ratchet that had stopped firing reports a clean tree, and a
+      # clean tree reports a clean tree.
+      - name: Prove the case drift ratchet can fail
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-translation-drift.mjs --selftest
+        working-directory: frontend
+
+      - name: Check no case English was reworded without its translations
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-translation-drift.mjs --ratchet
+        working-directory: frontend
       - name: Prove the payment application sense gate can fail
         if: ${{ !cancelled() }}
         run: python scripts/check_payment_application_sense.py --selftest
@@ -1033,14 +1169,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: python scripts/check_locale_mojibake.py
 
-      # A revision that creates a table without asking whether it is already
-      # there cannot run on any install this application has booted, because the
-      # boot heal's create_all built that table first. The upgrade dies on
-      # DuplicateTable, PostgreSQL rolls the whole transaction back, and every
-      # revision behind it is skipped in silence along with its backfills.
-      - name: Check migrations guard create_table against an existing table
+      # A revision that adds schema without asking whether it is already there
+      # cannot run on any install this application has booted, because the boot
+      # heal's create_all built that schema first. The upgrade dies on
+      # DuplicateTable, DuplicateColumn or DuplicateObject, PostgreSQL rolls the
+      # whole transaction back, and every revision behind it is skipped in
+      # silence along with its backfills. Widened from create_table alone after
+      # a replay over a booted database died on DuplicateColumn for
+      # oe_changeorders_order.rejected_by, a call the old gate could not see
+      # because it was written as batch.add_column rather than op.create_table.
+      - name: Check migrations guard additive DDL against an existing schema
         if: ${{ !cancelled() }}
-        run: python scripts/check_migration_create_table_guarded.py
+        run: python scripts/check_migration_ddl_guarded.py
 
       # A class like `bg-oe-blue-subtle/60` names a colour token that cannot
       # take an alpha modifier, and Tailwind's answer to that is to emit
@@ -1104,15 +1244,18 @@ jobs:
         run: node scripts/check-tailwind-alpha-drop.mjs
         working-directory: frontend
 
-  # Alone deliberately, and it has to stay alone. This is the only guard that
-  # reads git history rather than the working tree, so it is the only one that
-  # needs fetch-depth: 0. Folding it into either job above would hand it the
-  # default shallow checkout, where it would scan the single commit it can see,
-  # find nothing, and pass - a green tick for a guard that had stopped running.
-  # A one-step job next to the two large ones looks like an oversight; it is not.
+  # Separate deliberately, and it has to stay separate. These are the guards
+  # that read git history rather than the working tree, so this is the only job
+  # that needs fetch-depth: 0. Folding one of them into either job above would
+  # hand it the default shallow checkout, where it would scan the single commit
+  # it can see, find nothing, and pass - a green tick for a guard that had
+  # stopped running. A short job next to the two large ones looks like an
+  # oversight; it is not.
   # (This said "two ten-step jobs" until 2026-08-29, which was true the day it
-  # was written and had not been true for a while. No number here now, because
-  # nothing recounts this one.)
+  # was written and had not been true for a while. It then said "alone" and
+  # "the only guard", which stopped being true on 2026-09-06 when the lost
+  # accent rule arrived and needed the same full history. No number here now,
+  # because nothing recounts this one.)
   commit-history:
     name: Commit history guards
     runs-on: ubuntu-latest
@@ -1122,7 +1265,7 @@ jobs:
           # Full history so the guard scans every commit reachable from HEAD,
           # not just the tip; the tree is clean today and must stay that way.
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -1192,3 +1335,18 @@ jobs:
       - name: Scan commit subjects for shell quoting artefacts
         if: ${{ !cancelled() }}
         run: python scripts/check_commit_subject.py
+
+      # The rule below reads two revisions of the same key, so it belongs here
+      # with the history guards and nowhere else. Its sibling in the locale job,
+      # check_locale_stripped_diacritics.py, reads only the working tree and
+      # judges a bare word by what the rest of the file spells. That is blind to
+      # two shapes: a value too short to reach its word count, and damage wide
+      # enough to supply its own second opinion. Ten Czech module names shipped
+      # through both on 2026-09-06 with their accents removed.
+      - name: Prove the lost accent rule can fail
+        if: ${{ !cancelled() }}
+        run: python scripts/check_locale_value_lost_diacritics.py --selftest
+
+      - name: Check no locale value lost the diacritics it used to carry
+        if: ${{ !cancelled() }}
+        run: python scripts/check_locale_value_lost_diacritics.py

@@ -27,12 +27,16 @@ directly.
 
 from __future__ import annotations
 
+import locale
 import logging
 import os
 import socket
 import struct
 import subprocess
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from typing import NamedTuple
@@ -71,6 +75,19 @@ _FALSY = {"0", "false", "no", "off"}
 
 #: Support contact surfaced (in the log) when embedded PostgreSQL cannot start.
 _CONTACT_EMAIL = "info@datadrivenconstruction.io"
+
+#: Name of the logger ``pixeltable-pgserver`` writes everything through. Both of
+#: its emitters (``postgres_server`` and ``pgexec``) take this one name, so a
+#: filter here sees every record the library produces.
+_PGSERVER_LOGGER = "pixeltable_pgserver"
+
+#: Longest record this module lets ``pixeltable-pgserver`` put on our stream.
+#:
+#: Generous for any real message that library writes, and tiny beside the one it
+#: writes when a start fails: the entire contents of ``<pgdata>/log``, a file
+#: ``pg_ctl -l`` only ever appends to and nothing truncates. See
+#: :class:`_PgLogEchoCap` for what that costs a user.
+_PG_LOG_ECHO_LIMIT = 8000
 
 #: How often a slow crash recovery repeats that it is still recovering.
 #:
@@ -224,6 +241,86 @@ def boot(data_dir: Path | str) -> bool:
         return False
 
     pgdata = Path(data_dir).expanduser() / "pgdata"
+
+    # Windows only: refuse a first initdb whose files Windows will not let it
+    # open, and say so with the number in it. See windows_path_limit_problem for
+    # what the reader is told today, which is that their installation may be
+    # corrupt and that they should download it again.
+    #
+    # Measured BEFORE the mkdir below rather than after. On a data directory over
+    # the limit that mkdir is the call that fails first, and it fails with "data
+    # dir unavailable", which is the same unactionable answer one layer up; a
+    # check placed after it would be dead code on exactly the machines it is
+    # written for.
+    #
+    # Only while the cluster still has to be created, and PG_VERSION is how that
+    # is read. Worth stating why, because the obvious reason is the wrong one and
+    # was written here before: "the paths were once short enough to work" is
+    # evidence about the DATA directory, and this same gate also lets through a
+    # problem measured on the INSTALL directory, which a deeper reinstall can
+    # have changed underneath a data directory that never moved.
+    #
+    # What actually licenses it is that the deep names are needed to CREATE the
+    # cluster. initdb derives its support directory from its own executable and
+    # scans the whole timezone tree to identify the machine's zone, which is
+    # where _PGINSTALL_LONGEST_RELATIVE comes from. A postmaster attaching to a
+    # cluster that exists does neither: it opens no bki, and it reads only the
+    # one zone file its configuration names rather than walking the tree. Not
+    # "opens nothing deep" - a zone with a long enough name is still a way for
+    # this to bite after creation, which is why the branch below stays a warning
+    # and not silence. So PG_VERSION reads as "initdb is not about to run", and
+    # that is a statement about the install directory too.
+    #
+    # Kept as a warning rather than tightened into a refusal because a machine
+    # measured at 211 characters, over the 195 quoted at it, booted through
+    # migration to healthy. Refusing it would break a working install to make the
+    # arithmetic look tidy. Refusing to open a database that opened yesterday
+    # would be a worse bug than the one this fixes.
+    #
+    # It is not hypothetical: reinstalling into a deeper directory while keeping
+    # the data directory reaches it. "openconstructionerp doctor" runs the same
+    # measurement with no such gate, which is where that user finds it.
+    too_deep = windows_path_limit_problem(pgdata)
+    if too_deep is not None:
+        if (pgdata / "PG_VERSION").exists():
+            logger.warning("%s", too_deep.message)
+            # Say which of the two outcomes this is and what decided it. Both
+            # branches used to emit this identical paragraph, so the length and
+            # the limit in it read as the whole rule - and they are not the rule.
+            # Three installs measured on one Windows machine: 213 characters
+            # refused, 207 refused, 211 started and ran. All three were over the
+            # same 195, and what separated them was this PG_VERSION, not their
+            # length. A reader who is shown only the arithmetic concludes the
+            # arithmetic is broken, or shortens 213 to 207 and gets the same
+            # refusal for the same reason they were never told.
+            logger.warning(
+                "Starting anyway: the local database in %s already exists, so it is not being "
+                "created now and creating it is the step that needs those names to fit. The same "
+                "path becomes a refusal if this data directory is ever recreated, on a new machine "
+                "or after deleting it, so the folder above is still worth shortening.",
+                pgdata,
+            )
+        else:
+            _fatal_detail = too_deep.message
+            # The stage detail carries both numbers, because on the desktop the
+            # launcher checklist is the only surface this reader has and the
+            # paragraph above goes to a log file they are not reading. The
+            # numbers lead and the path trails, because the path is over 200
+            # characters by construction and the checklist line does not wrap:
+            # whichever half comes last is the half that runs off the edge, and
+            # a reader who can see only one half needs the one they can act on.
+            #
+            # It names creating the database rather than calling the number a
+            # maximum, because the branch above starts on paths over it.
+            emit_stage(
+                "pg",
+                "fail",
+                f"path too long to create the local database: {too_deep.length} characters, and "
+                f"{too_deep.limit} is the most that fits, for {too_deep.directory}",
+            )
+            logger.error("%s", too_deep.message)
+            return False
+
     # Create the directory that HOLDS the cluster, and stop there: initdb makes
     # ``pgdata`` itself. It used to be created here too, and on Windows that is
     # what broke it. initdb re-executes itself under a restricted token (it drops
@@ -320,6 +417,14 @@ def boot(data_dir: Path | str) -> bool:
     _apply_ascii_locale_env()
     _pre_initialize_cluster(resolved_pgdata)
     _apply_server_settings(resolved_pgdata)
+
+    # Note how far the cluster's log had already grown, after the last step that
+    # can shrink it (_clear_incomplete_cluster empties the whole directory) and
+    # before the first that can grow it. pixeltable-pgserver logs the WHOLE of
+    # that file when pg_ctl fails, and the file is appended to for the life of
+    # the installation, so without this the launcher shows the user every start
+    # they have ever had, on every start. See _PgLogEchoCap.
+    _cap_pg_log_echo(resolved_pgdata)
 
     emit_stage("pg", "start", "Starting embedded PostgreSQL")
 
@@ -435,6 +540,90 @@ def boot(data_dir: Path | str) -> bool:
     return True
 
 
+@contextmanager
+def _heartbeat_while_blocked(pgdata: Path, deadline: float) -> Iterator[None]:
+    """Keep reporting progress for as long as the wrapped call has not returned.
+
+    ``pgserver.get_server()`` is one call that can run for many minutes, and
+    while it runs this process writes nothing the desktop launcher can see. That
+    is not an oversight in the library: it reports each step it takes, but every
+    one of those reports is a ``logging`` call at INFO level, and the embedded
+    cluster is brought up *before* the application configures logging, so they
+    are handled by ``logging.lastResort``, which passes WARNING and above and
+    drops the rest. The result on a cluster replaying its write-ahead log is a
+    single call that is silent for as long as the replay takes.
+
+    The launcher gives up on a backend that has said nothing for four minutes,
+    so that silence is what killed a user's install while it was working. The
+    other long wait in this module, :func:`_wait_until_connectable`, already
+    reports itself for the same reason, but it is only reached once
+    ``get_server()`` has *raised*. This covers the call itself, which is the
+    window where the silence actually falls.
+
+    Two properties matter more than the message:
+
+    * The ticking runs on a separate thread and the wrapped call does not move.
+      ``pixeltable-pgserver`` shells out to ``pg_ctl`` and ``initdb`` from the
+      calling thread; running that off the main thread would risk turning a slow
+      start into a hard failure, and a slow start is exactly the case being
+      rescued here.
+    * It stops at ``deadline``, the same budget the whole bring-up shares. A
+      heartbeat with no end would defeat the launcher's quiet timeout outright,
+      which is a worse bug than the one it fixes: a start that genuinely never
+      finishes has to be given up on. When the budget is spent this goes quiet
+      again and the launcher's own limits take over.
+    """
+    started = time.monotonic()
+    stop = threading.Event()
+    probe_failed = False
+
+    def tick() -> None:
+        nonlocal probe_failed
+        while True:
+            # Read the interval each turn rather than binding it once, and wait
+            # on the event rather than sleeping, so the wrapped call returning
+            # ends this immediately instead of after one more full interval.
+            if stop.wait(_RECOVERY_HEARTBEAT_SECONDS):
+                return
+            now = time.monotonic()
+            if now >= deadline:
+                return
+            # Both numbers are measured, not estimated. No percentage is
+            # reported because none is known: neither this module nor the
+            # library can say how much of a replay is done.
+            waited = int(now - started)
+            left = max(int(deadline - now), 0)
+            try:
+                # The only phase question that can be answered from here, and
+                # it is answered by what is on disk rather than by guessing:
+                # either a live postmaster owns the data directory, in which
+                # case the database process is up and has not finished starting,
+                # or none does and this is still initdb or the launch itself.
+                phase = (
+                    "Waiting for the local database to finish starting up"
+                    if _postmaster_recovering(pgdata)
+                    else "Setting up the local database"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A heartbeat that dies quietly reproduces the bug it exists to
+                # prevent, so an unreadable pidfile costs the phase name and
+                # nothing else. Logged once; this runs every few seconds.
+                if not probe_failed:
+                    probe_failed = True
+                    logger.warning("cannot tell which start-up phase the cluster is in: %r", exc)
+                phase = "Starting the local database"
+            emit_stage("pg", "progress", f"{phase} ({waited}s so far, {left}s left)")
+
+    worker = threading.Thread(target=tick, name="oe-pg-boot-heartbeat", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        # Bounded so a wedged ticker can never hold up the boot it reports on.
+        worker.join(timeout=5.0)
+
+
 def _boot_once(
     pgserver: ModuleType,
     pgdata: Path,
@@ -457,13 +646,23 @@ def _boot_once(
       once so the caller can reset and retry, instead of blocking the whole
       recovery window on a cluster that never started - the old code's opaque
       multi-minute hang on exactly this class of transient failure.
+
+    The ``get_server()`` call itself is wrapped in
+    :func:`_heartbeat_while_blocked`, because the triage above only begins once
+    that call comes back and the call is free to take the entire budget first.
     """
     last_exc: Exception | None = None
     probe = 0
     while time.monotonic() < deadline:
         probe += 1
         try:
-            server = pgserver.get_server(str(pgdata))
+            # The call is silent on the stream the launcher watches and can run
+            # for minutes; the heartbeat is what stops a working start from
+            # being mistaken for a wedged one. It exits with the ``with`` block,
+            # so it is already stopped by the time the handler below emits its
+            # own marker and the two can never overlap.
+            with _heartbeat_while_blocked(resolved_pgdata, deadline):
+                server = pgserver.get_server(str(pgdata))
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             # The first get_server() launches the postmaster, which keeps
@@ -1080,6 +1279,219 @@ def _apply_ascii_locale_env() -> None:
         os.environ[key] = value
 
 
+#: Longest fully qualified path a program without long-path support can open.
+#:
+#: Windows' MAX_PATH is 260 *including* the terminating NUL, so 259 characters is
+#: the most a name can actually be. The machine-wide LongPathsEnabled registry
+#: switch does not lift this for the bundled PostgreSQL: that switch serves only
+#: processes whose manifest declares ``longPathAware``, and those binaries do not
+#: declare it. Observed with the switch already set to 1 on the reporting
+#: machine, which is why the message below says so instead of sending the reader
+#: to the registry to change something that is already changed.
+_WINDOWS_MAX_PATH = 259
+
+#: Subtrees of ``pginstall`` whose depth constrains where we may be installed.
+#:
+#: ``include/`` is deliberately absent. Its deepest entry is 74 characters
+#: (``include/postgresql/server/snowball/libstemmer/stem_ISO_8859_1_indonesian.h``)
+#: but those are C headers for building extensions against this server, and
+#: nothing at run time opens them, so counting them would refuse installs that
+#: work perfectly.
+_PGINSTALL_SUBTREES_IN_USE = ("bin", "lib", "share")
+
+#: Longest path, relative to ``pginstall``, of a file those subtrees hold.
+#:
+#: Walked out of the shipped tree rather than guessed, because what decides how
+#: deep the package may be installed is the deepest file underneath it, not the
+#: length of any one name. Today it is
+#: ``lib/postgresql/pgxs/src/test/isolation/pg_isolation_regress.exe`` at 63; the
+#: deepest one a running server truly opens is
+#: ``share/postgresql/timezone/America/Argentina/ComodRivadavia`` at 58, and
+#: ``initdb`` opens exactly that tree, because ``select_default_timezone()``
+#: scans it to identify the machine's zone.
+#:
+#: ``test_a_windows_install_too_deep_to_read_itself_is_named_before_initdb.py``
+#: re-derives this from the installed tree, so a PostgreSQL bump that ships a
+#: deeper file goes red there rather than silently widening the gap here.
+_PGINSTALL_LONGEST_RELATIVE = 63
+
+#: Longest path PostgreSQL creates below PGDATA, relative to PGDATA.
+#:
+#: A live 4860-file cluster from this application tops out at 32
+#: (``pg_logical/replorigin_checkpoint``). The longest form PostgreSQL can create
+#: there without replication slots or logical decoding, neither of which this
+#: application configures, is an archive-status marker,
+#: ``pg_wal/archive_status/<24-character segment name>.ready`` at 52. The larger
+#: of the two, so the number covers the life of the cluster and not just the
+#: moment initdb finishes.
+_PGDATA_LONGEST_RELATIVE = 52
+
+
+class PathTooLong(NamedTuple):
+    """A directory Windows is too shallow for the bundled PostgreSQL to use.
+
+    ``length`` and ``limit`` are kept apart from ``message`` so a caller can act
+    on the arithmetic without parsing prose, and so a later rewording of the
+    paragraph cannot quietly change what a test is checking.
+    """
+
+    directory: Path
+    length: int
+    limit: int
+    longest_relative: int
+    message: str
+
+
+def _measured_path_text(directory: Path) -> str:
+    """The spelling of *directory* whose length MAX_PATH is measured against.
+
+    ``Path.resolve()`` can hand back the extended-length form (``\\\\?\\C:\\...``)
+    for a path that is already long. Those four characters are a marker asking
+    the caller to switch the limit off, not part of the name, and the PostgreSQL
+    binaries do not understand it - so counting them would report a number four
+    larger than the one the user sees and than the one that actually failed.
+    """
+    text = str(directory)
+    return text[4:] if text.startswith("\\\\?\\") else text
+
+
+def _path_limit_problem(directory: Path, longest_relative: int, opening: str, fix: str) -> PathTooLong | None:
+    """Measure one directory against what Windows leaves room for underneath it.
+
+    The limit is not MAX_PATH. ``initdb`` is handed a directory and opens names
+    below it, so what has to fit is the directory, a separator, and the longest
+    of those names; the directory itself being under 259 characters proves
+    nothing. Returns ``None`` when there is room.
+
+    The message says what needs the room rather than declaring the number an
+    unconditional maximum, because :func:`boot` does not treat it as one: a
+    cluster that already exists is started on a path over this limit instead of
+    being refused. Wording it as "the most that fits" was the flat assertion two
+    readers checked it against, and on the machine that boots at 211 characters
+    with 195 quoted at it, the number reads as simply wrong. The caller that
+    knows which of the two outcomes it is taking says so in its own sentence.
+    """
+    limit = _WINDOWS_MAX_PATH - 1 - longest_relative
+    text = _measured_path_text(directory)
+    if len(text) <= limit:
+        return None
+    message = (
+        f"{opening} The folder is {text}, which is {len(text)} characters long. "
+        f"Fitting everything PostgreSQL keeps under that folder needs it to be {limit} characters "
+        f"or shorter, because Windows caps a full path at {_WINDOWS_MAX_PATH} characters and the "
+        f"longest name below that folder is {longest_relative} characters. "
+        f"{fix} "
+        f"The files are not missing and the download was not damaged, so reinstalling into the "
+        f"same place will report exactly this again. Turning on LongPathsEnabled in Windows does "
+        f"not help either: it applies only to programs that declare support for long paths, and "
+        f"the PostgreSQL binaries do not declare it."
+    )
+    return PathTooLong(
+        directory=directory,
+        length=len(text),
+        limit=limit,
+        longest_relative=longest_relative,
+        message=message,
+    )
+
+
+def _bundled_install_dir() -> Path | None:
+    """The ``pginstall`` directory holding the bundled PostgreSQL, or ``None``.
+
+    ``POSTGRES_BIN_PATH`` is ``pginstall/bin``, and everything those binaries
+    read at run time is a sibling of it. Fails open on an unimportable package or
+    a missing directory, the way :func:`_bundled_major` does: a check that cannot
+    locate our own installation has nothing to say about how deep it sits.
+    """
+    try:
+        from pixeltable_pgserver.utils import POSTGRES_BIN_PATH  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    install = Path(POSTGRES_BIN_PATH).parent
+    return install if install.is_dir() else None
+
+
+def path_limit_applies() -> bool:
+    """Whether the Windows MAX_PATH limit governs the bundled PostgreSQL here.
+
+    A function rather than ``os.name == "nt"`` spelled inline at each site, for
+    two reasons. The doctor check in the CLI needs the same answer to decide
+    whether to print a line at all, and one predicate keeps the two from drifting
+    apart. And it gives the tests a seam, so the measurement can be exercised on
+    the platforms our CI actually runs; patching ``os.name`` itself would work
+    and would lie to every other reader of it in the interpreter meanwhile.
+    """
+    return os.name == "nt"
+
+
+def windows_path_limit_problem(pgdata: Path | str) -> PathTooLong | None:
+    """Name the directory Windows is too shallow for, before initdb blames itself.
+
+    ``initdb`` is not given ``-L``; it derives its support directory from where
+    its own executable sits, so an installation deep enough to push
+    ``pginstall/share/postgresql`` past the limit cannot open its own files. What
+    it then prints is::
+
+        initdb: error: file ".../share/postgresql/postgres.bki" does not exist
+        initdb: hint: This might mean you have a corrupted installation or
+                identified the wrong directory with the invocation option -L.
+
+    The file is there, it is 944104 bytes, and any long-path-aware tool reads it.
+    Nothing downstream can tell that apart from a genuinely damaged wheel, so the
+    reader is told their installation may be corrupt and sent to
+    ``--force-reinstall``, which downloads 84 MB to land in the same directory and
+    fail the same way. Measuring the two directories first turns that into one
+    sentence with a number and a fix in it.
+
+    Windows only, by :func:`path_limit_applies`: every other platform this
+    application runs on allows paths in the thousands, so there is nothing here to
+    measure and a check that fired would only be wrong.
+
+    Returns the install directory's problem before the data directory's, because
+    a user with both would have to move the install anyway. When both are too
+    long the returned message names the data directory as well, rather than
+    sending the reader off to move the install and then refusing them a second
+    time with a different number once they are back. ``None`` means no problem
+    was found, including the cases where the installation cannot be located at
+    all.
+    """
+    if not path_limit_applies():
+        return None
+
+    data_problem = _path_limit_problem(
+        Path(pgdata),
+        _PGDATA_LONGEST_RELATIVE,
+        "The folder the local database lives in sits too deep in the filesystem for Windows to "
+        "let PostgreSQL open the files inside it.",
+        "Start the application with a shorter data directory, for example "
+        "openconstructionerp serve --data-dir C:\\OpenConstructionERP\\data, or set the "
+        "OE_DATA_DIR environment variable to that path.",
+    )
+
+    install = _bundled_install_dir()
+    if install is not None:
+        install_problem = _path_limit_problem(
+            install,
+            _PGINSTALL_LONGEST_RELATIVE,
+            "The PostgreSQL that ships with this application sits too deep in the filesystem "
+            "for Windows to let it open its own files.",
+            "Install OpenConstructionERP somewhere shorter, for example C:\\OpenConstructionERP, and this goes away.",
+        )
+        if install_problem is not None:
+            if data_problem is None:
+                return install_problem
+            return install_problem._replace(
+                message=(
+                    f"{install_problem.message} The data directory is too deep as well: "
+                    f"{_measured_path_text(data_problem.directory)} is {data_problem.length} characters "
+                    f"and needs to be {data_problem.limit} or shorter, so moving only the installation "
+                    f"leaves this refusal in place."
+                )
+            )
+
+    return data_problem
+
+
 def _initdb_args(pgdata: Path) -> tuple[str, ...]:
     """``initdb`` arguments matching pixeltable-pgserver, plus an explicit C locale.
 
@@ -1643,6 +2055,176 @@ def _wait_until_connectable(pgdata: Path, deadline: float) -> bool:
     return False
 
 
+def _decode_pg_log(raw: bytes) -> str | None:
+    """Turn bytes of ``<pgdata>/log`` into the characters its readers see.
+
+    The codec is the one ``Path.read_text()`` uses with no encoding, because
+    that is what ``pixeltable-pgserver`` calls; UTF-8 is tried second for a
+    build running in UTF-8 mode. The newlines are normalised because on Windows
+    the postmaster's output lands in this file as CRLF while every text-mode
+    read of it hands back bare newlines, and two spellings of the same lines
+    never compare equal. ``None`` when nothing decodes it.
+    """
+    for encoding in (locale.getpreferredencoding(False), "utf-8"):
+        try:
+            decoded = raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+        return decoded.replace("\r\n", "\n").replace("\r", "\n")
+    return None
+
+
+class _PgLogEchoCap(logging.Filter):
+    """Keep a boot's echo of ``<pgdata>/log`` down to the lines that boot wrote.
+
+    ``pixeltable-pgserver`` hands ``pg_ctl`` the cluster log with ``-l``, which
+    opens it for append, and when ``pg_ctl`` then fails or times out it logs the
+    WHOLE file: ``self.log.read_text()`` in ``ensure_postgres_running``. Nothing
+    truncates or rotates that file, so on the tenth start it replays nine earlier
+    starts, and on the hundredth it replays ninety-nine. The desktop launcher
+    pumps this process's output into ``desktop-launcher.log``, so what a user saw
+    on opening the application was every FATAL line their installation had ever
+    produced, stamped with the time it was re-read rather than the time it
+    happened.
+
+    That is expensive twice over. The user is alarmed by months of dead history,
+    and anyone reading the report counts those lines and reads a long-standing
+    installation as a badly broken one.
+
+    The cap is a filter rather than a rotation because the history has to stay
+    where it is. Support asks a user for that file, so deleting the oldest part
+    of it on a schedule trades one problem for a worse one. This only shortens
+    what reaches the stream: the boot records how large the file was before it
+    started, and an oversized record from that library has exactly that prefix
+    replaced by a line naming where it still lives. What remains is what this
+    boot produced, which is the part anyone diagnosing this boot needs.
+
+    Anything still over the limit after that is trimmed from the front, keeping
+    the tail, because the end of a PostgreSQL log is where it says why it
+    stopped.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._log: Path | None = None
+        self._baseline = 0
+        self._armed = False
+
+    def rebase(self, log: Path) -> None:
+        """Record how far the log had already grown before this boot appends to it."""
+        self._log = log
+        try:
+            self._baseline = log.stat().st_size
+            self._armed = True
+        except FileNotFoundError:
+            # A fresh cluster has no log at all yet. That is a definite answer
+            # rather than a missing one: this boot inherits nothing, so whatever
+            # the file holds afterwards is its own.
+            self._baseline = 0
+            self._armed = True
+        except OSError:
+            # The size is unknown. A baseline of zero would read as "the file
+            # was empty", and everything in it would then be claimed as this
+            # boot's own work. Decline to answer instead of answering wrongly.
+            self._baseline = 0
+            self._armed = False
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001
+            # A record we cannot render is a record we cannot measure. Let the
+            # logging machinery deal with it exactly as it would without us.
+            return True
+        if len(message) <= _PG_LOG_ECHO_LIMIT:
+            return True
+        record.msg = self._condense(message)
+        # Clearing the args matters: the condensed text is already formatted, and
+        # a PostgreSQL line holding a per cent sign would otherwise be re-read as
+        # a format spec and raise inside the handler.
+        record.args = ()
+        return True
+
+    def _condense(self, message: str) -> str:
+        history = self._history()
+        if history and history in message:
+            inherited = history.count("\n")
+            message = message.replace(
+                history,
+                f"[{inherited} earlier lines, from runs before this one, left in {self._log}]\n",
+            )
+        if len(message) <= _PG_LOG_ECHO_LIMIT:
+            return message
+        kept = message[-_PG_LOG_ECHO_LIMIT:]
+        return f"[{len(message) - len(kept)} characters trimmed, the full log is at {self._log}]\n{kept}"
+
+    def _history(self) -> str:
+        """The log as it stood at :meth:`rebase`, spelled the way the library reads it.
+
+        The spelling is :func:`_decode_pg_log`'s job, and it decides whether the
+        prefix is found at all: get it wrong and the cap silently degrades from
+        stripping the history to merely trimming the echo.
+
+        A file now smaller than the baseline was replaced rather than appended
+        to, so none of what it holds was inherited and there is nothing to
+        strip. Saying so here keeps a caller from having to order its steps
+        around this.
+        """
+        if self._log is None or self._baseline <= 0:
+            return ""
+        try:
+            if self._log.stat().st_size < self._baseline:
+                return ""
+            with self._log.open("rb") as handle:
+                head = handle.read(self._baseline)
+        except OSError:
+            return ""
+        return _decode_pg_log(head) or ""
+
+    def appended_since_rebase(self, log: Path) -> str | None:
+        """What ``log`` has gained since :meth:`rebase`, or ``None`` when unknown.
+
+        ``None`` is "ask the file yourself": this cap is tracking a different
+        file, was never armed, could not measure the file when it was armed, or
+        the file has been replaced since. It is never "nothing was added", which
+        is the empty string and is a real answer about a real start.
+        """
+        if self._log != log or not self._armed:
+            return None
+        try:
+            if log.stat().st_size < self._baseline:
+                return None
+            with log.open("rb") as handle:
+                handle.seek(self._baseline)
+                fresh = handle.read()
+        except OSError:
+            return None
+        return _decode_pg_log(fresh)
+
+
+#: The single installed :class:`_PgLogEchoCap`. :func:`boot` can run more than
+#: once in a process (the CLI's commands, the tests), and a filter added per call
+#: would stack up copies that each re-scan the file.
+_pg_log_echo_cap: _PgLogEchoCap | None = None
+
+
+def _cap_pg_log_echo(pgdata: Path) -> _PgLogEchoCap:
+    """Arm the log-echo cap for the boot that is about to run, and return it.
+
+    Installing on the logger rather than on a handler is deliberate: :func:`boot`
+    runs before the application configures logging, so the library's records
+    reach the launcher through ``logging.lastResort``, which has no handler of
+    ours to attach to. A filter on the logger runs in ``Logger.handle``, before
+    any of that is decided.
+    """
+    global _pg_log_echo_cap
+    if _pg_log_echo_cap is None:
+        _pg_log_echo_cap = _PgLogEchoCap()
+        logging.getLogger(_PGSERVER_LOGGER).addFilter(_pg_log_echo_cap)
+    _pg_log_echo_cap.rebase(pgdata / "log")
+    return _pg_log_echo_cap
+
+
 def _launcher_log_path() -> Path:
     """Best-effort path to the desktop launcher log the STAGE markers land in.
 
@@ -1659,6 +2241,15 @@ def _pg_failure_detail(pgdata: Path, last_exc: Exception | None) -> str:
     Carries the REAL underlying error (exception type and its message, not just
     the class name) plus the tail of the PostgreSQL log, so the ``STAGE:pg:fail``
     marker the launcher shows names an actionable cause instead of an opaque one.
+
+    The tail is taken from what THIS start appended, not from the end of the
+    file. They are the same thing only when the start reached PostgreSQL: a
+    ``pg_ctl`` that fails before the postmaster writes a line leaves the last
+    three lines of the file belonging to some run months ago, and this string is
+    rendered on the failure screen as the cause of what is happening now. That
+    is the misreading this whole change is about, and it is worse here than in
+    the log, because this screen is the only thing a user whose window will not
+    paint can read. When the start added nothing, say so.
     """
     detail = "Could not start the local database"
     if last_exc is not None:
@@ -1670,10 +2261,22 @@ def _pg_failure_detail(pgdata: Path, last_exc: Exception | None) -> str:
     log = pgdata / "log"
     try:
         if log.exists():
-            tail = log.read_text(encoding="utf-8", errors="ignore").splitlines()[-3:]
+            cap = _pg_log_echo_cap
+            fresh = cap.appended_since_rebase(log) if cap is not None else None
+            if fresh is None:
+                # Nobody noted where this start began, so the whole file is all
+                # we can honestly offer. This is the pre-existing behaviour.
+                fresh = log.read_text(encoding="utf-8", errors="ignore")
+                empty_note = ""
+            else:
+                # Deliberately without the path: this goes on the launcher's
+                # failure screen, which already carries the log location, and a
+                # screen a user photographs for a report is the wrong place to
+                # spell out their home directory.
+                empty_note = " (this start wrote nothing to the postgres log)"
+            tail = fresh.splitlines()[-3:]
             joined = " ".join(line.strip() for line in tail if line.strip())
-            if joined:
-                detail += f" (postgres log: {joined})"
+            detail += f" (postgres log: {joined})" if joined else empty_note
     except OSError:
         pass
     return detail

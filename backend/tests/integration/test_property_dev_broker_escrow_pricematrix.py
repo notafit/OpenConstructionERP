@@ -224,10 +224,13 @@ async def test_broker_kyc_verify_manager_only(
 
 @pytest.mark.asyncio
 async def test_broker_license_uniqueness(http_client, manager_headers):
-    """Two brokers with the same (tenant, license) violate the unique
-    constraint. Whether the API returns 409 (handled) or 500 (unhandled
-    IntegrityError) is acceptable — what matters is that the second
-    insert does NOT silently succeed with 201.
+    """A second broker with the same licence number is refused with 409.
+
+    These brokers are registered without a tenant, which is the default
+    deployment. The (tenant_id, license_number) unique constraint never
+    fires for that cohort because NULL never collides in SQL, so the
+    service checks the licence itself and a partial unique index backs it.
+    The first broker still exists afterwards and the second was not stored.
     """
     license = f"LIC-{uuid.uuid4().hex[:8]}"
     first = await http_client.post(
@@ -236,21 +239,20 @@ async def test_broker_license_uniqueness(http_client, manager_headers):
         headers=manager_headers,
     )
     assert first.status_code == 201, first.text
-    try:
-        dup = await http_client.post(
-            "/api/v1/property-dev/brokers/",
-            json={"name": "Second", "license_number": license},
-            headers=manager_headers,
-        )
-        assert dup.status_code != 201, dup.text
-    except Exception as exc:
-        # The IntegrityError can surface through the ASGI transport instead of
-        # being mapped to a 500. That still proves the constraint is enforced.
-        # Match the violation across drivers: asyncpg raises
-        # UniqueViolationError ("duplicate key value violates unique
-        # constraint"); SQLAlchemy wraps it as IntegrityError.
-        detail = f"{type(exc).__name__}: {exc}".lower()
-        assert "integrity" in detail or "unique" in detail or "duplicate" in detail, exc
+    dup = await http_client.post(
+        "/api/v1/property-dev/brokers/",
+        json={"name": "Second", "license_number": license},
+        headers=manager_headers,
+    )
+    assert dup.status_code == 409, dup.text
+    assert license in dup.json()["detail"]
+    listing = await http_client.get(
+        "/api/v1/property-dev/brokers/?limit=500",
+        headers=manager_headers,
+    )
+    assert listing.status_code == 200, listing.text
+    holders = [b for b in listing.json() if b["license_number"] == license]
+    assert [b["name"] for b in holders] == ["First"]
 
 
 # ── Tests: CommissionAgreement structure validation ───────────────────
@@ -463,9 +465,16 @@ async def test_commission_accrual_event_flow(
             trigger_entity_type="spa",
             trigger_entity_id=uuid.uuid4(),
         )
-        assert len(accruals) == 1
-        accrual_id = accruals[0].id
-        assert accruals[0].commission_amount == Decimal("12500.00")
+        # The event fires one accrual per matching agreement, and an agreement
+        # with no development_id is broker-wide by design (see
+        # CommissionAgreementRepository.list_matching). Earlier tests in this
+        # module leave active broker-wide agreements behind in the shared
+        # session cluster, so the flow legitimately accrues for them too.
+        # Assert on the accrual this agreement produced, not on the count.
+        mine = [a for a in accruals if a.agreement_id == agreement_id]
+        assert len(mine) == 1, [(a.agreement_id, a.commission_amount) for a in accruals]
+        accrual_id = mine[0].id
+        assert mine[0].commission_amount == Decimal("12500.00")
         await session.commit()
 
     # Approve via endpoint as MANAGER.

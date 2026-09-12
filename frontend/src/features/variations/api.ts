@@ -7,7 +7,7 @@
  * backend/app/modules/variations/router.py
  */
 
-import { apiGet, apiPost, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -92,6 +92,31 @@ export interface VariationRequest {
   decision_at: string | null;
   decision_notes: string;
   decided_by: string | null;
+  /** The bill that was in front of the approver, frozen at submission. */
+  submitted_boq_id: string | null;
+  /**
+   * What that bill priced at, read once at submission and never recomputed.
+   * Null when the request carries no bill of its own, which is a different
+   * statement from a bill that prices at nothing.
+   */
+  submitted_boq_total: string | null;
+  /**
+   * The submitted bill as a snapshot in the bill's own version history, which
+   * is what makes the total above openable: the bill itself keeps being
+   * revised while the variation is negotiated, so reading it today does not
+   * tell anyone what the approver saw. The API has served this since the
+   * commercial approval boundary landed and this interface did not declare
+   * it, so the field arrived on the wire and every reader here was blind to
+   * it. Null for a request with no bill and for one submitted before the
+   * snapshot was taken.
+   */
+  submitted_boq_snapshot_id: string | null;
+  /** What was actually agreed. Null until somebody has decided. */
+  agreed_cost_impact: string | null;
+  /** 'negotiated' | 'priced_boq' | 'headline_estimate', or '' when undecided. */
+  agreed_basis: string;
+  /** Why the agreed amount departs from the pricing state it was agreed against. */
+  agreed_variance_note: string;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -336,13 +361,40 @@ export function submitVR(id: string): Promise<VariationRequest> {
   return apiPost<VariationRequest>(`/v1/variations/variation-requests/${id}/submit`, {});
 }
 
+/**
+ * What one approval decides, in the shape the approve route reads.
+ *
+ * The wire name of the money is `decided_amount`, not `agreed_cost_impact`:
+ * the latter is what the server writes down and serves back, and sending it
+ * as the request key is accepted with a 200 and silently dropped, which
+ * records the bill total as the agreed value and looks exactly like success.
+ */
+export interface ApproveVRPayload {
+  decision_notes?: string;
+  /**
+   * The amount actually agreed, when it is not simply the pricing state that
+   * was submitted. Sent as the string the approver typed so the server parses
+   * the decimal they saw rather than a float that has been through binary.
+   * Left out entirely to approve on the submitted pricing state, which the
+   * server then records as `priced_boq` or `headline_estimate`.
+   */
+  decided_amount?: string;
+  /**
+   * Why the agreed amount departs from the submitted bill total. The server
+   * refuses a departure without one, because the gap between the two figures
+   * is the only part of the decision nobody can reconstruct afterwards.
+   */
+  agreed_variance_note?: string;
+}
+
 export function approveVR(
   id: string,
-  decision_notes?: string,
+  payload: ApproveVRPayload = {},
 ): Promise<VariationRequest> {
-  return apiPost<VariationRequest>(`/v1/variations/variation-requests/${id}/approve`, {
-    decision_notes,
-  });
+  return apiPost<VariationRequest>(
+    `/v1/variations/variation-requests/${id}/approve`,
+    payload,
+  );
 }
 
 export function rejectVR(
@@ -395,7 +447,21 @@ export function deleteVR(id: string): Promise<void> {
 
 /* ── A request's own bill of quantities (Issue #435) ───────────────────── */
 
-/** Where one line of a variation's bill came from. */
+/**
+ * What a variation line does to the source it traces to.
+ *
+ * `added` is scope the contract never held; `removed` is contracted scope the
+ * variation omits, carried as a negative quantity against the schedule of
+ * values; `modified` is the same contract line kept at a different quantity
+ * or rate. Stated by the estimator, never inferred from the numbers: the
+ * server's `variations.change_kind_matches_numbers` rule reports a
+ * contradiction between the two, it does not resolve it.
+ */
+export type VariationChangeKind = 'added' | 'removed' | 'modified';
+
+export const VARIATION_CHANGE_KINDS: readonly VariationChangeKind[] = ['added', 'removed', 'modified'];
+
+/** Where one line of a variation's bill came from, and what it does to it. */
 export interface VariationBOQTrace {
   id: string;
   variation_request_id: string;
@@ -407,8 +473,29 @@ export interface VariationBOQTrace {
   source_position_id: string | null;
   contract_id: string | null;
   contract_line_id: string | null;
+  /** `added` on every row written before the kind existed. */
+  change_kind: VariationChangeKind;
   note: string;
   created_at: string;
+}
+
+/** The lines of one change kind and what they add up to (direct cost, base currency). */
+export interface VariationBOQKindSubtotal {
+  line_count: number;
+  total: string;
+}
+
+/**
+ * The bill's direct cost split by what each line does to the contract. The
+ * net is the sum of the three, so an omission carried as a negative line
+ * comes off and the figure reads as arithmetic a person can check. A line
+ * with no trace row counts as `added`.
+ */
+export interface VariationBOQChangeSummary {
+  added: VariationBOQKindSubtotal;
+  removed: VariationBOQKindSubtotal;
+  modified: VariationBOQKindSubtotal;
+  net_total: string;
 }
 
 /** One validation finding about the bill, from the variations rule set. */
@@ -444,6 +531,8 @@ export interface VariationBOQ {
   estimated_cost_impact: string;
   estimate_matches_boq: boolean;
   traces: VariationBOQTrace[];
+  /** Null when there is no bill, for the same reason the money fields are. */
+  change_summary: VariationBOQChangeSummary | null;
   checks: VariationBOQCheck[];
 }
 
@@ -454,13 +543,29 @@ export interface CreateVariationBOQPayload {
   source_positions?: {
     position_id: string;
     quantity?: number | string;
+    /** Left out to mean `added`, which is what the server records for it. */
+    change_kind?: VariationChangeKind;
     note?: string;
   }[];
   source_contract_lines?: {
     contract_line_id: string;
     quantity?: number | string;
+    change_kind?: VariationChangeKind;
     note?: string;
   }[];
+}
+
+/**
+ * One line's provenance as the trace PUT reads it. Every field is sent on
+ * every write, including the nulls: the server replaces the row whole, and a
+ * body that named only the new reference would still read as a full answer,
+ * so the client says the whole answer too rather than relying on that.
+ */
+export interface SetVariationBOQLineTracePayload {
+  contract_line_id: string | null;
+  source_position_id: string | null;
+  change_kind: VariationChangeKind;
+  note: string;
 }
 
 export function getVariationRequestBOQ(id: string): Promise<VariationBOQ> {
@@ -486,6 +591,37 @@ export function adoptVariationRequestBOQ(id: string): Promise<VariationRequest> 
   return apiPost<VariationRequest>(
     `/v1/variations/variation-requests/${id}/boq/adopt`,
     {},
+  );
+}
+
+/**
+ * Record where one line of the request's bill came from and what it does to
+ * that source. The route exists for every line typed into the bill after it
+ * was opened, which is most of them; until the editor called it, such a line
+ * could never acquire provenance from the product at all.
+ */
+export function setVariationBOQLineTrace(
+  requestId: string,
+  positionId: string,
+  payload: SetVariationBOQLineTracePayload,
+): Promise<VariationBOQTrace> {
+  return apiPut<VariationBOQTrace>(
+    `/v1/variations/variation-requests/${requestId}/boq/lines/${positionId}/trace`,
+    payload,
+  );
+}
+
+/**
+ * Withdraw a line's provenance. The row survives as `manual` / `added` with
+ * no references, so "somebody said this derives from nothing" stays
+ * distinguishable from "nobody has looked".
+ */
+export function clearVariationBOQLineTrace(
+  requestId: string,
+  positionId: string,
+): Promise<VariationBOQTrace> {
+  return apiDelete<VariationBOQTrace>(
+    `/v1/variations/variation-requests/${requestId}/boq/lines/${positionId}/trace`,
   );
 }
 

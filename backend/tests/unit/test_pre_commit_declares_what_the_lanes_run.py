@@ -75,6 +75,16 @@ CI_ONLY_BY_DESIGN = {
         "Reads the committed tree. Step: 'Check every intra-app import against the "
         "committed tree'. At pre-commit time the commit it needs does not exist yet."
     ),
+    "check_locale_value_lost_diacritics.py": (
+        "Reads committed history rather than the working tree. Step: 'Check no locale "
+        "value lost the diacritics it used to carry', with 'Prove the lost accent rule "
+        "can fail' beside it. It compares each key against the value the same key "
+        "carried in the parent commit, over every commit from the most recent tag to "
+        "HEAD, so at pre-commit time the commit it would have to read does not exist "
+        "yet. Its sibling check_locale_stripped_diacritics.py is a hook because it "
+        "judges a value by what the rest of the file spells, which the working tree "
+        "answers on its own."
+    ),
     "check_module_inference_declarations.py": (
         "Reports rather than gates. Step: 'Report which modules reach an inference primitive'."
     ),
@@ -90,6 +100,14 @@ CI_ONLY_BY_DESIGN = {
         "a locale. Its three siblings in .pre-commit-config.yaml are hooks because they "
         "read the locale files alone. Nine seconds of hook accounting was already judged "
         "too much here (673773c00); this is fourteen times that."
+    ),
+    "check_public_language_counts.py": (
+        "Counts locale files and offered languages at import time, then checks "
+        "every number in README.md and DEVELOPING.md against the live count. "
+        "Step: 'Check the public documents still count the languages correctly', "
+        "with 'Prove the public language count guard can fail' beside it. A hook "
+        "scoped to locale files would miss a prose change, and a hook scoped to "
+        "the docs would miss a locale addition; the gate needs both sides at once."
     ),
 }
 

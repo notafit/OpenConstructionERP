@@ -4,7 +4,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { apiGet, apiPost, type Page } from '@/shared/lib/api';
+import { apiGet, apiPost, apiDelete, type Page } from '@/shared/lib/api';
+import { APP_VERSION } from '@/shared/lib/version';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -130,6 +131,9 @@ const PunchListQualityCard = lazy(() =>
 const RegionalPackCard = lazy(() =>
   import('./RegionalPackCard').then((m) => ({ default: m.RegionalPackCard })),
 );
+const DashboardMarketCasesCard = lazy(() =>
+  import('./DashboardMarketCasesCard').then((m) => ({ default: m.DashboardMarketCasesCard })),
+);
 
 /**
  * Widget ids whose card self-hides internally (renders `null` when its module
@@ -246,7 +250,7 @@ interface ProjectCardMetrics {
   phase: string | null;
   created_at: string | null;
   updated_at: string | null;
-  boq_total_value: number;
+  boq_total_value: number | string;
   boq_count: number;
   position_count: number;
   open_tasks: number;
@@ -930,7 +934,7 @@ function KpiRibbon({
         currency: code,
         // A ceiling belongs to compact notation, where one decimal is the
         // point of compacting. It does not belong to the full-length figure.
-        ...(compact ? { notation: 'compact' as const, maximumFractionDigits: 1 } : {}),
+        ...(compact ? { notation: 'compact' as const, minimumFractionDigits: 0, maximumFractionDigits: 1 } : {}),
       }).format(value);
     } catch {
       // Unknown currency code \u2014 fall back to raw number with code suffix.
@@ -2075,6 +2079,7 @@ function DashboardPageInner() {
 
   const [showAllActivity, setShowAllActivity] = useState(false);
   const [customizing, setCustomizing] = useState(false);
+  const [showUpdateWelcome, setShowUpdateWelcome] = useState(false);
 
   // Single rollup-context read - every widget on this page shares this one
   // fetch via the provider mounted above. Replaces the per-project fan-out
@@ -2196,14 +2201,42 @@ function DashboardPageInner() {
         sessionStorage.removeItem('oe_skip_onboarding_redirect');
         return;
       }
-      if (localStorage.getItem('oe_onboarding_completed') === 'true') return;
+      // Always wait for the server state before making decisions.
+      // localStorage is a fast-path hint, but it can be STALE — WebView2
+      // on Windows preserves localStorage across uninstall/reinstall, so a
+      // fresh install inherits oe_onboarding_completed=true from the
+      // previous one and the user never sees the wizard.
       if (onboardingState === undefined) return; // wait for fetch
-      if (onboardingState === null) return; // fetch failed - do not ambush the user
-      if (onboardingState.completed) {
-        localStorage.setItem('oe_onboarding_completed', 'true');
+      if (onboardingState === null) {
+        // Fetch failed — fall back to localStorage so a network hiccup
+        // does not ambush the user with the wizard.
+        if (localStorage.getItem('oe_onboarding_completed') === 'true') return;
+        return; // cannot determine — do nothing
+      }
+      if (!onboardingState.completed) {
+        // Server says NOT completed — clear any stale localStorage flags
+        // (e.g. from a previous install) and redirect to the wizard.
+        localStorage.removeItem('oe_onboarding_completed');
+        localStorage.removeItem('oe_onboarding_completed_version');
+        localStorage.removeItem('oe_lang_explicit');
+        navigate('/onboarding', { replace: true });
         return;
       }
-      navigate('/onboarding', { replace: true });
+      // Server says completed — sync localStorage and check version.
+      localStorage.setItem('oe_onboarding_completed', 'true');
+      const completedVersion = localStorage.getItem('oe_onboarding_completed_version');
+      if (completedVersion && APP_VERSION) {
+        const cv = completedVersion.split('.').map((x) => parseInt(x, 10) || 0);
+        const av = APP_VERSION.split('.').map((x) => parseInt(x, 10) || 0);
+        const majorMinorChanged =
+          (av[0] ?? 0) > (cv[0] ?? 0) ||
+          ((av[0] ?? 0) === (cv[0] ?? 0) && (av[1] ?? 0) > (cv[1] ?? 0));
+        if (majorMinorChanged) {
+          setShowUpdateWelcome(true);
+        }
+      } else if (!completedVersion) {
+        localStorage.setItem('oe_onboarding_completed_version', APP_VERSION);
+      }
     } catch { /* storage unavailable */ }
   }, [navigate, onboardingState]);
 
@@ -2512,7 +2545,7 @@ function DashboardPageInner() {
             {/* Map (left) and sites list (right) share one fixed-height row on
                 desktop so the two columns always line up; both children fill it
                 (map via h-full, panel via its own h-full + internal scroll). */}
-            <div className="grid grid-cols-1 gap-3 lg:h-[19rem] lg:grid-cols-[1.5fr_1fr]">
+            <div className="grid grid-cols-1 gap-3 lg:h-[19rem] lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
               <DashboardProjectsMap className="lg:h-full" projects={mapPins} />
               <DashboardSitesPanel projects={mapPins} />
             </div>
@@ -2610,6 +2643,10 @@ function DashboardPageInner() {
     // case it most needs to speak up in, so a self-hiding version would go
     // silent exactly where it is needed.
     regional_pack: <RegionalPackCard />,
+    // Same rule: never in WIDGET_NULL_FALLBACK. It waits for the pack answer
+    // so the market it leads with is decided once, and the grid's skeleton
+    // stands in meanwhile rather than a card that flips.
+    cases_market: <DashboardMarketCasesCard />,
 
     weather_site: <WeatherSiteWidget projects={projects} />,
     labour_cost: <LabourCostWidget />,
@@ -2861,6 +2898,76 @@ function DashboardPageInner() {
         })}
       </div>
     </div>
+
+      {/* Update welcome dialog — shown when the app version has changed
+          since the user last completed onboarding. Offers to re-run the
+          setup wizard or just continue with the new version. */}
+      {showUpdateWelcome && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fade-in"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="update-welcome-title"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              try {
+                localStorage.setItem('oe_onboarding_completed_version', APP_VERSION);
+              } catch { /* ignore */ }
+              setShowUpdateWelcome(false);
+            }
+          }}
+        >
+          <div className="relative w-full max-w-lg mx-4 rounded-2xl bg-surface-primary shadow-2xl border border-border-light overflow-hidden">
+            <div className="absolute inset-0 bg-gradient-to-br from-oe-blue/5 via-transparent to-purple-500/5 pointer-events-none" />
+            <div className="relative px-8 py-8 text-center">
+              <div className="flex justify-center mb-4">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-oe-blue-subtle">
+                  <Sparkles size={28} className="text-oe-blue" />
+                </div>
+              </div>
+              <h2 id="update-welcome-title" className="text-xl font-bold text-content-primary">
+                {t('dashboard.update_welcome_title', {
+                  defaultValue: 'Welcome to v{{version}}',
+                  version: APP_VERSION,
+                })}
+              </h2>
+              <p className="mt-2 text-sm text-content-secondary leading-relaxed max-w-sm mx-auto">
+                {t('dashboard.update_welcome_body', {
+                  defaultValue: 'The platform has been updated with new features and improvements. You can re-run the setup wizard to configure new options, or continue working right away.',
+                })}
+              </p>
+              <div className="mt-6 flex flex-col sm:flex-row gap-3 justify-center">
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    try {
+                      localStorage.removeItem('oe_onboarding_completed');
+                      localStorage.removeItem('oe_onboarding_completed_version');
+                      localStorage.removeItem('oe_lang_explicit');
+                    } catch { /* ignore */ }
+                    void apiDelete('/v1/users/me/onboarding/complete/').catch(() => {});
+                    navigate('/onboarding', { replace: true });
+                  }}
+                >
+                  {t('dashboard.update_rerun_setup', { defaultValue: 'Re-run setup' })}
+                </Button>
+                <Button
+                  variant="primary"
+                  autoFocus
+                  onClick={() => {
+                    try {
+                      localStorage.setItem('oe_onboarding_completed_version', APP_VERSION);
+                    } catch { /* ignore */ }
+                    setShowUpdateWelcome(false);
+                  }}
+                >
+                  {t('dashboard.update_continue', { defaultValue: 'Continue' })}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </DashboardRollupProvider>
   );
 }
@@ -3068,12 +3175,13 @@ function AnalyticsSection({ projects }: { projects: ProjectSummary[] }) {
   // Used for the per-currency Total Value subtotals and the per-project
   // bar labels so no figure is ever shown without its currency.
   const fmtCompact = (value: number, code: string): string => {
+    const safe = Number.isFinite(value) ? value : 0;
     const num =
-      value >= 1_000_000
-        ? `${fmtFixed(value / 1_000_000, 1)}M`
-        : value >= 1_000
-          ? `${fmtFixed(value / 1_000, 0)}K`
-          : value.toLocaleString(getNumberLocale(), {
+      safe >= 1_000_000
+        ? `${fmtFixed(safe / 1_000_000, 1)}M`
+        : safe >= 1_000
+          ? `${fmtFixed(safe / 1_000, 0)}K`
+          : safe.toLocaleString(getNumberLocale(), {
               minimumFractionDigits: 0,
               maximumFractionDigits: 0,
             });

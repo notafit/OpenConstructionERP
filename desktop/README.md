@@ -18,7 +18,7 @@ You need three toolchains on the build machine.
 
 Rust stable with Cargo, plus the Tauri CLI. Install the same version the release workflow pins, `cargo install tauri-cli --version 2.11.4 --locked`, and keep the two in step whenever either moves. The version matters beyond reproducibility: the installer's own message translations ship inside the CLI rather than in this repository, so a different CLI produces an installer that speaks a different set of languages. The pin lives in `TAURI_CLI_VERSION` in `.github/workflows/desktop-release.yml`.
 
-Node.js (the workflow uses Node 20) for building the React frontend. The frontend is built and shipped inside the sidecar.
+Node.js (the workflow uses Node 24) for building the React frontend. The frontend is built and shipped inside the sidecar.
 
 Python 3.12 for building the sidecar with PyInstaller. Install the backend in editable mode first so all runtime dependencies are present: from `backend/`, run `pip install -e ".[dev]"`.
 
@@ -65,7 +65,7 @@ You do not normally build all three platforms by hand. The workflow at `.github/
 
 The Windows `.exe` is not signed. No code signing certificate exists for this project yet, so every Windows installer published so far is unsigned, and Windows SmartScreen warns each person who runs one. The release workflow states that on the run page rather than passing over it in silence.
 
-The pipeline that will sign them is already in place and waiting on credentials. It signs through Azure Key Vault with AzureSignTool, so the private key stays inside the vault and never reaches the runner, then re-uploads the signed files over the unsigned ones while the release is still a draft. Turning it on takes five repository secrets and one repository variable, and no code change.
+The pipeline that will sign them is already in place and waiting on credentials. It signs through Azure Key Vault with AzureSignTool, so the private key stays inside the vault and never reaches the runner, then re-uploads the signed files over the unsigned ones. The release is already public by then, because release.yml publishes it before the installers are built, so an unsigned installer is downloadable until the signed one replaces it. Turning it on takes five repository secrets and one repository variable, and no code change.
 
 AZURE_KV_URL is the Key Vault URL, for example https://myvault.vault.azure.net. AZURE_KV_CERT_NAME is the certificate name inside the vault. AZURE_KV_CLIENT_ID is the service principal application (client) id. AZURE_KV_CLIENT_SECRET is the Key Vault client secret for that service principal, and it must be a freshly rotated secret. AZURE_KV_TENANT_ID is the Entra (Azure AD) tenant id. The variable WINDOWS_SIGNING_REQUIRED, set to true, makes a later disappearance of those secrets fail the build instead of quietly going back to shipping unsigned installers.
 

@@ -92,7 +92,11 @@
     },
     "unrealistic_rate": {
       "fail": "Position {ordinal}: {details}",
-      "suggestion": "Verify this value - it seems unrealistically high"
+      "suggestion": "Verify this value - it seems unrealistically high",
+      "not_assessed_no_currency": "{count} position(s) not assessed: the bill states no currency, so the money thresholds (written in {reference}) could not be scaled to it",
+      "not_assessed_no_currency_suggestion": "Set the project currency, or record a currency on the positions",
+      "not_assessed_no_rate": "{count} position(s) in {currency} not assessed: no {reference} to {currency} rate is on file, so the money thresholds could not be scaled to this bill",
+      "not_assessed_no_rate_suggestion": "Add a {reference} rate for {currency} to the FX rate register or to the project's exchange rates"
     },
     "total_mismatch": {
       "fail": "Position {ordinal}: computed {computed} != stored {stored} (diff={diff})",
@@ -112,7 +116,11 @@
     },
     "rate_vs_benchmark": {
       "fail": "Position {ordinal}: unit rate {rate}/{unit} exceeds benchmark threshold {threshold}/{unit} - potentially unrealistic",
-      "suggestion": "Verify this rate - typical rates for {unit} should be below {threshold}. Check for unit or decimal errors."
+      "suggestion": "Verify this rate - typical rates for {unit} should be below {threshold}. Check for unit or decimal errors.",
+      "not_assessed_no_currency": "{count} position(s) not assessed: the bill states no currency, so the benchmark thresholds (written in {reference}) could not be scaled to it",
+      "not_assessed_no_currency_suggestion": "Set the project currency, or record a currency on the positions",
+      "not_assessed_no_rate": "{count} position(s) in {currency} not assessed: no {reference} to {currency} rate is on file, so the benchmark thresholds could not be scaled to this bill",
+      "not_assessed_no_rate_suggestion": "Add a {reference} rate for {currency} to the FX rate register or to the project's exchange rates"
     },
     "lump_sum_ratio": {
       "fail": "{lsum_count} of {total_count} positions ({percent}) use lump sum - exceeds {threshold} threshold",
@@ -133,6 +141,10 @@
     "revision_cost_impact_review": {
       "fail": "Revision cost impact of {amount} is not yet captured as a variation",
       "suggestion": "Create a draft variation request from this revision compare to track the cost change"
+    },
+    "base_date_readable": {
+      "fail": "Base date '{base_date}' is not a date, so the bill is taxed at today's rate rather than its own",
+      "suggestion": "State the price base as a day, a month, a quarter or a year ({shapes})"
     }
   },
   "din276": {
@@ -437,6 +449,10 @@
     "missing_duration": {
       "fail": "Activity '{activity}' has an invalid duration ({duration} days) for a non-milestone task",
       "suggestion": "Set a positive working-day duration, or type the row as a milestone if it is genuinely a zero-duration event"
+    },
+    "duration_on_project_week": {
+      "fail": "Activity '{activity}' is stored as {stored} working days, the Monday-to-Friday count of {start} to {end}; on the project's week, {calendar}, those dates hold {expected}",
+      "suggestion": "Save the activity's dates again so the duration is recounted on the project's working week, or enter the duration deliberately"
     }
   },
   "sheet_completeness": {
@@ -642,6 +658,13 @@
     "boq_total_matches_estimate": {
       "fail": "The headline estimate on this request is {estimate}, but its priced bill totals {priced}",
       "suggestion": "Adopt the priced total onto the request, or correct the bill, so one figure is the answer"
+    },
+    "change_kind_matches_numbers": {
+      "removed_positive": "Line {line} is marked as removed scope but carries a positive quantity of {quantity} - an omission comes off the contract as a negative quantity",
+      "added_negative": "Line {line} is marked as added scope but carries a negative quantity of {quantity} - scope that comes off the contract is removed, not added",
+      "removed_needs_contract_line": "Line {line} is marked as removed scope but traces to no schedule-of-values line, so there is no contracted item for it to remove",
+      "modified_needs_contract_line": "Line {line} is marked as modified scope but traces to no schedule-of-values line, so there is no contracted item for it to modify",
+      "suggestion": "Correct the change kind or the quantity on the line's trace, or name the contract line the change affects"
     }
   },
   "cases": {
@@ -696,6 +719,61 @@
     "vat_treatment_declared": {
       "fail": "The estimate does not say how VAT is treated",
       "suggestion": "Record the treatment: the standard rate, a reduced or zero rate where the work qualifies, or the domestic reverse charge where the supply falls inside it. The reverse charge moves the VAT to the customer and changes what the contractor may invoice"
+    }
+  },
+    "project_completeness": {
+      "country_set": {
+        "fail": "The project names no country, so no price base, tax rate or working calendar can be resolved for it",
+        "suggestion": "Set the project's country in its settings. The country decides which regional pack, tax and calendar every figure is read against"
+      },
+      "currency_set": {
+        "fail": "The project states no currency, so its bills, markups and contracts cannot be summed",
+        "suggestion": "Choose the project currency in its settings. Every bill and contract is priced in it and every total is read in it"
+      },
+      "currency_matches_bill": {
+        "fail": "The project is priced in {project_currency}, but rows of this bill are priced in {bill_currencies}",
+        "suggestion": "Convert the rows to the project currency at a stated rate, or record the exchange rate on the project, so the bill total is one number"
+      },
+      "priced_bill_present": {
+        "fail": "The project has no bill of quantities with positions, so there is nothing to estimate from",
+        "suggestion": "Create a bill of quantities and add positions, or import one from a CAD model, a spreadsheet or an exchange file"
+      },
+      "bill_base_date_set": {
+        "fail": "The bill \"{bill}\" does not state the base date its rates are current at",
+        "suggestion": "Record the base date on the bill. Without it the rates cannot be indexed, taxed at their own date or compared with another estimate"
+      },
+      "classification_standard_set": {
+        "fail": "The project has no classification standard, so its positions carry codes nobody can check",
+        "suggestion": "Choose the classification standard the project is coded to. It also decides which country rule sets validation runs"
+      },
+      "planned_dates_set": {
+        "both_missing": "The project has neither a planned start nor a planned end date",
+        "start_missing": "The project has a planned end date but no planned start date",
+        "end_missing": "The project has a planned start date but no planned end date",
+        "unreadable": "The planned date \"{value}\" cannot be read as a date",
+        "suggestion": "Enter the planned start and end dates on the project as dates. Time-related cost, escalation and the programme are priced between them"
+      },
+      "planned_dates_ordered": {
+        "fail": "The project is planned to start on {start} and end on {end}, which is before it starts",
+        "suggestion": "Swap or correct the planned dates so the start comes before the end"
+      },
+      "client_recorded": {
+        "fail": "The project records no client, and no contract names an employer",
+        "suggestion": "Record the client on the project, or add the employer as a party on the contract, so the estimate has an addressee"
+      },
+      "procurement_started": {
+        "fail": "The project is in the {phase} phase, yet it has no contract and no tender package",
+        "suggestion": "Create a tender package from the bill or record the contract, or set the phase back to the estimating stage the project is actually in"
+      }
+    },
+  "boq_resources": {
+    "unit_rate_not_rederived": {
+      "fail": "Position {ordinal}: the resource rows cannot price the line, so the unit rate was not re-derived from them",
+      "fallback_allowance": "Position {ordinal}: the resource rows are an estimated allowance split holding the position quantity, so the unit rate was not re-derived from them",
+      "assumed_norm": "Position {ordinal}: the resource rows carry norms the catalogue never stated, so the unit rate was not re-derived from them",
+      "norm_collapsed": "Position {ordinal}: the resource rows lost their catalogue norm and hold the position quantity instead, so the unit rate was not re-derived from them",
+      "whole_position_quantities": "Position {ordinal}: the resource rows hold whole-position quantities instead of per-unit norms, so the unit rate was not re-derived from them",
+      "suggestion": "Review the buildup - re-derive the position from its catalogue item through the resource norm review, or correct the rows by hand"
     }
   }
 }

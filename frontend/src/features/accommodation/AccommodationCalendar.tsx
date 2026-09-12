@@ -63,6 +63,8 @@ import {
   isSameMonth,
   isToday as dfIsToday,
 } from 'date-fns';
+import { useDateFnsLocale } from '@/shared/lib/dateFnsLocale';
+import { useWeekStartsOn, type WeekStartsOn } from '@/shared/lib/weekStart';
 
 import {
   Button,
@@ -125,18 +127,29 @@ const STATE_BLOCK_CLASS: Record<BookingStatus, string> = {
  * Compute the inclusive list of dates rendered in the grid given the
  * current view + anchor date.
  *
- * - Week: 7 days starting Monday.
+ * - Week: 7 days starting on the reader's first weekday.
  * - Month: full weeks bracketing the anchor month (always 35 or 42 days,
  *   includes leading + trailing greyed-out days from neighbour months).
+ *
+ * `weekStartsOn` used to be hardcoded to Monday here, which drew a
+ * Monday-first camp calendar for all 42 offered languages. A booking is a
+ * per-night cell and nothing in this feature prices or books by the week, so
+ * there was no operational week to preserve, only an unstated default. The
+ * range also bounds the fetch window, so the grid and the query rotate
+ * together and stay consistent.
  */
-function computeRange(view: CalendarView, anchor: Date): { start: Date; end: Date } {
+function computeRange(
+  view: CalendarView,
+  anchor: Date,
+  weekStartsOn: WeekStartsOn,
+): { start: Date; end: Date } {
   if (view === 'week') {
-    const start = startOfWeek(anchor, { weekStartsOn: 1 });
+    const start = startOfWeek(anchor, { weekStartsOn });
     const end = addDays(start, 6);
     return { start, end };
   }
-  const start = startOfWeek(startOfMonth(anchor), { weekStartsOn: 1 });
-  const end = endOfWeek(endOfMonth(anchor), { weekStartsOn: 1 });
+  const start = startOfWeek(startOfMonth(anchor), { weekStartsOn });
+  const end = endOfWeek(endOfMonth(anchor), { weekStartsOn });
   return { start, end };
 }
 
@@ -338,9 +351,10 @@ export function AccommodationCalendar({
     if (scopedAccommodationId) setFilterId(scopedAccommodationId);
   }, [scopedAccommodationId]);
 
+  const weekStartsOn = useWeekStartsOn();
   const { start: viewStart, end: viewEnd } = useMemo(
-    () => computeRange(view, anchor),
-    [view, anchor],
+    () => computeRange(view, anchor, weekStartsOn),
+    [view, anchor, weekStartsOn],
   );
 
   // List of accommodations — used both for the filter dropdown (when
@@ -481,12 +495,18 @@ export function AccommodationCalendar({
   const inputCls =
     'h-9 rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue';
 
+  // Month and weekday names are the only date-fns output on this page a reader
+  // sees as words, so they are the only calls that take a locale. Every other
+  // `format` here writes `yyyy-MM-dd` for a query parameter or a React key,
+  // where a locale would be a bug rather than a fix.
+  const dfLocale = useDateFnsLocale();
+
   const headerLabel = useMemo(() => {
     if (view === 'week') {
-      return `${format(viewStart, 'MMM d')} – ${format(viewEnd, 'MMM d, yyyy')}`;
+      return `${format(viewStart, 'MMM d', { locale: dfLocale })} – ${format(viewEnd, 'MMM d, yyyy', { locale: dfLocale })}`;
     }
-    return format(anchor, 'MMMM yyyy');
-  }, [view, viewStart, viewEnd, anchor]);
+    return format(anchor, 'MMMM yyyy', { locale: dfLocale });
+  }, [view, viewStart, viewEnd, anchor, dfLocale]);
 
   return (
     <div className={embedded ? 'space-y-4' : 'space-y-5 animate-fade-in'}>
@@ -777,6 +797,9 @@ function CalendarGrid({
   onBlockClick,
 }: CalendarGridProps) {
   const { t } = useTranslation();
+  // The day-column headers below print a weekday name, the one piece of
+  // date-fns output in this component a reader sees as a word.
+  const dfLocale = useDateFnsLocale();
   // Use the middle day as the anchor for month-view shading. `days` is
   // never empty in practice (week=7, month=35/42) but `noUncheckedIndexedAccess`
   // makes us provide a fallback for safety.
@@ -942,7 +965,7 @@ function CalendarGrid({
                   style={{ width: DAY_WIDTH_PX }}
                 >
                   <span className="font-medium text-content-tertiary uppercase">
-                    {format(d, 'EEE')}
+                    {format(d, 'EEE', { locale: dfLocale })}
                   </span>
                   <span
                     className={clsx(

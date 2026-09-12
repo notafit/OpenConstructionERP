@@ -54,6 +54,7 @@ from app.modules.variations.repository import (
     VariationScheduleImpactRepository,
 )
 from app.modules.variations.schemas import (
+    DEFAULT_CHANGE_KIND,
     DayworkSheetCreate,
     DayworkSheetLineCreate,
     DayworkSheetLineUpdate,
@@ -69,6 +70,8 @@ from app.modules.variations.schemas import (
     SiteMeasurementCreate,
     SiteMeasurementUpdate,
     VariationBOQCreate,
+    VariationBOQLineTraceUpdate,
+    VariationChangeKind,
     VariationCostImpactCreate,
     VariationCostImpactUpdate,
     VariationOrderCreate,
@@ -1498,17 +1501,44 @@ class VariationsService:
             )
         return vr
 
-    async def _freeze_submitted_pricing_state(self, vr_id: uuid.UUID) -> dict[str, Any]:
-        """Which bill, and at what total, was put in front of the approver.
+    @staticmethod
+    def _actor_uuid(user_id: str | None) -> uuid.UUID | None:
+        """The actor as the UUID a ``created_by`` column takes, or None.
+
+        Actors reach this service as strings, and not every string is an id:
+        a script or a test may name itself. A name is recorded as nobody
+        rather than refused, because who pressed submit is already in the
+        activity log and the snapshot must not fail to be written over it.
+        """
+        try:
+            return uuid.UUID(str(user_id)) if user_id else None
+        except ValueError:
+            return None
+
+    async def _freeze_submitted_pricing_state(
+        self,
+        vr: VariationRequest,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Which bill, at what total, and made of which lines, was put in front of the approver.
 
         Read once, at submission, and never recomputed. The bill can go on
         being revised after it is submitted - that is the normal way a
         variation gets negotiated - so a total read later answers a
         different question from the one the record has to answer.
 
+        The total is the right thing to agree against and the wrong thing to
+        defend a price with: once the bill has moved, nothing says which
+        lines, at which quantities and rates, the frozen figure was made of.
+        So submission also writes a point-in-time copy of the bill into its
+        own version history (``BOQService.create_snapshot``, the same copy
+        the editor's history panel lists) and records which one. The copy
+        is named after the request so a reader of that history can tell it
+        from a snapshot somebody took by hand.
+
         A request with no bill of its own is priced by its headline figure
-        alone, which is a legitimate way to run a small variation, and both
-        columns stay NULL to say so.
+        alone, which is a legitimate way to run a small variation, and all
+        three columns stay NULL to say so.
 
         A request whose revision chain has forked is refused rather than
         recorded as NULL. It HAS a bill and we cannot say which one, so
@@ -1516,18 +1546,29 @@ class VariationsService:
         that has two, and that is the one answer that is worse than an
         error message.
         """
-        boq, reason = await self.resolve_request_boq(vr_id)
+        boq, reason = await self.resolve_request_boq(vr.id)
         if boq is None:
             if reason == "no_active_boq":
-                return {"submitted_boq_id": None, "submitted_boq_total": None}
+                return {
+                    "submitted_boq_id": None,
+                    "submitted_boq_total": None,
+                    "submitted_boq_snapshot_id": None,
+                }
             raise self._request_boq_refusal(reason)
 
         from app.modules.boq.service import BOQService
 
-        breakdown = (await BOQService(self.session).compute_boq_totals([boq.id])).get(boq.id, {})
+        boq_service = BOQService(self.session)
+        breakdown = (await boq_service.compute_boq_totals([boq.id])).get(boq.id, {})
+        snapshot = await boq_service.create_snapshot(
+            boq.id,
+            name=f"{vr.code}: as submitted for approval"[:255],
+            user_id=self._actor_uuid(user_id),
+        )
         return {
             "submitted_boq_id": boq.id,
             "submitted_boq_total": _money(breakdown.get("grand_total")),
+            "submitted_boq_snapshot_id": snapshot.id,
         }
 
     def _record_agreed_value(
@@ -1602,7 +1643,9 @@ class VariationsService:
         (Issue #435) as well as the status.
 
         Submitting freezes which pricing state was put in front of the
-        approver. Approving records what was actually agreed and why it is
+        approver, and keeps a copy of the bill as it stood, so the frozen
+        total has lines behind it after the bill has been revised. Approving
+        records what was actually agreed and why it is
         that number, which is the half that was missing: without it the
         agreed value is whatever figure happened to be on the request, and a
         negotiated amount cannot be told from a stale headline.
@@ -1624,7 +1667,7 @@ class VariationsService:
         fields: dict[str, Any] = {"status": to_status}
         if to_status == "submitted":
             fields["submitted_at"] = _now_iso()
-            fields.update(await self._freeze_submitted_pricing_state(vr_id))
+            fields.update(await self._freeze_submitted_pricing_state(vr, user_id=user_id))
         if to_status in {"approved", "rejected"}:
             fields["decision_at"] = _now_iso()
             fields["decided_by"] = user_id
@@ -1793,10 +1836,19 @@ class VariationsService:
     ) -> dict[uuid.UUID, Any]:
         """Estimating positions the variation takes scope from, by id.
 
-        Every id must resolve to a position on a bill of *this* project. A
-        request that names a position from somewhere else is refused rather
-        than silently skipped: seeding a bill with fewer lines than were asked
-        for, and saying nothing, is how a variation ends up understated.
+        Every id must resolve to a position on an *estimating* bill of this
+        project. A request that names a position from somewhere else is
+        refused rather than silently skipped: seeding a bill with fewer lines
+        than were asked for, and saying nothing, is how a variation ends up
+        understated.
+
+        Another variation's bill is somewhere else, and is excluded by the
+        same ``variation_request_id IS NULL`` filter the three other places
+        that mean "the project's own bills" already apply
+        (``app/core/boq_target.py``, ``BOQRepository.list_for_project``,
+        ``_resolve_writeback_boq`` in change orders). It is priced scope that
+        nobody has agreed to yet, so estimating provenance pointing at it
+        would defend one unagreed figure with another.
         """
         if not position_ids:
             return {}
@@ -1809,7 +1861,11 @@ class VariationsService:
                 await self.session.execute(
                     select(Position)
                     .join(BOQ, BOQ.id == Position.boq_id)
-                    .where(Position.id.in_(position_ids), BOQ.project_id == project_id)
+                    .where(
+                        Position.id.in_(position_ids),
+                        BOQ.project_id == project_id,
+                        BOQ.variation_request_id.is_(None),
+                    )
                 )
             )
             .scalars()
@@ -1818,13 +1874,17 @@ class VariationsService:
         found = {row.id: row for row in rows}
         missing = [str(pid) for pid in position_ids if pid not in found]
         if missing:
+            # One code for one refusal. A caller that learned it when the only
+            # filter was the project keeps reading it, and the message says
+            # what the filter is now rather than a narrower thing it once was.
             raise HTTPException(
                 status_code=http_status.HTTP_400_BAD_REQUEST,
                 detail={
                     "error": "source_position_not_in_project",
                     "message": (
-                        "These positions are not on any bill of this project, so a variation on "
-                        "this project cannot take scope from them."
+                        "These positions are not on any estimating bill of this project, so a "
+                        "variation on this project cannot take scope from them. Another "
+                        "variation's own bill is not estimating scope."
                     ),
                     "position_ids": missing,
                 },
@@ -2022,6 +2082,7 @@ class VariationsService:
                     "source_position_id": source.id,
                     "contract_id": None,
                     "contract_line_id": None,
+                    "change_kind": item.change_kind,
                     "note": item.note,
                 }
             )
@@ -2053,6 +2114,7 @@ class VariationsService:
                     "source_position_id": None,
                     "contract_id": line.contract_id,
                     "contract_line_id": line.id,
+                    "change_kind": item.change_kind,
                     "note": item.note,
                 }
             )
@@ -2073,11 +2135,219 @@ class VariationsService:
                 source_position_id=fields["source_position_id"],
                 contract_id=fields["contract_id"],
                 contract_line_id=fields["contract_line_id"],
+                change_kind=str(fields["change_kind"]),
                 note=str(fields["note"] or ""),
             )
             for position, fields in zip(positions, pending, strict=True)
         ]
         return await self.boq_trace_repo.bulk_create(traces)
+
+    async def _require_variation_boq_line(self, vr_id: uuid.UUID, position_id: uuid.UUID) -> Any:
+        """The line, once it is established that it is a line of *this* bill.
+
+        Two separate facts, and both have to hold. Project access, checked at
+        the route, says the caller may touch this request. It says nothing at
+        all about the position id in the path, which is a bare id from another
+        module's table: without the ``boq_id`` comparison below, a caller with
+        access to one project could write a provenance row naming a line of a
+        different project's bill, and the trace table would then hold a row
+        about a line its own request has never seen.
+        """
+        from app.modules.boq.models import Position
+
+        boq = await self._require_request_boq(vr_id)
+        position = await self.session.get(Position, position_id)
+        if position is None or position.boq_id != boq.id:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "line_not_in_variation_boq",
+                    "message": (
+                        "This line is not part of this variation request's bill of quantities, so "
+                        "its provenance cannot be recorded here."
+                    ),
+                },
+            )
+        return position
+
+    async def _write_boq_line_trace(
+        self,
+        *,
+        vr: VariationRequest,
+        boq_id: uuid.UUID,
+        position_id: uuid.UUID,
+        origin: str,
+        source_boq_id: uuid.UUID | None,
+        source_position_id: uuid.UUID | None,
+        contract_id: uuid.UUID | None,
+        contract_line_id: uuid.UUID | None,
+        change_kind: VariationChangeKind,
+        note: str,
+    ) -> VariationBOQTrace:
+        """Upsert the one trace row a line is allowed to have.
+
+        ``uq_oe_variations_boq_trace_position`` permits exactly one row per
+        line, so writing provenance a second time has to replace the first
+        answer rather than add a second one. Every field is written on both
+        paths, including the ones being cleared: a partial update would leave
+        the previous answer's ``contract_id`` sitting under a new
+        ``source_position_id`` and read as a line traced to both. The change
+        kind is written for the same reason - ``removed`` left under a fresh
+        estimating reference would read as omitting scope the line adds.
+        """
+        fields = {
+            "origin": origin,
+            "source_boq_id": source_boq_id,
+            "source_position_id": source_position_id,
+            "contract_id": contract_id,
+            "contract_line_id": contract_line_id,
+            "change_kind": change_kind,
+            "note": note,
+        }
+        existing = await self.boq_trace_repo.get_for_position(position_id)
+        if existing is not None:
+            await self.boq_trace_repo.update_fields(existing.id, **fields)
+            return existing
+        return await self.boq_trace_repo.create(
+            VariationBOQTrace(
+                variation_request_id=vr.id,
+                boq_id=boq_id,
+                position_id=position_id,
+                **fields,
+            )
+        )
+
+    async def set_boq_line_trace(
+        self,
+        vr_id: uuid.UUID,
+        position_id: uuid.UUID,
+        data: VariationBOQLineTraceUpdate,
+        user_id: str | None = None,
+    ) -> VariationBOQTrace:
+        """Record where one line of a variation's bill came from.
+
+        Seeding a bill records this for the lines it copies, and until this
+        existed that was the only moment at which a line could acquire it. A
+        bill is an ordinary bill, so it grows through the BOQ editor like any
+        other, and every line added that way stayed permanently untraced -
+        which ``variations.boq_lines_are_traced`` reported, correctly, with no
+        way for the reader to act on it.
+
+        The references are validated against the request's project, which is
+        the only scope available: a variation request names a project, not a
+        contract, so "the contract this variation is against" is not a fact
+        this record holds. A schedule-of-values line of any contract on the
+        project is therefore accepted, and one belonging to another project's
+        contract is refused by the same loader the seeding path uses.
+
+        The estimating position goes through the same loader, which admits
+        only the project's estimating bills. A line of this bill, or of any
+        other variation's bill, is refused there rather than guarded against
+        here, so there is one answer to "what may a line be traced to" and
+        both paths give it.
+        """
+        vr = await self.get_request(vr_id)
+        position = await self._require_variation_boq_line(vr_id, position_id)
+
+        contract_lines = await self._load_source_contract_lines(
+            vr.project_id, [data.contract_line_id] if data.contract_line_id else []
+        )
+        sources = await self._load_source_positions(
+            vr.project_id, [data.source_position_id] if data.source_position_id else []
+        )
+        line = contract_lines.get(data.contract_line_id) if data.contract_line_id else None
+        source = sources.get(data.source_position_id) if data.source_position_id else None
+
+        # The contract line is the stronger statement of the two: it says
+        # what contracted scope this line changes, which is what a variation
+        # argues about. The estimating position is provenance for the money.
+        origin = "contract_line" if line is not None else "boq_position" if source is not None else "manual"
+        # The kind is stored as stated, even where it contradicts the
+        # numbers or names no contract line to remove from. The validator
+        # reports that on the next read of the bill; refusing it here would
+        # make "the estimator has not finished" and "the estimator is wrong"
+        # the same 4xx, and only the second is anybody's business to stop.
+        trace = await self._write_boq_line_trace(
+            vr=vr,
+            boq_id=position.boq_id,
+            position_id=position_id,
+            origin=origin,
+            source_boq_id=source.boq_id if source is not None else None,
+            source_position_id=source.id if source is not None else None,
+            contract_id=line.contract_id if line is not None else None,
+            contract_line_id=line.id if line is not None else None,
+            change_kind=data.change_kind,
+            note=data.note,
+        )
+        _safe_publish(
+            "variations.request.boq_line_traced",
+            {
+                "project_id": str(vr.project_id),
+                "variation_request_id": str(vr_id),
+                "code": vr.code,
+                "boq_id": str(position.boq_id),
+                "position_id": str(position_id),
+                "origin": origin,
+                "change_kind": data.change_kind,
+                "actor_id": user_id or "",
+            },
+        )
+        logger.info(
+            "Variation request %s traced line %s of bill %s as %s (%s)",
+            vr.code,
+            position_id,
+            position.boq_id,
+            origin,
+            data.change_kind,
+        )
+        return trace
+
+    async def clear_boq_line_trace(
+        self,
+        vr_id: uuid.UUID,
+        position_id: uuid.UUID,
+        user_id: str | None = None,
+    ) -> VariationBOQTrace:
+        """Withdraw a line's provenance without withdrawing the answer.
+
+        The row survives with ``origin='manual'`` and both references null,
+        which is the state the model describes for a line entered by hand:
+        "recorded with ``origin='manual'`` rather than left without a row, so
+        the trace covers the bill rather than only the parts of it that were
+        derived". Deleting the row instead would make "nobody has said" and
+        "somebody said it derives from nothing" the same absence.
+
+        The line then fails ``variations.boq_lines_are_traced`` again, which
+        is correct: it no longer traces anywhere. Its change kind goes back
+        to ``added`` with the references, because a line that derives from
+        nothing cannot be omitting or modifying anything.
+        """
+        vr = await self.get_request(vr_id)
+        position = await self._require_variation_boq_line(vr_id, position_id)
+        trace = await self._write_boq_line_trace(
+            vr=vr,
+            boq_id=position.boq_id,
+            position_id=position_id,
+            origin="manual",
+            source_boq_id=None,
+            source_position_id=None,
+            contract_id=None,
+            contract_line_id=None,
+            change_kind=DEFAULT_CHANGE_KIND,
+            note="",
+        )
+        _safe_publish(
+            "variations.request.boq_line_trace_cleared",
+            {
+                "project_id": str(vr.project_id),
+                "variation_request_id": str(vr_id),
+                "code": vr.code,
+                "boq_id": str(position.boq_id),
+                "position_id": str(position_id),
+                "actor_id": user_id or "",
+            },
+        )
+        return trace
 
     async def get_request_boq_view(self, vr_id: uuid.UUID) -> dict[str, Any]:
         """Everything the request's bill says, priced and traced.
@@ -2109,7 +2379,8 @@ class VariationsService:
         from app.modules.boq.service import BOQService
 
         boq_id = boq.id
-        breakdown = (await BOQService(self.session).compute_boq_totals([boq_id])).get(boq_id, {})
+        boq_service = BOQService(self.session)
+        breakdown = (await boq_service.compute_boq_totals([boq_id])).get(boq_id, {})
         rows = list(
             (
                 await self.session.execute(
@@ -2121,6 +2392,7 @@ class VariationsService:
         )
         traces = await self.boq_trace_repo.list_for_boq(boq_id)
         by_position = {trace.position_id: trace for trace in traces}
+        change_summary = await self._summarise_change_kinds(boq_service, vr.project_id, rows, by_position)
 
         grand_total = _money(breakdown.get("grand_total"))
         payload: dict[str, Any] = {
@@ -2140,9 +2412,54 @@ class VariationsService:
             "estimated_cost_impact": headline,
             "estimate_matches_boq": abs(headline - grand_total) < _MONEY_EPSILON,
             "traces": traces,
+            "change_summary": change_summary,
         }
         payload["checks"] = await self._run_variation_boq_rules(payload, rows, by_position)
         return payload
+
+    async def _summarise_change_kinds(
+        self,
+        boq_service: Any,
+        project_id: uuid.UUID,
+        rows: list[Any],
+        by_position: dict[uuid.UUID, VariationBOQTrace],
+    ) -> dict[str, Any]:
+        """The bill's direct cost split by what each line does to the contract.
+
+        Each priced line is valued by the same helper
+        ``BOQService.compute_boq_totals`` values it with, against the same
+        project FX table, so the three subtotals sum to the bill's own
+        ``direct_cost`` rather than to a second figure that agrees with it
+        only on a single-currency bill. Which lines count as priced is also
+        the BOQ module's answer (``_is_section``), for the same reason.
+
+        A line with no trace row is ``added``, and so is a row whose kind is
+        something this code does not know - a value that reached the column
+        by some path other than the schema is not a claim about an omission.
+        """
+        from app.modules.boq.service import _is_section, _leaf_total_base_with_resources
+
+        base_currency, fx_map = await boq_service._resolve_project_fx_by_project(project_id)
+        buckets: dict[str, dict[str, Any]] = {
+            kind: {"line_count": 0, "total": Decimal("0")} for kind in ("added", "removed", "modified")
+        }
+        for row in rows:
+            if _is_section(row):
+                continue
+            trace = by_position.get(row.id)
+            kind = str(getattr(trace, "change_kind", "") or "") if trace is not None else ""
+            bucket = buckets.get(kind) or buckets[DEFAULT_CHANGE_KIND]
+            bucket["line_count"] += 1
+            bucket["total"] += _leaf_total_base_with_resources(row, fx_map, base_currency)
+        # Cents at the boundary, the way ``direct_cost`` leaves this module, so
+        # the three figures read like the total beside them and the net is the
+        # sum of the figures shown rather than of the unrounded ones behind them.
+        for bucket in buckets.values():
+            bucket["total"] = _money(bucket["total"])
+        return {
+            **buckets,
+            "net_total": sum((bucket["total"] for bucket in buckets.values()), Decimal("0")),
+        }
 
     async def _run_variation_boq_rules(
         self,
@@ -2176,6 +2493,16 @@ class VariationsService:
                             "id": str(row.id),
                             "ordinal": row.ordinal,
                             "unit": row.unit,
+                            "quantity": row.quantity,
+                            # The stated kind, or the default a line with no
+                            # row reads as. The rule that judges it against
+                            # the numbers has to see the same kind the
+                            # subtotals bucket the line under.
+                            "change_kind": (
+                                by_position[row.id].change_kind
+                                if row.id in by_position and by_position[row.id].change_kind
+                                else DEFAULT_CHANGE_KIND
+                            ),
                             "source_position_id": (
                                 str(by_position[row.id].source_position_id)
                                 if row.id in by_position and by_position[row.id].source_position_id

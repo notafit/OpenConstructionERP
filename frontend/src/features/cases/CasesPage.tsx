@@ -26,7 +26,7 @@ import {
   useState,
   type ComponentType,
 } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
@@ -53,6 +53,8 @@ import {
   X,
   SlidersHorizontal,
   ChevronDown,
+  Check,
+  Package,
   type LucideProps,
 } from "lucide-react";
 import {
@@ -65,12 +67,21 @@ import {
 import { fmtList } from "@/shared/lib/formatters";
 import { useNearViewport } from "@/shared/hooks/useNearViewport";
 import { useActiveProjectId } from "@/shared/hooks/useActiveProjectId";
+import { useInstalledPacks } from "@/shared/hooks/usePartnerPack";
 import { useProjectContextStore } from "@/stores/useProjectContextStore";
 import { projectsApi } from "@/features/projects/api";
+import { useAuthStore } from "@/stores/useAuthStore";
+import { PartnerPackApplyDialog } from "@/features/modules/PartnerPackApplyDialog";
 import { PLAYBOOKS, getPlaybook } from "./playbooks";
 import { caseIdFromPlaybookId } from "./api";
 import { useAuthoredCases } from "./useCustomCases";
 import { PlaybookRunner } from "./PlaybookRunner";
+import { MarketPackPanel } from "./MarketPackPanel";
+import {
+  CasePackStrip,
+  useMarketPackOffers,
+  type CasePackOffer,
+} from "./CasePackStrip";
 import { useCasesStore } from "./useCasesStore";
 import { completedCount } from "./progress";
 import {
@@ -121,6 +132,8 @@ import type {
 
 import { regionDisplayName } from "./regions";
 import { homeMarketFirst, homeMarketForLanguage } from "./homeMarket";
+import { countCasesByMarket, orderMarkets } from "./marketCases";
+import { compareNames } from '@/shared/lib/collator';
 
 export function CasesPage() {
   const { playbookId } = useParams<{ playbookId?: string }>();
@@ -239,7 +252,7 @@ function CasesList() {
     staleTime: 5 * 60_000,
   });
   const sortedProjects = useMemo(
-    () => [...(projects ?? [])].sort((a, b) => a.name.localeCompare(b.name)),
+    () => [...(projects ?? [])].sort((a, b) => compareNames(a.name, b.name)),
     [projects],
   );
   const pinnedIds = useMemo(
@@ -348,6 +361,68 @@ function CasesList() {
     (p: Playbook) => activeRegion === "all" || p.region === activeRegion,
     [activeRegion],
   );
+
+  // The market is the one filter a link has to carry. Persisting it in the
+  // store answers the reader who comes back; it says nothing to the reader
+  // who is SENT here - a colleague pasting the address, the dashboard card,
+  // a pack's onboarding - because the address bar of a filtered hub read
+  // `/cases` and the receiver saw their own stored market, or none.
+  //
+  // So `?market=DE` is read from the address and written back to it. Two
+  // directions, one effect, and a ref that remembers the last value this
+  // component saw in the address decides which way is newer: an address the
+  // ref has not seen came from navigation and wins over the store; an
+  // unchanged address with a changed store is a chip click, and the address
+  // follows. Without that memory a chip click would be undone at once by
+  // the stale parameter still sitting in the bar. Writes replace the history
+  // entry so filtering never stacks the back button, `all` or an unknown
+  // code clears the filter, and a lower-case code is accepted and rewritten
+  // upper case, the way the cases spell it. Nothing here guards against the
+  // case page: `CasesPage` returns the runner before this component is
+  // reached, so the hub is the only address this effect ever writes to.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const seenMarketParam = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const raw = searchParams.get("market");
+    if (raw !== seenMarketParam.current) {
+      seenMarketParam.current = raw;
+      const code = raw?.trim().toUpperCase() ?? "";
+      const fromUrl =
+        code === "" ? null : code === "ALL" ? "all" : regions.includes(code) ? code : null;
+      if (fromUrl !== null && fromUrl !== activeRegion) {
+        setRegion(fromUrl);
+        return;
+      }
+    }
+    const wanted = activeRegion === "all" ? null : activeRegion;
+    if (raw !== wanted) {
+      seenMarketParam.current = wanted;
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (wanted) next.set("market", wanted);
+          else next.delete("market");
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [searchParams, activeRegion, regions, setRegion, setSearchParams]);
+  // The pack that serves each of those markets, resolved once for the whole
+  // grid rather than per card: twelve cards mount per batch and every one of
+  // them would otherwise run the same match over the same list of packs.
+  const packOffers = useMarketPackOffers(regions);
+  // Applying a pack is admin-only in the backend (`RequireRole("admin")` on
+  // /apply and /full-install-stream), so the card says so rather than offering
+  // a button that would come back 403.
+  const canInstallPack = useAuthStore((s) => s.userRole) === "admin";
+  // ONE dialog for the whole grid. It is the same dialog the Modules page and
+  // the case page open - a dry run of what changes, an explicit confirm for
+  // the modules it would switch off, then a streamed install with named steps
+  // - and a copy of it per card would be twelve mounted previews of nothing.
+  const [packToInstall, setPackToInstall] = useState<CasePackOffer | null>(
+    null,
+  );
   // The market the reader's UI language speaks for, when the catalogue has
   // cases for it. Five of the forty-two languages reach one; the rest reach
   // null, and null is the whole behaviour for them - the catalogue keeps the
@@ -363,6 +438,37 @@ function CasesList() {
     () => homeMarketForLanguage(i18n.language, regions),
     [i18n.language, regions],
   );
+  // The shelf in reading order: the reader's own market first, then the rest
+  // by how many cases they hold. It was sorted by ISO code, which in a German
+  // UI read Australien, Brasilien, Kanada, China, Deutschland - the reader's
+  // market fifth and unmarked, in an order that is alphabetical in no
+  // language. `orderMarkets` is the dashboard card's own helper
+  // (./marketCases), so the two surfaces can never rank the same markets
+  // differently. Ranked by the TOTAL count, not the count under the current
+  // filters, so picking a company type never reshuffles the tiles under the
+  // reader's cursor; the number printed on a tile is still the filtered one.
+  const shelf = useMemo(
+    () => orderMarkets(countCasesByMarket(allPlaybooks), homeMarket),
+    [allPlaybooks, homeMarket],
+  );
+  // Whether the pack list has answered. `packOffers` is empty both while the
+  // request is in flight and for a market with no pack, and only the second is
+  // an absence worth printing on a tile.
+  const packsKnown = useInstalledPacks().data !== undefined;
+  // What each market is called, for the search box: the reader's language,
+  // the English name and the ISO code. "Deutschland", "Germany" and "DE" all
+  // have to find the thirteen German cases, and none of the three appears in
+  // a title or a description.
+  const marketTerms = useMemo(() => {
+    const terms = new Map<string, string>();
+    for (const r of regions) {
+      terms.set(
+        r,
+        `${regionDisplayName(r, i18n.language)} ${regionDisplayName(r, "en")} ${r}`,
+      );
+    }
+    return terms;
+  }, [regions, i18n.language]);
 
   // Only surface a selector option that actually has a matching case, and scope
   // each option's availability + count by the OTHER two active filters, so a
@@ -520,10 +626,13 @@ function CasesList() {
       if (!inRegion(pb)) return false;
       if (showOnlyPinned && !pinnedIds.includes(pb.id)) return false;
       if (!q) return true;
-      const haystack =
-        `${t(pb.titleKey, { defaultValue: pb.titleDefault })} ${t(pb.descKey, {
-          defaultValue: pb.descDefault,
-        })}`.toLowerCase();
+      // Title, description and the market's names. A reader who types the
+      // country they work in is asking the most natural question this page
+      // can be asked, and it used to answer with "No matching cases".
+      const haystack = `${t(pb.titleKey, { defaultValue: pb.titleDefault })} ${t(
+        pb.descKey,
+        { defaultValue: pb.descDefault },
+      )} ${(pb.region && marketTerms.get(pb.region)) || ""}`.toLowerCase();
       return haystack.includes(q);
     });
     // Then order it: the reader's own market in front, the rest of the
@@ -548,6 +657,7 @@ function CasesList() {
     pinnedIds,
     caseNumbers,
     homeMarket,
+    marketTerms,
     t,
   ]);
 
@@ -633,7 +743,11 @@ function CasesList() {
           aria-hidden="true"
           className="pointer-events-none absolute -right-8 -top-10 h-40 w-40 rounded-full bg-oe-blue/10 blur-3xl"
         />
-        <div className="relative flex items-start gap-3">
+        {/* Wraps below `sm`: the action column is `w-full` there, and inside
+            a row that cannot wrap a full-width column leaves the title and the
+            subtitle a sliver, one word per line, with the buttons drawn past
+            the right edge of a phone. */}
+        <div className="relative flex flex-wrap items-start gap-3 sm:flex-nowrap">
           <span className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-oe-blue/15 text-oe-blue ring-1 ring-inset ring-oe-blue/25">
             <Route size={22} strokeWidth={1.9} />
           </span>
@@ -716,10 +830,13 @@ function CasesList() {
 
               Country is a SHELF, not the catalogue's spine. Grouping the whole
               list by market was considered and rejected on the count: 140 of
-              202 cases carry no region, so a country grouping yields six
-              small labelled sections and one bucket holding 69% of the
+              220 cases carry no region, so a country grouping yields fifteen
+              small labelled sections and one bucket holding 64% of the
               catalogue under "everything else". (Counted from ./data; the
-              catalogue grows, so re-count before leaning on the figures.)
+              catalogue grows, so re-count before leaning on the figures. The
+              denominator read 202 for a while after eighteen cases landed,
+              every one of them carrying a market, which is why the numerator
+              did not move and the staleness did not show.)
               Those cases are universal on
               purpose (see the `region` doc in ./types.ts), so that bucket is
               the product rather than a backlog to be worked off.
@@ -771,29 +888,57 @@ function CasesList() {
                     </button>
                   )}
                 </div>
+                {/* Five across at `xl`: fifteen markets in four columns were
+                    four rows of tiles between the header and the first case;
+                    three rows leave room for the pack line each tile now
+                    carries without the shelf growing. */}
                 <div
-                  className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4"
+                  className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5"
                   role="group"
                   aria-label={t("cases.region_selector.heading", {
                     defaultValue: "Market",
                   })}
                 >
-                  {regions.map((r) => {
+                  {shelf.map(({ market: r }) => {
                     const active = activeRegion === r;
+                    const isHome = r === homeMarket;
                     const count = byAllButRegion.filter(
                       (p) => p.region === r,
                     ).length;
+                    // Three answers about the pack, told on the tile rather
+                    // than two clicks away: applied, on disk and switched
+                    // off, or none in this build. Nothing while the list is
+                    // in flight, for the reason `CasePackStrip` gives: "no
+                    // pack" is wrong for every market that has one and would
+                    // flip a moment later.
+                    const offer = packOffers.get(r);
+                    const packState = !packsKnown
+                      ? null
+                      : offer
+                        ? offer.applied
+                          ? "installed"
+                          : "install"
+                        : "none";
                     return (
                       <button
                         key={r}
                         type="button"
+                        data-testid="market-tile"
+                        data-market={r}
+                        data-home={isHome || undefined}
+                        data-pack-state={packState ?? undefined}
                         onClick={() => setRegion(active ? "all" : r)}
                         aria-pressed={active}
                         className={clsx(
                           "flex items-center gap-2.5 rounded-xl border p-2.5 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40 motion-reduce:transition-none",
                           active
                             ? "border-oe-blue bg-oe-blue/10 text-oe-blue shadow-sm"
-                            : "border-border-light bg-surface-primary text-content-primary hover:border-oe-blue/30",
+                            : isHome
+                              ? // The reader's own market wears a firmer
+                                // border at rest, so it is found by eye before
+                                // it is read; the badge below says why.
+                                "border-oe-blue/40 bg-surface-primary text-content-primary hover:border-oe-blue/60"
+                              : "border-border-light bg-surface-primary text-content-primary hover:border-oe-blue/30",
                         )}
                       >
                         <CountryFlag
@@ -802,8 +947,21 @@ function CasesList() {
                           className="shrink-0 shadow-sm ring-1 ring-inset ring-black/10"
                         />
                         <span className="min-w-0 flex-1">
-                          <span className="block text-sm font-semibold leading-tight">
-                            {regionDisplayName(r, i18n.language)}
+                          <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                            <span className="break-words text-sm font-semibold leading-tight">
+                              {regionDisplayName(r, i18n.language)}
+                            </span>
+                            {/* Says that the catalogue below already leads
+                                with this market, and why this tile is the
+                                one to look at. Text in the button, not a
+                                tooltip, so a screen reader hears it too. */}
+                            {isHome && (
+                              <Badge variant="blue" size="sm">
+                                {t("cases.region_selector.home", {
+                                  defaultValue: "Your market",
+                                })}
+                              </Badge>
+                            )}
                           </span>
                           <span
                             className={clsx(
@@ -816,6 +974,56 @@ function CasesList() {
                               count,
                             })}
                           </span>
+                          {/* The pack, in the words the card strip and the
+                              market panel already use, so a reader meets one
+                              sentence in three places rather than three. */}
+                          {offer && offer.applied && (
+                            <span className="mt-0.5 flex items-center gap-1 text-2xs font-medium text-semantic-success">
+                              <Check
+                                size={11}
+                                aria-hidden="true"
+                                className="shrink-0"
+                              />
+                              <span className="truncate">{offer.name}</span>
+                              <span className="shrink-0 font-semibold">
+                                {t("modules.active", {
+                                  defaultValue: "Active",
+                                })}
+                              </span>
+                            </span>
+                          )}
+                          {offer && !offer.applied && (
+                            <span
+                              className={clsx(
+                                "mt-0.5 flex items-center gap-1 text-2xs",
+                                active ? "opacity-80" : "text-content-secondary",
+                              )}
+                            >
+                              <Package
+                                size={11}
+                                aria-hidden="true"
+                                className="shrink-0"
+                              />
+                              <span className="truncate">
+                                {t("cases.regional_pack_needed", {
+                                  defaultValue: "Needs {{name}}",
+                                  name: offer.name,
+                                })}
+                              </span>
+                            </span>
+                          )}
+                          {packState === "none" && (
+                            <span
+                              className={clsx(
+                                "mt-0.5 block truncate text-2xs",
+                                active ? "opacity-70" : "text-content-tertiary",
+                              )}
+                            >
+                              {t("modules.pack_chip_none", {
+                                defaultValue: "No regional pack",
+                              })}
+                            </span>
+                          )}
                         </span>
                       </button>
                     );
@@ -969,7 +1177,13 @@ function CasesList() {
                       <span className="min-w-0 flex-1">
                         <span
                           className={clsx(
-                            "block text-xs font-semibold leading-tight",
+                            // `break-words` on every tile label: a German
+                            // compound such as Generalunternehmer or
+                            // Sicherheitsbeauftragter is one word, cannot
+                            // wrap on its own, and at 1280 wide with the
+                            // sidebar open was drawn past the tile's edge
+                            // and under the next one.
+                            "block break-words text-xs font-semibold leading-tight",
                             !active && "text-content-primary",
                           )}
                         >
@@ -1010,7 +1224,7 @@ function CasesList() {
                     whole screen of height for no gain. Eight company cards in
                     three columns and twelve role cards in four come out the
                     same three rows deep, so the two columns end level. */}
-                <div className="grid gap-x-5 gap-y-3 xl:grid-cols-[2fr_3fr]">
+                <div className="grid gap-x-5 gap-y-3 xl:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
                   {/* ── "I work as..." company-type selector ─────────────── */}
                   <div>
                     <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-0.5">
@@ -1070,7 +1284,7 @@ function CasesList() {
                       title={t(c.labelKey, { defaultValue: c.labelDefault })}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block text-xs font-semibold leading-tight">
+                      <span className="block break-words text-xs font-semibold leading-tight">
                         {t(c.labelKey, { defaultValue: c.labelDefault })}
                       </span>
                       <span className="mt-0.5 block text-2xs tabular-nums text-content-tertiary">
@@ -1153,7 +1367,7 @@ function CasesList() {
                       title={t(r.labelKey, { defaultValue: r.labelDefault })}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="block text-xs font-semibold leading-tight">
+                      <span className="block break-words text-xs font-semibold leading-tight">
                         {t(r.labelKey, { defaultValue: r.labelDefault })}
                       </span>
                       <span className="mt-0.5 block text-2xs tabular-nums text-content-tertiary">
@@ -1457,6 +1671,19 @@ function CasesList() {
               {t("cases.region_selector.all", { defaultValue: "All markets" })}
             </button>
           </div>
+          {/* The pack that carries the standards the band above just promised.
+              The cards below each carry a one-line version of the same offer,
+              and this is the full one: what the pack sets, in which currency,
+              against which reference standards. It belongs on the market band
+              rather than only on the cards because the pack is a property of
+              the MARKET - thirteen German cases need one German pack between
+              them, not thirteen. Where the market has no pack in this build,
+              the panel says so here once instead of thirteen cards each saying
+              nothing: the German and Canadian packs are in the source tree and
+              in no wheel, and no pack declares ES at all. "On disk" was the
+              wrong test and reading it as one is how the German market came to
+              show no install control anywhere. */}
+          <MarketPackPanel region={activeRegion} className="relative mt-4" />
         </section>
       )}
 
@@ -1500,9 +1727,16 @@ function CasesList() {
               // worth a closer look, and eight columns underneath it reads as
               // the same dense list with a banner stuck on top. The largest
               // market holds 13 cases, so five across still fills the row.
-              // Unfiltered, the density is exactly what it always was.
+              //
+              // Unfiltered, eight across arrives one step later than it did.
+              // The breakpoints are viewport-wide and the sidebar takes 250px
+              // of it, so at 1280 wide eight columns were 112px cards: every
+              // title clamped mid-word on its second line and every module
+              // line cut after one name, measured on the released build.
+              // Six at `xl` gives the same card its third word back; eight
+              // returns at `2xl`, where the card is as wide as six were.
               activeRegion === "all"
-                ? "md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8"
+                ? "md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8"
                 : "md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5",
             )}
           >
@@ -1522,6 +1756,9 @@ function CasesList() {
                   roles={rolesByPlaybook.get(pb.id) ?? []}
                   face={facesByPlaybook.get(pb.id) ?? null}
                   done={bestDoneFor(pb)}
+                  pack={(pb.region && packOffers.get(pb.region)) || null}
+                  canInstallPack={canInstallPack}
+                  onActivatePack={setPackToInstall}
                   pinProjectId={pinProjectId}
                   pinned={pinProjectId ? pinnedIds.includes(pb.id) : false}
                   onOpen={() => navigate(`/cases/${pb.id}`)}
@@ -1565,6 +1802,17 @@ function CasesList() {
           )}
         </>
       )}
+
+      {/* The grid's one install dialog, opened by whichever card was pressed.
+          Mounted outside the grid so it survives the card scrolling out from
+          under it: the batches window, and a dialog owned by a card would be
+          unmounted mid-install by the reveal sentinel. */}
+      <PartnerPackApplyDialog
+        open={packToInstall !== null}
+        onClose={() => setPackToInstall(null)}
+        slug={packToInstall?.slug ?? ""}
+        partnerName={packToInstall?.name ?? ""}
+      />
     </div>
   );
 }
@@ -1590,6 +1838,15 @@ interface CaseCardProps {
   face: CaseFace | null;
   /** Furthest step reached across any run of this case. */
   done: number;
+  /** The regional pack this case's market needs, already resolved and named,
+   *  or null when the case names no market or the market has no pack on disk.
+   *  Resolved by the list so the card knows whether a strip will render before
+   *  it renders one - the hover panel's foot padding depends on the answer. */
+  pack: CasePackOffer | null;
+  /** Whether this reader may apply a pack at all (admin). */
+  canInstallPack: boolean;
+  /** Opens the grid's install dialog on this card's pack. */
+  onActivatePack: (pack: CasePackOffer) => void;
   /** The project the pin picker is scoped to ('' = none, hides the pin). */
   pinProjectId: string;
   /** Whether this case is pinned to `pinProjectId`. */
@@ -1617,6 +1874,9 @@ function CaseCard({
   roles,
   face,
   done,
+  pack,
+  canInstallPack,
+  onActivatePack,
   pinProjectId,
   pinned,
   onOpen,
@@ -2025,10 +2285,29 @@ function CaseCard({
         </div>
       </div>
 
+      {/* What this case's market needs installed, and the one press that starts
+          it. Only for a case whose market has a pack on disk; the rest of the
+          catalogue keeps exactly the card it had. Above the hover panel, like
+          the pin and the edit control, because a reader decides they want the
+          market's standards by reading that panel. */}
+      <CasePackStrip
+        pack={pack}
+        canInstall={canInstallPack}
+        onActivate={onActivatePack}
+      />
+
       {/* Hover / focus reveal: the fuller story surfaces over the whole card so
           the dense resting grid still explains itself at a glance. The panel is
           pointer-events-none so the card stays a single click target. */}
-      <div className="pointer-events-none absolute inset-0 z-10 flex flex-col gap-2 bg-gradient-to-t from-slate-950/95 via-slate-950/90 to-slate-950/80 p-3 opacity-0 backdrop-blur-[1px] transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100 motion-reduce:transition-none">
+      <div
+        className={clsx(
+          "pointer-events-none absolute inset-0 z-10 flex flex-col gap-2 bg-gradient-to-t from-slate-950/95 via-slate-950/90 to-slate-950/80 p-3 opacity-0 backdrop-blur-[1px] transition-opacity duration-200 group-hover:opacity-100 group-focus-visible:opacity-100 motion-reduce:transition-none",
+          // The pack strip lies over the panel's foot. Without this the line
+          // the panel ends on - the one that says "Open" - is the line the
+          // strip covers.
+          pack && "pb-10",
+        )}
+      >
         <h4 className="line-clamp-2 text-xs font-semibold leading-snug text-white">
           {t(pb.titleKey, { defaultValue: pb.titleDefault })}
         </h4>

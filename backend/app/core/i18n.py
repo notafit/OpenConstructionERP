@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 """Internationalization system.
 
-28 languages built into core. Zero hardcoded strings.
+38 languages built into core. Zero hardcoded strings.
 New language = add a JSON file to locales/ AND an entry in both lists below.
 A file without a list entry is unreachable, because every caller that picks a
 locale (the Accept-Language middleware, the /i18n routes) gates on
@@ -47,6 +47,7 @@ SUPPORTED_LOCALES = [
     "nl",  # Dutch (Nederlands)
     "pl",  # Polish (Polski)
     "cs",  # Czech (Čeština)
+    "hu",  # Hungarian (Magyar)
     "tr",  # Turkish (Türkçe)
     "ar",  # Arabic (العربية)
     "zh",  # Chinese Simplified (简体中文)
@@ -65,6 +66,15 @@ SUPPORTED_LOCALES = [
     "vi",  # Vietnamese (Tiếng Việt)
     "uk",  # Ukrainian (Українська)
     "uz",  # Uzbek (Oʻzbekcha), Latin script since 1993
+    "et",  # Estonian (Eesti)
+    "ky",  # Kyrgyz (Кыргызча)
+    "bn",  # Bengali (বাংলা)
+    "kk",  # Kazakh (Қазақша)
+    "fil",  # Filipino
+    "ur",  # Urdu (اردو), right-to-left
+    "fa",  # Persian (فارسی), right-to-left
+    "he",  # Hebrew (עברית), right-to-left
+    "el",  # Greek (Ελληνικά)
 ]
 
 LOCALE_NAMES = {
@@ -78,6 +88,7 @@ LOCALE_NAMES = {
     "nl": "Nederlands",
     "pl": "Polski",
     "cs": "Čeština",
+    "hu": "Magyar",
     "tr": "Türkçe",
     "ar": "العربية",
     "zh": "简体中文",
@@ -98,6 +109,15 @@ LOCALE_NAMES = {
     # U+02BB MODIFIER LETTER TURNED COMMA, not an ASCII apostrophe: in Uzbek
     # the mark is a letter, and O' spells a different sound from Oʻ.
     "uz": "Oʻzbekcha",
+    "et": "Eesti",
+    "ky": "Кыргызча",
+    "bn": "বাংলা",
+    "kk": "Қазақша",
+    "fil": "Filipino",
+    "ur": "اردو",
+    "fa": "فارسی",
+    "he": "עברית",
+    "el": "Ελληνικά",
 }
 
 LOCALES_DIR = Path(__file__).parent.parent.parent / "locales"

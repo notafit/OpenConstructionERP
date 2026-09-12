@@ -1,6 +1,6 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -345,7 +345,7 @@ export function Header({ title, onMenuClick }: HeaderProps) {
   // the very top. `null` when the route has no sidebar entry (then nothing
   // renders and the layout is unchanged).
   const RouteIcon = getRouteIcon(location.pathname);
-  const currentLang = getLanguageByCode(i18n.language) ?? { code: 'en', name: 'English', flag: '', country: 'gb' };
+  const currentLang = getLanguageByCode(i18n.language) ?? { code: 'en', name: 'English', flag: '', country: 'xx' };
   const openCommandPalette = useCallback(() => {
     // Dispatch Ctrl+K to open the CommandPalette managed by App.tsx
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
@@ -594,15 +594,35 @@ function ThemeToggle() {
    A red dot on the icon flags that errors were captured this session,
    so the user notices the entry point is relevant to them. */
 
-function BugReportMenu() {
+/**
+ * Shortest description we will file a report with, in trimmed characters.
+ *
+ * The two channels that transmit a report body (GitHub, e-mail) are disabled
+ * below this, and the requirement is stated above the field before anyone
+ * types rather than discovered on the way out. Roughly four words: enough to
+ * name what was clicked and what happened, which is exactly the question we
+ * would otherwise have to ask in a reply a day later, and low enough that a
+ * reporter writing in a language with long compounds is not fighting it.
+ */
+export const MIN_DESCRIPTION_LENGTH = 20;
+
+export function BugReportMenu() {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
   const [open, setOpen] = useState(false);
   // Once the user clicks "report anyway" we stop nagging them with the
   // network-only banner for the rest of the popover lifetime.
   const [overrodeNetworkWarning, setOverrodeNetworkWarning] = useState(false);
+  // What the reporter is telling us. Held here rather than prefilled into the
+  // issue body so there is nothing to accidentally send: an untouched field is
+  // empty, and empty cannot be filed.
+  const [description, setDescription] = useState('');
   const ref = useRef<HTMLDivElement>(null);
+  const descriptionId = useId();
+  const descriptionHintId = `${descriptionId}-hint`;
   const errorCount = getErrorCount();
+  const trimmedDescription = description.trim();
+  const descriptionTooShort = trimmedDescription.length < MIN_DESCRIPTION_LENGTH;
   // Re-evaluated each open of the popover. ``isLastErrorNetworkOnly``
   // returns true when every recent level=error entry is a transport
   // blip (Failed to fetch, AbortError, 502/503/504, …) — i.e. nothing
@@ -628,6 +648,12 @@ function BugReportMenu() {
 
   // Reset the network-only override each time the popover is dismissed
   // so the next open shows the banner again if nothing new has happened.
+  //
+  // `description` is deliberately NOT reset here. The popover closes on any
+  // click outside it, and throwing away a paragraph somebody just typed
+  // because they reached for the scrollbar is the same disrespect for their
+  // effort as making them file an empty report. It is cleared once a channel
+  // actually fires.
   useEffect(() => {
     if (!open) setOverrodeNetworkWarning(false);
   }, [open]);
@@ -644,8 +670,10 @@ function BugReportMenu() {
   }, []);
 
   const handleGithub = () => {
+    if (descriptionTooShort) return;
     setOpen(false);
-    const { url, body } = buildBugReportUrl(t);
+    setDescription('');
+    const { url, body } = buildBugReportUrl(trimmedDescription);
     if (url) {
       openLink(url);
       return;
@@ -667,8 +695,10 @@ function BugReportMenu() {
   };
 
   const handleEmail = () => {
+    if (descriptionTooShort) return;
     setOpen(false);
-    const { body, title } = buildBugReportUrl(t);
+    setDescription('');
+    const { body, title } = buildBugReportUrl(trimmedDescription);
     const subject = `OpenConstructionERP Issue - ${title}`;
     // mailto bodies are also length-limited (~2000 chars in Chrome),
     // so we trim aggressively. The downloaded log JSON is the long form.
@@ -718,6 +748,14 @@ function BugReportMenu() {
     title: string;
     desc: string;
     onClick: () => void;
+    /**
+     * True for the channels that file a written report and therefore need the
+     * description. The other two are not reports: the web form asks for the
+     * story again in its own fields, and downloading the log is usually the
+     * step BEFORE writing anything. Gating those would block a user from
+     * getting the JSON they were about to attach.
+     */
+    requiresDescription: boolean;
   };
 
   const channels: Channel[] = [
@@ -730,6 +768,7 @@ function BugReportMenu() {
       title: t('app.report_bug', { defaultValue: 'Report a bug (with logs)' }),
       desc: t('bug.channel_github_desc', { defaultValue: 'Pre-filled with the last error and environment. Public.' }),
       onClick: handleGithub,
+      requiresDescription: true,
     },
     {
       icon: Mail,
@@ -737,6 +776,7 @@ function BugReportMenu() {
       title: t('bug.channel_email', { defaultValue: 'Email the team' }),
       desc: t('bug.channel_email_desc', { defaultValue: 'Opens your mail client with the report attached.' }),
       onClick: handleEmail,
+      requiresDescription: true,
     },
     {
       icon: MessageSquarePlus,
@@ -744,6 +784,7 @@ function BugReportMenu() {
       title: t('bug.channel_form', { defaultValue: 'Web feedback form' }),
       desc: t('bug.channel_form_desc', { defaultValue: 'Richer fields and screenshots on openconstructionerp.com.' }),
       onClick: handleFeedbackForm,
+      requiresDescription: false,
     },
     {
       icon: Upload,
@@ -751,6 +792,7 @@ function BugReportMenu() {
       title: t('bug.channel_download', { defaultValue: 'Download log only' }),
       desc: t('bug.channel_download_desc', { defaultValue: 'Save the JSON to share manually with support.' }),
       onClick: handleDownloadLog,
+      requiresDescription: false,
     },
   ];
 
@@ -759,7 +801,7 @@ function BugReportMenu() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
         className={clsx(
           'relative flex h-8 w-8 items-center justify-center rounded-lg transition-colors',
@@ -782,8 +824,12 @@ function BugReportMenu() {
       </button>
 
       {open && (
+        // A non-modal dialog rather than a menu: it holds a text field now,
+        // and a textarea is not a valid child of `role="menu"` - a screen
+        // reader in menu mode cannot reach it to type into.
         <div
-          role="menu"
+          role="dialog"
+          aria-label={t('bug.menu_heading', { defaultValue: 'Report a bug' })}
           className="absolute right-0 top-full mt-1.5 w-80 rounded-xl border border-border-light bg-surface-elevated shadow-lg animate-scale-in py-2 z-40"
         >
           <div className="px-3 pb-2 border-b border-border-light">
@@ -807,6 +853,47 @@ function BugReportMenu() {
                 defaultValue: 'Pick where to send it - every channel includes the same diagnostic payload.',
               })}
             </p>
+          </div>
+
+          {/* What happened, in the reporter's own words. Nothing is prefilled:
+              the placeholder is a real placeholder attribute, so an untouched
+              field is empty and the two channels that file a written report
+              stay disabled until it is not. The minimum is stated here, above
+              the field, so nobody learns it on the way out. */}
+          <div className="px-3 pt-2.5">
+            <label
+              htmlFor={descriptionId}
+              className="block text-2xs font-medium text-content-secondary"
+            >
+              {t('bug.description_label', { defaultValue: 'What happened?' })}
+              <span className="text-semantic-error ml-0.5" aria-hidden="true">*</span>
+            </label>
+            <p id={descriptionHintId} className="mt-0.5 text-2xs text-content-tertiary leading-snug">
+              {t('bug.description_hint', {
+                defaultValue:
+                  'What you clicked and what happened instead, in at least {{min}} characters. Sent exactly as written, so leave out anything private.',
+                min: MIN_DESCRIPTION_LENGTH,
+              })}
+            </p>
+            <textarea
+              id={descriptionId}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder={t('bug.description_placeholder', {
+                defaultValue: 'I clicked Install on a module and the page stayed empty...',
+              })}
+              rows={3}
+              maxLength={2000}
+              required
+              aria-required="true"
+              aria-describedby={descriptionHintId}
+              className={clsx(
+                'mt-1.5 w-full rounded-lg border border-border-light bg-surface-primary px-2.5 py-1.5',
+                'text-xs text-content-primary placeholder:text-content-quaternary',
+                'focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue',
+                'transition-colors resize-none',
+              )}
+            />
           </div>
 
           {networkOnly && (
@@ -840,13 +927,20 @@ function BugReportMenu() {
           <div className={clsx('py-1', networkOnly && 'opacity-40 pointer-events-none')}>
             {channels.map((ch, idx) => {
               const Icon = ch.icon;
+              // Disabled for real, not dimmed: a `pointer-events-none` wrapper
+              // (the trick used for the network banner above) still lets a
+              // keyboard reach the control, and tells nobody why it is grey.
+              const blocked = ch.requiresDescription && descriptionTooShort;
               return (
                 <button
                   key={idx}
                   type="button"
-                  role="menuitem"
                   onClick={ch.onClick}
-                  className="flex w-full items-start gap-3 px-3 py-2 text-left hover:bg-surface-secondary transition-colors"
+                  disabled={blocked}
+                  className={clsx(
+                    'flex w-full items-start gap-3 px-3 py-2 text-left transition-colors',
+                    blocked ? 'cursor-not-allowed opacity-60' : 'hover:bg-surface-secondary',
+                  )}
                 >
                   <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-surface-secondary">
                     <Icon size={14} className={ch.iconColor} />
@@ -855,8 +949,17 @@ function BugReportMenu() {
                     <span className="block text-[13px] font-medium text-content-primary">
                       {ch.title}
                     </span>
-                    <span className="block text-2xs text-content-tertiary leading-snug mt-0.5">
-                      {ch.desc}
+                    <span
+                      className={clsx(
+                        'block text-2xs leading-snug mt-0.5',
+                        blocked ? 'text-amber-600 dark:text-amber-400' : 'text-content-tertiary',
+                      )}
+                    >
+                      {blocked
+                        ? t('bug.description_required', {
+                            defaultValue: 'Describe what happened above before sending this.',
+                          })
+                        : ch.desc}
                     </span>
                   </span>
                 </button>
@@ -1256,16 +1359,49 @@ export function deriveComponentFromRoute(pathname: string): string {
 }
 
 /**
- * Build the GitHub "new issue" URL pre-filled with environment + last error.
+ * Build the GitHub "new issue" URL pre-filled with the reporter's own
+ * description, the environment and the last captured error.
  *
  * Returns `{ url, body }` so callers can fall back to clipboard when the
- * repo is not configured.  The body is plain text (markdown-ish) and never
- * contains user JWT, email, or other PII — `getLastError()` returns
- * already-anonymized strings via `errorLogger.anonymize()`.
+ * repo is not configured.
+ *
+ * `description` is what the reporter typed in the bug menu, embedded verbatim.
+ * It is deliberately NOT passed through `errorLogger.anonymize()`: that
+ * scrubber rewrites "invoice 1234567 failed" as "invoice [ID] failed" and
+ * would eat the detail the report exists to carry. The diagnostic half is
+ * still anonymized at capture time — `getLastError()` returns strings that
+ * already went through `anonymize()` — so the only text that can carry PII is
+ * text the reporter chose to write, on a field that says the issue is public
+ * before they type into it.
+ *
+ * The description comes first because the size guard below keeps the head and
+ * trims the tail, so a long stack is never what the guard reaches for. It is
+ * not an absolute guarantee: the field allows 2000 characters, and in a script
+ * that encodes to three bytes each that alone can pass `MAX_BODY_BYTES`, at
+ * which point the proportional slice cuts inside the description. Ordering
+ * buys the common case, not every case. This
+ * slot used to hold the literal placeholder `<!-- describe what you were
+ * doing -->`, which renders as nothing on GitHub: a reporter who pressed
+ * submit without editing filed a visibly empty issue and only learned it was
+ * useless a day later, when we wrote back to ask what they had clicked. The
+ * caller now requires the text (see `MIN_DESCRIPTION_LENGTH`) rather than
+ * inviting it, so there is no longer a version of this body that travels
+ * looking filled in while saying nothing.
+ *
+ * Everything this function writes itself is an English literal, and that is
+ * why it takes no `t`. The audience for the payload is not the person in
+ * front of the screen: it is a public tracker and an inbox we read in
+ * English, so the title, the section headings and the "no error captured"
+ * marker are ours to word, not the UI language's. Two of them used to go
+ * through `t()` and travelled in whatever language the app was running in,
+ * which put a title nobody could scan the issue list by, in one of forty
+ * odd spellings, on every automatically filed report. Passing the function
+ * a translator is what made that possible, so the parameter is gone rather
+ * than merely unused: there is no longer a call shape that can localize the
+ * payload by accident. The reporter's own words are the exception and stay
+ * exactly as typed, in their own language, because they are the report.
  */
-function buildBugReportUrl(
-  t: (key: string, opts?: { defaultValue?: string; [k: string]: unknown }) => string,
-): {
+function buildBugReportUrl(description: string): {
   url: string;
   body: string;
   title: string;
@@ -1274,18 +1410,30 @@ function buildBugReportUrl(
   const stackLines = last?.stack ? last.stack.split('\n').slice(0, 30).join('\n') : '';
   const errorBlock = last
     ? `\`\`\`\n${last.message}\n${stackLines}\n\`\`\``
-    : t('app.report_bug_no_error', { defaultValue: '_No error captured during this session._' });
+    : '_No error captured during this session._';
 
   const component = deriveComponentFromRoute(window.location.pathname);
+  // The language the app was running in, which a report written in one we do
+  // not read otherwise leaves us to infer from the prose. App.tsx keeps this
+  // attribute in step with the active UI language, so that is normally what
+  // this names: the bundle that rendered the screen being described. If it is
+  // ever unset the browser's own locale stands in, which is a near neighbour
+  // rather than the same fact, and a named fallback beats a blank line that
+  // reads as though the question was never asked.
+  const uiLocale =
+    document.documentElement.lang ||
+    (typeof navigator !== 'undefined' ? navigator.language : '') ||
+    'unknown';
 
   const body = [
     '### Description',
-    '<!-- describe what you were doing -->',
+    description.trim(),
     '',
     '### Environment',
     `- App version: ${APP_VERSION}`,
     `- Component: ${component}`,
     `- Page: ${window.location.pathname}${window.location.search}`,
+    `- UI locale: ${uiLocale}`,
     `- User agent: ${navigator.userAgent}`,
     `- Build: ${APP_BUILD_FINGERPRINT}`,
     last ? `- Captured at: ${last.at}` : '',
@@ -1311,11 +1459,9 @@ function buildBugReportUrl(
   }
 
   // Name the screen in the title so triage knows the affected surface at a
-  // glance (#168). i18n interpolation keeps the component verbatim.
-  const title = t('app.report_bug_title_component', {
-    defaultValue: '[{{component}}] Bug report from in-app menu',
-    component,
-  });
+  // glance (#168), and keep the rest of the line fixed so the same report
+  // filed from two installs reads as the same report.
+  const title = `[${component}] Bug report from in-app menu`;
   const encodedTitle = encodeURIComponent(title);
   const url = GITHUB_REPO
     ? `https://github.com/${GITHUB_REPO}/issues/new?title=${encodedTitle}&body=${encoded}`

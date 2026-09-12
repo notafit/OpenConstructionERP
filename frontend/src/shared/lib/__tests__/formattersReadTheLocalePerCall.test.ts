@@ -84,7 +84,7 @@ describe('number helpers follow a language change while the preference is auto',
   });
 
   it('writes the separators of the language in force at the call', async () => {
-    await i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+    await i18next.init({ lng: 'en', resources: {}, initAsync: false });
     const inEnglish = fmtNumber(12550880.81, 2);
     await i18next.changeLanguage('de');
     const inGerman = fmtNumber(12550880.81, 2);

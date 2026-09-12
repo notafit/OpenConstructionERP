@@ -42,7 +42,7 @@ import { fmtList } from '../formatters';
 // measuring what it is about.
 import { SUPPORTED_LANGUAGES } from '@/app/i18n';
 
-void i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+void i18next.init({ lng: 'en', resources: {}, initAsync: false });
 const original = i18next.language;
 afterAll(() => {
   void i18next.changeLanguage(original);

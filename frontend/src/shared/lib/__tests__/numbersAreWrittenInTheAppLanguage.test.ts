@@ -448,6 +448,11 @@ const FIXED_ALLOWED: ReadonlyArray<{ file: string; snippet: string; why: string 
     why: 'fmtPrecision handing a non-finite value back rather than inventing a zero for it. This is the replacement.',
   },
   {
+    file: 'shared/lib/formatters.ts',
+    snippet: "return Number.isFinite(value) ? value.toFixed(decimals) : '';",
+    why: 'fmtNumberForInput, the whole body of it. A field a person is editing takes one spelling and it is this one, so the absence of a locale here is the feature (#466).',
+  },
+  {
     file: 'modules/gaeb-exchange/data/gaebExport.ts',
     snippet: 'return value.toFixed(decimals);',
     why: 'Writes a decimal into GAEB XML 3.3, which is a data format with its own grammar, not a screen.',
@@ -461,6 +466,11 @@ const FIXED_ALLOWED: ReadonlyArray<{ file: string; snippet: string; why: string 
     file: 'features/geo-hub/utils.ts',
     snippet: 'return `${sign}${Math.abs(value).toFixed(4)}°`;',
     why: 'Renders a coordinate in degrees, which keeps the universal convention for the same reason latitudes do.',
+  },
+  {
+    file: 'shared/ui/ProjectMap/streetThumbnail.ts',
+    snippet: 'return v.toFixed(4);',
+    why: 'Rounds a latitude or longitude into the snapshot cache key, so two cards a few metres apart share one render. Compared as a string and never shown, and the geo-coordinate rule cannot see it because the line is the whole body of roundCoord.',
   },
   ];
 /* FIXED-ALLOWED:END */
@@ -647,7 +657,7 @@ describe('every number and date is written in the language the reader picked', (
   });
 
   it('lists every argued toFixed exemption, so adding one shows up as a diff', () => {
-    // Sixteen entries covering eighteen sites in ten files, against 139
+    // Eighteen entries covering twenty sites in eleven files, against 139
     // exempted by a rule.
     // The ratio is the point: rules carry the categories that repeat, and
     // anything left over has to be argued in a sentence someone can disagree
@@ -666,9 +676,11 @@ describe('every number and date is written in the language the reader picked', (
       'features/dashboard/components/DashboardBackdrop.tsx :: const a2 = (0.06 * effIntensity).toFixed(3);',
       'shared/lib/formatters.ts :: if (!Number.isFinite(value)) return value.toFixed(decimals);',
       'shared/lib/formatters.ts :: if (!Number.isFinite(value)) return value.toPrecision(digits);',
+      "shared/lib/formatters.ts :: return Number.isFinite(value) ? value.toFixed(decimals) : '';",
       'modules/gaeb-exchange/data/gaebExport.ts :: return value.toFixed(decimals);',
       'features/takeoff/lib/takeoff-export.ts :: return n.toFixed(precision);',
       'features/geo-hub/utils.ts :: return `${sign}${Math.abs(value).toFixed(4)}°`;',
+      'shared/ui/ProjectMap/streetThumbnail.ts :: return v.toFixed(4);',
     ]);
     expect(FIXED_ALLOWED.filter((a) => a.why.length < 20)).toEqual([]);
     const stale = FIXED_ALLOWED.filter(
@@ -683,7 +695,7 @@ describe('every number and date is written in the language the reader picked', (
     // so it names the setting rather than inheriting it: the day the default
     // stops being `auto`, these lines go red at a change that broke nothing.
     usePreferencesStore.setState({ numberLocale: 'auto' });
-    await i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+    await i18next.init({ lng: 'en', resources: {}, initAsync: false });
     await i18next.changeLanguage('en');
     expect(fmtFixed(12550880.81, 2)).toBe('12,550,880.81');
     await i18next.changeLanguage('de');
@@ -700,7 +712,7 @@ describe('every number and date is written in the language the reader picked', (
   });
 
   it('resolves the tag a date is written with', async () => {
-    await i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+    await i18next.init({ lng: 'en', resources: {}, initAsync: false });
     await i18next.changeLanguage('en');
     const inEnglish = (12550880.81).toLocaleString(getIntlLocale(), { minimumFractionDigits: 2 });
     await i18next.changeLanguage('de');

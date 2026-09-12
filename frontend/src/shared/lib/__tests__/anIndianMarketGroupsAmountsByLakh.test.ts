@@ -34,7 +34,7 @@ import { formatCurrency } from '../money';
 import { getMarketNumberLocale, setMarketNumberLocale } from '../marketNumberLocale';
 import { numberLocaleForCountry, usePreferencesStore } from '@/stores/usePreferencesStore';
 
-void i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+void i18next.init({ lng: 'en', resources: {}, initAsync: false });
 const originalLanguage = i18next.language;
 afterAll(() => {
   setMarketNumberLocale(null);

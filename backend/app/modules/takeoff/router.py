@@ -60,10 +60,17 @@ from app.core.converter_source import (
     resolve_converter_repo,
 )
 from app.core.csv_safety import neutralise_formula
+from app.core.host_disclosure import without_host_fields
 from app.core.i18n import get_locale
 from app.core.rate_limiter import ai_limiter, upload_limiter
 from app.core.validation.messages import translate
-from app.dependencies import CurrentUserId, RequirePermission, SessionDep, verify_project_access
+from app.dependencies import (
+    CurrentUserId,
+    OptionalUserPayload,
+    RequirePermission,
+    SessionDep,
+    verify_project_access,
+)
 from app.modules.takeoff.manifest_verifier import (
     InstallNotSupported,
     InstallSHAMismatch,
@@ -165,12 +172,37 @@ _CONVERTER_META: list[dict[str, Any]] = [
 ]
 
 
+#: What an anonymous caller may not read off a converter row. ``path`` is the
+#: exe's absolute location on the server's disk and ``health_message`` names
+#: the folder it lives in whenever the smoke test has something to report, so
+#: both carry the operator's home directory and account name. See
+#: ``app.core.host_disclosure`` for why the route stays open and these do not.
+_CONVERTER_ROW_ANONYMOUS_BLANKS = {"path": None, "health_message": ""}
+
+#: The same rule over an install-progress record. ``path`` is where the exe
+#: landed, ``message`` quotes it back on success, ``error`` is an OS exception
+#: that names the file it failed on, and ``instructions`` is a generated shell
+#: snippet with directories in it. The counters and the stage are not host
+#: facts and stay.
+_INSTALL_PROGRESS_ANONYMOUS_BLANKS = {"path": None, "message": "", "error": "", "instructions": ""}
+
+
 @router.get("/converters/")
-async def list_converters(verify: bool = False) -> dict[str, Any]:
+async def list_converters(verify: bool = False, user: OptionalUserPayload = None) -> dict[str, Any]:
     """Return the status of all known CAD/BIM converters.
 
     Scans standard install paths and returns which converters are found.
-    No authentication required - this is a public status check.
+    No authentication required - this is a public status check, because the
+    BIM page asks for it before anyone has signed in.
+
+    That the route is reachable anonymously is not a licence for the body to
+    describe the machine. ``path`` and ``health_message`` name the folder the
+    converter sits in, which on a default install is under the operator's home
+    directory and therefore carries their account name; both are emptied for a
+    caller who has not signed in. What the status check is *for* survives that
+    untouched: ``installed``, ``health`` and ``suggested_actions`` say whether
+    a converter is there and what to do about it, and none of them needs to say
+    where it is.
 
     Args:
         verify: When ``true``, also runs a quick smoke test (~8 s timeout
@@ -178,11 +210,26 @@ async def list_converters(verify: bool = False) -> dict[str, Any]:
             loads. Result is cached for 5 minutes so repeated calls are
             cheap. The default is ``false`` so the page-load list call
             stays fast (<50 ms); the BIM page polls with ``verify=true``
-            after install completes.
+            after install completes. Ignored for a caller who has not
+            signed in, see below.
+        user: The caller, or ``None`` when there is no usable token. Resolving
+            it costs an anonymous request nothing - no header, no database
+            read - so the route's public contract is unchanged.
     """
     import asyncio
 
     from app.modules.boq.cad_import import find_converter, smoke_test_converter
+
+    # A smoke test is not a file stat. It launches the converter exe and waits
+    # up to 8 s for it, four of them on a full install. The per-converter
+    # verify route below asks for ``takeoff.read`` for that exact reason, and
+    # this flag is the same act under a query parameter, so an anonymous caller
+    # gets the listing with the smoke test declined rather than the request
+    # refused. It costs them nothing they could read anyway: the health prose
+    # is emptied for them further down, and ``health: "unknown"`` is what the
+    # default listing answers, a shape every reader already handles.
+    if user is None:
+        verify = False
 
     # Phase 1: cheap file-stat lookup for every converter (synchronous,
     # bounded by ~4 disk reads - sub-millisecond on a warm cache).
@@ -239,6 +286,8 @@ async def list_converters(verify: bool = False) -> dict[str, Any]:
             entry["health"] = "unknown"
             entry["health_message"] = ""
             entry["suggested_actions"] = []
+        if user is None:
+            entry = without_host_fields(entry, _CONVERTER_ROW_ANONYMOUS_BLANKS)
         converters.append(entry)
 
     installed_count = sum(1 for c in converters if c["installed"])
@@ -267,7 +316,8 @@ async def verify_converter(converter_id: str) -> dict[str, Any]:
     asks for. What this returns is health, so the bar is a read; what made it
     worth gating is that producing that health spawns the converter binary,
     and it used to do so for a caller who had not logged in. The listing at
-    ``/converters/`` stays open because it only stats files.
+    ``/converters/`` stays open because for a caller who has not signed in it
+    only stats files: it declines the smoke test rather than the request.
     """
     import asyncio
 
@@ -1645,8 +1695,19 @@ def _download_converter_files_windows(converter_id: str, *, clean: bool = False)
     "/converters/{converter_id}/install-progress/",
     include_in_schema=True,
 )
-async def get_install_progress(converter_id: str) -> dict[str, Any]:
+async def get_install_progress(converter_id: str, user: OptionalUserPayload = None) -> dict[str, Any]:
     """Lightweight progress poll for an in-flight converter install.
+
+    Open to an anonymous caller, and the four fields that describe the server's
+    own disk are emptied for one. A finished install leaves ``path`` and a
+    ``message`` reading "installed successfully at <absolute path>" in the
+    record, and a failed one leaves an ``error`` stringified from an OS
+    exception that names the file it could not touch; the record lingers for
+    three minutes afterwards, so anyone polling in that window used to be
+    handed the operator's home directory. Everything the progress bar renders -
+    stage, counts, bytes, the file currently being fetched - is untouched, and
+    the caller who started the install holds a token by construction, since
+    installing needs ``takeoff.create``.
 
     The Windows installer downloads 30-175 files (~600 MB for RVT) inside
     a thread pool. ``install_converter`` doesn't return until the smoke
@@ -1680,6 +1741,8 @@ async def get_install_progress(converter_id: str) -> dict[str, Any]:
     if finished_at and (_time.time() - float(finished_at)) > _INSTALL_RESULT_TTL_SEC:
         _clear_install_progress(converter_id)
         return {"active": False}
+    if user is None:
+        progress = without_host_fields(progress, _INSTALL_PROGRESS_ANONYMOUS_BLANKS)
     return {"active": True, **progress}
 
 
@@ -2314,7 +2377,10 @@ _SUPPORTED_CAD_EXTS = {"rvt", "ifc", "dwg", "dgn", "rfa", "dxf"}
     dependencies=[Depends(RequirePermission("takeoff.read"))],
 )
 async def cad_extract(
-    file: UploadFile = File(..., description="CAD/BIM file (.rvt, .ifc, .dwg, .dgn)"),
+    file: UploadFile = File(
+        ...,
+        description="CAD/BIM file. Accepted extensions: .rvt, .rfa, .ifc, .dwg, .dxf, .dgn",
+    ),
 ) -> dict[str, Any]:
     """Extract grouped quantity tables from a CAD/BIM file.
 
@@ -2581,7 +2647,10 @@ class CadGroupRequest(BaseModel):
     dependencies=[Depends(RequirePermission("takeoff.read"))],
 )
 async def cad_columns(
-    file: UploadFile = File(..., description="CAD/BIM file (.rvt, .ifc, .dwg, .dgn)"),
+    file: UploadFile = File(
+        ...,
+        description="CAD/BIM file. Accepted extensions: .rvt, .rfa, .ifc, .dwg, .dxf, .dgn",
+    ),
     session: SessionDep = None,  # type: ignore[assignment]
     user_id: CurrentUserId = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:

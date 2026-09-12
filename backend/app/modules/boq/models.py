@@ -232,6 +232,27 @@ class Position(Base):
     # Written by the spine generator; NULL on positions not yet wired.
     cost_line_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
 
+    # ── Issue #457: the production norm this line was priced from ────────
+    # Written at the storage boundary from ``metadata["norm_id"]`` /
+    # ``metadata["work_key"]``, which the apply-an-assembly path already sets
+    # when the assembly was itself built from a norm. The identity is COPIED
+    # rather than resolved through the assembly, because the assembly can be
+    # edited or deleted after a bill was priced from it and provenance that has
+    # to be resolved through a mutable row is not provenance. For the same
+    # reason there is no foreign key to the norm table: the norm library is
+    # editable and deletable, and a key would either block that or null the
+    # provenance out on cascade.
+    #
+    # ``norm_work_key`` rides along rather than being looked up, because it is
+    # the human handle and it has to survive the deletion of the row it names.
+    #
+    # Both NULL until something prices the line from a norm, and NULL is the
+    # only honest way to say "not priced from a norm": most of a real bill is
+    # typed or imported and never was. The metadata keys stay written too, so a
+    # reader from before these columns keeps working.
+    norm_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    norm_work_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
     metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         "metadata",
         JSON,
@@ -461,7 +482,10 @@ class BOQSnapshot(Base):
     """Point-in-time snapshot of a BOQ for version history.
 
     Stores a full JSON snapshot of the BOQ state (positions, markups)
-    so users can view and restore previous versions.
+    so users can view and restore previous versions. ``total_value``
+    and ``position_count`` are denormalised summaries captured at
+    creation time so the version-history list can render deltas
+    without deserialising the heavy ``snapshot_data`` blob.
     """
 
     __tablename__ = "oe_boq_snapshot"
@@ -479,12 +503,18 @@ class BOQSnapshot(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     snapshot_data: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         JSON,
         nullable=False,
         default=dict,
         server_default="{}",
     )
+    # Denormalised summaries so the version-history drawer can show
+    # position count and grand total without loading snapshot_data.
+    # String for the same SQLite-precision reason as Position.total.
+    total_value: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    position_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         GUID(),
         ForeignKey("oe_users_user.id", ondelete="SET NULL"),

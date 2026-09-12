@@ -96,6 +96,7 @@ class ContractResponse(BaseModel):
     start_date: str | None = None
     end_date: str | None = None
     total_value: Decimal
+    original_contract_value: Decimal | None = None
     currency: str
     retention_percent: Decimal
     retention_release_event: str
@@ -705,6 +706,11 @@ class ContractDashboardResponse(BaseModel):
 
     contract_id: UUID
     total_value: Decimal
+    original_contract_value: Decimal | None = None
+    agreed_variations: Decimal = Decimal("0")
+    current_contract_value: Decimal = Decimal("0")
+    pending_variations: Decimal = Decimal("0")
+    forecast_contract_value: Decimal = Decimal("0")
     paid_to_date: Decimal
     retention_held: Decimal
     outstanding: Decimal

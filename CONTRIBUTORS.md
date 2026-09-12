@@ -1,57 +1,61 @@
 # Contributors
 
 OpenConstructionERP is authored and owned by DataDrivenConstruction (see
-[AUTHORS.md](AUTHORS.md)). The people listed here are contributors: they have sent
-patches, fixes and feedback that made the project better. They are not authors of the
-project, and authorship and copyright remain with DataDrivenConstruction.
+[AUTHORS.md](AUTHORS.md)). The people listed here are contributors: they have sent bug
+reports, questions, ideas and patches that made the project better. They are not authors
+of the project, and authorship and copyright remain with DataDrivenConstruction.
 
 Thank you to everyone who has contributed.
 
-Almost everyone listed here helped by reporting a bug, asking a question or proposing an
-idea, not by shipping code into the project. When a fix does arrive as a patch, we
-normally reimplement it ourselves rather than merging the change as-is. That keeps one
-reviewed source of truth for a codebase that many companies run in production, and it
+Being listed here means one thing: you reported a bug, asked a question, proposed an idea
+or sent a patch, and the project is better for it. It does not mean that any of your code
+is in the product. We do not merge external pull requests. When a fix arrives as a patch
+we read it, credit the author, and write our own implementation from scratch. That keeps
+one reviewed source of truth for a codebase that many companies run in production, and it
 avoids taking in code we have not written ourselves, which is the safer path on security.
-So the credit below is for the report or the idea that led to a fix, and the
+So every credit below is for the report, the question or the proposal, and the
 implementation is our own.
 
 - **skolodi** ([@skolodi](https://github.com/skolodi)): issue reports and field feedback
   on the BOQ AI assistant, and reported that a single budget could mix currencies and that
   an exchange rate could be entered the wrong way round
   ([#111](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/111)).
-- **Mourtadha Diop** ([@Mourdi59](https://github.com/Mourdi59)): fixed three BIM viewer
-  bugs ([#159](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/159)),
+- **Mourtadha Diop** ([@Mourdi59](https://github.com/Mourdi59)): sent a pull request
+  proposing fixes for three BIM viewer bugs
+  ([#159](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/159)),
   COLLADA namespace-prefix serialisation in `ifc_processor`, defence-in-depth regex
-  tolerance in `ElementManager`, and `degraded` model status surfacing in the viewer UI.
-  Later raised ideas for driving BOQ quantities from live BIM parameters, surfacing real
-  server errors on Excel paste, and resolving linked elements per model in multi-model
-  setups ([#206](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/206)).
+  tolerance in `ElementManager`, and `degraded` model status surfacing in the viewer UI;
+  the shipped implementation is our own. Later raised ideas for driving BOQ quantities
+  from live BIM parameters, surfacing real server errors on Excel paste, and resolving
+  linked elements per model in multi-model setups
+  ([#206](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/206)).
   More recently proposed BOQ per-element quantity formulas with a projection editor and a
   batch of multi-model BIM viewer fixes
-  ([#347](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/347)), and a
+  ([#347](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/347)), and a
   schedule dependency editor, an editable activity data grid and a per-activity work
   calendar for the Gantt
-  ([#348](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/348)). Both
+  ([#348](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/348)). Both
   shipped as our own implementation.
-- **rjohny** ([@rjohny55](https://github.com/rjohny55)): multi-area patch set
-  ([#161](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/161)),
-  defensive guards for the slow-query SQLAlchemy listener and the module-presence probe
-  under concurrency, a FieldReport activity-rollup column fix, Qdrant multipart snapshot
-  upload so app-container snapshots reach a separate Qdrant container, and three new AI
-  providers, Kimi (Moonshot AI), Ollama and vLLM, with custom base URL support for the
-  two local backends.
-- **Jehad Baniowda** ([@jehadbaniodeh](https://github.com/jehadbaniodeh)): fixed the
-  production Docker deployment and the takeoff viewer. The backend image now installs its
-  dependencies and starts correctly
-  ([#173](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/173)), nginx
-  upgrades WebSocket connections so real-time notifications and presence work
-  ([#176](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/176)), `.mjs`
-  workers are served with the correct MIME type so the PDF takeoff viewer renders
-  ([#175](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/175)), the
-  upload ceiling is raised to 100M for PDF and CAD drawings
+- **rjohny** ([@rjohny55](https://github.com/rjohny55)): sent a multi-area pull request
+  ([#161](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/161))
+  proposing defensive guards for the slow-query SQLAlchemy listener and the
+  module-presence probe under concurrency, a FieldReport activity-rollup column fix,
+  Qdrant multipart snapshot upload so app-container snapshots reach a separate Qdrant
+  container, and three new AI providers, Kimi (Moonshot AI), Ollama and vLLM, with custom
+  base URL support for the two local backends. The shipped implementation is our own.
+- **Jehad Baniowda** ([@jehadbaniodeh](https://github.com/jehadbaniodeh)): sent five pull
+  requests proposing fixes to the production Docker deployment and the takeoff viewer:
+  that the backend image install its dependencies and start correctly
+  ([#173](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/173)), that
+  nginx upgrade WebSocket connections so real-time notifications and presence work
+  ([#176](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/176)), that
+  `.mjs` workers be served with the correct MIME type so the PDF takeoff viewer renders
+  ([#175](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/175)), that
+  the upload ceiling be raised to 100M for PDF and CAD drawings
   ([#174](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/174)), and
-  takeoff documents open in the in-app viewer instead of a broken download navigation
-  ([#172](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/172)).
+  that takeoff documents open in the in-app viewer instead of a broken download navigation
+  ([#172](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/172)). The
+  shipped implementation is our own.
 - **Jérémy Christillin** ([@bvisible](https://github.com/bvisible)): feedback and feature
   proposals for the PDF takeoff module, in-canvas measurement editing and LLM-assisted
   plan reading
@@ -242,9 +246,149 @@ implementation is our own.
   inline preview of files referenced from transmittals, inspections and non-conformance
   records, and for files to be linkable from further sections, both of which shipped in v9.2.0
   ([#246](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/246)).
+- **cosanostra** ([@cosanostratr](https://github.com/cosanostratr)): sent a pull request
+  proposing an LED display management module
+  ([#97](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/97)).
+- **MEEGOO** ([@mahabdalla](https://github.com/mahabdalla)): sent a pull request carrying
+  changes from their fork
+  ([#108](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/108)).
+- **Abi Paudel** ([@abipaudel](https://github.com/abipaudel)): sent two pull requests
+  proposing a Dockerfile for a Node.js setup at the repository root
+  ([#329](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/329),
+  [#330](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/330)).
+- **INAPA-desarrolloTIC** ([@INAPA-desarrolloTIC](https://github.com/INAPA-desarrolloTIC)):
+  sent a pull request proposing API key authentication on the inbound capture webhook
+  endpoints, so a headless caller no longer needs a login and refresh cycle
+  ([#331](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/331)). The
+  shipped implementation is our own.
+- **Ali Sadikin Ma** ([@alisadikinma](https://github.com/alisadikinma)): sent a pull request
+  proposing an Indonesian AHSP unit price analysis module
+  ([#345](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/345)).
+- **ziadeh** ([@ziadeh](https://github.com/ziadeh)): sent a pull request proposing a schedule
+  intelligence module with a locked-figure guard and a readiness engine
+  ([#362](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/362)), and
+  reported that the XER import decoded files as Latin-1 and so garbled Arabic and other
+  non-Western activity names
+  ([#460](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/460)).
+- **Elric** ([@elric-cpu](https://github.com/elric-cpu)): sent a pull request proposing a
+  guarded job workflow that turns an accepted estimate into a job with planning and delivery
+  states ([#364](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/364)).
+- **Arthur Ganem** ([@LetsBIMtogether](https://github.com/LetsBIMtogether)): sent a pull
+  request proposing a spacing fix for the ASCII diagrams in the README
+  ([#370](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/370)).
+- **baguscandrautamamr** ([@baguscandrautamamr](https://github.com/baguscandrautamamr)): sent
+  a pull request proposing an importer for model and sheet dumps pulled from a BIM authoring
+  tool over MCP
+  ([#415](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/415)).
+- **ziul03** ([@ziul03](https://github.com/ziul03)): reported that raw tool-calling tags
+  rendered as plain text in chat with third-party providers
+  ([#417](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/417)), that
+  deleted accounts stayed visible in user management with anonymised email addresses
+  ([#418](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/418)), and
+  that the AI provider was configured without tool access
+  ([#424](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/424)).
+- **Sontung05** ([@Sontung05](https://github.com/Sontung05)): reported that the Linux desktop
+  app could not start its local database because a PostgreSQL dictionary library was missing
+  ([#419](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/419)).
+- **OleksandrDemydenko** ([@OleksandrDemydenko](https://github.com/OleksandrDemydenko)): asked
+  in Discussions why draft contracts could not be deleted
+  ([#425](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/425)),
+  asked for a Ukrainian localisation with the hryvnia and a translated interface, which the
+  app now ships
+  ([#429](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/429)),
+  and sent questions and comments on the 4D schedule and its tasks
+  ([#456](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/456)).
+- **juanjosecasba** ([@juanjosecasba](https://github.com/juanjosecasba)): reported through the
+  in-app reporter that an in-app upgrade timed out from the resource catalog page
+  ([#430](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/430)).
+- **JimZed** ([@JimZed](https://github.com/JimZed)): reported through the in-app reporter that
+  indexing the cost database for vector search timed out
+  ([#436](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/436)).
+- **CADcoLabs** ([@CADcoLabs](https://github.com/CADcoLabs)): sent a pull request proposing
+  partner branding on the login page
+  ([#437](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/437)).
+- **Bluster83** ([@Bluster83](https://github.com/Bluster83)): asked in Discussions what a main
+  contractor needs from a construction ERP, from an imported BOQ through procurement,
+  valuations and cost control
+  ([#440](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/440)).
+- **mherrerap87** ([@mherrerap87](https://github.com/mherrerap87)): twelve reports across BI
+  dashboards, custom KPIs, assemblies and migrations, including money KPIs that summed across
+  currencies
+  ([#465](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/465)), actual
+  cost and hours that could not be attributed to a BOQ position
+  ([#454](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/454)) and a
+  migration upgrade that always failed because startup had already created its tables
+  ([#449](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/449)), and
+  nine more.
+- **Dzintars** ([@dzintars](https://github.com/dzintars)): wrote in Discussions about the
+  project continuity risk a company adopter sees when a platform depends on one maintainer
+  ([#450](https://github.com/datadrivenconstruction/OpenConstructionERP/discussions/450)).
+- **stubbzy3-creator** ([@stubbzy3-creator](https://github.com/stubbzy3-creator)): sent a pull
+  request proposing cross-department work requests, correspondence registers and a daily
+  delivery board
+  ([#464](https://github.com/datadrivenconstruction/OpenConstructionERP/pull/464)).
+- **Mazen S. H. Elsayed** ([@elsayed-mazen](https://github.com/elsayed-mazen)): reported that
+  the invoice total went blank for amounts of 1,000 or more
+  ([#466](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/466)) and that
+  approving a pending invoice set its status to Sent and blocked marking it paid
+  ([#467](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/467)).
+- **JoseJFernandezAlvarez**
+  ([@JoseJFernandezAlvarez](https://github.com/JoseJFernandezAlvarez)): sent an in-app report
+  from the Modules page
+  ([#468](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/468)).
+- **NeilYam** ([@NeilYam](https://github.com/NeilYam)): reported that the desktop app on macOS
+  could not initialise bundled PostgreSQL due to a code signature Team ID mismatch on libpq
+  ([#480](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/480)).
+- **maverikhp** ([@maverikhp](https://github.com/maverikhp)): sent an in-app bug report from
+  the Dashboard page
+  ([#481](https://github.com/datadrivenconstruction/OpenConstructionERP/issues/481)).
 
 See the full list of everyone who has contributed:
 
 https://github.com/datadrivenconstruction/OpenConstructionERP/graphs/contributors
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+# Acknowledged: @Bluster83
+# Acknowledged: @CADcoLabs
+# Acknowledged: @EQSTLab
+# Acknowledged: @INAPA-desarrolloTIC
+# Acknowledged: @JimZed
+# Acknowledged: @JoseJFernandezAlvarez
+# Acknowledged: @LetsBIMtogether
+# Acknowledged: @Mr-OpenR
+# Acknowledged: @Nebulasunrise-OG
+# Acknowledged: @NeilYam
+# Acknowledged: @OleksandrDemydenko
+# Acknowledged: @SimonOhli
+# Acknowledged: @Sontung05
+# Acknowledged: @abipaudel
+# Acknowledged: @aganinvadim1-commits
+# Acknowledged: @aidankoetaan-tech
+# Acknowledged: @alisadikinma
+# Acknowledged: @arq-migfrazao
+# Acknowledged: @baguscandrautamamr
+# Acknowledged: @buzzy84
+# Acknowledged: @colintanlk
+# Acknowledged: @cosanostratr
+# Acknowledged: @darkleono
+# Acknowledged: @dizconnectz
+# Acknowledged: @dzintars
+# Acknowledged: @elric-cpu
+# Acknowledged: @elsayed-mazen
+# Acknowledged: @hibohsuc-svg
+# Acknowledged: @j209
+# Acknowledged: @juanjosecasba
+# Acknowledged: @mahabdalla
+# Acknowledged: @masc145
+# Acknowledged: @maverikhp
+# Acknowledged: @mherrerap87
+# Acknowledged: @nullbenny
+# Acknowledged: @ravindrakumar2053-bit
+# Acknowledged: @rfwn
+# Acknowledged: @ronna
+# Acknowledged: @sa05e60
+# Acknowledged: @serviteur
+# Acknowledged: @stubbzy3-creator
+# Acknowledged: @yhay81
+# Acknowledged: @ziadeh
+# Acknowledged: @ziul03

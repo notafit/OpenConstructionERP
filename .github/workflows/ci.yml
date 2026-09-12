@@ -35,6 +35,22 @@ concurrency:
   # cancelled, 19 of the last 20 consecutively. What that costs is not a wrong
   # answer, it is NO answer. A cancelled run has no conclusion, nothing goes
   # red, and the silence is indistinguishable from health.
+  #
+  # Remeasured 2026-09-08: this setting does what it says and main is still
+  # losing verdicts, 8 of the last 20 runs cancelled. The setting governs the
+  # run that is already executing. It does not govern the one waiting behind
+  # it: a group holds at most one pending run, so when a third push arrives
+  # the pending one is evicted. Both cancelled runs read that day had zero
+  # jobs and a run_started_at equal to their created_at, which is what being
+  # dropped from the queue looks like as opposed to being stopped mid-flight.
+  #
+  # So the guarantee here is narrower than "every push to main gets a
+  # verdict". It is "the newest push gets one, once the pushes stop". That is
+  # enough for the way we read this workflow, since we read it on a settled
+  # head, and it is not enough for anyone who reads a per-commit result. Fix
+  # it, if it ever needs fixing, by putting the sha in the group rather than
+  # by touching the line below; the cost of that is one full matrix per
+  # commit, which is why it is not the default.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -46,7 +62,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -66,7 +82,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -146,7 +162,7 @@ jobs:
           filter: blob:none
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -284,7 +300,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -452,10 +468,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -639,6 +655,33 @@ jobs:
         if: ${{ !cancelled() }}
         run: node ../scripts/check_e2e_spec_coverage.mjs
 
+      - name: Prove the case coverage ratchet can fail
+        # A gate only ever seen passing is indistinguishable from one that
+        # cannot fail. This builds playbooks and locales in memory, loses a
+        # key, ships a case without strings, and fails if the check stays
+        # quiet on any of it.
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-coverage.mjs --selftest
+
+      - name: Check no case answers fewer translated keys than the manifest records
+        # A case playbook names its strings by key and carries the English
+        # inline, so a key no locale answers renders English in that locale
+        # and nothing else reports it: the orphan gate reads literal t()
+        # calls and here the key is a variable off a data row, and the drift
+        # check (run by caseTranslationDrift.test.ts in the step above) skips
+        # a key that was never translated because it cannot have gone stale.
+        # This counts what every offered locale still does not answer, per
+        # playbook, against a committed floor that --update can only lower.
+        # Measured on 2026-09-06 over 220 playbooks, 7037 keys and 40 locales,
+        # so it pins the debt where it stands rather than clearing it.
+        #
+        # Last in the job and under !cancelled() on purpose: a missing
+        # translation must not skip the build and the tests, and a failed
+        # build must not hide a missing translation. On all three OSes for
+        # the reason the two steps above give: it reads the tree by path.
+        if: ${{ !cancelled() }}
+        run: node scripts/check-case-coverage.mjs
+
   backend-cross-os:
     name: Backend CI (${{ matrix.os }}, embedded PG, shard ${{ matrix.shard }}/3)
     # GitHub Actions service containers are Linux-only, so the Windows and macOS
@@ -650,12 +693,13 @@ jobs:
     # on every push. e2e-cross-os.yml already proves the embedded cluster boots
     # on these runners.
     runs-on: ${{ matrix.os }}
-    # Advisory during rollout: the unit tree has never run on Windows or macOS
-    # before, so it reports on every push (that is the point - maximum quality
-    # signal on every change) but does not block while first-time OS-specific
-    # gaps are shaken out. Remove this line to make it a hard gate once it is
-    # consistently green.
-    continue-on-error: true
+    # This job carried continue-on-error while the unit tree was new to Windows
+    # and macOS. A census of 15 completed runs on main (2026-09-07 to 09-08)
+    # found every red it hid on shards 1 and 2 was the same test the ubuntu
+    # shards reported in the same run, Windows produced no independent red in
+    # 45 shards, and the one macOS-only red was the heartbeat timing test fixed
+    # in e0433b90b, after which all six shards ran green. A red shard reports
+    # itself now.
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -680,7 +724,7 @@ jobs:
           filter: blob:none
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip

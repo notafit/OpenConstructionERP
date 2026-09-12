@@ -42,7 +42,9 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen import canvas
 
 from app.core.pdf_fonts import pdf_font_for_text
-from app.modules.einvoice.cii import EInvoice, build_cii_xml
+from app.core.validation.address import format_address_lines
+from app.modules.einvoice.bank import is_bic, is_iban
+from app.modules.einvoice.cii import EInvoice, Party, build_cii_xml
 from app.modules.einvoice.pdf_translations import (
     DEFAULT_PDF_LOCALE,
     fmt_date,
@@ -63,6 +65,43 @@ _CONFORMANCE = {
     "facturx": "EN 16931",
     "xrechnung": "XRECHNUNG",
 }
+
+
+def party_address_lines(p: Party) -> list[str]:
+    """The address block of one party, as the readable page should print it.
+
+    The page carried the post code and the city and nothing else, so BT-35 and
+    BT-50 reached the receiver's software inside the embedded CII and never
+    reached the person reading the page. A hybrid invoice is one document in two
+    representations, and the two stated different addresses for the same party
+    on every invoice this product has issued, in every country.
+
+    A field the party does not answer produces no line, which is what keeps the
+    invoices that carry no street byte-identical to the pages they were before.
+
+    The order is the country's own. The page used to write the post code before
+    the city for everyone, which is right for the DACH countries and the rest of
+    continental Europe and wrong for every party the ``peppol_aunz`` and
+    ``peppol_sg`` profiles exist to serve. BT-40 / BT-55 already names the
+    country on both parties, so the page had the answer and was not asking.
+
+    ``state`` is not passed because :class:`Party` has no field to carry it:
+    BT-39 / BT-54 CountrySubentity is absent from the model, so a US or
+    Australian party prints "Boston 02108" where it should print
+    "Boston, MA 02108". The shape is right and one part is missing, which is a
+    question about the party model rather than about this renderer.
+
+    Args:
+        p: the seller or buyer trade party.
+
+    Returns:
+        The address lines, top to bottom, with nothing empty in them.
+    """
+    lines, _jurisdiction = format_address_lines(
+        {"street": p.line1, "postcode": p.postcode, "city": p.city},
+        p.country_code,
+    )
+    return lines
 
 
 def _readable_pdf(inv: EInvoice, locale: str = DEFAULT_PDF_LOCALE) -> bytes:
@@ -169,32 +208,47 @@ def _readable_pdf(inv: EInvoice, locale: str = DEFAULT_PDF_LOCALE) -> bytes:
     # block from there to the right margin, and the description column to the
     # quantity figure at left + 95mm. Those are the three strings a party can
     # make arbitrarily long, so each is clipped at the offset that follows it.
-    line(y - 5 * mm, fit(inv.seller.name, base="Helvetica", size=9, budget=90 * mm))
-    seller_loc = " ".join(x for x in (inv.seller.postcode, inv.seller.city) if x)
-    if seller_loc:
-        line(y - 10 * mm, seller_loc)
+    seller_budget = 90 * mm
+    sy = y - 5 * mm
+    line(sy, fit(inv.seller.name, base="Helvetica", size=9, budget=seller_budget))
+    for text in party_address_lines(inv.seller):
+        sy -= 5 * mm
+        line(sy, fit(text, base="Helvetica", size=9, budget=seller_budget))
     if inv.seller.vat_id:
-        line(y - 15 * mm, tr(locale, "vat_id", value=inv.seller.vat_id))
+        sy -= 5 * mm
+        line(sy, tr(locale, "vat_id", value=inv.seller.vat_id))
 
     c.setFont("Helvetica-Bold", 9)
     put(left + 90 * mm, y, tr(locale, "bill_to"), base="Helvetica-Bold", size=9)
     c.setFont("Helvetica", 9)
     buyer_budget = (width - 20 * mm) - (left + 90 * mm)
+    by = y - 5 * mm
     put(
         left + 90 * mm,
-        y - 5 * mm,
+        by,
         fit(inv.buyer.name, base="Helvetica", size=9, budget=buyer_budget),
         base="Helvetica",
         size=9,
     )
-    buyer_loc = " ".join(x for x in (inv.buyer.postcode, inv.buyer.city) if x)
-    if buyer_loc:
-        put(left + 90 * mm, y - 10 * mm, buyer_loc, base="Helvetica", size=9)
+    for text in party_address_lines(inv.buyer):
+        by -= 5 * mm
+        put(
+            left + 90 * mm,
+            by,
+            fit(text, base="Helvetica", size=9, budget=buyer_budget),
+            base="Helvetica",
+            size=9,
+        )
     if inv.buyer_reference:
-        put(left + 90 * mm, y - 15 * mm, tr(locale, "ref", value=inv.buyer_reference), base="Helvetica", size=9)
+        by -= 5 * mm
+        put(left + 90 * mm, by, tr(locale, "ref", value=inv.buyer_reference), base="Helvetica", size=9)
 
-    # Line table header
-    ty = y - 30 * mm
+    # Line table header. The party blocks used to be three lines each and the
+    # header sat at a fixed offset below them; an address is as many lines as
+    # its country writes, so the header takes whichever is lower, its old place
+    # or one line under the deeper of the two blocks. A party that answers what
+    # it answered before puts the header back exactly where it was.
+    ty = min(y - 30 * mm, min(sy, by) - 5 * mm)
     c.setFont("Helvetica-Bold", 8)
     put(left, ty, tr(locale, "th_description"), base="Helvetica-Bold", size=8)
     put(left + 95 * mm, ty, tr(locale, "th_qty"), base="Helvetica-Bold", size=8, align_right=True)
@@ -272,9 +326,15 @@ def _readable_pdf(inv: EInvoice, locale: str = DEFAULT_PDF_LOCALE) -> bytes:
         put(left, ry, tr(locale, "payment"), base="Helvetica-Bold", size=8)
         c.setFont("Helvetica", 8)
         ry -= 5 * mm
-        put(left, ry, tr(locale, "iban", value=inv.payee_iban), base="Helvetica", size=8)
+        # Label what the value actually is. A seller outside the IBAN area
+        # stores a domestic account identifier in the same business term, and
+        # calling it an IBAN on the page tells the person paying to look for a
+        # field their bank will not offer them.
+        account_key = "iban" if is_iban(inv.payee_iban) else "account_number"
+        put(left, ry, tr(locale, account_key, value=inv.payee_iban), base="Helvetica", size=8)
         if inv.payee_bic:
-            put(left + 70 * mm, ry, tr(locale, "bic", value=inv.payee_bic), base="Helvetica", size=8)
+            provider_key = "bic" if is_bic(inv.payee_bic) else "bank_code"
+            put(left + 70 * mm, ry, tr(locale, provider_key, value=inv.payee_bic), base="Helvetica", size=8)
         if inv.payee_account_name:
             ry -= 5 * mm
             # The fourth party-controlled string, and the widest budget on the

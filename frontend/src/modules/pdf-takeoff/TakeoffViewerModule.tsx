@@ -4,7 +4,7 @@
 // DDC-CWICR-OE-2026
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import * as pdfjsLib from 'pdfjs-dist';
+import { openPdf, type PDFDocumentProxy } from '@/shared/lib/pdfjs';
 import {
   Ruler,
   Upload,
@@ -84,7 +84,7 @@ import {
   type ConfidenceThresholds,
 } from '../../features/takeoff/lib/confidenceBand';
 import { apiGet, apiPost } from '../../shared/lib/api';
-import { formatFileSize, fmtFixed } from '../../shared/lib/formatters';
+import { formatFileSize, fmtFixed, fmtNumberForInput } from '../../shared/lib/formatters';
 import { convertBetween } from '../../shared/lib/unitConversion';
 import { useMeasurementPersistence } from './useMeasurementPersistence';
 import {
@@ -214,16 +214,11 @@ import {
 } from '../../features/takeoff/lib/takeoff-display-units';
 import { ElementCostMatchPanel } from '@/features/match';
 import { openLink } from '@/shared/lib/desktop';
+import { parseDecimalInput } from '@/shared/lib/parseDecimal';
 // Type-only: the scale-source vocabulary is a closed set owned by the backend
 // contract, so the viewer reuses it instead of restating it as a bare string.
 import type { ScaleSource } from '@/features/takeoff/api';
 import { fmtList, fmtPercent, getIntlLocale } from '@/shared/lib/formatters';
-
-// Configure PDF.js worker — bundled locally (no CDN dependency)
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url,
-).toString();
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -637,7 +632,7 @@ export default function TakeoffViewerModule({
   const { t, i18n } = useTranslation();
 
   // PDF state
-  const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
+  const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [zoom, setZoom] = useState(1.0);
@@ -1226,7 +1221,7 @@ export default function TakeoffViewerModule({
     setIsLoading(true);
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const doc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const doc = await openPdf(arrayBuffer).promise;
       setPdfDoc(doc);
       setTotalPages(doc.numPages);
       setCurrentPage(1);
@@ -1334,7 +1329,7 @@ export default function TakeoffViewerModule({
         }
         const arrayBuffer = await response.arrayBuffer();
         if (cancelled) return;
-        const doc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const doc = await openPdf(arrayBuffer).promise;
         if (cancelled) return;
         setPdfDoc(doc);
         setTotalPages(doc.numPages);
@@ -1603,7 +1598,6 @@ export default function TakeoffViewerModule({
 
         const viewport = page.getViewport({ scale: zoom * window.devicePixelRatio });
         const canvas = canvasRef.current!;
-        const ctx = canvas.getContext('2d')!;
 
         canvas.width = viewport.width;
         canvas.height = viewport.height;
@@ -1618,7 +1612,7 @@ export default function TakeoffViewerModule({
           overlayRef.current.getContext('2d')?.clearRect(0, 0, viewport.width, viewport.height);
         }
 
-        const task = page.render({ canvasContext: ctx, viewport });
+        const task = page.render({ canvas, viewport });
         activeTask = task;
         await task.promise;
         if (cancelled) return;
@@ -1675,9 +1669,7 @@ export default function TakeoffViewerModule({
           const off = document.createElement('canvas');
           off.width = Math.max(1, Math.ceil(vp.width));
           off.height = Math.max(1, Math.ceil(vp.height));
-          const offCtx = off.getContext('2d');
-          if (!offCtx) { queue.delete(n); continue; }
-          await page.render({ canvasContext: offCtx, viewport: vp }).promise;
+          await page.render({ canvas: off, viewport: vp }).promise;
           if (cancelled) { queue.delete(n); return; }
           const url = off.toDataURL('image/png');
           setThumbs((prev) => capThumbCache({ ...prev, [n]: url }, currentPage));
@@ -4365,18 +4357,19 @@ export default function TakeoffViewerModule({
         if (ftEmpty && inEmpty) {
           meters = undefined;
         } else {
-          const ft = parseFloat(draft.ft);
-          const inch = parseFloat(draft.in);
-          const combined =
-            toMeters(Number.isFinite(ft) ? ft : 0, 'ft') +
-            toMeters(Number.isFinite(inch) ? inch : 0, 'in');
+          // parseDecimalInput, not parseFloat: this is a typed field, and
+          // parseFloat('1,5') is 1 - a third of the width, stored with no
+          // error shown anywhere.
+          const ft = parseDecimalInput(draft.ft);
+          const inch = parseDecimalInput(draft.in);
+          const combined = toMeters(ft ?? 0, 'ft') + toMeters(inch ?? 0, 'in');
           meters = combined > 0 ? combined : undefined;
         }
       } else if (draft.m.trim() === '') {
         meters = undefined;
       } else {
-        const v = parseFloat(draft.m);
-        meters = Number.isFinite(v) && v > 0 ? toMeters(v, 'm') : undefined;
+        const v = parseDecimalInput(draft.m);
+        meters = v !== null && v > 0 ? toMeters(v, 'm') : undefined;
       }
       updateSelectedMeasurement(
         meters === undefined
@@ -9195,8 +9188,13 @@ export default function TakeoffViewerModule({
                               min={0}
                               max={89}
                               step={0.5}
-                              value={Number(
-                                fmtFixed(degreesFromSlopeFactor(selectedMeasurement.slopeFactor ?? 1), 1),
+                              // Rounded for the field without going through a
+                              // display formatter: a reader whose decimal mark
+                              // is a comma got "26,6" back, `Number` read that
+                              // as NaN and the pitch box came up empty (#466).
+                              value={fmtNumberForInput(
+                                degreesFromSlopeFactor(selectedMeasurement.slopeFactor ?? 1),
+                                1,
                               )}
                               onChange={(e) => {
                                 const deg = Number(e.target.value);

@@ -286,11 +286,11 @@ Function PageReinstall
     !endif
     ${NSD_OnClick} $R3 PageReinstallUpdateSelection
 
-    ; OpenConstructionERP fork of the stock Tauri template. The block below and
-    ; this comment are the only difference from upstream, and
-    ; scripts/check_nsis_template_drift.py proves that by fetching the template
-    ; at the CLI version pinned in .github/workflows/desktop-release.yml and
-    ; reconstructing this file from it.
+    ; OpenConstructionERP fork of the stock Tauri template, edit one of four.
+    ; The other three are in PageLeaveReinstall below and carry their own notes.
+    ; scripts/check_nsis_template_drift.py proves the set is exactly these four
+    ; by fetching the template at the CLI version pinned in
+    ; .github/workflows/desktop-release.yml and reconstructing this file from it.
     ;
     ; What it defends against. On an upgrade the first radio button reads
     ; "Uninstall before installing", and upstream starts it selected, so a user
@@ -320,9 +320,11 @@ Function PageReinstall
     ; different pair of choices and keeps its default, and the downgrade case
     ; keeps its default. The WiX migration path is excluded by hand, and that is
     ; the one exclusion that is not obvious: it reaches this page with $R0 = 1
-    ; too, but PageLeaveReinstall uninstalls on it whichever button is selected,
-    ; so pre-selecting "Do not uninstall" there would show a default the
-    ; installer does not honour. The condition also requires $ReinstallPageCheck
+    ; too, but installing over an MSI install leaves the MSI's own entry in
+    ; Add/Remove Programs, so one product would offer two ways to remove it. The
+    ; first radio button therefore stays the default there. PageLeaveReinstall
+    ; does honour the other button on that path, see the fork note in it.
+    ; The condition also requires $ReinstallPageCheck
     ; to still be empty, which is true only the first time the page is shown, so
     ; a user who picks the first radio button and then walks back into the page
     ; still finds their own choice selected.
@@ -375,9 +377,27 @@ FunctionEnd
 Function PageLeaveReinstall
   ${NSD_GetState} $R2 $R1
 
-  ; If migrating from Wix, always uninstall
+  ; OpenConstructionERP fork, edit two of four. Upstream sent every WiX
+  ; migration to reinst_uninstall without reading $R1, so the page offered a
+  ; choice and then ignored it: a user who picked "Do not uninstall" watched the
+  ; MSI uninstaller start anyway, and if it then failed the upgrade stopped on a
+  ; step that user had declined. The selection is honoured here instead.
+  ;
+  ; Passive mode is the exception, and it has to be one. PageReinstall calls
+  ; this function directly when $PassiveMode = 1, before nsDialogs::Create has
+  ; run, so $R2 still holds the label text rather than a window handle and the
+  ; ${NSD_GetState} above leaves $R1 at 0. Reading that as "the user chose not
+  ; to uninstall" would quietly stop removing the MSI on every unattended
+  ; migration, with nothing anywhere to say so. A passive run keeps uninstalling.
+  ; Note also that this branch sits ahead of the $UpdateMode check below, so
+  ; update mode does not cover the case either.
   ${If} $WixMode = 1
-    Goto reinst_uninstall
+    ${If} $PassiveMode = 1
+    ${OrIf} $R1 = 1
+      Goto reinst_uninstall
+    ${Else}
+      Goto reinst_done
+    ${EndIf}
   ${EndIf}
 
   ; In update mode, always proceeds without uninstalling
@@ -422,15 +442,74 @@ Function PageLeaveReinstall
       ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
       ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
       StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
-      ExecWait '$R1' $0
+      ; OpenConstructionERP fork, edit four of four. ExecWait blocks forever
+      ; when the old uninstaller hangs, and every release from v11.7.1 to v15.8.0
+      ; shipped an uninstaller whose process-stop hooks called nsExec without
+      ; /TIMEOUT. On a machine where PowerShell never returns (antivirus, PowerToys,
+      ; wedged WMI), that uninstaller never finishes, and the upgrade stops dead.
+      ; The default radio button already steers people away from this path (edit one
+      ; above), but a person who explicitly chose to uninstall still hits the hang.
+      ;
+      ; nsExec with /TIMEOUT=300000 (five minutes) replaces ExecWait. If the old
+      ; uninstaller finishes normally, nsExec pushes its exit code as a decimal
+      ; string. If it hangs, nsExec terminates it after five minutes and pushes
+      ; the string "timeout". If it cannot be started at all, nsExec pushes
+      ; "error". The three are distinguished below.
+      ;
+      ; On timeout the upgrade continues rather than aborting: the old uninstaller
+      ; was already killed, NSIS_HOOK_PREINSTALL will stop any processes it left
+      ; behind, and the install overwrites every file. This is a strictly better
+      ; outcome than the alternative, which was a frozen installer window with no
+      ; way out but the task manager.
+      nsExec::Exec /TIMEOUT=300000 '$R1'
+      Pop $0
     ${EndIf}
 
     BringToFront
 
-    ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|} ; ExecWait failed, set fake exit code
+    ; OpenConstructionERP fork, edit three of four (was three of three before
+    ; the timeout guard above). Three things change here, all of them about when
+    ; an upgrade is allowed to stop and what the person in front of it is told
+    ; when it does.
+    ;
+    ; A leftover binary on its own is no longer fatal. Upstream aborted when the
+    ; old uninstaller returned success and $INSTDIR still held the main
+    ; executable, which is what happens whenever that file was locked at the
+    ; moment it was deleted, and an antivirus or a search indexer holding it open
+    ; is ordinary rather than exotic. It explains why one machine refuses an
+    ; upgrade that two others take. The install that follows writes over that
+    ; exact path, so the check was refusing an upgrade that would have worked. A
+    ; non-zero code still stops us, because that means the previous version is
+    ; only partly removed and the two would be mixed.
+    ;
+    ; The message says what happened. It used to be one sentence carrying no
+    ; number and no path, so "the previous version could not be removed" was all
+    ; the user got and there was nothing in it to act on. The detail we add is
+    ; English only: $(unableToUninstall) is a LangString living in the bundler's
+    ; own language files, unreachable from this template, and keeping it as the
+    ; first sentence keeps the translations we ship for it.
+    ;
+    ; A fabricated code is not reported as one. Upstream put 2 in $0 when
+    ; ExecWait could not start the uninstaller at all, and printing that as an
+    ; exit code would be the same defect the message is here to fix.
+    ;
+    ; A timed-out uninstaller is not reported as an error at all. nsExec killed
+    ; it, NSIS_HOOK_PREINSTALL takes care of what is left, and the files are
+    ; overwritten. Aborting here after a five-minute wait would be worse than
+    ; the original hang, because the person waited and still got nothing.
+    StrCpy $R5 ""
+    ${If} $0 == "timeout"
+      ; Old uninstaller was hanging and has been terminated. Continue.
+      StrCpy $0 0
+    ${ElseIf} $0 == "error"
+      StrCpy $0 2
+      StrCpy $R5 "The uninstaller of the installed version could not be started."
+    ${Else}
+      ; $0 is the exit code as a decimal string; NSIS compares it numerically below
+      StrCpy $R5 "The uninstaller of the installed version exited with code $0."
+    ${EndIf}
 
     ${If} $0 <> 0
-    ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
       ; User cancelled wix uninstaller? return to select un/reinstall page
       ${If} $WixMode = 1
       ${AndIf} $0 = 1602
@@ -442,8 +521,12 @@ Function PageLeaveReinstall
         Abort
       ${EndIf}
 
-      ; Other erros? show generic error message and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
+      ${If} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
+        StrCpy $R5 "$R5$\nIt left $INSTDIR\${MAINBINARYNAME}.exe behind."
+      ${EndIf}
+
+      ; Other errors? say what happened and return to select un/reinstall page
+      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)$\n$\n$R5$\n$\nOpen Windows Settings, go to Apps, remove ${PRODUCTNAME} there, then run this installer again."
       Abort
     ${EndIf}
   reinst_done:

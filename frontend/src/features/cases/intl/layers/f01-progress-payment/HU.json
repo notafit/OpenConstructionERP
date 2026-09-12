@@ -1,0 +1,252 @@
+{
+  "family": "f01-progress-payment",
+  "jurisdiction": "HU",
+  "note": "Hungary hangs the whole period on one document: without a signed teljesitesigazolas there is no lawful invoice, and the dispute that follows a refused one has its own forum rather than the courts. So this layer surfaces register, measure, certify, invoice, clock, deadlines and escalate, and the escalation slot names the expert body rather than a letter.",
+  "slug": "get-the-teljesitesigazolas-signed-and-invoice-the-period",
+  "order": 1240,
+  "region": "HU",
+  "category": "commercial",
+  "companyTypes": [
+    "general-contractor",
+    "subcontractor",
+    "cost-consultant"
+  ],
+  "roles": [
+    "contract-administrator",
+    "commercial-manager",
+    "quantity-surveyor"
+  ],
+  "icon": "FileCheck2",
+  "estMinutes": 12,
+  "title": "Get the teljesitesigazolas signed and invoice the period",
+  "desc": "Register the contract, measure the period tetel by tetel, get the muszaki ellenor to sign the teljesitesigazolas, raise the szamla against it and let the module count the days the payment rules allow, so a refusal to certify is a dated fact with a forum rather than a stalemate.",
+  "longDesc": "Hungarian construction payment turns on the teljesitesigazolas, and the reason it matters is that the contractor cannot lawfully invoice without one. That gives the certifying party a great deal of leverage and creates the failure everybody in the chain recognises: work is finished, nobody disputes it was finished, and the certificate does not arrive. The law answers that with a dedicated expert body rather than a lawsuit, but the answer is only available to a contractor who can show what was submitted, when, and what came back. Kept as the period runs, that record is a filing. Reconstructed afterwards it is an argument.",
+  "slots": {
+    "priceLine": "tetel",
+    "priceLinePlural": "tetelek",
+    "valuationDoc": "teljesitesigazolas",
+    "certifier": "muszaki ellenor",
+    "excessTerm": "potmunka",
+    "retentionTerm": "visszatartas",
+    "payDoc": "szamla",
+    "payAgainst": "the signed teljesitesigazolas",
+    "clockRegime": "Ptk. 6:130",
+    "clockStart": "the day the szamla is received",
+    "payDays": "30",
+    "escalationRoute": "take it to the Teljesitesigazolasi Szakertoi Szerv and preserve the claim"
+  },
+  "steps": [
+    {
+      "id": "register",
+      "spine": "register",
+      "icon": "FileSignature",
+      "module": "Contracts",
+      "moduleKey": "nav.contracts",
+      "to": "/projects/:projectId/contracts",
+      "in": [
+        {
+          "key": "szerzodes",
+          "label": "Signed vallalkozasi szerzodes"
+        },
+        {
+          "key": "koltsegvetes",
+          "label": "Priced koltsegvetes"
+        }
+      ],
+      "out": [
+        {
+          "key": "registered",
+          "label": "Contract on record"
+        },
+        {
+          "key": "terms",
+          "label": "Certification and payment terms attached"
+        }
+      ]
+    },
+    {
+      "id": "measure",
+      "spine": "measure",
+      "icon": "Ruler",
+      "module": "Progress",
+      "moduleKey": "nav.progress",
+      "to": "/progress",
+      "in": [
+        {
+          "key": "koltsegvetes",
+          "label": "Priced koltsegvetes"
+        },
+        {
+          "key": "executed",
+          "label": "Work executed this period"
+        }
+      ],
+      "out": [
+        {
+          "key": "percent",
+          "label": "Percent complete per tetel"
+        },
+        {
+          "key": "quantities",
+          "label": "Earned quantities for the period"
+        }
+      ],
+      "note": {
+        "what": "Keep potmunka on its own tetel rather than inside an existing one. A certifier who has to decide the whole period in order to decide the extra will decide neither. Where the contract settles on measured quantities, the decree on construction contracting has them kept in the felmeresi naplo of the e-epitesi naplo, so the percentages here should be the ones that log can back."
+      }
+    },
+    {
+      "id": "igazolas",
+      "spine": "certify",
+      "icon": "Stamp",
+      "module": "Approval routes",
+      "moduleKey": "approvalRoutes.title",
+      "to": "/governance?tab=approvals",
+      "in": [
+        {
+          "key": "valuation",
+          "label": "Valuation for the period"
+        },
+        {
+          "key": "ellenor",
+          "label": "Muszaki ellenor named for certification"
+        }
+      ],
+      "out": [
+        {
+          "key": "signed",
+          "label": "Signed teljesitesigazolas"
+        },
+        {
+          "key": "date",
+          "label": "Certification date on record"
+        }
+      ],
+      "note": {
+        "what": "The decree on construction contracting gives the muszaki ellenor fifteen working days from your written notice that the performance is complete to issue the teljesitesigazolas or refuse it with reasons, and the szamla cannot lawfully be issued before it, so record the day the notice went in: the fifteen days run from it.",
+        "why": "A certificate that is refused and a certificate that has simply not arrived look identical from the contractor's side, and the remedies for them are different. Recording the submission date is what tells the two apart."
+      }
+    },
+    {
+      "id": "szamla",
+      "spine": "invoice",
+      "icon": "ReceiptText",
+      "module": "Finance",
+      "moduleKey": "nav.finance",
+      "to": "/projects/:projectId/finance",
+      "in": [
+        {
+          "key": "signed",
+          "label": "Signed teljesitesigazolas"
+        },
+        {
+          "key": "visszatartas",
+          "label": "Visszatartas and deductions"
+        }
+      ],
+      "out": [
+        {
+          "key": "szamla",
+          "label": "Szamla issued"
+        },
+        {
+          "key": "carried",
+          "label": "Amount carried into the accounts"
+        }
+      ],
+      "note": {
+        "what": "Between domestic VAT-registered businesses the reverse charge applies to construction and installation work on a property that needs a permit from, or a notification to, any authority, so the szamla carries the words forditott adozas and no tax, the customer accounts for the twenty-seven percent, and the invoice is reported to NAV online at issue like every other."
+      }
+    },
+    {
+      "id": "openclock",
+      "spine": "clock",
+      "icon": "Clock",
+      "module": "Payment Clock",
+      "moduleKey": "nav.payment_clock",
+      "to": "/payment-clock",
+      "in": [
+        {
+          "key": "szamla",
+          "label": "Szamla and its date"
+        },
+        {
+          "key": "terms",
+          "label": "Contract payment terms"
+        }
+      ],
+      "out": [
+        {
+          "key": "clock",
+          "label": "Open payment clock"
+        },
+        {
+          "key": "due",
+          "label": "Due date computed"
+        }
+      ],
+      "note": {
+        "what": "The module carries this period as the EU late-payment regime, which is the directive Ptk. 6:130 transposes, so pick that regime and count from the day the szamla arrives. Thirty days is the default; a business-to-business contract may agree longer, and past sixty days the term is presumed unfair, so where the contract sets its own date enter that date instead."
+      }
+    },
+    {
+      "id": "dates",
+      "spine": "deadlines",
+      "icon": "CalendarClock",
+      "module": "Payment Clock",
+      "moduleKey": "nav.payment_clock",
+      "to": "/payment-clock",
+      "in": [
+        {
+          "key": "clock",
+          "label": "Open payment clock"
+        },
+        {
+          "key": "regime",
+          "label": "Chosen regime"
+        }
+      ],
+      "out": [
+        {
+          "key": "due",
+          "label": "Due date"
+        },
+        {
+          "key": "derivation",
+          "label": "Derivation you can quote"
+        }
+      ]
+    },
+    {
+      "id": "escalate",
+      "spine": "escalate",
+      "icon": "Gavel",
+      "module": "Documents",
+      "moduleKey": "nav.documents",
+      "to": "/projects/:projectId/files",
+      "in": [
+        {
+          "key": "passed",
+          "label": "Passed deadlines"
+        },
+        {
+          "key": "record",
+          "label": "Submissions and certification dates"
+        }
+      ],
+      "out": [
+        {
+          "key": "filing",
+          "label": "Expert body filing"
+        },
+        {
+          "key": "entitlement",
+          "label": "Entitlement preserved"
+        }
+      ],
+      "note": {
+        "what": "The expert body can be asked when the certificate is refused, when it never arrives and when it was issued and not paid; it answers within thirty days, sixty at most, and a court asked to enforce its opinion afterwards hears the case out of turn."
+      }
+    }
+  ]
+}

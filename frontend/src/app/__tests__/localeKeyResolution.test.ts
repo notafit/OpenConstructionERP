@@ -52,7 +52,7 @@ function loadLocale(code: string): { translation: Record<string, string> } {
 /** A bundle built exactly as i18n.ts builds one. */
 function bundleFor(code: string, resource: { translation: Record<string, string> }) {
   const instance = i18next.createInstance();
-  void instance.init({ lng: code, resources: {}, initImmediate: false });
+  void instance.init({ lng: code, resources: {}, initAsync: false });
   instance.addResourceBundle(code, 'translation', resource.translation, false, true);
   return instance;
 }

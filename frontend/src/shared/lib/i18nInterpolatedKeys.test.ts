@@ -155,6 +155,13 @@ describe('#200 counted keys carry every plural form their own language uses', ()
     // invented roots passed every gate, so the language is withheld until the
     // file is retranslated. The file stays covered by every assertion below;
     // only the registry comparison must expect its absence.
+    //
+    // Hungarian sat in this list from 2026-09-04 to 2026-09-09 for a different
+    // reason: `extract` seeds every batch with the English source text as a
+    // placeholder, and `assemble` cannot tell a translated batch from one where
+    // the placeholder was never replaced, so 30,746 of 41,903 values were still
+    // byte-identical to English. The file was rebuilt (419 of 42,539 identical,
+    // 0.99%) and the language is offered, so hu is declared like any other.
     const undeclaredOnPurpose = ['mn'];
     expect([...localeFiles.map(([code]) => code)].filter((code) => !undeclaredOnPurpose.includes(code)).sort())
       .toEqual([...declaredCodes].sort());

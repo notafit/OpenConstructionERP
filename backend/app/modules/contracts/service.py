@@ -852,6 +852,9 @@ class ContractsService:
                 },
             )
         fields.pop("status", None)
+        # original_contract_value is set internally when the contract
+        # leaves draft and must never be edited through the API.
+        fields.pop("original_contract_value", None)
         # Once the contract leaves `draft`, its financial terms are frozen.
         if contract.status != "draft":
             locked = sorted(f for f in self._LOCKED_FINANCIAL_FIELDS if f in fields)
@@ -1528,6 +1531,12 @@ class ContractsService:
                 contract,
                 actor_id=actor_id,
             )
+
+            # Freeze the original contract value so it survives later
+            # amendments via change orders and variations.  The current
+            # value lives in total_value; this column is immutable after
+            # being set and is the figure auditors compare against.
+            fields["original_contract_value"] = contract.total_value
 
             # Gate passed - stamp the audit trail onto the contract metadata.
             meta = dict(contract.metadata_ or {})
@@ -2777,10 +2786,44 @@ class ContractsService:
                 )
                 gainshare_estimate = share["savings"] - share["overrun"]
         outstanding = Decimal(str(contract.total_value or 0)) - paid
-        change_orders_count, _change_orders_net = self._change_order_rollup(contract)
+        change_orders_count, change_orders_net = self._change_order_rollup(contract)
+
+        # Commercial breakdown (PR-14 / PR-15 of issue #435).
+        original = contract.original_contract_value
+        current_value = Decimal(str(contract.total_value or 0))
+        agreed_variations = change_orders_net
+
+        # Pending variations: sum of VR cost impacts that are submitted or
+        # under review but not yet approved.  This is a cross-module query
+        # that tolerates the variations module being absent.
+        pending_variations = DEC_ZERO
+        try:
+            from sqlalchemy import func, select
+
+            from app.modules.variations.models import VariationRequest
+
+            row = (
+                await self.session.execute(
+                    select(func.coalesce(func.sum(VariationRequest.estimated_cost_impact), 0)).where(
+                        VariationRequest.project_id == contract.project_id,
+                        VariationRequest.status.in_(("submitted", "under_review")),
+                    )
+                )
+            ).scalar_one()
+            pending_variations = Decimal(str(row or 0))
+        except (ImportError, Exception):
+            pass
+
+        forecast = current_value + pending_variations
+
         return {
             "contract_id": contract_id,
-            "total_value": Decimal(str(contract.total_value or 0)),
+            "total_value": current_value,
+            "original_contract_value": original,
+            "agreed_variations": agreed_variations,
+            "current_contract_value": current_value,
+            "pending_variations": pending_variations,
+            "forecast_contract_value": forecast,
             "paid_to_date": paid,
             "retention_held": retention,
             "outstanding": outstanding if outstanding > DEC_ZERO else DEC_ZERO,
@@ -2974,7 +3017,13 @@ class ContractsService:
             if rollup_tracked
             else Decimal(str((contract.terms or {}).get("change_orders_net", 0) or 0))
         )
-        original_contract_sum = Decimal(str(contract.total_value or 0)) - change_orders_net
+        # Prefer the immutable stored baseline when available; fall back
+        # to the subtraction reconstruction for contracts that were active
+        # before the column existed.
+        if contract.original_contract_value is not None:
+            original_contract_sum = contract.original_contract_value
+        else:
+            original_contract_sum = Decimal(str(contract.total_value or 0)) - change_orders_net
 
         g702 = build_g702_summary(
             g703,

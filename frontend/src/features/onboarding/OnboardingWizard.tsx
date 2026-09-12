@@ -55,7 +55,8 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { Logo, Button, CountryFlag, Badge } from '@/shared/ui';
-import { detectCountry, matchSupportedLanguage, SUPPORTED_LANGUAGES } from '@/app/i18n';
+import { APP_VERSION } from '@/shared/lib/version';
+import { detectCountry, matchSupportedLanguage, changeLanguage, SUPPORTED_LANGUAGES } from '@/app/i18n';
 import { useToastStore } from '@/stores/useToastStore';
 import {
   useBackgroundInstallStore,
@@ -74,6 +75,7 @@ import { companyThumbFor } from '@/features/cases/caseFaces';
 import { apiGet, apiPost, extractErrorMessageFromBody } from '@/shared/lib/api';
 import { useBaseCatalog } from '@/features/costs/baseCatalog';
 import { BaseCatalogBrowser } from '@/features/costs/BaseCatalogBrowser';
+import { BaseCatalogError } from '@/features/costs/BaseCatalogError';
 import {
   ALL_MODULES,
   MODULE_GROUPS,
@@ -145,17 +147,28 @@ function packDisplayName(t: TFunction, pack: InstalledPartnerPack): string {
   });
 }
 
+// Every value here is a global-market catalogue, never a national norm base. A
+// language is not a country: `es` serves both the Spain and Mexico packs and
+// `sv` also answers for no/da/fi, so this map cannot name one country's own
+// norm system without recommending it to speakers elsewhere. That is why `pt`
+// picks PT_SAOPAULO over BR_NATIONAL, `it` IT_ROME over IT_TOSCANA and `id`
+// ID_JAKARTA over ID_NATIONAL. `zh` and `tr` were the only two that broke the
+// rule: cdf7391c1 rewrote them to ZH_CHINA and TR_NATIONAL alongside the mirror
+// rename, so the language step recommended one base while the country pack for
+// the same market installed another, and which one a user got depended on the
+// step they came through. Held by test_country_preset_regions_resolve.py, which
+// takes an exception only if it is recorded there with a reason.
 const LANG_TO_REGION: Record<string, string> = {
   de: 'DE_BERLIN',
   fr: 'FR_PARIS',
   es: 'SP_BARCELONA',
   pt: 'PT_SAOPAULO',
   ru: 'RU_STPETERSBURG',
-  zh: 'ZH_CHINA',
+  zh: 'ZH_SHANGHAI',
   ar: 'AR_DUBAI',
   hi: 'HI_MUMBAI',
   en: 'USA_USD',
-  tr: 'TR_NATIONAL',
+  tr: 'TR_ISTANBUL',
   it: 'IT_ROME',
   ja: 'JA_TOKYO',
   ko: 'KO_SEOUL',
@@ -215,14 +228,14 @@ const CWICR_DATABASES: CWICRDatabase[] = [
   { id: 'BG_SOFIA', name: 'Bulgaria', city: 'Sofia', lang: 'Balgarski', currency: 'BGN', flagId: 'bg' },
   { id: 'RO_BUCHAREST', name: 'Romania', city: 'Bucharest', lang: 'Romana', currency: 'RON', flagId: 'ro' },
   { id: 'SV_STOCKHOLM', name: 'Sweden', city: 'Stockholm', lang: 'Svenska', currency: 'SEK', flagId: 'se' },
-  { id: 'TR_NATIONAL', name: 'T\u00fcrkiye', city: 'National', lang: 'T\u00fcrk\u00e7e', currency: 'TRY', flagId: 'tr' },
+  { id: 'TR_ISTANBUL', name: 'T\u00fcrkiye', city: 'Istanbul', lang: 'T\u00fcrk\u00e7e', currency: 'TRY', flagId: 'tr' },
   { id: 'RU_STPETERSBURG', name: 'Russia / CIS', city: 'St. Petersburg', lang: '\u0420\u0443\u0441\u0441\u043a\u0438\u0439', currency: 'RUB', flagId: 'ru' },
   // Middle East / Africa
   { id: 'AR_DUBAI', name: 'Middle East / Gulf', city: 'Dubai', lang: '\u0627\u0644\u0639\u0631\u0628\u064a\u0629', currency: 'AED', flagId: 'ae' },
   { id: 'ZA_JOHANNESBURG', name: 'South Africa', city: 'Johannesburg', lang: 'English', currency: 'ZAR', flagId: 'za' },
   { id: 'NG_LAGOS', name: 'Nigeria', city: 'Lagos', lang: 'English', currency: 'NGN', flagId: 'ng' },
   // Asia-Pacific
-  { id: 'ZH_CHINA', name: 'China', city: 'National', lang: '\u4e2d\u6587', currency: 'CNY', flagId: 'cn' },
+  { id: 'ZH_SHANGHAI', name: 'China', city: 'Shanghai', lang: '\u4e2d\u6587', currency: 'CNY', flagId: 'cn' },
   { id: 'JA_TOKYO', name: 'Japan', city: 'Tokyo', lang: '\u65e5\u672c\u8a9e', currency: 'JPY', flagId: 'jp' },
   { id: 'KO_SEOUL', name: 'South Korea', city: 'Seoul', lang: '\ud55c\uad6d\uc5b4', currency: 'KRW', flagId: 'kr' },
   { id: 'TH_BANGKOK', name: 'Thailand', city: 'Bangkok', lang: '\u0e44\u0e17\u0e22', currency: 'THB', flagId: 'th' },
@@ -233,6 +246,8 @@ const CWICR_DATABASES: CWICRDatabase[] = [
   { id: 'PT_SAOPAULO', name: 'Brazil / Portugal', city: 'S\u00e3o Paulo', lang: 'Portugu\u00eas', currency: 'BRL', flagId: 'br' },
   { id: 'MX_MEXICOCITY', name: 'Mexico', city: 'Mexico City', lang: 'Espa\u00f1ol', currency: 'MXN', flagId: 'mx' },
   // Authentic national / regional official bases (own local parquet, resource norms)
+  { id: 'ZH_CHINA', name: 'China (Dinge)', city: 'National', lang: '\u4e2d\u6587', currency: 'CNY', flagId: 'cn' },
+  { id: 'TR_NATIONAL', name: 'T\u00fcrkiye (Birim Fiyat)', city: 'National', lang: 'T\u00fcrk\u00e7e', currency: 'TRY', flagId: 'tr' },
   { id: 'BR_NATIONAL', name: 'Brazil (SINAPI)', city: 'National', lang: 'Portugu\u00eas', currency: 'BRL', flagId: 'br' },
   { id: 'ES_ANDALUCIA', name: 'Spain (BCCA)', city: 'Andaluc\u00eda', lang: 'Espa\u00f1ol', currency: 'EUR', flagId: 'es' },
   { id: 'IT_TOSCANA', name: 'Italy (Toscana)', city: 'Toscana', lang: 'Italiano', currency: 'EUR', flagId: 'it' },
@@ -546,6 +561,7 @@ export const ONBOARDING_COMPLETED_EVENT = 'oe:onboarding-completed';
 export function markOnboardingCompleted(): void {
   try {
     localStorage.setItem('oe_onboarding_completed', 'true');
+    localStorage.setItem('oe_onboarding_completed_version', APP_VERSION);
   } catch {
     // Storage unavailable -- ignore.
   }
@@ -1048,7 +1064,7 @@ function StepWelcome({
   const handleSelect = useCallback(
     (code: string) => {
       setSelected(code);
-      i18n.changeLanguage(code);
+      void changeLanguage(code);
       onLanguageChange(code);
     },
     [onLanguageChange],
@@ -1069,7 +1085,7 @@ function StepWelcome({
     // Portuguese and the user's click on Next made that the explicit choice.
     const target = matchSupportedLanguage(navigator.language) ?? 'en';
     if (target !== i18n.language) {
-      i18n.changeLanguage(target);
+      void changeLanguage(target);
       onLanguageChange(target);
     }
     setSelected(target);
@@ -3747,7 +3763,7 @@ export function StepDataSetup({
 
   /** Set the UI locale and persist it as an explicit user choice. */
   const applyLocale = useCallback((locale: string) => {
-    i18n.changeLanguage(locale);
+    void changeLanguage(locale);
     try {
       localStorage.setItem('oe_lang_explicit', '1');
     } catch {
@@ -3968,7 +3984,7 @@ export function StepDataSetup({
   // The full base catalog (9 families, 38 cost bases) with real work-item
   // counts, shared with the import page and database setup. The browser has its
   // own search, so no local region filter is needed here.
-  const { data: baseCatalog } = useBaseCatalog();
+  const { data: baseCatalog, error: baseCatalogError, refetch: refetchBaseCatalog } = useBaseCatalog();
 
   return (
     <div className="flex flex-col items-center">
@@ -4018,6 +4034,8 @@ export function StepDataSetup({
                   loadingRegion={loadingDb ? selectedRegion : null}
                 />
               </div>
+            ) : baseCatalogError ? (
+              <BaseCatalogError error={baseCatalogError} onRetry={() => void refetchBaseCatalog()} />
             ) : (
               <div className="flex items-center justify-center gap-2 py-8 text-xs text-content-tertiary">
                 <Loader2 size={14} className="animate-spin" />
@@ -4397,8 +4415,9 @@ function StepFinish({
   const handleFinish = useCallback(async () => {
     setSaving(true);
 
-    // Apply advanced mode (default for onboarding) in every path.
-    setViewMode('advanced');
+    // Start new users in simple mode -- clean sidebar with essential groups.
+    // They can switch to advanced any time from Settings > Interface Mode.
+    setViewMode('simple');
 
     if (packInstalled) {
       // The ready-made pack already configured modules, locale, classification
@@ -4622,7 +4641,7 @@ export function OnboardingWizard() {
   // never overrides it, complete onboarding exactly like the finish path, and
   // drop the user straight on the dashboard. No confirmation dialog.
   const handleSkipAll = useCallback(() => {
-    void i18n.changeLanguage('en');
+    void changeLanguage('en');
     try {
       localStorage.setItem('oe_lang_explicit', '1');
     } catch {
@@ -4692,7 +4711,7 @@ export function OnboardingWizard() {
   /** Set the UI locale and persist it as an explicit user choice (shared with
    *  the country-pack data step). */
   const applyLocale = useCallback((locale: string) => {
-    i18n.changeLanguage(locale);
+    void changeLanguage(locale);
     try {
       localStorage.setItem('oe_lang_explicit', '1');
     } catch {

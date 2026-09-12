@@ -163,9 +163,17 @@ const REGION_TO_PACK: Record<string, string> = {
 // short 'gbt' for China, which the backend spells 'gb50500'. They are removed
 // rather than added to the known set because "we don't render it yet" is the
 // true statement about them, and a picker is not the place to promise
-// otherwise. The label maps on the reading screens still name all three, which
-// is the right asymmetry: stop writing a value that cannot resolve, keep
-// naming one that is already stored.
+// otherwise.
+//
+// This comment used to add that "the label maps on the reading screens still
+// name all three, which is the right asymmetry". Measured 2026-09-07: that
+// half is false. The only reader of CLASSIFICATION_STANDARD_LABELS is the
+// section-path renderer at match_elements/service.py:3450, and it indexes the
+// map by a standard drawn from classification_order(), whose members are
+// KNOWN_CLASSIFICATION_STANDARDS. A label outside the known set is therefore
+// reachable by no reader at all, so the three names buy nothing today and no
+// stored code is named by them. Removing the options was still right; the
+// asymmetry it was justified with does not exist.
 const STANDARD_GROUPS: OptionGroup[] = [
   {
     group: 'Common Standards',
@@ -173,6 +181,9 @@ const STANDARD_GROUPS: OptionGroup[] = [
       { value: 'din276', label: 'DIN 276 (Germany / DACH)' },
       { value: 'nrm', label: 'NRM 1/2 (United Kingdom)' },
       { value: 'masterformat', label: 'MasterFormat (US / Canada)' },
+      { value: 'uniformat', label: 'UniFormat (US / Canada)' },
+      { value: 'uniclass', label: 'Uniclass (United Kingdom)' },
+      { value: 'omniclass', label: 'OmniClass (North America)' },
       { value: 'gb50500', label: 'GB/T (China)' },
       { value: 'tetelrend', label: 'Tételrend (Hungary)' },
     ],
@@ -180,19 +191,32 @@ const STANDARD_GROUPS: OptionGroup[] = [
   {
     // The rest of what the backend resolves. These were reachable server-side
     // and unreachable from here, so an estimator in Russia, Spain, France,
-    // Austria, Brazil, Japan, Korea or Turkey could not name their own
+    // Italy, Brazil, Japan, Korea or Turkey could not name their own
     // standard on a project. The list is hand-written because the picker needs
     // a country beside the name and the registry has no opinion about wording.
+    // Because it is hand-written, the country beside the name can drift from
+    // the country the registry maps, and did: VOCI read "(Austria)" here while
+    // COUNTRY_TO_STANDARD has only ever resolved it for IT. Austria resolves to
+    // din276, which this list already offers under "Germany / DACH", so an
+    // Austrian was being handed the Italian standard under their own country's
+    // name while their real entry sat two rows up. Checked once across all
+    // thirteen country-bearing options: VOCI was the only one whose country
+    // disagreed with the registry.
     group: 'National Standards',
     options: [
       { value: 'gesn', label: 'GESN / FER (Russia, CIS)' },
       { value: 'bc3', label: 'BC3 (Spain)' },
       { value: 'untec', label: 'UNTEC (France)' },
-      { value: 'voci', label: 'VOCI (Austria)' },
+      { value: 'voci', label: 'VOCI (Italy)' },
       { value: 'sinapi', label: 'SINAPI (Brazil)' },
       { value: 'sekisan', label: 'Sekisan (Japan)' },
       { value: 'kbim', label: 'KBIM (South Korea)' },
       { value: 'birimfiyat', label: 'Birim Fiyat (Turkey)' },
+      { value: 'dpgf', label: 'DPGF (France)' },
+      { value: 'cpwd', label: 'CPWD (India)' },
+      { value: 'nlsfb', label: 'NL/SfB (Netherlands)' },
+      { value: 'onorm', label: 'ÖNORM (Austria)' },
+      { value: 'gaeb', label: 'GAEB (Germany)' },
     ],
   },
   {
@@ -307,6 +331,7 @@ const LANGUAGES = [
   { value: 'nl', label: 'Nederlands' },
   { value: 'pl', label: 'Polski' },
   { value: 'cs', label: 'Čeština' },
+  { value: 'hu', label: 'Magyar' },
   { value: 'ru', label: 'Русский' },
   { value: 'tr', label: 'Türkçe' },
   { value: 'ar', label: 'العربية' },

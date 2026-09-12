@@ -613,7 +613,7 @@ export async function buildTakeoffPdf(ctx: PdfExportContext): Promise<JsPDF> {
     if (!canvasCtx) throw new Error('Failed to acquire 2D context for PDF export');
 
     // Render the PDF page itself.
-    await page.render({ canvasContext: canvasCtx, viewport }).promise;
+    await page.render({ canvas, viewport }).promise;
 
     // Bake the annotations on top — `zoom = renderScale`, `dpr = 1`
     // because we're authoring on a fresh canvas without device pixel

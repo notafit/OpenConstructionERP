@@ -43,7 +43,7 @@ import { auditRowTooltip } from '@/features/boq/grid/auditMarkers';
 import { PresenceAvatars } from '@/modules/collaboration/components/PresenceAvatars';
 import { usePresenceStore, type PresenceUser } from '@/modules/collaboration/hooks/usePresence';
 
-void i18next.init({ lng: 'en', resources: {}, initImmediate: false });
+void i18next.init({ lng: 'en', resources: {}, initAsync: false });
 const original = i18next.language;
 afterAll(() => {
   void i18next.changeLanguage(original);

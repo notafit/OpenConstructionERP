@@ -80,7 +80,7 @@ beforeAll(async () => {
     fallbackLng: 'en',
     resources: { en: { translation: EN }, de: { translation: DE } },
     interpolation: { escapeValue: false },
-    initImmediate: false,
+    initAsync: false,
   });
   // jsdom has no matchMedia; the panel asks it whether the viewport is mobile.
   if (!window.matchMedia) {

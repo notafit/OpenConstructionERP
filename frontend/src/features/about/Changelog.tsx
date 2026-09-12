@@ -46,6 +46,97 @@ interface ChangelogEntry {
 // carry the long form and are left alone as the record of what shipped.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '17.4.1',
+    date: '2026-09-11',
+    tag: 'NEW',
+    summary:
+      'BOQ import now opens a preview wizard showing parsed positions, sections, currency and warnings before committing. Invoice approval no longer writes the wrong status, and dashboard totals no longer show NaN. Nine backend modules hardened with repository layers, typed schemas and proper ORM relationships.',
+  },
+  {
+    version: '17.4.0',
+    date: '2026-09-10',
+    tag: 'NEW',
+    summary:
+      'Cost explorer substitute results can be added to a BOQ or saved as an assembly, and cost match results can be confirmed in batch. The Hungarian infrastructure importer now captures all ten tag columns and resolves them against the dictionary sheets. The Windows desktop upgrade no longer freezes on a legacy uninstaller.',
+  },
+  {
+    version: '17.3.1',
+    date: '2026-09-10',
+    tag: 'FIX',
+    summary:
+      'Two test fixtures did not carry the new original_contract_value field, breaking the Docker build of 17.3.0.',
+  },
+  {
+    version: '17.3.0',
+    date: '2026-09-10',
+    tag: 'NEW',
+    summary:
+      'One hundred and five hardcoded English strings are now translated into 41 languages. Contracts store their original value as an immutable baseline and the dashboard shows the commercial breakdown: original, agreed variations, current, pending and forecast. A mirrored change order inherits the variation bill as its write-back target. Twelve shadowed API routes are fixed. Two hundred and ten country portraits fill every gap in the cases honeycomb across fifteen markets.',
+  },
+  {
+    version: '17.2.0',
+    date: '2026-09-09',
+    tag: 'NEW',
+    summary:
+      'The sample budget the Spanish exchange screen offers could not be downloaded and could not be read, so the first thing a visitor tried came back as an error page under a budget name and imported nine rows with no money in them; it is rewritten, and a test now asks of every shipped sample whether the origin serves it and whether it imports as a budget with prices. The preview beside that drop zone no longer splits a native format on commas and announces rows it made up. Australia, New Zealand and Brazil gain nine guided cases each, with six more single cases for Mexico, Hungary, Saudi Arabia, South Africa, the United States and Russia, taking the library from 260 to 293 with every card translated into all 36 offered languages. On macOS the bundled database would not start because the build asked for a hardened runtime it had no signing identity to satisfy. On Windows a start refused for want of disk space now says where the space went, counting what earlier versions left behind instead of only printing an error number.',
+  },
+  {
+    version: '17.1.0',
+    date: '2026-09-09',
+    tag: 'NEW',
+    summary:
+      'A Windows desktop that gave up before it had finished starting now waits for the backend to speak first, and opening the API reference no longer makes the desktop shell think the backend has died. Hungary, Mexico, Saudi Arabia, South Africa and Russia each have a full shelf of guided cases, every national exchange format for bills of quantities has one place to go instead of hiding behind a German menu entry, Hungarian and English (UK) are offered in the language picker, and a spreadsheet header row is read in 28 languages. Russian VAT is 22 percent from 2026 with each bill taxed at its own base date, and this release ships on GitHub, as desktop installers and as a container image, but not on PyPI until old releases there are removed to make room.',
+  },
+  {
+    version: '17.0.2',
+    date: '2026-09-07',
+    tag: 'FIX',
+    summary:
+      'This is the release that actually reaches PyPI. Versions 17.0.0 and 17.0.1 are both tagged and neither put a package there, so installing with pip has been giving you 16.9.0. The build was repaired in 17.0.1 and the upload was then refused for a second reason: PyPI limits the total size a project may store, and this one is at its allowance. The package is now about 73 MB instead of 86, because two showcase files that nothing in the running application reads no longer ship inside it. Nothing 17.0.0 or 17.0.1 describes is withdrawn or changed.',
+  },
+  {
+    version: '17.0.1',
+    date: '2026-09-07',
+    tag: 'FIX',
+    summary:
+      'Version 17.0.0 published its release notes and nothing else: no package, no container image and none of the four desktop installers. Seven test files still passed an option to the translation library that its version 26 had removed, and the frontend type check rejects it, so every build that produces something a user installs failed on the same eight lines. Nothing 17.0.0 describes is withdrawn or changed, and this release carries all of it with the build repaired.',
+  },
+  {
+    version: '17.0.0',
+    date: '2026-09-07',
+    tag: 'NEW',
+    summary:
+      'Every screen that opens a PDF now goes through one binding, and that binding ships the decoders a scanned drawing needs. Five viewers configured the PDF library separately: the markup annotator, the drawing comparison, the plan room, the punch pin board and the takeoff viewer. The library fetches WebAssembly decoders for JBIG2 and JPEG 2000 images and an ICC profile for CMYK colour from paths the host supplies, and a viewer that does not supply them draws a blank page for exactly the scanned drawings a takeoff receives most often. There is now one place that names the library, and the decoders are published under a path carrying its version, so a future upgrade cannot pair a new worker with a decoder cached from the old one. The case hub also opens on the reader own market instead of ordering the shelf by country code, which in a German interface put Germany fifth and unmarked in an order that is alphabetical in no language. It leads with that market, badges it, ranks the rest by how many cases they hold, and carries the choice in the address so a pasted link shows the receiver the same shelf rather than their own stored market. Each tile says where its regional pack stands, applied, switched off, or absent from this build, and stays quiet while the pack list is still loading. Search matches a market name in the reader language as well as in English. The guided cases are now written in Russian and Chinese, 626 keys covering the step pages for work like issuing a compliant XRechnung, running the VOB payment clock and closing a month against a KS-2 act, with German document names left in German where they name a document rather than describe one. A further 282 keys were filled across German, Spanish, French, Portuguese, Russian and Chinese. Czech and Romanian have their accents back across a wide stretch of the interface, each word written out in the spelling its own file already uses rather than restored by rule. And a bug report can no longer be filed with an empty description.',
+  },
+  {
+    version: '16.9.0',
+    date: '2026-09-06',
+    tag: 'NEW',
+    summary:
+      'The dashboard now leads with the cases written for the country the reader works in. Eighty of the 220 guided cases name a market, and nothing on the front page used to say so: a site manager in Germany opened seventeen tiles of which none was necessarily German, while thirteen German cases sat in the catalogue behind a market row they had to know to look for. The card decides which market to lead with in three steps and says which one answered. An applied regional pack goes first, because switching a pack on says more about where somebody works than the language their software is in. Then the country the language registry declares, through the same helper the catalogue orders itself by, so the hub and the dashboard can never disagree about what a language means. Then, only for a language whose own country has no cases, the nearest market its readers work to, offered as a suggestion and worded as one: a reader in Chile meets the Spanish cases under a heading that says cases by market rather than cases for your market. Every other market sits below as chips that switch the list in place, and pressing one is looking rather than choosing, so it does not narrow the catalogue opened next. A quantity can also be measured by hand now, with no drawing and no model. A bill position carries a measurement sheet where each line has a description, how many times it repeats, up to three dimensions and a plus or minus; the sheet compares its total against the position and applying it writes the total in, keeping the lines so the number can be traced. The engine behind it had shipped several releases ago and nothing in the interface had ever called it. The case catalogue also speaks far more of its languages: card strings for the newest market cases went into thirty locales, the ten Indian cases were finished in Bengali, and the card tier is genuinely complete in twenty nine languages, with a ratchet that fails the build if a locale ever answers less. Two desktop faults are fixed, showing a file in its folder, which had been registered inside the test module rather than the handler list, and the unpacked copies a forced stop used to leave behind.',
+  },
+  {
+    version: '16.8.3',
+    date: '2026-09-06',
+    tag: 'FIX',
+    summary:
+      'A case page named a market and then said nothing about the pack that carries its standards. Filtering the catalogue to Germany gave thirteen cards each announcing that German standards apply, with nothing on that screen to act on, because the control that installs a regional pack sat only inside a case a reader had already opened. Each card whose market has a pack now carries a one line strip, and the market band carries the full offer once a market is selected, since a pack is a property of the market rather than of thirteen separate cards. It opens the same dialog the modules page already opens, so there is one install path and not a second one, and pressing the strip applies nothing. Thirty three of the eighty cases that name a market resolve no pack on a released install and used to render nothing at all, which could not be reproduced from a checkout: the source tree carries twenty packs and the wheel ships seventeen, so Germany and Canada resolve a pack while developing and resolve nothing on the build a user installs. That is stated in words now and linked to the module registry, where uploading a pack is a real route rather than a dead end, and only once the server has answered, since a panel keyed on an empty result would put a false line on every case page while the request is in flight. A pack that ships in the community wheel reached no market at all, because a manifest that names no country falls back to the region of its locale and this one carries a bare locale with nothing to take. And a country case used to be a whole page written again, so nine countries meant nine copies of one workflow; the workflow is written once now, with a country supplying a small file of the steps it surfaces and its own words for them.',
+  },
+  {
+    version: '16.8.2',
+    date: '2026-09-05',
+    tag: 'FIX',
+    summary:
+      'The project list drew the wrong kind of map. Every card painted one static tile of shaded relief at zoom 6, which is as deep as that source goes and carries no streets at any zoom, so the picture was geographically correct and of no use to anybody: a person opening a project list wants roads, street names and building footprints, and got landform. Cards render the vendored vector style now, one offscreen context at a time for the whole grid, and at zoom 15 six European cities came back with 95 to 235 road segments and 12 to 46 building footprints each, against zero of either before. No tighter than that on purpose, because a card\'s coordinates often come from geocoding a city and a country, which answers with a centroid. The relief tile stays as the fallback, so a browser without WebGL still gets a picture rather than an empty box. A bill position answered a different norm depending on which endpoint you asked, because two builders made the same response object and only one knew about the fields that shipped in 16.8.1; they had drifted on six fields in both directions, so the whole bill read had also been reporting every row\'s concurrency token as zero. There is one builder now. The API reference page fetched itself from a content delivery network, so an install with no route out to the internet showed a white page with nothing in the console to search for; the renderer ships in the product now at a pinned version, with no new dependency and less on the wire than the API assets already there. A status check that answers without credentials could still launch four converter binaries and wait eight seconds for them, which it declines to do now while still answering everybody. Forty three ignore rules meant for the backend sat where the wheel build could not read them, so a locally built archive carried an internal defect log, two seeding scripts and a stale frontend bundle, about eleven percent of it; published releases build on clean runners and carried none of it. And 16.8.1 shipped with no desktop installers, because the check that opens the built application ran all three of its legs against one port while the Windows helper process survives every stop signal available to it. Each leg takes its own port now. The first person to open the application after a restart used to wait about a minute for the front page, because FastAPI built the dependency tree for all 190 module routers on whichever request arrived first and did it on the event loop: a health check sent alongside answered 33.9 seconds later, five times the deadline the desktop launcher allows each poll, so a splash screen sat in front of a backend that was alive and listening. That work happens during startup now, before the port opens, and the API reference document is no longer built there at all, which was another minute of a core spent filling a cache most installations never read. The map on the project detail page had been two pixels tall, a live 300 pixel canvas cropped to a hairline because the shell carried two heights and the one the page asked for was not the one that won. The cost base browser answered an error to the address its own documentation gives, since a catch all route read the literal path as a cost item identifier, and it showed the same spinner for ever when a request did fail rather than saying so. And getting paid for a month of work is now written out in the paperwork of eight more places, Brazil, Mexico, Russia, Hungary, Australia, New Zealand, Saudi Arabia and South Africa, as one case with a layer per jurisdiction rather than eight copies of the same case.',
+  },
+  {
+    version: '16.8.1',
+    date: '2026-09-05',
+    tag: 'FIX',
+    summary:
+      'Mostly money. An invoice total was written for a reader and read back as a number, so the field came up empty from a thousand upwards, nine thousand left the browser as nine, and a reader whose decimal mark is a comma lost the cents off every invoice at any size; nothing was stored wrong, because the server rebuilt the total on every write, which is also why weeks of truncated figures went unreported. A total you type yourself now reaches the invoice or is refused on screen for not adding up, and an approved invoice can be marked paid again, which the register had not offered since approving started writing sent. Equipment, Service, Portal and Assets reported themselves empty on every install no matter how much data they held, and the four failing probes behind that produced ninety one thousand server side errors in one seventy eight day log. A Windows installation too deep for the path limit is named as such before it is called corrupt, with the path, its length, the limit and the fix. Three status routes that answer without credentials stop naming the folder the server runs from, which on a default install is the home directory and the account name of the operator. The project header no longer clips in German and Russian, relative timestamps are translated in all forty two languages rather than silently English, and nineteen German strings have their diacritics back. A validation run no longer reports that it took no time on Windows. A bill priced from a production norm can be compared against what the job actually spent, one row per norm with what was predicted, what was installed and what was spent. A money KPI over bill lines can say which currency it is in and break down by it. The API reference froze the whole application for over two minutes the first time anyone opened it, and on a server with no outbound internet it rendered as an empty page; it is built at startup now and its assets ship with the product. And the health reference names all seven conditions that make an installation degraded, where it had named two and told the reader the wrong way to tell them apart.',
+  },
+  {
     version: '16.8.0',
     date: '2026-09-04',
     tag: 'NEW',

@@ -66,7 +66,7 @@ jobs:
       OE_TEST_DB: pg
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Create empty frontend dist (hatchling force-include)
@@ -1005,7 +1005,7 @@ jobs:
       OE_TEST_DB: pg
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Create empty frontend dist (hatchling force-include)
@@ -1255,13 +1255,29 @@ jobs:
     # token check and the IDOR job. The conclusion is unchanged, the cause is
     # not, and a wrong cause invites somebody to "fix the OOM" and expect this
     # job to become redundant.
-    # Recounted 2026-08-17 out of the commit: the include in vite.config.ts is
-    # src/**/*.test.{ts,tsx} plus tests/**/*.test.{ts,tsx}, which collects 587
-    # files under src and 2 under frontend/tests/pwa, so 589 in all. 34 are
-    # named below, so 555 of them gate nothing. Recount rather than trust that
+    # Recounted 2026-09-07 out of the commit: the include in vite.config.ts is
+    # src/**/*.test.{ts,tsx} plus tests/**/*.test.{ts,tsx}, which collects 710
+    # files under src and 4 under frontend/tests, so 714 in all. 40 are named
+    # below, so 674 of them gate nothing. Recount rather than trust that
     # sentence, and recount against that include rather than against the vitest
     # default: the default would also sweep up the Playwright specs, which this
     # job does not run and which were never part of this number.
+    #
+    # The previous recount, 2026-09-05, said 701 collected and 39 named. The
+    # suite grew by thirteen files in two days while the list grew by one, which
+    # is the fourth consecutive recount to find the sentence stale rather than
+    # to confirm it.
+    #
+    # The recount before that, 2026-08-17, said 589 collected and 34 named. Both
+    # halves drifted again in nineteen days, the suite by 112 files and the list
+    # by 5, which is the argument for reading the count off the file rather than
+    # off this paragraph.
+    #
+    # Read the named list out of the job-level FRONTEND_TEST_FILES env value,
+    # parsed as YAML, and count the distinct entries in it. Scanning the whole
+    # workflow text for anything shaped like a test filename happens to agree
+    # today, but only by luck: it would also collect any test named in a comment
+    # anywhere in this file, and comments here do name test files.
     #
     # Count it out of the commit rather than out of a checkout. The 592 written
     # here earlier the same day was measured on a working tree carrying nine
@@ -1375,6 +1391,7 @@ jobs:
         src/features/field-time/workingTime.test.ts
         src/features/file-manager/SheetsIndexPage.test.tsx
         src/features/file-manager/sheetsInsights.test.ts
+        src/features/geo-hub/__tests__/cropPolygonPositionsAreNeverMutatedAfterConstruction.test.tsx
         src/features/integrations/calendarFeed.test.ts
         src/features/module-builder/api.test.ts
         src/features/module-builder/draft.test.ts
@@ -1392,9 +1409,9 @@ jobs:
         tests/pwa/service-worker.test.ts
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
@@ -1640,6 +1657,34 @@ jobs:
       #     that older revision, the stamp helper returns early because a
       #     revision is present, and nothing ever advances it. Read that red as
       #     "the stamp does not move on upgrade", which is true.
+      #
+      # WHICH COHORT THIS LANE COVERS, stated plainly because the pin decides it
+      # and the pin is easy to read as a version choice rather than a scope
+      # choice. There are three cohorts and this lane exercises exactly one.
+      #   COVERED - arrives with NO revision recorded, because the wheel it came
+      #     from shipped no alembic.ini. The current code stamps it at head on
+      #     boot and alembic_head_matches reads true afterwards. That is the
+      #     15.3.1 cohort, and it is the whole of what this job proves.
+      #   NOT COVERED - arrives already stamped at an OLDER revision, which is
+      #     every install from 15.4.0 onward. Nothing advances that stamp, so
+      #     alembic_head_matches reads false in perpetuity, and the replay an
+      #     operator would run by hand to fix it is the case the migration DDL
+      #     guard exists for. No lane exercises it today.
+      #   NOT COVERED - arrives populated and unstamped. The stamp is refused
+      #     deliberately; see stamp_head_if_unstamped.
+      #
+      # Cost of adding the stamped cohort, measured rather than guessed, so the
+      # decision can be made on a number: a second matrix leg over the same
+      # steps with the pin at the newest release. The schema delta from 15.4.0
+      # to HEAD is empty, so the healer has nothing to do and the leg's value is
+      # entirely in the stamp assertion, which means check 4 of
+      # verify_upgrade_from_previous_release.py has to learn that this cohort
+      # reads false rather than true. Its branch for a database that arrived
+      # carrying a revision asserts head_matches is True, so it would fail the
+      # new leg on a correct product. The cost is therefore one matrix
+      # dimension plus a per-cohort branch in check 4, not a new job. Not done
+      # here: widening the DDL gate was the task, and changing what the
+      # verifier asserts about a shipped behaviour is a separate decision.
       OE_UPGRADE_FROM_VERSION: "15.3.1"
       OE_UPGRADE_AGED_STATE: ${{ github.workspace }}/aged-database-state.json
       DATABASE_URL: postgresql+asyncpg://oe:oe@localhost:5432/openconstructionerp_upgrade
@@ -1664,7 +1709,7 @@ jobs:
     # carries information rather than destroying it.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Create empty frontend dist (hatchling force-include)

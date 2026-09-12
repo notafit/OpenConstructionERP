@@ -15,6 +15,9 @@ import { PageHeader } from '@/shared/ui/PageHeader';
 import { DismissibleInfo, IntroRichText } from '@/shared/ui/DismissibleInfo';
 import { useWidgetSettingsStore } from '@/stores/useWidgetSettingsStore';
 import { fmtNumber, getIntlLocale, fmtFixed } from '@/shared/lib/formatters';
+import { toNum } from '@/shared/lib/money';
+import { useNameCollator } from '@/shared/lib/collator';
+import { getDateFnsLocale } from '@/shared/lib/dateFnsLocale';
 import { projectsApi, type Project } from './api';
 import { apiGet, apiPatch, apiPost, apiDelete } from '@/shared/lib/api';
 import { useToastStore } from '@/stores/useToastStore';
@@ -243,7 +246,7 @@ export function ProjectsPage() {
      archived projects are rarely sorted by value). */
   interface DashboardCard {
     id: string;
-    boq_total_value: number;
+    boq_total_value: number | string;
     boq_count: number;
     open_tasks?: number;
     open_rfis?: number;
@@ -269,7 +272,7 @@ export function ProjectsPage() {
         return {
           projectId: p.id,
           boqCount: c?.boq_count ?? 0,
-          totalValue: c?.boq_total_value ?? 0,
+          totalValue: toNum(c?.boq_total_value),
           hasError: false,
         };
       });
@@ -298,6 +301,11 @@ export function ProjectsPage() {
   /* ── Filter + Sort ────────────────────────────────────────────────── */
 
   const pinnedIds = useProjectContextStore((s) => s.pinnedProjectIds);
+
+  // Project names are user data in whatever language the site works in, so
+  // "Name A-Z" has to order them the way THIS reader's language does, not the
+  // way the browser's locale happens to.
+  const compareNames = useNameCollator();
 
   // Whether the user's projects span more than one currency. Used to guard
   // the "Value" sort (cross-currency ordering is apples-to-oranges, since
@@ -358,7 +366,7 @@ export function ProjectsPage() {
 
       switch (sortOption) {
         case 'name_asc':
-          return a.name.localeCompare(b.name);
+          return compareNames(a.name, b.name);
         case 'newest':
           return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
         case 'oldest':
@@ -384,7 +392,7 @@ export function ProjectsPage() {
     });
 
     return list;
-  }, [projects, searchQuery, statusFilter, regionFilter, sortOption, boqStatsMap, pinnedIds, hasMultipleCurrencies]);
+  }, [projects, searchQuery, statusFilter, regionFilter, sortOption, boqStatsMap, pinnedIds, hasMultipleCurrencies, compareNames]);
 
   // Reset page when filters change
   useEffect(() => {
@@ -508,8 +516,8 @@ export function ProjectsPage() {
     if (!projects) return ['all'];
     const set = new Set<string>();
     for (const p of projects) if (p.region) set.add(p.region);
-    return ['all', ...Array.from(set).sort()];
-  }, [projects]);
+    return ['all', ...Array.from(set).sort(compareNames)];
+  }, [projects, compareNames]);
 
   // Available status filter values - the curated recommended set UNION any
   // distinct statuses actually present on the fetched projects (mirrors the
@@ -1266,7 +1274,12 @@ function ProjectCard({
   const modifiedDate = modifiedSource ? parseISO(modifiedSource) : null;
   const relativeModified =
     modifiedDate && isValidDate(modifiedDate)
-      ? formatDistanceToNowStrict(modifiedDate, { addSuffix: true })
+      ? formatDistanceToNowStrict(modifiedDate, {
+          addSuffix: true,
+          // Without `locale` date-fns answers in en-US, so this line stayed
+          // "3 hours ago" next to an absolute date that was already localised.
+          locale: getDateFnsLocale(),
+        })
       : null;
   const absoluteModified = modifiedDate && isValidDate(modifiedDate)
     ? modifiedDate.toLocaleDateString(getIntlLocale())

@@ -18,6 +18,7 @@ lane, so a guard placed there would pass review and gate nothing.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -67,6 +68,28 @@ MX_FIELDS = {
 # ── Country registry and status machine (no DB) ──────────────────────────────
 
 
+#: Where each class's example paragraph starts in the registry docstring, and
+#: the marker that ends the last of them. The three acts are headed by their
+#: literal name; the hybrid paragraph by its section title.
+_DOCSTRING_HEADINGS: tuple[tuple[str, str], ...] = (
+    (regimes.REGIME_CLEARANCE, "``clearance``\n"),
+    (regimes.REGIME_REPORTING, "``reporting``\n"),
+    (regimes.REGIME_NETWORK, "``network``\n"),
+    (regimes.REGIME_HYBRID, "Countries that do more than one of them\n"),
+)
+_DOCSTRING_EXAMPLES_END = "``regime`` therefore"
+#: An ISO code the docstring attaches to a country name: ``(FR)`` or ``(ES, SII``.
+_DOCSTRING_CODE = re.compile(r"\(([A-Z]{2})(?=[,)])")
+
+
+def _docstring_examples(doc: str) -> dict[str, set[str]]:
+    """The ISO codes named under each class heading of the registry docstring."""
+    starts = [(cls, doc.index(marker)) for cls, marker in _DOCSTRING_HEADINGS]
+    end = doc.index(_DOCSTRING_EXAMPLES_END)
+    bounds = [*(pos for _, pos in starts[1:]), end]
+    return {cls: set(_DOCSTRING_CODE.findall(doc[pos:stop])) for (cls, pos), stop in zip(starts, bounds, strict=True)}
+
+
 class TestCountryRegistry:
     def test_every_en16931_link_names_a_profile_that_actually_exists(self):
         # The one place this module touches document generation. A link to a
@@ -111,6 +134,130 @@ class TestCountryRegistry:
             assert entry.correction_mechanism, code
         for code in ("MX", "BR", "IN", "ES"):
             assert regimes.COUNTRY_REGIMES[code].is_cancellable is True, code
+
+    def test_a_country_that_does_two_acts_is_classed_hybrid_and_not_named_by_one(self):
+        # The class is derived from the acts, so the two cannot disagree. A
+        # country filed under one of the three names while performing two of
+        # them tells the operator something false about what happens to their
+        # invoice.
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            expected = regimes.REGIME_HYBRID if entry.additional_regimes else entry.regime
+            assert entry.regime_class == expected, code
+            assert entry.is_hybrid is bool(entry.additional_regimes), code
+
+    def test_every_additional_act_is_one_of_the_three_and_is_not_the_deciding_one(self):
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            assert set(entry.additional_regimes) <= set(regimes.REGIMES), code
+            assert entry.regime not in entry.additional_regimes, code
+            assert len(set(entry.additional_regimes)) == len(entry.additional_regimes), code
+
+    def test_hybrid_is_a_class_and_never_an_act(self):
+        # If "hybrid" were a fourth member of REGIMES it would reach
+        # TERMINAL_SUCCESS, where there is no answer to what a successful
+        # submission under two acts at once amounted to. It is a class of
+        # country, and the deciding act stays one of the three.
+        assert regimes.REGIME_HYBRID not in regimes.REGIMES
+        assert regimes.REGIME_HYBRID in regimes.REGIME_CLASSES
+        assert set(regimes.REGIMES) < set(regimes.REGIME_CLASSES)
+        for entry in regimes.COUNTRY_REGIMES.values():
+            assert entry.regime in regimes.REGIMES, entry.country
+
+    def test_every_country_the_docstring_uses_as_an_example_is_a_row_of_the_class_it_illustrates(self):
+        # The module docstring is the taxonomy's worked explanation and it has
+        # drifted twice: it named France as the example of a class France is
+        # not in, and later named Greece, Croatia and Turkiye as countries
+        # pairing two acts when the registry held no row for any of them.
+        # Every example now carries its ISO code in parentheses, and this
+        # reads the codes back rather than trusting the prose.
+        examples = _docstring_examples(regimes.__doc__ or "")
+        for act in regimes.REGIMES:
+            codes = examples[act]
+            assert codes, f"the {act} paragraph names no example"
+            for code in codes:
+                assert code in regimes.COUNTRY_REGIMES, f"{code} is named under {act} but has no row"
+                assert regimes.COUNTRY_REGIMES[code].regime == act, f"{code} is named under {act}"
+        hybrid_named = examples[regimes.REGIME_HYBRID]
+        for code in hybrid_named:
+            assert code in regimes.COUNTRY_REGIMES, f"{code} is named as a hybrid example but has no row"
+        classed_hybrid = {code for code, entry in regimes.COUNTRY_REGIMES.items() if entry.is_hybrid}
+        assert classed_hybrid, "the registry classes nothing hybrid; the paragraph would explain an empty class"
+        assert classed_hybrid <= hybrid_named, f"classed hybrid but not named: {sorted(classed_hybrid - hybrid_named)}"
+
+    def test_no_commencement_date_is_stated_without_the_source_it_was_read_from(self):
+        # The whole point of the field. A date a business plans around that
+        # nobody can trace back to the authority that set it cannot be
+        # rechecked, cannot be aged, and is indistinguishable from one somebody
+        # remembered.
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            for phase in entry.commencement:
+                assert phase.obligation in regimes.OBLIGATIONS, (code, phase.obligation)
+                assert phase.legal_status in regimes.LEGAL_STATUSES, (code, phase.legal_status)
+                assert phase.source_url.startswith("http"), (code, phase.obligation)
+                assert phase.read_date, (code, phase.obligation)
+                assert phase.scope, (code, phase.obligation)
+
+    def test_receiving_and_issuing_are_dated_separately_where_both_are_known(self):
+        # They commence years apart in several countries, so one date standing
+        # for both would tell half the population the wrong year.
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            for obligation in regimes.OBLIGATIONS:
+                phases = entry.phases_for(obligation)
+                assert all(p.obligation == obligation for p in phases), code
+                dated = [p.effective_date for p in phases if p.is_dated]
+                assert dated == sorted(dated), (code, obligation)
+
+    def test_a_country_with_a_reporting_obligation_admits_to_performing_reporting(self):
+        # The two halves are written in different places on the entry - the acts
+        # in additional_regimes, the dates in commencement - so they can drift
+        # apart silently. France is currently the only row carrying both, and a
+        # later row could file report phases while still calling itself a pure
+        # network country, which is exactly the misclassification this registry
+        # was corrected for.
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            has_report_phase = any(p.obligation == regimes.OBLIGATION_REPORT for p in entry.commencement)
+            if has_report_phase:
+                assert regimes.REGIME_REPORTING in entry.regimes, code
+        fr = regimes.COUNTRY_REGIMES["FR"]
+        assert fr.regime_class == regimes.REGIME_HYBRID
+        # The deciding act is unchanged, so a French document still ends up
+        # delivered rather than reported. The reporting leg is an obligation
+        # alongside the routing and not the thing the submission resolves to.
+        assert TERMINAL_SUCCESS[fr.regime] == "delivered"
+
+    def test_a_cancellation_rule_says_which_kind_of_rule_it_is(self):
+        # Mexico's deadline is the fiscal year of issue, which is a calendar and
+        # not a window: the same count of days is weeks for a December invoice
+        # and nearly a year for a January one.
+        for code, entry in regimes.COUNTRY_REGIMES.items():
+            assert entry.cancellation_basis in regimes.CANCELLATION_BASES, code
+        assert regimes.COUNTRY_REGIMES["MX"].cancellation_basis == regimes.CANCELLATION_BASIS_FISCAL_YEAR
+
+    def test_the_flattened_regime_keeps_every_key_it_used_to_carry(self):
+        # Additive only. A reader written against the older shape is a reader we
+        # cannot see, so no key may change meaning and none may disappear.
+        was = {
+            "country",
+            "regime",
+            "platform",
+            "label",
+            "identifier_label",
+            "document_format",
+            "en16931_profile",
+            "profile_fields",
+            "document_fields",
+            "cancellation_window_days",
+            "is_cancellable",
+            "correction_mechanism",
+            "notes",
+        }
+        for entry in regimes.COUNTRY_REGIMES.values():
+            flat = regimes.regime_as_dict(entry)
+            assert was <= set(flat), entry.country
+            # And it still validates against the response model the meta
+            # endpoint serves, with the new fields carried rather than dropped.
+            served = schemas.CountryRegimeResponse(**flat)
+            assert served.regime_class == entry.regime_class
+            assert len(served.commencement) == len(entry.commencement)
 
     def test_an_unregistered_country_is_none_and_not_a_guess(self):
         # Assuming network exchange for an unknown country would let a

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -66,6 +67,17 @@ pytestmark = pytest.mark.asyncio
 
 _TAX_TABLE = "oe_i18n_tax_config"
 
+#: The reconciler's own logger. Named so the warning assertions below read only
+#: what this repair said: ``run_data_repairs`` runs every registered repair, and
+#: a neighbour's warning must not be able to satisfy or break them.
+_LOGGER = "app.modules.i18n_foundation.tax_seed_reconcile"
+
+
+def _warnings(caplog) -> list[str]:
+    """What the reconciler warned about, in order."""
+    return [r.getMessage() for r in caplog.records if r.name == _LOGGER and r.levelno >= logging.WARNING]
+
+
 #: Rows the seed file gained after the v15.4.0-era file, by
 #: ``(country, tax_code, effective_from)``. Written out rather than derived from
 #: the reconciler's own tables on purpose: deriving the fixture from the code
@@ -85,16 +97,31 @@ _ADDED_AFTER_V15_4_0 = {
     ("IL", "VAT", "2025-01-01"),
     ("KW", "NONE", None),
     ("QA", "NONE", None),
+    # Russia's 22 % window. Unlike every entry above it, this is a second row
+    # on a rate line both cohorts already hold rather than a line they lack,
+    # which is why it is excluded here and left out of _EXPECTED_DELIVERY: a
+    # rate that changed belongs to the supersede repair, exactly as Nova
+    # Scotia's 14 % row does.
+    ("RU", "NDS", "2026-01-01"),
 }
 
 #: Rows the current file has since EDITED, restored to what the old file said.
-#: All three are windows that were still open back then and have since been
+#: All four are windows that were still open back then and have since been
 #: closed, which is the half of an old cohort that an exclusion list alone
 #: cannot reproduce.
+#:
+#: Only Romania restores a second field, and the asymmetry is the data rather
+#: than an oversight. Romania unflagged its 19 % row as the default when the
+#: reform closed it, while Russia's 20 % row keeps ``is_default`` true on both
+#: sides of its own close, because the reduced NDS_RED row is open ended and
+#: unflagging the closed standard one would leave Russia unable to price at
+#: all from 2019 to 2025. So for Russia the open window is the whole of the
+#: difference.
 _RESTORED_TO_V15_4_0 = {
     ("RO", "TVA", "2017-01-01"): {"effective_to": None, "is_default": True},
     ("CA", "HST_NS", "2010-07-01"): {"effective_to": None},
     ("IL", "VAT", "2015-10-01"): {"effective_to": None},
+    ("RU", "NDS", "2019-01-01"): {"effective_to": None},
 }
 
 _ADDED_AFTER_V15_9_1 = {
@@ -102,17 +129,19 @@ _ADDED_AFTER_V15_9_1 = {
     ("IL", "VAT", "2025-01-01"),
     ("KW", "NONE", None),
     ("QA", "NONE", None),
+    ("RU", "NDS", "2026-01-01"),
 }
 
 #: The v15.9.1 cohort needed no restorations until Israel's 18 % rate was
 #: added: every window the current file had closed by then was already closed
-#: in the file that release shipped. Israel's 17 % window is the first one to
-#: be closed after v15.9.1, so this is where that cohort's copy of it is put
-#: back to open. An empty dict here would silently reconstruct a database in
-#: which Israel was already up to date, which is the one state the supersede
-#: repair cannot be measured in.
+#: in the file that release shipped. Israel's 17 % window was the first one to
+#: be closed after v15.9.1 and Russia's 20 % one is the second, so this is
+#: where that cohort's copy of each is put back to open. A country missing from
+#: this dict would silently reconstruct a database in which it was already up
+#: to date, which is the one state the supersede repair cannot be measured in.
 _RESTORED_TO_V15_9_1 = {
     ("IL", "VAT", "2015-10-01"): {"effective_to": None},
+    ("RU", "NDS", "2019-01-01"): {"effective_to": None},
 }
 
 #: SHA-256 of the real shipped file at each tag, over the fields the fixture
@@ -548,8 +577,14 @@ async def test_a_v15_9_1_install_gets_only_what_shipped_after_it(repair_factory)
     assert still == 0, "the labelling repairs left rows the constraint would refuse to validate"
 
 
-async def test_a_database_whose_seed_cannot_be_dated_is_given_nothing(repair_factory) -> None:
-    """No timestamp, no delivery. The one branch where the repair gives up on purpose."""
+async def test_a_database_whose_seed_cannot_be_dated_is_given_nothing(repair_factory, caplog) -> None:
+    """No timestamp, no delivery. The one branch where the repair gives up on purpose.
+
+    The warning is asserted rather than merely allowed. This is the population
+    the sentence about adding rates by hand is true of: the table holds a row,
+    so the seeder's own empty-table guard will not fill it, and nothing else is
+    coming. Silencing it here would take away the only notice this install gets.
+    """
     async with repair_factory() as session:
         session.add(
             TaxConfiguration(
@@ -568,11 +603,46 @@ async def test_a_database_whose_seed_cannot_be_dated_is_given_nothing(repair_fac
         )
         await session.commit()
 
-    report = await run_data_repairs(repair_factory)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        report = await run_data_repairs(repair_factory)
 
     assert _outcome(report, REPAIR_ID).rows_changed == 0
     assert await _deliveries(repair_factory) == set()
     assert await _count(repair_factory) == 1
+    assert len(_warnings(caplog)) == 1, "the install that really has to be told by hand was not told"
+    assert "by hand" in _warnings(caplog)[0]
+
+
+async def test_an_unseeded_database_is_left_to_the_seeder_without_a_warning(repair_factory, caplog) -> None:
+    """The first boot, where this repair runs before the data it reconciles exists.
+
+    ``run_data_repairs`` is called from ``app.main`` well before
+    ``seed_i18n_data``, so on a fresh data directory the reconciler meets an
+    empty table. Read as a database whose seed cannot be dated, that produced a
+    warning telling the user to add the rates by hand, and roughly seven minutes
+    later the seeder wrote all eighty-odd of them. The sentence was not early,
+    it was false.
+
+    An empty table is what tells the two apart, and it is a sound signal rather
+    than a convenient one: ``_seed_tax_configurations`` fills this table
+    whenever it is empty, so an empty table always means the rows are on their
+    way, on a first boot and on any later one.
+    """
+    async with repair_factory() as session:
+        await session.execute(TaxConfiguration.__table__.delete())
+        await session.commit()
+    assert await _count(repair_factory) == 0, "this fixture is not the unseeded install it claims to be"
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        report = await run_data_repairs(repair_factory)
+
+    assert _warnings(caplog) == [], "a fresh install was told to add by hand what the seeder is about to write"
+    assert _outcome(report, REPAIR_ID).rows_changed == 0, "the reconciler wrote rates the seeder will write"
+    assert await _deliveries(repair_factory) == set(), (
+        "deliveries were recorded against a database that has not been seeded, which would make the "
+        "reconciler skip those rate lines for the life of the install"
+    )
+    assert await _count(repair_factory) == 0
 
 
 async def test_one_rate_re_entered_by_hand_does_not_freeze_the_seed_date(repair_factory) -> None:

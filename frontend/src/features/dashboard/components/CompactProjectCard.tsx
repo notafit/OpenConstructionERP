@@ -14,6 +14,8 @@ import {
 } from 'lucide-react';
 import { Card } from '@/shared/ui';
 import { fmtCompact, fmtNumber, getIntlLocale } from '@/shared/lib/formatters';
+import { toNum } from '@/shared/lib/money';
+import { getDateFnsLocale } from '@/shared/lib/dateFnsLocale';
 
 export interface CompactProjectCardProps {
   id: string;
@@ -107,14 +109,20 @@ export function CompactProjectCard({
   const modifiedDate = modifiedSource ? parseISO(modifiedSource) : null;
   const relativeModified =
     modifiedDate && isValidDate(modifiedDate)
-      ? formatDistanceToNowStrict(modifiedDate, { addSuffix: true })
+      ? formatDistanceToNowStrict(modifiedDate, {
+          addSuffix: true,
+          // Without `locale` date-fns answers in en-US, so this line stayed
+          // "3 hours ago" next to an absolute date that was already localised.
+          locale: getDateFnsLocale(),
+        })
       : null;
   const absoluteModified =
     modifiedDate && isValidDate(modifiedDate)
       ? modifiedDate.toLocaleDateString(getIntlLocale())
       : '';
 
-  const hasValue = typeof boqTotalValue === 'number' && boqTotalValue > 0;
+  const numericValue = toNum(boqTotalValue);
+  const hasValue = numericValue > 0;
 
   return (
     <Card
@@ -178,7 +186,7 @@ export function CompactProjectCard({
             </div>
             <div className="mt-0.5 flex items-baseline gap-1.5">
               <span className="text-base font-bold tabular-nums text-content-primary">
-                {formatCompactValue(boqTotalValue!)}
+                {formatCompactValue(numericValue)}
               </span>
               <span className="text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">
                 {currency}

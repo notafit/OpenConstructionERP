@@ -41,6 +41,29 @@ Thumbs.db
 .env
 .env.local
 .env.production
+# The three lines above name suffixes somebody thought of. Any other one, a
+# .env.staging or a .env.dev or a prod.env copied off a server, was tracked as
+# ordinary source in a public repository. Name the shape instead: *.env catches
+# a name ending in .env, .env.* catches any suffix after .env.
+#
+# The negation is load-bearing, do not delete it. .env.* DOES match
+# .env.example, and the three tracked template files (.env.example,
+# backend/.env.example, deploy/docker/.env.example) are the only thing keeping
+# it from swallowing them. Verified with git check-ignore on all three.
+*.env
+.env.*
+!.env.example
+
+# Two files the running application writes, both holding live secrets: the
+# generated demo passwords from app/main.py _persist_demo_credentials, and the
+# persisted JWT signing secret from app/config.py. Both default to a directory
+# outside the checkout (OE_CLI_DATA_DIR, else ~/.openestimator), so this is not
+# covering a live leak. It is the guard for a data directory pointed at the
+# working tree, which is a plausible dev or container misconfiguration and
+# would otherwise put a signing secret into a commit. Unanchored on purpose:
+# the data directory can be at any depth.
+.demo_credentials.json
+.jwt-secret
 
 # Database
 *.db
@@ -83,14 +106,10 @@ qa-output/
 playwright/.auth/
 test-results/
 
-# Dev / debug artefacts
-backend/audit_output.txt
-backend/data/bim_samples/
-backend/app/scripts/seed_demo_v*.py
-backend/app/scripts/seed_*school*.py
-backend/app/scripts/seed_*technical*.py
-backend/app/scripts/audit_*.py
-backend/app/scripts/demo_seed_issues.md
+# Backend dev/debug artefacts, QA scratch and runtime data are ignored in
+# backend/.gitignore, which is the Python project root. A pattern written here
+# as backend/... is inert for the wheel build: hatchling matches repo-root
+# patterns against paths relative to backend/, so it looks for backend/backend/.
 
 # Build
 *.tar.gz
@@ -100,6 +119,11 @@ frontend/stats.html
 # Logs
 *.log
 logs/
+
+# Process id files a dev or build script leaves behind. `frontend/build.pid`
+# outlived its build and sat untracked at the top of the tree, which is the
+# shape of file a wide `git add` sweeps into somebody else's commit.
+*.pid
 
 # Generated
 # backend/locales/ — kept tracked: stub locales ship with the wheel,
@@ -220,12 +244,6 @@ test-screenshots/
 !frontend/public/*.jpeg
 # Partner-pack company logos are real shipped assets, not dev screenshots
 !packs/**/logo.png
-# Bundled demo site photos are real shipped seed assets, not dev screenshots
-!backend/app/scripts/flagship_assets/site_photos/*.jpg
-
-# QA test scripts (contain demo credentials)
-backend/qa_*.py
-backend/tmp_*.json
 
 # LanceDB local data
 lancedb_data/
@@ -243,9 +261,6 @@ desktop/src-tauri/binaries/
 
 # Backup files
 *.backup.*
-backend/data/dwg_uploads/
-backend/data/dwg_entities/
-backend/data/dwg_thumbnails/
 
 # Local-only working state (not for commit)
 tmp/
@@ -257,24 +272,11 @@ frontend/scripts/.howto-i18n/
 # Smoke-sweep E2E run artefacts (regenerable test output, not source).
 frontend/qa-smoke/
 frontend/qa-smoke-report/
-backend/_frontend_dist/
-backend/app/_frontend_dist/
-backend/*.log.err
-backend/*.log.out
 frontend/*.log.err
 frontend/*.log.out
 qa-tests/v275-probe/shots*/
 i18n_audit_report.md
 qa-report/
-
-# Ad-hoc QA/test scripts that hit a hardcoded localhost — not real tests
-backend/qa_api_test.py
-backend/qa_ai_test.py
-backend/test_all_modules.py
-backend/test_final_qa.py
-backend/test_full.py
-backend/test_upload.dxf
-backend/tmp_api.json
 
 # Heavy sample data — fetched on demand, not committed
 data/bim/
@@ -288,14 +290,6 @@ data/reingest_backup_*.json
 # Generated license inventories — attached to GH Releases, not committed
 /NOTICE.backend.json
 /NOTICE.frontend.json
-
-# Runtime QMS upload artifacts (smoke/demo attachments, not source)
-backend/uploads/qms/
-
-# Scratch dev/test output
-backend/.pytest_*.out
-backend/_dev_backend.err
-backend/*.err
 
 # Deep-QA sweep working artifacts (progress + per-module findings; durable on disk, not committed)
 qa-sweep/
@@ -356,17 +350,6 @@ _qa_tmp/
 /_dl_build/
 /_i18n_gaps/
 /_pr_review/
-backend/_*.py
-backend/_*.txt
-backend/*_id.txt
-backend/markup_id_qa.txt
-backend/sess_id.txt
-backend/_qa_findings.json
-backend/_e2e_shots/
-backend/_flagship/
-backend/_pdfreport/
-backend/_report_pages/
-backend/app/_frontend_dist_prev/
 frontend/_*.cjs
 frontend/_*.mjs
 frontend/_qa_b3dm.bin
@@ -377,7 +360,6 @@ docs/postgres-migration/*.json
 docs/postgres-migration/*.diff
 docs/strategy/improvement-2026-06/_*.txt
 /_wheelboot_health.json
-backend/uploads/
 data/connectors/
 
 # Recurring session scratch (QA temp output + i18n build/merge tooling)
@@ -387,7 +369,6 @@ data/connectors/
 /_i18n_*.json
 /_i18n_new_*.txt
 /_qa_tsc_out.txt
-backend/_qa_tmp_*
 
 frontend/_qa_tmp_*
 frontend/tsc_result.txt
@@ -414,8 +395,6 @@ scripts/translate_mn_*.py
 /_m_*.json
 /_backend_restart.*
 /tmp_rvt_repro*.py
-backend/app/scripts/_flagship_dump.txt
-backend/app/scripts/_snap_dump.txt
 frontend/_qa/
 frontend/scripts/_apply_translations.cjs
 frontend/scripts/_dupcheck.cjs
