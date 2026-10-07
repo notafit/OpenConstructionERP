@@ -143,7 +143,7 @@ setup: ## First-time setup: install backend + frontend dependencies
 	cd $(FRONTEND_DIR) && npm install
 	@echo ""
 	@echo "Setup complete! Run 'make dev' to start the application."
-	@echo "  Backend:  http://localhost:8000 (FastAPI + SQLite)"
+	@echo "  Backend:  http://localhost:8000 (FastAPI + PostgreSQL)"
 	@echo "  Frontend: http://localhost:5173 (Vite dev server)"
 
 # ─── Quickstart (single command) ──────────────────────────────────────────
@@ -186,7 +186,7 @@ quickstart-secrets:
 # Building is optional. A failed build used to end at a raw compose error,
 # which left people stuck on a step they never had to run, so the failure
 # path now names the published image instead.
-quickstart: quickstart-secrets ## Start OpenEstimate (PostgreSQL + App) — needs a .env with two secrets
+quickstart: quickstart-secrets ## Start OpenConstructionERP (PostgreSQL + App) — needs a .env with two secrets
 	@$(DOCKER_COMPOSE) -f docker-compose.quickstart.yml up --build || $(MAKE) --no-print-directory quickstart-build-failed
 
 quickstart-build-failed:

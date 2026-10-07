@@ -139,7 +139,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Final
 
 from sqlalchemy import select
@@ -148,7 +149,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.data_repairs import delivered_keys, record_deliveries
 from app.modules.i18n_foundation.models import SUBNATIONAL_COMBINATIONS, TaxConfiguration
 from app.modules.i18n_foundation.seed import load_tax_seed_rows, tax_configuration_from_seed_row
-from app.modules.i18n_foundation.tax_rules import TaxRateRow, active_rows, row_from_orm
+from app.modules.i18n_foundation.tax_rules import TaxRateRow, TaxRuleError, active_rows, resolve, row_from_orm
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,11 @@ RateLine = tuple[str, str]
 #: The date is the commit's, deliberately taken as midnight rather than as the
 #: commit time: an install seeded earlier that same day is then read as too
 #: young and skipped, which costs a fix rather than risking a resurrection.
+#:
+#: A line added between two releases takes the date of the release that ships
+#: it, not of its commit: an install of the previous release seeded after the
+#: commit came from a file without the line, and a commit date would read it as
+#: one that already had the line and deleted it.
 #:
 #: Adding a line to ``tax_configurations.json`` means adding it here too.
 #: ``tests/unit/test_tax_seed_reconcile_covers_the_seed_file.py`` refuses a
@@ -194,6 +200,38 @@ LINE_FIRST_SHIPPED: Final[dict[RateLine, str]] = {
     # the shared regional stack for the life of the install.
     ("KW", "NONE"): "2026-09-02",
     ("QA", "NONE"): "2026-09-02",
+    # Greece, with the Greek country pack. Until then a Greek bill was charged
+    # the 24 on the GR region line, which is the right number read from the
+    # wrong table: an install seeded before these rows has no dated Greek rate
+    # at all, so a bill dated before a rate change could not be priced at the
+    # rate in force on its date. Standard 24 since 1 June 2016, reduced 13 and
+    # super-reduced 6 (Ν. 5144/2024 art. 26).
+    ("GR", "FPA"): "2026-09-27",
+    ("GR", "FPA_RED"): "2026-09-27",
+    ("GR", "FPA_SRED"): "2026-09-27",
+    # Croatia's two reduced rates and its zero rate. The seed carried only the
+    # 25 % standard rate, so a Croatian contractor typed the others by hand.
+    # Each rate is its own line, the way India's GST bands are, because the
+    # reconciler and the supersede repair key on the code: two open rows under
+    # one code would read as two windows of one rate.
+    ("HR", "PDV_13"): "2026-09-27",
+    ("HR", "PDV_5"): "2026-09-27",
+    ("HR", "PDV_0"): "2026-09-27",
+    # Ireland's second reduced rate and its zero rate, and Hungary's two
+    # reduced rates. The seed carried only Ireland's 23 % and 13.5 % and only
+    # Hungary's 27 %, so a 9 % Irish supply or a 5 % Hungarian new-home sale
+    # had no rate to pick. Tiers, delivered the Croatian way: each beside the
+    # standard rate the install already holds, never instead of it.
+    #
+    # Ireland, Revenue "Current VAT rates" (read 2026-10-04): standard 23,
+    # reduced 13.5, second reduced 9. The 9 % rate has existed since
+    # 2011-07-01 and the zero rate since VAT itself, 1972-11-01.
+    # Hungary: 5 % since EU accession on 2004-01-01 and 18 % since
+    # 2009-07-01, both unchanged beside the 27 % standard rate.
+    ("IE", "VAT_RED_9"): "2026-10-04",
+    ("IE", "VAT_ZERO"): "2026-10-04",
+    ("HU", "AFA_18"): "2026-10-04",
+    ("HU", "AFA_5"): "2026-10-04",
 }
 
 #: Rate lines another repair owns. Two repairs writing one line would each see
@@ -354,20 +392,137 @@ def _refusal(existing: Sequence[TaxRateRow], planned: Sequence[TaxRateRow], coun
     touched and the table still looks additive, which is what makes this worth
     checking for rather than assuming.
 
-    Delivering only into an empty slot is enough on its own here, and that is
-    worth stating because :mod:`~app.modules.i18n_foundation.romania_vat`
-    carries a second guard that resolves the country as it would read
-    afterwards. It needs one: it closes a window as it opens another, so it can
-    take an answer away. This repair only ever fills a jurisdiction that has
-    nothing in force, and a jurisdiction with no rate resolves to the federal
-    layer or to nothing at all - neither of which a valid rate for that
-    jurisdiction can turn into a worse answer.
+    Delivering only into an empty slot is enough on its own for a rate that
+    claims to be the standard one. A jurisdiction with no rate resolves to the
+    federal layer or to nothing at all, and neither of those can be turned into
+    a worse answer by a valid rate for that jurisdiction.
+
+    A reduced tier is the one exception, and it is the only place this repair
+    borrows the second guard :mod:`~app.modules.i18n_foundation.romania_vat`
+    carries, the one that resolves the country as it would read afterwards.
+    See :func:`_tier_refusal`.
     """
     wanted = _claimed_jurisdictions(planned)
     held = _claimed_jurisdictions(active_rows(existing, country, date.today().isoformat()))
-    collisions = sorted(str(slot) for slot in wanted & held)
+    collisions = wanted & held
+    # An empty country-wide slot goes through the tier guard as well: a lone
+    # reduced rate there answers as the standard one, so Croatia with its 25 %
+    # deleted would start pricing at 13 %.
+    if collisions <= {None} and _is_a_reduced_tier(planned):
+        return _tier_refusal(existing, planned, country)
     if collisions:
-        return f"it already has a rate of its own in force for {', '.join(collisions)}"
+        return f"it already has a rate of its own in force for {', '.join(sorted(str(slot) for slot in collisions))}"
+    return ""
+
+
+def jurisdiction_refusal(existing: Sequence[TaxRateRow], planned: Sequence[TaxRateRow], country: str) -> str:
+    """Why a whole rate line must not be added beside ``existing``, or ``""``.
+
+    The public face of :func:`_refusal`, for the explicit reference data update
+    in :mod:`app.modules.i18n_foundation.reference_data_update`. That pass adds
+    absent rate lines too, on an administrator's confirmation rather than at
+    boot, and a confirmation does not make a second standard rate for one
+    country any less of a broken answer, so it asks the same guard rather than
+    carrying its own copy of it.
+    """
+    return _refusal(existing, planned, country)
+
+
+def _is_a_reduced_tier(planned: Sequence[TaxRateRow]) -> bool:
+    """Whether every planned row is a country-wide rate that does not claim to be the standard one.
+
+    Croatia's 13 %, 5 % and 0 % are the case this exists for. They land in the
+    country-wide slot the 25 % standard rate already fills, so the slot rule
+    above refused them on every install that holds Croatia at all - which is
+    every install, the production one included. A tier is an alternative a
+    supply is charged at instead of the standard rate, not a second standard
+    rate, so a full slot is not by itself a reason to withhold one.
+    """
+    return bool(planned) and all(row.combination in ("national", "federal") and not row.is_default for row in planned)
+
+
+def _answer_on(rows: Sequence[TaxRateRow], country: str, on_date: str) -> tuple[str, str | None]:
+    """What the country resolves to on a date, reduced to what a caller prices with.
+
+    Every unanswered status reads as one answer here. An install seeded from
+    the old file dates Croatia's 25 % from 2013-03-01, so on 2013-01-01 it has
+    no Croatian rate at all (``no_configuration``), and with the 5 % tier on
+    file the same day reads ``default_rate_not_in_force``. Both return no
+    number, so no bill can be priced differently, and refusing the tier over
+    which reason an unanswerable date gives would withhold it for ever.
+    """
+    try:
+        resolution = resolve(rows, country, None, on_date)
+    except TaxRuleError as exc:
+        return (f"error:{exc.code}", None)
+    if not resolution.resolved:
+        return ("unresolved", None)
+    return (resolution.status, resolution.combined_rate_pct)
+
+
+def _dates_to_check(rows: Sequence[TaxRateRow], planned: Sequence[TaxRateRow], country: str) -> list[str]:
+    """Every date on which the country's answer could differ, inside the planned window.
+
+    The answer is constant between the days a window opens or closes, so the
+    days on which one opens, and the day after one closes, stand for every day
+    in between. Today is added because it is the answer every new bill reads.
+    """
+    start = min((row.effective_from or "0001-01-01") for row in planned)
+    ends = [row.effective_to for row in planned]
+    end = None if any(e is None for e in ends) else max(e for e in ends if e is not None)
+    candidates = {start, date.today().isoformat()}
+    for row in [*rows, *planned]:
+        if row.country_code.strip().upper() != country:
+            continue
+        if row.effective_from:
+            candidates.add(row.effective_from)
+        if row.effective_to:
+            candidates.add((date.fromisoformat(row.effective_to) + timedelta(days=1)).isoformat())
+    return sorted(day for day in candidates if day >= start and (end is None or day <= end))
+
+
+def _tier_refusal(existing: Sequence[TaxRateRow], planned: Sequence[TaxRateRow], country: str) -> str:
+    """Why a reduced tier must not join a filled country-wide slot, or ``""``.
+
+    Two conditions, and both are about the answer rather than the table,
+    which is the guard :mod:`~app.modules.i18n_foundation.romania_vat` carries.
+
+    The country has to resolve to the same status and the same rate with the
+    tier as without it, on every date the tier is in force. A tier cannot
+    change a rate the data states as the default, but it can take one away: a
+    lone unflagged row answers as the standard rate, and a second unflagged row
+    beside it leaves the resolver unable to name either.
+
+    And the customer must not already carry that rate. A 13 % they typed in
+    under their own code is the same tier, and a second 13 % in the list is a
+    choice between two identical rates that nobody can tell apart.
+    """
+    start = min((row.effective_from or "0001-01-01") for row in planned)
+    held_rates = set()
+    for row in existing:
+        if row.country_code.strip().upper() != country or row.combination not in ("national", "federal"):
+            continue
+        if row.effective_to is not None and row.effective_to < start:
+            # A rate that ended before the tier begins is history, not a tier
+            # the customer is charging alongside it.
+            continue
+        try:
+            held_rates.add(Decimal(row.rate_pct))
+        except (InvalidOperation, TypeError):
+            continue
+    duplicates = sorted({row.rate_pct for row in planned if Decimal(row.rate_pct) in held_rates})
+    if duplicates:
+        return f"it already carries a country-wide rate of {', '.join(duplicates)} %"
+
+    projected = [*existing, *planned]
+    for day in _dates_to_check(existing, planned, country):
+        before = _answer_on(existing, country, day)
+        after = _answer_on(projected, country, day)
+        if before != after:
+            return (
+                f"adding it would change what the country resolves to on {day} "
+                f"from {before[0]} {before[1]} to {after[0]} {after[1]}"
+            )
     return ""
 
 

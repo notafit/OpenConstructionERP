@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "loe",
+  "name": "LOE — Ley de Ordenacion de la Edificacion",
+  "standard": "LOE (Ley 38/1999)",
+  "jurisdiction": "ES",
+  "description": "Validates project and contract documentation against the Ley de Ordenacion de la Edificacion (LOE). Checks that the roles of promotor, proyectista, director de obra, director de ejecucion de obra and constructor are defined, that the Libro del Edificio is referenced, that warranty periods (1 year acabado, 3 years habitabilidad, 10 years estructura) are documented, and that the seguro decenal (10-year structural insurance) obligation is noted for residential buildings.",
+  "applies_to": ["tender", "contracts", "validation"],
+  "enables_rule_ids": [
+    "loe.promotor_defined",
+    "loe.proyectista_defined",
+    "loe.director_obra_defined",
+    "loe.director_ejecucion_obra_defined",
+    "loe.constructor_defined",
+    "loe.libro_edificio_referenced",
+    "loe.garantia_1_year_acabado_documented",
+    "loe.garantia_3_years_habitabilidad_documented",
+    "loe.garantia_10_years_estructura_documented",
+    "loe.seguro_decenal_if_residential",
+    "loe.acta_recepcion_clause_present",
+    "loe.licencia_obras_referenced"
+  ],
+  "regulator": "Ministerio de Transportes y Movilidad Sostenible",
+  "publication_year": 1999
+}

@@ -35,7 +35,7 @@ function getInitialSubscribed(): boolean {
   }
 }
 
-export function SubscribeButton({ condensed = false }: { condensed?: boolean } = {}) {
+export function SubscribeButton() {
   const { t } = useTranslation();
   const [subscribed, setSubscribed] = useState<boolean>(getInitialSubscribed);
 
@@ -80,60 +80,19 @@ export function SubscribeButton({ condensed = false }: { condensed?: boolean } =
 
   return (
     <>
-      {/* Desktop pill — matches Support / Help sizing (h-8 px-3). */}
+      {/* Icon-only square at every width, the Help footprint: the news
+          subscription stays one click away without taking a labelled pill. */}
       <button
         type="button"
         onClick={handleClick}
         aria-label={t('header.subscribe.button_aria', {
           defaultValue: 'Get release notes by email - opens the newsletter form on openconstructionerp.com',
         })}
-        title={t('header.subscribe.button_title', {
+        title={subscribed ? buttonLabel : t('header.subscribe.button_title', {
           defaultValue: 'Get release notes by email (opens openconstructionerp.com)',
         })}
         className={clsx(
-          // Partner mode condenses to the icon-only form so the co-brand
-          // chip gets a clean central slot; otherwise full pill from 2xl up.
-          // 2xl rather than md for the header-width reason documented on the
-          // matching line in SupportUsButton: the action cluster is `shrink-0`
-          // and sets the document width, and these two labels are what put it
-          // over 1280. xl would not do - xl is 1280 exactly, the failing width.
-          condensed ? 'hidden' : 'hidden 2xl:inline-flex',
-          'h-8 items-center gap-1.5 rounded-lg border px-3',
-          'text-xs font-medium transition-colors',
-          'focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/40',
-          subscribed
-            ? clsx(
-                'border-emerald-400/50 bg-emerald-50/70 text-emerald-700',
-                'dark:border-emerald-500/40 dark:bg-emerald-950/30 dark:text-emerald-300',
-                'hover:bg-emerald-50 dark:hover:bg-emerald-950/50',
-              )
-            : clsx(
-                'border-sky-400/50 bg-sky-50/70 text-sky-700',
-                'dark:border-sky-500/40 dark:bg-sky-950/30 dark:text-sky-300',
-                'hover:border-sky-500 hover:bg-sky-100/80',
-                'dark:hover:border-sky-400/60 dark:hover:bg-sky-900/40',
-              ),
-        )}
-      >
-        {subscribed ? (
-          <Check size={14} strokeWidth={2} className="shrink-0" />
-        ) : (
-          <Mail size={14} strokeWidth={2} className="shrink-0" />
-        )}
-        <span className="whitespace-nowrap tracking-wide truncate max-w-[140px]">
-          {buttonLabel}
-        </span>
-      </button>
-
-      {/* Mobile — icon-only square matching the Help footprint. */}
-      <button
-        type="button"
-        onClick={handleClick}
-        aria-label={t('header.subscribe.button_short', { defaultValue: 'Subscribe' })}
-        title={buttonLabel}
-        className={clsx(
-          condensed ? 'inline-flex' : '2xl:hidden inline-flex',
-          'h-8 w-8 items-center justify-center rounded-lg',
+          'inline-flex h-8 w-8 items-center justify-center rounded-lg',
           'transition-colors',
           subscribed
             ? 'text-emerald-600 hover:bg-surface-secondary'

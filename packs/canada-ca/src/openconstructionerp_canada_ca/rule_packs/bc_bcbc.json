@@ -1,0 +1,18 @@
+{
+  "rule_pack_id": "bc_bcbc",
+  "name": "British Columbia Building Code",
+  "name_fr-CA": "Code du bâtiment de la Colombie-Britannique",
+  "standard": "BC Building Code (BCBC)",
+  "jurisdiction": "CA-BC",
+  "regulator": "Province of British Columbia (Building and Safety Standards Branch)",
+  "applies_to": [
+    "projects",
+    "validation"
+  ],
+  "description": "Reference document for British Columbia compliance on top of the national code. What the regime requires a project to show: the project references its building permit, the edition of the BC Building Code in force for the project is recorded, projects inside the City of Vancouver are flagged because Vancouver builds to its own by-law under the Vancouver Charter rather than to the provincial code, WorkSafeBC registration is on file for every contractor, the energy step the project is designed to is recorded, and holdback under the Builders Lien Act is configured. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la conformité particulière à la Colombie-Britannique en complément du code national. Ce que le régime exige du projet : le permis de construire est référencé, l'édition du code du bâtiment applicable au projet est consignée, les projets situés dans la Ville de Vancouver sont signalés car Vancouver applique son propre règlement en vertu de la Charte de Vancouver plutôt que le code provincial, l'inscription à WorkSafeBC est au dossier pour chaque entrepreneur, le palier énergétique visé est consigné, et la retenue prévue par la Builders Lien Act est configurée. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "review_status": "The BC Building Code is reissued on the province's own cycle and is amended between editions, and the energy step requirements move with it. This document names the instruments; the edition and the step in force for a given project must be confirmed against the Building and Safety Standards Branch and the authority having jurisdiction before it is relied on for a submission.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. The provincial code is applied by the authority having jurisdiction against a submitted design, which this platform does not hold. A rule id here would report on a question the engine is not in a position to ask.",
+  "enables_rule_ids": []
+}

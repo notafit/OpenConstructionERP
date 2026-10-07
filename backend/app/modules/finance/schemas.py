@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from app.modules.einvoice.rules import VAT_CATEGORY_CODES
 from app.modules.finance.variance import expected_outturn
@@ -167,6 +167,10 @@ class InvoiceCreate(BaseModel):
     status: str = Field(default="draft", max_length=50)
     payment_terms_days: str | None = Field(default=None, max_length=10)
     notes: str | None = Field(default=None, max_length=5000)
+    # The purchase order a supplier invoice bills against. Payable only; the
+    # order must be on the same project and, when both name one, with the same
+    # supplier. Optional: most small payables have no order behind them.
+    purchase_order_id: UUID | None = None
     line_items: list[InvoiceLineItemCreate] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -204,6 +208,8 @@ class InvoiceUpdate(BaseModel):
     status: str | None = Field(default=None, max_length=50)
     payment_terms_days: str | None = Field(default=None, max_length=10)
     notes: str | None = Field(default=None, max_length=5000)
+    # Send null to unlink the invoice from its purchase order.
+    purchase_order_id: UUID | None = None
     line_items: list[InvoiceLineItemCreate] | None = None
     metadata: dict[str, Any] | None = None
 
@@ -258,6 +264,10 @@ class InvoiceResponse(BaseModel):
     counterparty_name: str | None = None
     # Gap E: link back to the certified claim this AR invoice was raised from.
     source_claim_id: UUID | None = None
+    # The purchase order this supplier invoice bills against: the column, or
+    # the ``metadata.po_id`` stamp an order-created invoice carried before the
+    # column existed (see ``finance.po_link``).
+    purchase_order_id: UUID | None = None
     invoice_direction: str
     invoice_number: str
     invoice_date: str
@@ -284,6 +294,14 @@ class InvoiceResponse(BaseModel):
         "amount_total",
         mode="before",
     )(lambda cls, v: _decimal_to_str(v))
+
+    @model_validator(mode="after")
+    def _legacy_po_stamp(self) -> "InvoiceResponse":
+        if self.purchase_order_id is None:
+            from app.modules.finance.po_link import invoice_po_link
+
+            self.purchase_order_id = invoice_po_link(None, self.metadata)
+        return self
 
 
 class InvoiceListResponse(BaseModel):
@@ -506,6 +524,10 @@ class BudgetResponse(BaseModel):
     id: UUID
     project_id: UUID
     wbs_id: str | None = None
+    #: A readable name for ``wbs_id`` when it is an id: the WBS node's code and
+    #: name, or the bill section's number and description. ``None`` when the
+    #: id is already readable (a code such as "02") or names nothing.
+    wbs_label: str | None = None
     category: str | None = None
     currency_code: str = ""
     # Phase 2d: the ORM now hands us ``Decimal`` values (see MoneyType
@@ -682,8 +704,20 @@ class FinanceDashboardResponse(BaseModel):
     invoices_paid: int = 0
     total_budget_original: Decimal = Decimal("0")
     total_budget_revised: Decimal = Decimal("0")
+    # The cost position, read from the records by ``finance.cost_position``
+    # (its docstring states the basis of each). All net of VAT like the budget
+    # above them, except ``total_paid``: ``total_actual`` is what has been
+    # incurred, ``total_committed`` what is promised and not yet incurred (so
+    # the two add up to the outturn), ``total_invoiced`` what suppliers have
+    # billed; ``total_paid`` is cash paid, VAT included.
     total_committed: Decimal = Decimal("0")
+    total_invoiced: Decimal = Decimal("0")
     total_actual: Decimal = Decimal("0")
+    total_paid: Decimal = Decimal("0")
+    # Incurred beyond what was committed (received past an order nobody
+    # invoiced, settled past a subcontract's value). Committed never goes
+    # below zero, so this is where that excess is shown.
+    total_over_commitment: Decimal = Decimal("0")
     total_variance: Decimal = Decimal("0")
     budget_consumed_pct: float = 0.0
     budget_warning_level: str = "normal"  # "normal" | "caution" | "critical"
@@ -713,7 +747,10 @@ class FinanceDashboardResponse(BaseModel):
         "total_budget_original",
         "total_budget_revised",
         "total_committed",
+        "total_invoiced",
         "total_actual",
+        "total_paid",
+        "total_over_commitment",
         "total_variance",
         "total_payments",
         when_used="json",

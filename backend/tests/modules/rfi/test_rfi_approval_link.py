@@ -19,6 +19,8 @@ Mirrors the submittal wiring tests with the conservative RFI mapping:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from typing import Any
 
@@ -107,11 +109,50 @@ async def _make_route(
     )
 
 
-def _capture() -> list[tuple[str, dict[str, Any]]]:
-    captured: list[tuple[str, dict[str, Any]]] = []
+class _Captured:
+    """Terminal approval events seen on the bus, with a deterministic wait.
+
+    The engine publishes through ``publish_detached``, so the fan-out is a
+    separate task and has not necessarily run by the time the call that caused
+    it returns. Reading the list straight after the call therefore races the
+    scheduler, which is what made this file red on the nightly. Waiting on the
+    handler instead of on a sleep costs nothing when the event is already there
+    and cannot go red for being on a slow runner.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+        self._arrived = asyncio.Event()
+
+    def note(self, name: str, data: dict[str, Any]) -> None:
+        self.events.append((name, data))
+        self._arrived.set()
+
+    def saw(self, name: str) -> bool:
+        return any(n == name for n, _ in self.events)
+
+    async def wait_for(self, name: str, timeout: float = 10.0) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            # Cleared before the check, never after: an event that lands in
+            # between then either shows up in the check or leaves the flag set,
+            # and the wait below returns at once. The other order loses it.
+            self._arrived.clear()
+            if self.saw(name):
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._arrived.wait(), remaining)
+
+
+def _capture() -> _Captured:
+    captured = _Captured()
 
     async def _handler(event: Any) -> None:
-        captured.append((event.name, dict(event.data or {})))
+        captured.note(event.name, dict(event.data or {}))
 
     for n in (
         "approval_routes.instance.completed",
@@ -196,7 +237,9 @@ async def test_approval_completed_reaffirms_answer(session: AsyncSession) -> Non
         approver_id=user_id,
     )
     assert completed_inst.status == "approved"
-    assert any(n == "approval_routes.instance.completed" for n, _ in captured)
+    assert await captured.wait_for("approval_routes.instance.completed"), (
+        f"no approval_routes.instance.completed event; saw {captured.events}"
+    )
 
     result = await svc.apply_approval_decision(rfi.id, decision="approved", decided_by=str(user_id))
     assert result is not None

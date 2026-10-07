@@ -251,6 +251,20 @@ class SubcontractAgreement(Base):
         default=False,
         server_default="0",
     )
+    # The GC's prime contract (``oe_contracts_contract``) this subcontract sits
+    # under, which is the contract whose progress claims the subcontractor's
+    # pay applications roll up into. Plain GUID with no ORM foreign key, per
+    # the cross-module convention: contracts does not know subcontractors
+    # exists. NULL means "not stated": the rollup then takes the single active
+    # client contract on the project, and reports the agreement as ambiguous
+    # when there is more than one rather than guessing between them.
+    prime_contract_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    # The same subcontract written in the contracts module (a contract with
+    # ``counterparty_type="subcontractor"``), when there is one. Both records
+    # describe one spend, so only one of them may commit the budget: when this
+    # is set the agreement carries the commitment and the contract does not.
+    # Plain GUID with no ORM foreign key, like ``prime_contract_id``.
+    contract_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -302,6 +316,11 @@ class WorkPackage(Base):
         default="planned",
         index=True,
     )
+    # The GC schedule-of-values line (``oe_contracts_contract_line``) this
+    # scope bills under by default. Every pay-application line against the
+    # package inherits it unless the line names its own. Plain GUID, no ORM
+    # foreign key: the SOV belongs to the contracts module.
+    contract_line_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
 
     def __repr__(self) -> str:
         return f"<WorkPackage {self.name!r} ({self.status})>"
@@ -357,8 +376,23 @@ class PaymentApplication(Base):
         nullable=True,
     )
     finance_approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # What finance approved to pay, set once at finance approval and empty
+    # before it. The gross, retention and net above stay as the sub claimed
+    # them, and the lien waiver gate reads that net; these three are the
+    # payable side: the claimed gross less what was not approved on the lines,
+    # retention at the agreement's rate on that, and the net paid. They equal
+    # the claimed figures unless finance lowered a line.
+    approved_gross_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    approved_retention_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    approved_net_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The GC progress claim (``oe_contracts_progress_claim``) this pay
+    # application was included in. Set only by a person including it from the
+    # claim's rollup, never inferred, so "which sub bills make up this month's
+    # GC bill" has one stored answer. A pay application sits in at most one
+    # claim; the service refuses a second inclusion with 409.
+    progress_claim_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
     created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         "metadata",
@@ -407,6 +441,29 @@ class PaymentApplicationLine(Base):
         default=Decimal("0"),
         server_default="0",
     )
+    # Three-stage QS quantities
+    claimed_qty: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    assessed_qty: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    certified_qty: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    # Per-line override of the work package's GC schedule-of-values line, for
+    # the line that bills scope the package default does not describe. The
+    # rollup resolves a line as: this value, else the package's, else unmapped.
+    contract_line_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
 
     def __repr__(self) -> str:
         return f"<PaymentApplicationLine wp={self.work_package_id} approved={self.approved_amount}>"
@@ -564,6 +621,11 @@ class LienWaiver(Base):
     mime_type: Mapped[str | None] = mapped_column(String(120), nullable=True)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     signed_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # The last day of work the waiver releases lien rights for. A waiver is
+    # "through" a date, and that date is what a lender checks against the pay
+    # period; the signing date says only when the paper was signed, which is
+    # usually later. NULL on every waiver filed before the column existed.
+    through_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     # Amount the waiver covers - informational; the actual money flows
     # through the payment_application row. Stored as Numeric(18,2)
     # like every other money column in the module.

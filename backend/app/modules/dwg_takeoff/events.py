@@ -94,7 +94,7 @@ def _register_handlers() -> None:
 
     Idempotent: tests can call ``event_bus.clear()`` then re-invoke this.
     """
-    event_bus.subscribe("boq.position.deleted", _on_boq_position_deleted)
+    event_bus.subscribe_once("boq.position.deleted", _on_boq_position_deleted)
 
 
 _register_handlers()

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "合格"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "この事業の工事は{start}に着手されており、{filed}の申請提出より前です。申請前に着手した事業は、ほとんどの制度で一切補助されません",
+      "unevidenced": "{start}に事前着工しています。記録には交付機関が認めたとありますが、書面による許可が記載されていません",
+      "evidence": "事前着工を認めた書面の文書番号を記録してください。記録だけで根拠を示せるようになります",
+      "suggestion": "これ以上支出する前に制度の要綱を確認してください。事前着工が書面で認められている場合はそれを記録し、認められていない場合は申請を進める前に交付機関に相談してください"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "交付金請求 {draw} に、交付対象期間の開始日である{period_start}より前の経費が含まれています",
+      "after": "交付金請求 {draw} に、交付対象期間の終了日である{period_end}より後の経費が含まれています",
+      "spans": "交付金請求 {draw} は、交付対象期間（{period_start}から{period_end}まで）の前後両方にはみ出しています",
+      "suggestion": "期間外の経費は別の交付金請求に分け、交付機関と協議してください。期間内と期間外の経費を一つの請求にまとめないでください"
+    },
+    "own_share_is_covered": {
+      "fail": "制度は{rate}%の自己負担分（{required}）を求めていますが、申請に記録されているのは{recorded}です",
+      "suggestion": "提出前に、残りの自己負担分をどこから賄うかを明記してください。制度はプロジェクト全体ではなく対象経費の基準額に対して自己負担分を算定します"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "このプロジェクトの{count}件の申請を合わせると対象経費の{intensity}%となり、各制度のうち最も厳しい制度が定める補助強度の上限{cap}%を超えています",
+      "suggestion": "公的資金は、制度をまたいでも、国や自治体など行政のレベルをまたいでも合算されます。いずれかの申請額を減らすか、事業を分けてそれぞれが自らの経費を負担できないか確認してください"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "交付対象期間は{period_end}に終了しましたが、最終実績報告の作成がまだ始まっていません",
+      "late": "最終実績報告の期限は{due}でしたが、提出されたのは{submitted}です",
+      "overdue": "最終実績報告の期限は{due}でしたが、まだ提出されていません",
+      "suggestion": "完成を待たずに、手元にあるものを提出してください。多くの交付機関は申請があれば期限を延長しますが、すでに過ぎた期限を延長することはありません"
+    },
+    "errors": {
+      "application_not_found": "申請が見つかりません",
+      "programme_code_taken": "この国には同じ管理番号の制度がすでに存在します",
+      "programme_not_found": "制度が見つかりません",
+      "programme_has_applications": "この制度には申請があるため削除できません。代わりに状況を「終了」にしてください。",
+      "application_code_taken": "このプロジェクトには同じ管理番号の申請がすでに存在します",
+      "approved_application_not_deletable": "採択された申請は削除できません。代わりに状況を「取下げ」または「終了」にしてください。",
+      "approval_needs_period_end": "以降の期限はすべて交付対象期間の終了日から計算されるため、交付決定にはこの日付が必要です",
+      "draw_needs_approval": "交付金請求は採択された申請に対してのみ行えます",
+      "draw_not_found": "交付金請求が見つかりません",
+      "paid_draw_not_deletable": "支払済みの交付金請求は削除できません",
+      "proof_not_found": "実績報告が見つかりません",
+      "obligation_not_found": "義務が見つかりません",
+      "eligible_exceeds_amount": "対象経費の額は全体の金額を超えることはできません",
+      "allocation_not_found": "経費が見つかりません"
+    }
+  }
+}

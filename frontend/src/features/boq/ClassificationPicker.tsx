@@ -229,6 +229,139 @@ const NRM_TREE: ClassificationNode[] = [
   { code: '8', label: 'External works' },
 ];
 
+/* ── Division-based work-results tree (US/CA) ──────────────────────────
+ * Division numbers are the interoperability keys and stay. The wording is
+ * our own scope-of-work description, kept in step with the division scopes
+ * in backend/app/modules/us_pack/config.py; the official titles are the
+ * licensor's text and are not bundled. */
+
+const MASTERFORMAT_TREE: ClassificationNode[] = [
+  { code: '01', label: 'General project requirements and temporary provisions' },
+  { code: '02', label: 'Demolition, site assessment and existing structures' },
+  {
+    code: '03', label: 'Cast-in-place and precast concrete work',
+    children: [
+      { code: '03 10 00', label: 'Formwork, shoring and embeds' },
+      { code: '03 20 00', label: 'Rebar and mesh supply and placing' },
+      { code: '03 30 00', label: 'Site-poured slabs, walls and frames' },
+      { code: '03 40 00', label: 'Factory-cast panels and members' },
+    ],
+  },
+  { code: '04', label: 'Brick, block and stone work' },
+  {
+    code: '05', label: 'Structural and miscellaneous metal work',
+    children: [
+      { code: '05 10 00', label: 'Steel frame: beams, columns, bracing' },
+      { code: '05 20 00', label: 'Open-web steel joists' },
+      { code: '05 30 00', label: 'Steel floor and roof deck' },
+      { code: '05 50 00', label: 'Stairs, railings, lintels and misc. steel' },
+    ],
+  },
+  {
+    code: '06', label: 'Carpentry, millwork and composite framing',
+    children: [
+      { code: '06 10 00', label: 'Framing, blocking and sheathing' },
+      { code: '06 20 00', label: 'Trim, shelving and interior joinery' },
+      { code: '06 40 00', label: 'Custom cabinetry and panelling' },
+    ],
+  },
+  { code: '07', label: 'Roofing, waterproofing and insulation' },
+  {
+    code: '08', label: 'Doors, windows and glazed assemblies',
+    children: [
+      { code: '08 10 00', label: 'Door leaves, frames and hardware sets' },
+      { code: '08 40 00', label: 'Shopfronts, entrance systems and glass facades' },
+      { code: '08 50 00', label: 'Window units' },
+      { code: '08 80 00', label: 'Glass panes and glazing work' },
+    ],
+  },
+  {
+    code: '09', label: 'Interior finishing: drywall, flooring, painting',
+    children: [
+      { code: '09 20 00', label: 'Drywall partitions and plasterwork' },
+      { code: '09 30 00', label: 'Ceramic and stone tile work' },
+      { code: '09 50 00', label: 'Suspended and acoustic ceiling systems' },
+      { code: '09 60 00', label: 'Floor coverings: resilient, carpet, timber' },
+      { code: '09 90 00', label: 'Paint and protective coatings' },
+    ],
+  },
+  { code: '10', label: 'Built-in specialty items and signage' },
+  { code: '11', label: 'Fixed building equipment' },
+  { code: '12', label: 'Furniture, casework and window treatments' },
+  { code: '13', label: 'Pre-engineered and special-purpose structures' },
+  { code: '14', label: 'Elevators, escalators and lifts' },
+  { code: '21', label: 'Sprinkler and fire-suppression systems' },
+  {
+    code: '22', label: 'Piping systems and sanitary fixtures',
+    children: [
+      { code: '22 10 00', label: 'Water, waste and vent pipework, pumps' },
+      { code: '22 30 00', label: 'Water heaters and softeners' },
+      { code: '22 40 00', label: 'WCs, basins, sinks and showers' },
+    ],
+  },
+  {
+    code: '23', label: 'Heating, cooling and ventilation systems',
+    children: [
+      { code: '23 05 00', label: 'Mechanical supports, insulation, balancing' },
+      { code: '23 20 00', label: 'Heating and chilled water pipework, pumps' },
+      { code: '23 30 00', label: 'Ductwork, diffusers and fans' },
+      { code: '23 60 00', label: 'Boilers and heat generation plant' },
+      { code: '23 70 00', label: 'Air-handling units and packaged plant' },
+    ],
+  },
+  {
+    code: '26', label: 'Power distribution and lighting systems',
+    children: [
+      { code: '26 05 00', label: 'Conduit, cable, earthing and supports' },
+      { code: '26 20 00', label: 'Switchboards, panels and final circuits' },
+      { code: '26 40 00', label: 'Surge and corrosion protection' },
+      { code: '26 50 00', label: 'Luminaires and lighting controls' },
+    ],
+  },
+  { code: '27', label: 'Voice, data and network cabling' },
+  { code: '28', label: 'Fire alarm, access control and surveillance' },
+  { code: '31', label: 'Excavation, grading and earth support' },
+  { code: '32', label: 'Paving, landscaping and site amenities' },
+  { code: '33', label: 'Site water, sewer, storm and power services' },
+];
+
+/* ── SINAPI classification tree (Brazil) ──────────────────────────────── */
+
+const SINAPI_TREE: ClassificationNode[] = [
+  { code: '73', label: 'Servicos preliminares' },
+  { code: '74', label: 'Movimento de terra' },
+  { code: '75', label: 'Fundacoes e estruturas' },
+  { code: '76', label: 'Paredes e paineis' },
+  { code: '77', label: 'Coberturas e protecoes' },
+  { code: '78', label: 'Forros' },
+  { code: '79', label: 'Instalacoes eletricas' },
+  { code: '80', label: 'Instalacoes hidro-sanitarias' },
+  { code: '81', label: 'Revestimentos' },
+  { code: '82', label: 'Pisos' },
+  { code: '83', label: 'Esquadrias' },
+  { code: '84', label: 'Vidros' },
+  { code: '85', label: 'Pintura' },
+  { code: '86', label: 'Servicos complementares' },
+];
+
+/* ── GB50500 classification tree (China) ─────────────────────────────── */
+
+const GB50500_TREE: ClassificationNode[] = [
+  { code: '01', label: 'Site preparation' },
+  { code: '02', label: 'Foundation engineering' },
+  { code: '03', label: 'Masonry engineering' },
+  { code: '04', label: 'Concrete and RC engineering' },
+  { code: '05', label: 'Structural steel engineering' },
+  { code: '06', label: 'Metal structure engineering' },
+  { code: '07', label: 'Wooden structure engineering' },
+  { code: '08', label: 'Doors, windows and curtain walls' },
+  { code: '09', label: 'Roofing engineering' },
+  { code: '10', label: 'Waterproofing engineering' },
+  { code: '11', label: 'Insulation engineering' },
+  { code: '12', label: 'Decoration engineering' },
+  { code: '13', label: 'Mechanical and electrical installation' },
+];
+
 /* ── Flatten for search ───────────────────────────────────────────────── */
 
 function flattenTree(nodes: ClassificationNode[], parentPath = ''): Array<{ code: string; label: string; path: string }> {
@@ -306,7 +439,7 @@ function TreeNode({
 
 /* ── Main ClassificationPicker component ──────────────────────────────── */
 
-export type ClassificationStandard = 'din276' | 'nrm';
+export type ClassificationStandard = 'din276' | 'nrm' | 'masterformat' | 'sinapi' | 'gb50500';
 
 interface ClassificationPickerProps {
   /** Which standard to browse */
@@ -333,7 +466,14 @@ export function ClassificationPicker({
   const [expandedCodes, setExpandedCodes] = useState<Set<string>>(new Set());
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const tree = standard === 'nrm' ? NRM_TREE : DIN_276_TREE;
+  const TREE_MAP: Record<ClassificationStandard, ClassificationNode[]> = {
+    din276: DIN_276_TREE,
+    nrm: NRM_TREE,
+    masterformat: MASTERFORMAT_TREE,
+    sinapi: SINAPI_TREE,
+    gb50500: GB50500_TREE,
+  };
+  const tree = TREE_MAP[standard] ?? DIN_276_TREE;
   const flatItems = useMemo(() => flattenTree(tree), [tree]);
 
   // Filter by search

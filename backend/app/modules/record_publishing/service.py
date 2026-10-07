@@ -30,10 +30,12 @@ source modules or the transmittals engine at import time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException, status
@@ -219,7 +221,7 @@ async def _render_meeting_minutes(session: AsyncSession, source_id: uuid.UUID) -
     minutes = await MeetingService(session).get_minutes_row(source_id)
     if minutes is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="This meeting has no confirmed minutes to publish yet",
         )
 
@@ -227,7 +229,19 @@ async def _render_meeting_minutes(session: AsyncSession, source_id: uuid.UUID) -
         await session.execute(select(Project.name).where(Project.id == meeting.project_id))
     ).scalar_one_or_none() or "Unknown Project"
     content = minutes.content if isinstance(minutes.content, dict) else {}
-    pdf_bytes = build_minutes_pdf(meeting, minutes, proj_name)
+    # Plain snapshots of the fields the renderer reads, so no ORM row crosses into
+    # the thread. Laying out the PDF is pure CPU, so it runs in a worker thread.
+    meeting_snapshot = SimpleNamespace(
+        title=meeting.title,
+        meeting_date=meeting.meeting_date,
+        meeting_number=meeting.meeting_number,
+    )
+    minutes_snapshot = SimpleNamespace(
+        content=minutes.content,
+        status=minutes.status,
+        issued_at=minutes.issued_at,
+    )
+    pdf_bytes = await asyncio.to_thread(build_minutes_pdf, meeting_snapshot, minutes_snapshot, proj_name)
 
     number = str(content.get("meeting_number") or meeting.meeting_number or "").strip()
     title = str(content.get("title") or meeting.title or "").strip()
@@ -295,7 +309,7 @@ class RecordPublishingService:
         source = _RECORD_SOURCES.get(req.source_kind)
         if source is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unsupported record kind '{req.source_kind}'",
             )
 
@@ -309,7 +323,7 @@ class RecordPublishingService:
         recipients = await self._collect_recipients(req, user_id)
         if not recipients:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="At least one recipient is required to publish and distribute a record",
             )
 

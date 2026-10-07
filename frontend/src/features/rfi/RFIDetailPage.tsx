@@ -17,6 +17,7 @@ import { useState, useMemo, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import clsx from 'clsx';
 import {
   AlertTriangle,
@@ -26,6 +27,7 @@ import {
   CheckCircle2,
   Clock,
   ExternalLink,
+  FileDown,
   FileText,
   History,
   Loader2,
@@ -51,6 +53,7 @@ import { apiGet, type Page } from '@/shared/lib/api';
 import { useAuthStore } from '@/stores/useAuthStore';
 import {
   closeRFI,
+  downloadRFIPdf,
   fetchRFIActivity,
   getRFI,
   respondToRFI,
@@ -69,7 +72,12 @@ import {
   type RFIFormData,
 } from './RFIPage';
 import { ApprovalInstanceCard } from '@/features/approval-routes';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import {
+  COMPANY_PROFILE_KEY,
+  getCompanyProfile,
+  hasLetterhead,
+} from '@/features/settings/companyProfile';
+import { fmtDate, getIntlLocale } from '@/shared/lib/formatters';
 
 // English fallbacks for the computed `rfi.status_*` keys. The default used to be
 // the raw value, so until the key lands in a locale the screen shows the bare
@@ -145,17 +153,12 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
+/** Format a date value. Delegates to the shared ``fmtDate`` which pins
+ *  date-only strings (``YYYY-MM-DD``) to UTC so they don't shift across
+ *  timezones (OC-18). */
 function formatDate(value: string | null | undefined): string {
   if (!value) return '—';
-  try {
-    return new Date(value).toLocaleDateString(getIntlLocale(), {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
-  } catch {
-    return '—';
-  }
+  return fmtDate(value);
 }
 
 function formatDateTime(value: string | null | undefined): string {
@@ -274,14 +277,17 @@ export function RFIDetailPage() {
     queryKey: ['rfi', rfiId],
     queryFn: () => getRFI(rfiId as string),
     enabled: !!rfiId,
+    refetchOnWindowFocus: true,
   });
 
   // Lookup users so we can resolve raised_by / assigned_to / ball_in_court
   // to display names where possible. Falls back to the raw id when unknown.
+  const canListUsers = useHasPermission('users.list');
   const { data: users = [] } = useQuery({
     queryKey: ['users-search'],
     queryFn: () => apiGet<UserResult[]>('/v1/users/?limit=100&is_active=true'),
     staleTime: 60_000,
+    enabled: canListUsers,
   });
 
   // Activity journal (item #13) — the RFI's lifecycle history from
@@ -292,6 +298,7 @@ export function RFIDetailPage() {
     queryFn: () => fetchRFIActivity(rfiId as string),
     enabled: !!rfiId,
     staleTime: 30_000,
+    refetchOnWindowFocus: true,
   });
   // The journal comes back oldest first and the endpoint caps `limit` at 100,
   // so on a long-running RFI the entries this page does NOT have are the most
@@ -312,6 +319,20 @@ export function RFIDetailPage() {
     staleTime: 5 * 60_000,
   });
   const projectCurrency = (project?.currency || '').trim().toUpperCase();
+
+  // Some firms may not send an RFI without their letterhead, so the export
+  // offers a way to add one while none is set. Only to an admin, who is the
+  // one who can set it, and never once it exists: a failed or pending read
+  // leaves `data` undefined and the hint stays away.
+  const userRole = useAuthStore((s) => s.userRole);
+  const isAdmin = userRole === 'admin' || userRole === 'superuser' || userRole === 'owner';
+  const { data: companyProfile } = useQuery({
+    queryKey: COMPANY_PROFILE_KEY,
+    queryFn: getCompanyProfile,
+    enabled: isAdmin,
+    staleTime: 5 * 60_000,
+  });
+  const letterheadMissing = isAdmin && companyProfile !== undefined && !hasLetterhead(companyProfile);
 
   // Resolve linked_drawing_ids to filenames. One GET per attached id is
   // acceptable today — RFIs typically reference a handful of drawings.
@@ -463,6 +484,18 @@ export function RFIDetailPage() {
       }),
   });
 
+  // The printable RFI form. The server renders it in the reader's language
+  // and names the file after the RFI number; any status can be printed.
+  const pdfMut = useMutation({
+    mutationFn: () => downloadRFIPdf(rfiId as string, rfi?.rfi_number ?? ''),
+    onError: (e: Error) =>
+      addToast({
+        type: 'error',
+        title: t('common.export_failed', { defaultValue: 'Export failed' }),
+        message: e.message,
+      }),
+  });
+
   const { confirm, ...confirmProps } = useConfirm();
 
   const handleClose = useCallback(async () => {
@@ -530,11 +563,13 @@ export function RFIDetailPage() {
   const statusCfg = STATUS_CONFIG[rfi.status] ?? STATUS_CONFIG.draft;
   const isOverdue =
     rfi.is_overdue ??
-    !!(
-      rfi.response_due_date &&
-      rfi.status === 'open' &&
-      new Date(rfi.response_due_date) < new Date()
-    );
+    (() => {
+      if (!rfi.response_due_date || rfi.status !== 'open') return false;
+      // OC-18: compare as calendar dates, not timestamps, so a date-only
+      // string like "2026-10-01" is not shifted by the local timezone.
+      const d = new Date(rfi.response_due_date + 'T23:59:59Z');
+      return d < new Date();
+    })();
   // Compute ball-in-court side relative to the viewer so the hero shows
   // a "With you / With them / Answered / Closed" pill — matches the row
   // chip on the list page, helping the operator instantly know whether
@@ -646,6 +681,31 @@ export function RFIDetailPage() {
             >
               {t('rfi.action_edit', { defaultValue: 'Edit' })}
             </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => pdfMut.mutate()}
+            disabled={pdfMut.isPending}
+            data-testid="rfi-export-pdf"
+            icon={
+              pdfMut.isPending ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <FileDown size={14} />
+              )
+            }
+          >
+            {t('rfi.export_pdf', { defaultValue: 'Export PDF' })}
+          </Button>
+          {letterheadMissing && (
+            <Link
+              to="/settings?tab=company"
+              className="text-xs text-content-tertiary hover:text-oe-blue hover:underline"
+              data-testid="rfi-letterhead-hint"
+            >
+              {t('rfi.letterhead_hint', { defaultValue: 'Add your company letterhead' })}
+            </Link>
           )}
           {rfi.status === 'draft' && (
             <Button

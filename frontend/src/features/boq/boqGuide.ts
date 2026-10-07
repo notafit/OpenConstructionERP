@@ -7,7 +7,9 @@ import type { ModuleGuideContent } from '@/shared/ui';
  *
  * Consumed by <ModuleGuideButton content={boqGuide} /> in BOQEditorPage.
  * Every string is inline-defaulted and read via t(key, { defaultValue }),
- * so these keys deliberately live nowhere in en.ts or any locale file.
+ * so the keys are not in en.ts, the inline defaults are the English source;
+ * their translations live in the other locale files, so a changed default
+ * needs its translations redone too.
  *
  * Spotlight selectors reuse the same stable data-testid hooks the
  * ProductTour relies on, so the highlight survives Tailwind churn and

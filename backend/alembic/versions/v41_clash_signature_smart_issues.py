@@ -23,9 +23,19 @@ Also extends:
   default 500 mm) so a coordinator can dial the precision per run.
 
 Idempotent — every table/column/index op is inspector-guarded so a
-re-run on a partially-migrated DB skips already-present objects. Safe
-on both the SQLite dev DB (``GUID()`` impls as ``VARCHAR(36)``) and the
-Postgres prod DB (native ``UUID``).
+re-run on a partially-migrated DB skips already-present objects.
+
+Identity columns are ``VARCHAR(36)`` on every dialect, PostgreSQL
+included, because that is what ``GUID`` in ``app.database`` renders to
+and so what ``Base.metadata.create_all`` builds. This file used to
+declare native ``UUID`` on PostgreSQL, which made ``oe_clash_issue``
+point a ``uuid`` at ``oe_projects_project.id`` and ``oe_clash_run.id``,
+both ``character varying``, and PostgreSQL refused the first foreign
+key it reached::
+
+    fk_oe_clash_issue_project_id_oe_projects_project cannot be implemented
+    DETAIL: Key columns "project_id" and "id" are of incompatible types:
+            uuid and character varying.
 
 Revision ID: v41_clash_signature_smart_issues
 Revises: v40_fieldreports_uuid_typing
@@ -38,6 +48,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy import exc as sa_exc
 
 # revision identifiers, used by Alembic.
 revision: str = "v41_clash_signature_smart_issues"
@@ -45,6 +56,13 @@ down_revision: Union[str, Sequence[str], None] = "v40_fieldreports_uuid_typing"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
+# The identity type the models use. ``GUID`` in ``app.database`` is a
+# ``TypeDecorator`` whose ``impl`` is ``String(36)`` and which defines no
+# ``load_dialect_impl``, so it renders as ``VARCHAR(36)`` on every dialect.
+# Spelling the width out rather than importing ``GUID`` keeps this revision
+# importable without the app settings.
+_GUID = sa.String(36)
 
 _ISSUE_TABLE = "oe_clash_issue"
 _SUPPRESSION_TABLE = "oe_clash_suppression"
@@ -66,23 +84,35 @@ def _existing_index_names(
     inspector: sa.engine.reflection.Inspector,
     table: str,
 ) -> set[str]:
+    """Return the names of the indexes on ``table``.
+
+    Args:
+        inspector: Reflection handle bound to the migration's connection.
+        table: Table to inspect; an absent table yields an empty set.
+
+    Returns:
+        Every index name reflected for ``table``. ``ReflectedIndex.name`` is
+        ``Optional[str]`` because a dialect may report an index it cannot
+        name; those are dropped rather than carried through as ``None``,
+        since every caller uses this set for a membership test against a
+        name it is about to create or drop, and an unnamed index can never
+        match one.
+    """
     if not _has_table(inspector, table):
         return set()
-    return {ix["name"] for ix in inspector.get_indexes(table)}
+    return {name for ix in inspector.get_indexes(table) if (name := ix["name"]) is not None}
 
 
 def upgrade() -> None:
     """Create smart-issue tables + extend result/run with signature columns."""
     bind = op.get_bind()
-    is_sqlite = bind.dialect.name == "sqlite"
-    guid_type = sa.String(36) if is_sqlite else sa.dialects.postgresql.UUID(as_uuid=True)
     inspector = sa.inspect(bind)
 
     # ── oe_clash_issue ──
     if not _has_table(inspector, _ISSUE_TABLE):
         op.create_table(
             _ISSUE_TABLE,
-            sa.Column("id", guid_type, primary_key=True),
+            sa.Column("id", _GUID, primary_key=True),
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
@@ -95,7 +125,7 @@ def upgrade() -> None:
                 server_default=sa.text("CURRENT_TIMESTAMP"),
                 nullable=False,
             ),
-            sa.Column("project_id", guid_type, nullable=False),
+            sa.Column("project_id", _GUID, nullable=False),
             sa.Column("signature_hash", sa.String(40), nullable=False),
             sa.Column(
                 "status",
@@ -103,16 +133,16 @@ def upgrade() -> None:
                 nullable=False,
                 server_default="new",
             ),
-            sa.Column("first_seen_run_id", guid_type, nullable=False),
-            sa.Column("last_seen_run_id", guid_type, nullable=False),
-            sa.Column("resolved_run_id", guid_type, nullable=True),
+            sa.Column("first_seen_run_id", _GUID, nullable=False),
+            sa.Column("last_seen_run_id", _GUID, nullable=False),
+            sa.Column("resolved_run_id", _GUID, nullable=True),
             sa.Column(
                 "missing_run_count",
                 sa.Integer(),
                 nullable=False,
                 server_default="0",
             ),
-            sa.Column("assignee_id", guid_type, nullable=True),
+            sa.Column("assignee_id", _GUID, nullable=True),
             sa.Column("due_date", sa.Date(), nullable=True),
             sa.Column(
                 "priority",
@@ -181,14 +211,14 @@ def upgrade() -> None:
             if ix_name not in existing_ix:
                 try:
                     op.create_index(ix_name, _ISSUE_TABLE, cols)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
 
     # ── oe_clash_suppression ──
     if not _has_table(inspector, _SUPPRESSION_TABLE):
         op.create_table(
             _SUPPRESSION_TABLE,
-            sa.Column("id", guid_type, primary_key=True),
+            sa.Column("id", _GUID, primary_key=True),
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
@@ -201,7 +231,7 @@ def upgrade() -> None:
                 server_default=sa.text("CURRENT_TIMESTAMP"),
                 nullable=False,
             ),
-            sa.Column("project_id", guid_type, nullable=False),
+            sa.Column("project_id", _GUID, nullable=False),
             sa.Column("signature_hash", sa.String(40), nullable=False),
             sa.Column(
                 "reason",
@@ -209,7 +239,7 @@ def upgrade() -> None:
                 nullable=False,
                 server_default="",
             ),
-            sa.Column("suppressed_by_user_id", guid_type, nullable=True),
+            sa.Column("suppressed_by_user_id", _GUID, nullable=True),
             sa.ForeignKeyConstraint(
                 ["project_id"],
                 ["oe_projects_project.id"],
@@ -232,7 +262,7 @@ def upgrade() -> None:
             if ix_name not in existing_ix:
                 try:
                     op.create_index(ix_name, _SUPPRESSION_TABLE, cols)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
 
     # ── oe_clash_run.spatial_grid_mm ──
@@ -266,7 +296,7 @@ def upgrade() -> None:
             new_cols.append(
                 (
                     "issue_id",
-                    sa.Column("issue_id", guid_type, nullable=True),
+                    sa.Column("issue_id", _GUID, nullable=True),
                 )
             )
         if not _has_column(inspector, _RESULT_TABLE, "signature_quality"):
@@ -310,7 +340,7 @@ def upgrade() -> None:
             if ix_name not in existing_ix:
                 try:
                     op.create_index(ix_name, _RESULT_TABLE, cols)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
 
 
@@ -326,7 +356,7 @@ def downgrade() -> None:
             if ix in existing_ix:
                 try:
                     op.drop_index(ix, table_name=_RESULT_TABLE)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
         with op.batch_alter_table(_RESULT_TABLE) as batch:
             for col in (
@@ -338,7 +368,7 @@ def downgrade() -> None:
                 if _has_column(inspector, _RESULT_TABLE, col):
                     try:
                         batch.drop_column(col)
-                    except sa.exc.OperationalError:
+                    except sa_exc.OperationalError:
                         pass
 
     # ── Drop run.spatial_grid_mm ──
@@ -346,7 +376,7 @@ def downgrade() -> None:
         with op.batch_alter_table(_RUN_TABLE) as batch:
             try:
                 batch.drop_column("spatial_grid_mm")
-            except sa.exc.OperationalError:
+            except sa_exc.OperationalError:
                 pass
 
     # ── Drop the new tables ──
@@ -359,7 +389,7 @@ def downgrade() -> None:
             if ix in existing_ix:
                 try:
                     op.drop_index(ix, table_name=_SUPPRESSION_TABLE)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
         op.drop_table(_SUPPRESSION_TABLE)
 
@@ -373,6 +403,6 @@ def downgrade() -> None:
             if ix in existing_ix:
                 try:
                     op.drop_index(ix, table_name=_ISSUE_TABLE)
-                except sa.exc.OperationalError:
+                except sa_exc.OperationalError:
                     pass
         op.drop_table(_ISSUE_TABLE)

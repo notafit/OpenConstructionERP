@@ -1,27 +1,21 @@
 # DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 # Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-"""``property_dev.owner_scoped_delete`` is only safe next to an owner check.
+"""Owner-scoped permissions are only safe next to an owner check.
 
-The module has two delete permissions on purpose. ``property_dev.delete``
-maps to MANAGER and is the only wall on the routes that carry it.
-``property_dev.owner_scoped_delete`` maps to EDITOR, which is deliberately
-low, because on those routes the real wall is the strict ownership check in
-the handler body: only ``project.owner_id`` passes it, the global admin
-role included.
+The module has permissions that map to EDITOR on the assumption that every
+route carrying them also calls a ``_verify_owner_via_*`` helper. Without that
+helper, EDITOR-level RBAC is an open door: anyone with EDITOR can hit the
+endpoint and there is nothing else stopping them. The ownership check IS the
+security gate; the low RBAC level just makes sure the project owner can
+actually reach it.
 
-That makes the low level safe today and dangerous tomorrow. The first route
-that picks up ``owner_scoped_delete`` without also calling a
-``_verify_owner_via_*`` helper is a hole any editor in the system can walk
-through, and nothing else in the tree would notice. It would not look like
-a bug: the request would arrive, pass its permission check, and be served.
-No 500, no traceback, no failing test, just a delete that should not have
-been allowed. Review would have to spot an ABSENT line, which is the thing
-review is worst at.
+This test enforces the pairing at the source level (AST walk) so that a
+route that picks up an owner-scoped permission without calling a helper is
+caught before it ships. A missing call has no observable behaviour until
+somebody actually exploits it.
 
-So the pairing is enforced here rather than trusted. This is a source-level
-invariant, not a behavioural test, because the defect it guards against is
-a missing call - and a missing call has no behaviour to observe until
-somebody exercises that one route with the wrong account.
+Originally this covered only ``owner_scoped_delete``. After the R6/R8 dead-
+route fix it covers every permission whose safety depends on ownership.
 """
 
 import ast
@@ -29,7 +23,35 @@ from pathlib import Path
 
 ROUTER = Path(__file__).resolve().parents[3] / "app" / "modules" / "property_dev" / "router.py"
 
-OWNER_SCOPED = "property_dev.owner_scoped_delete"
+# Every permission in this set MUST appear alongside a _verify_owner_via_*
+# call in every route that uses it. If you add a new owner-scoped permission,
+# add it here; the floor assertion will tell you if you forget.
+OWNER_SCOPED_PERMISSIONS: set[str] = {
+    "property_dev.owner_scoped_delete",
+    "property_dev.owner_scoped_reservation_expire",
+    "property_dev.owner_scoped_instalment_waive",
+    # Permissions lowered to EDITOR because ALL their routes have owner
+    # checks. If any route is ever added without a helper, it must either
+    # get the helper or be moved to a new MANAGER permission.
+    "property_dev.contract_buyer",
+    "property_dev.lock_selection",
+    "property_dev.handover",
+    "property_dev.reservation.cancel",
+    "property_dev.spa.send",
+    "property_dev.spa.sign",
+    "property_dev.spa.cancel",
+    "property_dev.payment_schedule.activate",
+    "property_dev.payment_schedule.suspend",
+    "property_dev.contract_party.update_ownership",
+    "property_dev.contract_party.remove",
+    "property_dev.lead.delete",
+    "property_dev.lead.convert",
+    "property_dev.price_matrix.activate",
+    "property_dev.price_matrix.bulk_recompute",
+    "property_dev.regulator_report.generate",
+    "property_dev.escrow.reconcile",
+}
+
 OWNER_HELPER_PREFIX = "_verify_owner_via"
 
 
@@ -59,33 +81,42 @@ def _calls_an_owner_helper(fn: ast.AST) -> bool:
     )
 
 
-def _owner_scoped_routes() -> list[tuple[int, str, bool]]:
+def _owner_scoped_routes() -> list[tuple[int, str, str, bool]]:
+    """Return (line, func_name, permission, has_owner_check) for every route
+    gated by one of the owner-scoped permissions."""
     tree = ast.parse(ROUTER.read_text(encoding="utf-8"))
     out = []
     for fn in ast.walk(tree):
-        if isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef) and _permission_of(fn) == OWNER_SCOPED:
-            out.append((fn.lineno, fn.name, _calls_an_owner_helper(fn)))
+        if not isinstance(fn, ast.AsyncFunctionDef | ast.FunctionDef):
+            continue
+        perm = _permission_of(fn)
+        if perm in OWNER_SCOPED_PERMISSIONS:
+            out.append((fn.lineno, fn.name, perm, _calls_an_owner_helper(fn)))
     return sorted(out)
 
 
-def test_owner_scoped_delete_always_sits_behind_an_owner_check() -> None:
+def test_owner_scoped_permissions_always_sit_behind_an_owner_check() -> None:
     routes = _owner_scoped_routes()
 
-    # Floor. Without it this passes triumphantly over an empty set the day
-    # the permission is renamed or the routes are restructured, which is
-    # exactly when the invariant stops being checked and nobody is told.
-    assert routes, (
-        f"no route is gated by {OWNER_SCOPED!r} any more. Either the permission was renamed "
-        f"and this gate was left pointing at the old name, or the routes were restructured. "
-        f"Either way the pairing is no longer being enforced - fix the gate, do not delete it."
+    # Floor: at least one route must exist per permission. Without this the
+    # test passes triumphantly over a renamed permission.
+    found_permissions = {perm for _, _, perm, _ in routes}
+    missing = OWNER_SCOPED_PERMISSIONS - found_permissions
+    assert not missing, (
+        f"{len(missing)} owner-scoped permission(s) have zero routes in router.py: "
+        + ", ".join(sorted(missing))
+        + ". Either the permission was renamed and the set here was left pointing at the old "
+        "name, or the routes were restructured. Fix this set, do not delete the gate."
     )
 
-    unguarded = [(line, name) for line, name, guarded in routes if not guarded]
+    # Main invariant: every route carrying an owner-scoped permission must
+    # call a _verify_owner_via_* helper.
+    unguarded = [(line, name, perm) for line, name, perm, guarded in routes if not guarded]
     assert not unguarded, (
-        f"{len(unguarded)} of {len(routes)} routes carry {OWNER_SCOPED!r} without calling a "
+        f"{len(unguarded)} of {len(routes)} owner-scoped routes lack a "
         f"{OWNER_HELPER_PREFIX}* helper: "
-        + ", ".join(f"{name} (router.py:{line})" for line, name in unguarded)
-        + ". That permission maps to EDITOR and is only safe because ownership is checked in "
-        "the handler body. Without the helper any editor can delete another tenant's record. "
-        "Add the owner check, or move the route back to 'property_dev.delete' (MANAGER)."
+        + ", ".join(f"{name} [{perm}] (router.py:{line})" for line, name, perm in unguarded)
+        + ". These permissions map to EDITOR and are only safe because ownership is checked "
+        "in the handler body. Without the helper any editor can hit the endpoint. "
+        "Add the owner check, or move the route to a MANAGER-level permission."
     )

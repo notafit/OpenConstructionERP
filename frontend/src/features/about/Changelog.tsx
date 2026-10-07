@@ -34,6 +34,33 @@ interface ChangelogEntry {
   tag?: Tag;
 }
 
+/**
+ * Work that has landed since the newest release and has not shipped yet. It
+ * mirrors the `## [Unreleased]` section of the repo-root CHANGELOG.md, and
+ * `scripts/check_changelog_mirror.py` fails when one of the two carries an
+ * unreleased section and the other does not. Set it back to `null` when the
+ * section is folded into a release.
+ *
+ * It is deliberately NOT a member of the CHANGELOG array below, because
+ * everything in that array is treated as a release: `getRecentReleases` feeds
+ * the /about header and the inside page, the count in this component's own
+ * header reads "N releases", and the sort is semver-aware and would file a
+ * non-numeric version last rather than first. An entry here is none of those
+ * things, so it rides above the list instead of inside it.
+ *
+ * `version` is a label rather than a number on purpose: the release gate reads
+ * the first dotted-numeric version literal in this file as the version the app
+ * claims to be, so anything numeric-looking here would be read as a release
+ * that nothing else in the tree has been bumped to.
+ */
+const UNRELEASED: ChangelogEntry | null = {
+  version: 'Unreleased',
+  date: '2026-09-30',
+  tag: 'FIX',
+  summary:
+    'Demo data stays in demo projects, and a deleted demo stays deleted through restarts and upgrades, including on installs that removed their demos before this version. Settings can now find the demo records an older version left in your own projects and remove them after you confirm; on a server, demo-cleanup does the same.',
+};
+
 // Sorted newest to oldest. Sort is enforced at runtime below (semver-aware) so
 // out-of-order entries here still display correctly.
 //
@@ -45,6 +72,97 @@ interface ChangelogEntry {
 // The entries from 15.3.0 up read at the new length; the older ones below still
 // carry the long form and are left alone as the record of what shipped.
 const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: '18.4.0',
+    date: '2026-10-04',
+    tag: 'NEW',
+    summary:
+      'A trade package goes from the drawing to the subcontractor and back: a wall measured on the plan keeps its openings and becomes a bill position, the bill goes out as Excel or GAEB X83 without prices, each firm types its prices through a personal link without an account, and the price comparison exports to Excel with missing prices flagged rather than read as zero. Cost control gets a quantity check of measured against contract quantities with the cost of each difference. Records lead to each other from RFIs and NCRs to change orders, budgets and purchase orders, contracts start from their country\'s payment terms, Germany gets GAEB X31 and X89, the United Kingdom an NRM 1 cost plan and Russia the resource-index method.',
+  },
+  {
+    version: '18.3.0',
+    date: '2026-10-02',
+    tag: 'NEW',
+    summary:
+      'The 4D schedule saves the assignee, files a new activity inside its section with the next WBS code, and reopens a collapsed section; tasks take their assignee from contacts. Deleted projects stay out of every list and analytics view, and demo data stays in demo projects through restarts and upgrades. Every country pack now validates with its own rules, switches to its own language and imports bills in its own number format, Excel 97-2003 included. Ctrl+click no longer asks you to sign in again, images and maps load with your session, and video covers no longer go blank until a hard reload.',
+  },
+  {
+    version: '18.2.0',
+    date: '2026-09-29',
+    tag: 'NEW',
+    summary:
+      'The position copilot now only suggests: each change shows before and after with a confidence score and waits for Accept or Reject, and a locked bill refuses every write, imports included. Approved change orders can be added to the schedule of values one by one or marked as already counted, finished records stay steady, a Hungarian budget imports with its split rates and totals, deactivated users get no mail, big exports no longer stall the server, and the desktop app checks for a new version once a day.',
+  },
+  {
+    version: '18.1.0',
+    date: '2026-09-28',
+    tag: 'NEW',
+    summary:
+      'Croatia, Romania, Greece and Ukraine join with their own VAT, validation, contract rules and defaults, and a Croatian troškovnik imports in its own language with its total, tax and recap lines left out. The money follows one path: a purchase order, contract, subcontract, invoice and payment each count once in committed, invoiced and paid, Mark Paid records the payment, and every dashboard and the budget table read the same number. Subcontracts are drawn up, signed and billed from their own page and flagged when they look like an unlinked contract, tenders can go out by section and award to the real firm, and a punch item or NCR can be charged back. A new Learn section at the top of the menu holds Video guides and Use cases: 34 OpenConstruction Academy lessons from YouTube, filtered by role, country and stage, with chapters, moments and a coverage map. It folds into a top bar icon when hidden, and the Start here card on the dashboard now shows video guides above the use cases. The bill total matches the grid, a large cost database load ends with what really happened, dates stay on the day they were entered, the session token leaves WebSocket URLs, and in-app updates are off unless switched on.',
+  },
+  {
+    version: '18.0.0',
+    date: '2026-09-24',
+    tag: 'MILESTONE',
+    summary:
+      'The AI assistant now prepares changes to BOQ positions, tasks, RFIs, risks, punch items and schedule progress that a person reviews, applies, edits or undoes, and it sits beside the page with a Changes tab listing every proposal. The map inside a project opens on streets and buildings again, and onboarding asks what the company does instead of how big the team is. A payment certificate now adds up when a claim bills money that no schedule of values line carries, a contract retains at the ladder of its country from the day it is signed, and a German exemption certificate is read on the day of payment. Bills, bids, RFQs, purchase orders, invoices, subcontracts, variations and property sales keep their figures once they are approved, sent, paid or decided, and each refusal says what to do instead. The estimates list loads in one request and names a project it cannot read instead of dropping it from the totals, project pickers no longer stop at 50, heavy exports no longer stall the server, and the macOS installer is marked as Apple Silicon only.',
+  },
+  {
+    version: '17.8.3',
+    date: '2026-09-23',
+    tag: 'NEW',
+    summary:
+      'A general contractor can bill a job month by month and get paid for it. A payment application covers its own period, is checked before it goes out, and can pull in approved subcontractor claims instead of being retyped. Retention can be released: the contract shows what is held, what has gone back and what is free, sized by the rules of the project country, approved only with the documents that event needs, and billed on a claim so the owner actually pays it. The G702 and G703 form is right in five places it was wrong, retainage now prints on completed work and stored material separately, and the statutory payment clocks for the United States run on the sum that had to be paid. A contract typed in by hand can be billed, a schedule of values can be corrected while the contract is a draft, a spreadsheet exported with your letterhead can be imported back, and one oversized logo no longer costs a document minutes and gigabytes.',
+  },
+  {
+    version: '17.8.2',
+    date: '2026-09-22',
+    tag: 'NEW',
+    summary:
+      'Formal documents print on your company letterhead: set a document logo, legal name and address once in Settings, Company & documents, and the RFI, G702 and G703, closeout cover, punch list, transmittal, meeting minutes, daily diary, tender letters and the bill of quantities cover carry it. The punch list gets an Export PDF button, the G703 fits the page, contract, finance and subcontractor tabs can be linked to, and funding checks answer in your language.',
+  },
+  {
+    version: '17.8.1',
+    date: '2026-09-22',
+    tag: 'FIX',
+    summary:
+      'The How it works guide on every module page now reads in your language, and the field app bottom tabs are translated too. The field issue screen says report a problem in sixteen languages that had translated it word by word, and a few strings got their accents back.',
+  },
+  {
+    version: '17.8.0',
+    date: '2026-09-21',
+    tag: 'NEW',
+    summary:
+      'An approved change order counts once in the project budget again, and one with no cost impact can be approved. An RFI prints as a PDF form in every left-to-right language, the desktop app has a text size setting, and the bill editor no longer freezes on price entry or drops the first digit typed. Large bills open faster, a unit rate built from resources is protected from paste and fill down, and funding obligations read in the user\'s language.',
+  },
+  {
+    version: '17.7.1',
+    date: '2026-09-17',
+    tag: 'FIX',
+    summary:
+      'Faster tab switching: 2-minute cache window, no redundant refetches on window focus. Hover-intent preloading warms 115 sidebar page chunks before you click. Collaborative queries (approvals, RFI, tasks, punch list, contracts, variations) keep live refresh. Schedule rollup recurses ancestors, portfolio tree shows project names.',
+  },
+  {
+    version: '17.7.0',
+    date: '2026-09-16',
+    tag: 'NEW',
+    summary:
+      'Cost database compare panel, page size selector and bulk actions. BOQ PDF export localized to 8 languages with Letter size for US/CA, 20+ currency formats, country-specific tax labels. Classification picker adds MasterFormat, SINAPI and GB50500. Markup templates expanded to 42 regions. Review workflow, position-scoped markups, GAEB X84 inline export.',
+  },
+  {
+    version: '17.6.0',
+    date: '2026-09-15',
+    tag: 'NEW',
+    summary:
+      'Ten country packs fleshed out with national pricing methodologies, demo projects and BIM bundles. NL/SfB standard wired end-to-end, seven unresolvable standards removed from the picker, e-invoice Content-Language header, and 72 explainer i18n keys across all locales.',
+  },
+  {
+    version: '17.5.0',
+    date: '2026-09-12',
+    tag: 'NEW',
+    summary:
+      'Twelve platform improvements from the Landshut review. Country code wired into project creation, estimate basis shows "Not yet estimated" for empty bills, conditions generated in the project language (13 locales), bulk check/uncheck for template conditions, save indicator, budget target alongside the estimate, location precision on geocoded addresses, persistent notification dismiss, document reference on variations, linked review tasks on assumptions, and standalone CO overlap warning.',
+  },
   {
     version: '17.4.1',
     date: '2026-09-11',
@@ -894,11 +1012,19 @@ export function Changelog({ maxEntries }: { maxEntries?: number } = {}) {
   // When collapsed (maxEntries set) we render only the newest few cards but
   // still report the full release count so the "Show full changelog" toggle
   // reads as an invitation rather than the whole list.
-  const entries =
+  const releases =
     typeof maxEntries === 'number' ? sorted.slice(0, Math.max(0, maxEntries)) : sorted;
+  // The unreleased card rides above the releases rather than among them, so it
+  // is prepended after the slice: maxEntries counts releases, and a collapsed
+  // list that dropped the newest work to honour a count of one would be hiding
+  // exactly what the reader opened the section for.
+  const entries = UNRELEASED ? [UNRELEASED, ...releases] : releases;
   // Latest 7 versions get visible tag chips; older ones drop the tag to keep
   // the card list calm. The tag is still encoded in the data, just not shown.
+  // The window counts releases, so the unreleased card widens it by one rather
+  // than pushing the seventh release out of it.
   const FRESH_TAG_COUNT = 7;
+  const tagWindow = FRESH_TAG_COUNT + (UNRELEASED ? 1 : 0);
 
   const tagLabel = (tag: Tag): string => {
     switch (tag) {
@@ -932,9 +1058,19 @@ export function Changelog({ maxEntries }: { maxEntries?: number } = {}) {
       */}
       <div className="columns-1 md:columns-2 gap-4 [column-fill:_balance]">
         {entries.map((entry, idx) => {
+          const isUnreleased = entry === UNRELEASED;
           const isCurrent = entry.version === APP_VERSION;
-          const stale = !isCurrent && isStale(entry.date);
-          const showTag = entry.tag && idx < FRESH_TAG_COUNT;
+          // Unreleased work never fades. Its date says when the section was
+          // last added to, and a section that waits months for a release slot
+          // would otherwise render the newest thing on the page as the most
+          // stale thing on it.
+          const stale = !isCurrent && !isUnreleased && isStale(entry.date);
+          const showTag = entry.tag && idx < tagWindow;
+          // Releases are stamped `v17.7.1`; the unreleased card carries a word
+          // where the number goes, so it would otherwise read "vUnreleased".
+          let versionVariant: 'success' | 'neutral' | 'blue' = 'blue';
+          if (isCurrent) versionVariant = 'success';
+          else if (isUnreleased) versionVariant = 'neutral';
           return (
             <article
               key={`${entry.version}-${entry.date}`}
@@ -948,8 +1084,8 @@ export function Changelog({ maxEntries }: { maxEntries?: number } = {}) {
               ].join(' ')}
             >
               <div className="flex items-center gap-2 flex-wrap">
-                <Badge variant={isCurrent ? 'success' : 'blue'} size="sm">
-                  v{entry.version}
+                <Badge variant={versionVariant} size="sm">
+                  {isUnreleased ? entry.version : `v${entry.version}`}
                 </Badge>
                 <span className={`font-mono text-2xs tabular-nums ${stale ? 'text-content-quaternary' : 'text-content-tertiary'}`}>
                   {entry.date}

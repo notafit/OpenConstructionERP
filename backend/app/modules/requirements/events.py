@@ -109,7 +109,7 @@ async def _on_requirement_deleted(event: Event) -> None:
     await _delete_requirement_vector(event)
 
 
-event_bus.subscribe("requirements.requirement.created", _on_requirement_created)
-event_bus.subscribe("requirements.requirement.updated", _on_requirement_updated)
-event_bus.subscribe("requirements.requirement.deleted", _on_requirement_deleted)
-event_bus.subscribe("requirements.requirement.linked_bim", _on_requirement_linked_bim)
+event_bus.subscribe_once("requirements.requirement.created", _on_requirement_created)
+event_bus.subscribe_once("requirements.requirement.updated", _on_requirement_updated)
+event_bus.subscribe_once("requirements.requirement.deleted", _on_requirement_deleted)
+event_bus.subscribe_once("requirements.requirement.linked_bim", _on_requirement_linked_bim)

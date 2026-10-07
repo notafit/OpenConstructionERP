@@ -26,9 +26,9 @@ any revision (``oe_users_user``, ``oe_assemblies_component``,
 only in ``Base.metadata``. A walk from base dies within a handful of
 revisions on ``no such table``. Even with the tables supplied it stops
 again on a type conflict, because ``create_all`` renders identity
-columns as ``varchar(36)`` while 53 revisions declare native
+columns as ``varchar(36)`` while 50 revisions declare native
 ``postgresql.UUID``, and the foreign key between them is rejected.
-``tests/unit/test_migration_uuid_convention.py`` freezes that set so it
+``tests/pg/test_migration_uuid_convention.py`` freezes that set so it
 stops growing.
 
 Making the chain walkable was measured and deliberately not done. The
@@ -77,11 +77,41 @@ back.
 # Tables only the migrations create, absent from Base.metadata and so absent
 # from every create_all install:
 #   oe_tender_addendum    (v3085_tendering_addendum_leveling)
-#   oe_translation_cache  (v280_translation_cache)
 #
-# Columns only the migrations add, absent from create_all:
+# ``oe_translation_cache`` (v280_translation_cache) was listed here too and is
+# not a divergence. What this file can see is not the whole metadata: asked on
+# 2026-09-23 with only ``app.modules.*.models`` imported, the way the loop
+# below imports them, the registry holds 636 tables and the cache is not among
+# them - which is exactly why it read as missing. Import ``app.main`` and call
+# ``create_app()`` and the registry holds 638 and it is there, because
+# ``app/core/translation/cache.py`` declares the table ON ``Base.metadata``
+# and ``create_app`` pulls that module in with the translation router. Two
+# import sets build the schema and they differ: the serve path goes through
+# ``create_app`` and does create the table, while ``init-db`` in ``app/cli.py``
+# imports the module models plus audit, audit_log and data_repairs only, so on
+# that path the table waits for the first serve or for the module's own lazy
+# ``create(checkfirst=True)``. Measure a table's absence under the import set
+# that builds the schema, and say which one, rather than under this one.
+#
+# Columns only the migrations add, absent from create_all under both of the
+# import sets above:
 #   oe_boq_boq.tax_rate            oe_projects_project.unit_system
 #   oe_tendering_bid.leveled_amount    oe_tendering_bid.leveling_notes
+#
+# "Latent" above means no code reads them, and that holds: the ORM cannot
+# reference a column that is not on a model, and no raw SQL in ``app/`` names
+# one. It does not mean harmless, because a phantom column's NAME travels even
+# when its data cannot. ``BOQUnitSystemConsistencyRule`` spent its life
+# advising readers to "update the project's unit_system" - a setting on no
+# screen, in no schema and in no table on any supported install. It now names
+# what actually decides the value, the project's country through its regional
+# pack. ``tax_rate`` escaped the same way and was answered the same way at
+# ``app/modules/boq/schemas.py`` (TAX_RATE_NOT_STORED_MESSAGE).
+# ``leveled_amount`` and ``leveling_notes`` never escaped: every occurrence of
+# those names in ``app/`` belongs to the computed
+# ``tendering.BidLevelingSummary``, which is a Pydantic rollup and not the bid
+# row. So before adding a column here, ask not only whether code reads it but
+# whether anything quotes its name at a user.
 
 import importlib
 import os
@@ -226,7 +256,21 @@ def render_item(type_, obj, autogen_context):
 
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ``disable_existing_loggers`` defaults to True, and that default is wrong
+    # for anything that runs a migration inside a longer-lived process.
+    # ``fileConfig`` would set ``disabled = True`` on every logger that already
+    # exists and is not named in alembic.ini, which names only root, sqlalchemy
+    # and alembic. A disabled logger drops records in ``Logger.handle`` before
+    # any handler sees them, it stays disabled for the life of the process, and
+    # neither ``caplog.at_level`` nor setting a level puts it back.
+    #
+    # Measured on the 2026-09-22 nightly: the Windows cross-OS job ran this
+    # file at test 1530 of 38466 and then failed 83 later tests that assert on
+    # captured log output, all of them with "expected a log line, got none",
+    # spread across 43 unrelated files. macOS had none of them only because the
+    # same tests died in setup on a separate bug, so alembic never ran there.
+    # The fix is the keyword; the count is what it was worth.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

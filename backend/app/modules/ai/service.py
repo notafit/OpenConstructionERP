@@ -462,7 +462,14 @@ def _build_settings_response(settings: AISettings) -> AISettingsResponse:
     every chat/estimate call fails with a decrypt error.
     """
     from app.core.crypto import decrypt_secret
-    from app.modules.ai.ai_client import DEFAULT_MODELS
+    from app.modules.ai.ai_client import (
+        AI_TIMEOUT,
+        DEFAULT_MODELS,
+        SELF_HOSTED_PROVIDERS,
+        TOOL_CALLING_MODES,
+        default_tool_calling_mode,
+    )
+    from app.modules.ai.models import VLLM_API_KEY_META
 
     def _usable(value: Any) -> bool:
         return bool(decrypt_secret(value)) if value else False
@@ -515,6 +522,30 @@ def _build_settings_response(settings: AISettings) -> AISettingsResponse:
     has_local_provider = bool(ollama_url) or bool(vllm_url)
     ai_ready = has_cloud_key or has_local_provider
 
+    # Issue #499: per-endpoint tool calling and per-provider timeouts, read
+    # back in the shape the settings page edits, plus the defaults it shows.
+    raw_modes = meta.get("tool_calling") if _meta_is_dict else None
+    tool_calling = (
+        {p: m for p, m in raw_modes.items() if p in SELF_HOSTED_PROVIDERS and m in TOOL_CALLING_MODES}
+        if isinstance(raw_modes, dict)
+        else {}
+    )
+    raw_timeouts = meta.get("timeouts") if _meta_is_dict else None
+    timeouts = (
+        {
+            str(p): int(v)
+            for p, v in raw_timeouts.items()
+            if isinstance(v, int | float) and not isinstance(v, bool) and v > 0
+        }
+        if isinstance(raw_timeouts, dict)
+        else {}
+    )
+    from app.config import get_settings
+
+    env_timeout = get_settings().ai_timeout
+    # The ciphertext of the endpoint key lives in metadata; it never leaves.
+    public_meta = {k: v for k, v in meta.items() if k != VLLM_API_KEY_META} if _meta_is_dict else {}
+
     return AISettingsResponse(
         id=settings.id,
         user_id=settings.user_id,
@@ -536,13 +567,18 @@ def _build_settings_response(settings: AISettings) -> AISettingsResponse:
         baidu_api_key_set=_usable(getattr(settings, "baidu_api_key", None)),
         yandex_api_key_set=_usable(getattr(settings, "yandex_api_key", None)),
         gigachat_api_key_set=_usable(getattr(settings, "gigachat_api_key", None)),
+        vllm_api_key_set=_usable(getattr(settings, "vllm_api_key", None)),
         ollama_base_url=ollama_url,
         vllm_base_url=vllm_url,
+        tool_calling=tool_calling,
+        tool_calling_defaults={p: default_tool_calling_mode(p) for p in SELF_HOSTED_PROVIDERS},
+        timeouts=timeouts,
+        default_timeout_seconds=env_timeout if env_timeout is not None else AI_TIMEOUT,
         ai_ready=ai_ready,
         preferred_model=settings.preferred_model,
         model_overrides=model_overrides,
         default_models=dict(DEFAULT_MODELS),
-        metadata_=settings.metadata_ or {},
+        metadata_=public_meta,
         created_at=settings.created_at,
         updated_at=settings.updated_at,
     )
@@ -665,7 +701,7 @@ async def _match_cost_items(
     embedder / vector DB silently falls back to SQL keyword search, and any
     error yields an empty match list rather than raising.
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import case, or_, select
 
     from app.modules.costs.models import CostItem
 
@@ -698,12 +734,17 @@ async def _match_cost_items(
         if keywords:
             try:
                 conditions = [CostItem.description.ilike(f"%{kw}%") for kw in keywords]
+                # Rank in the query, before the cap. Without an order the cap
+                # kept whichever 15 rows the scan met first, so on a cost base
+                # of any size the item matching every keyword was often never
+                # scored, and which rate got applied changed from run to run.
+                hits = sum((case((cond, 1), else_=0) for cond in conditions[1:]), case((conditions[0], 1), else_=0))
 
                 async def _kw_search(use_region: bool) -> list[CostItem]:
                     stmt = select(CostItem).where(CostItem.is_active.is_(True), or_(*conditions))
                     if use_region and region:
                         stmt = stmt.where(CostItem.region == region)
-                    stmt = stmt.limit(15)
+                    stmt = stmt.order_by(hits.desc(), CostItem.code.asc()).limit(15)
                     res = await session.execute(stmt)
                     return list(res.scalars().all())
 
@@ -850,6 +891,42 @@ class AIService:
                 merged[meta_key] = trimmed or None
             return merged
 
+        def _merge_endpoint_options(current: Any) -> dict[str, Any]:
+            """Fold issue #499's options into metadata: tool modes, timeouts, endpoint key.
+
+            Each is merged per provider, so saving one leaves the others alone,
+            and an empty value removes the entry. The endpoint key is stored
+            encrypted, exactly like the key columns.
+            """
+            from app.modules.ai.models import with_vllm_api_key
+
+            merged: dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+            if data.tool_calling is not None:
+                existing = merged.get("tool_calling")
+                modes: dict[str, str] = dict(existing) if isinstance(existing, dict) else {}
+                for provider, mode in data.tool_calling.items():
+                    if mode:
+                        modes[provider] = mode
+                    else:
+                        modes.pop(provider, None)
+                merged["tool_calling"] = modes
+            if data.timeouts is not None:
+                existing = merged.get("timeouts")
+                timeouts: dict[str, int] = dict(existing) if isinstance(existing, dict) else {}
+                for provider, seconds in data.timeouts.items():
+                    if seconds:
+                        timeouts[provider] = int(seconds)
+                    else:
+                        timeouts.pop(provider, None)
+                merged["timeouts"] = timeouts
+            if data.vllm_api_key is not None:
+                merged = with_vllm_api_key(merged, encrypt_secret(data.vllm_api_key) if data.vllm_api_key else None)
+            return merged
+
+        has_endpoint_options = (
+            data.tool_calling is not None or data.timeouts is not None or data.vllm_api_key is not None
+        )
+
         if settings is None:
             # Create with provided values (encrypt API keys at rest)
             create_kwargs: dict[str, Any] = {"user_id": uid}
@@ -863,6 +940,8 @@ class AIService:
             current_meta = create_kwargs.get("metadata_", {})
             if isinstance(current_meta, dict):
                 create_kwargs["metadata_"] = _merge_base_urls(current_meta, data.ollama_base_url, data.vllm_base_url)
+            if has_endpoint_options:
+                create_kwargs["metadata_"] = _merge_endpoint_options(create_kwargs.get("metadata_"))
             settings = AISettings(**create_kwargs)
             settings = await self.settings_repo.create(settings)
         else:
@@ -879,6 +958,8 @@ class AIService:
             if has_base_url_update:
                 base_meta = fields.get("metadata_", settings.metadata_)
                 fields["metadata_"] = _merge_base_urls(base_meta, data.ollama_base_url, data.vllm_base_url)
+            if has_endpoint_options:
+                fields["metadata_"] = _merge_endpoint_options(fields.get("metadata_", settings.metadata_))
 
             if fields:
                 await self.settings_repo.update_fields(settings.id, **fields)

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Prace w ramach tego przedsięwzięcia rozpoczęto {start}, a wniosek złożono dopiero {filed}. Większość programów nie finansuje niczego, jeśli przedsięwzięcie zostało już rozpoczęte",
+      "unevidenced": "Prace rozpoczęto przed złożeniem wniosku (data rozpoczęcia: {start}), a we wniosku zaznaczono, że instytucja na to zezwoliła, ale nie wskazano pisemnej zgody",
+      "evidence": "Zapisz numer pisemnej zgody na wcześniejsze rozpoczęcie prac, aby dokumentacja broniła się sama podczas kontroli",
+      "suggestion": "Sprawdź zasady programu, zanim poniesiesz kolejne wydatki. Jeśli na wcześniejsze rozpoczęcie prac jest pisemna zgoda, zapisz ją; jeśli jej nie ma, zwróć się do instytucji, zanim wniosek pójdzie dalej"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Wypłata {draw} obejmuje koszty poniesione przed {period_start}, czyli przed rozpoczęciem okresu realizacji",
+      "after": "Wypłata {draw} obejmuje koszty poniesione po {period_end}, czyli po zakończeniu okresu realizacji",
+      "spans": "Wypłata {draw} wykracza z obu stron poza okres realizacji, który trwa od {period_start} do {period_end}",
+      "suggestion": "Przenieś koszty spoza okresu realizacji do osobnej wypłaty i wyjaśnij je z instytucją, zamiast łączyć oba rodzaje kosztów w jednej wypłacie"
+    },
+    "own_share_is_covered": {
+      "fail": "Program wymaga wkładu własnego w wysokości {rate} procent, czyli {required}, a we wniosku zapisano {recorded}",
+      "suggestion": "Przed złożeniem wniosku wskaż, skąd pochodzi brakująca część wkładu własnego, ponieważ program liczy go od bazy kosztów kwalifikowalnych, a nie od całkowitego kosztu projektu"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Łączna intensywność pomocy z wniosków w tym projekcie (liczba wniosków: {count}) wynosi {intensity} procent kosztów kwalifikowalnych i przekracza limit {cap} procent, który określa najbardziej restrykcyjny z ich programów",
+      "suggestion": "Finansowanie publiczne kumuluje się między programami i szczeblami administracji. Zmniejsz jedną z wnioskowanych kwot albo sprawdź, czy przedsięwzięcia można rozdzielić tak, by każde obejmowało własne koszty"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Okres realizacji zakończył się {period_end}, a rozliczenie końcowe nie zostało jeszcze rozpoczęte",
+      "late": "Termin złożenia rozliczenia końcowego upłynął {due}, a rozliczenie złożono {submitted}",
+      "overdue": "Termin złożenia rozliczenia końcowego upłynął {due}, a rozliczenia nie złożono",
+      "suggestion": "Złóż to, co już masz, zamiast czekać na komplet. Większość instytucji przedłuża termin na wniosek, ale żadna nie przedłuża terminu, który już upłynął"
+    },
+    "errors": {
+      "application_not_found": "Nie znaleziono wniosku",
+      "programme_code_taken": "Program o tym numerze referencyjnym już istnieje w tym kraju",
+      "programme_not_found": "Nie znaleziono programu",
+      "programme_has_applications": "Ten program ma wnioski i nie można go usunąć. Zamiast tego zamknij program.",
+      "application_code_taken": "Wniosek o tym numerze referencyjnym już istnieje w tym projekcie",
+      "approved_application_not_deletable": "Zatwierdzonego wniosku nie można usunąć. Zamiast tego zmień jego status na Wycofany lub Zamknięty.",
+      "approval_needs_period_end": "Zatwierdzenie wymaga daty końca okresu realizacji, ponieważ od niej liczą się wszystkie późniejsze terminy",
+      "draw_needs_approval": "Środki można wypłacać tylko na podstawie zatwierdzonego wniosku",
+      "draw_not_found": "Nie znaleziono wypłaty",
+      "paid_draw_not_deletable": "Wypłaty o statusie Wypłacono nie można usunąć",
+      "proof_not_found": "Nie znaleziono rozliczenia wykorzystania",
+      "obligation_not_found": "Nie znaleziono terminu",
+      "eligible_exceeds_amount": "Część kwalifikowalna nie może przekraczać kwoty",
+      "allocation_not_found": "Nie znaleziono pozycji kosztów"
+    }
+  }
+}

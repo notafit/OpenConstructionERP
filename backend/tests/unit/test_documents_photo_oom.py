@@ -4,7 +4,7 @@
 
 A raster photo's PIXEL count, not its byte size, is what OOMs the decoder: a
 few-MB file can declare ~150 MP and expand to hundreds of MB of RGB on decode,
-OOM-killing the single-worker container on the 2 GB target box (and blocking
+OOM-killing the single-worker container on the 3 GB target box (and blocking
 the event loop while it does). These tests pin the guard added to
 ``documents.service``:
 

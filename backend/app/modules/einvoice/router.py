@@ -16,6 +16,7 @@ call, which is useful for integrations, pre-flight checks and testing.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from typing import Any
 
@@ -146,7 +147,7 @@ async def generate_invoice(
     profile = (body.profile or "xrechnung").strip().lower()
     if profile not in SUPPORTED_PROFILES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown e-invoice profile {body.profile!r}; use one of {', '.join(SUPPORTED_PROFILES)}",
         )
 
@@ -155,9 +156,12 @@ async def generate_invoice(
     seller = body.seller.model_dump(mode="python") if body.seller else None
     buyer = body.buyer.model_dump(mode="python") if body.buyer else None
 
+    # Rendering the XML (and the hybrid PDF around it) is pure CPU, so it runs in
+    # a worker thread instead of holding up every other request on the event loop.
     try:
         if body.embed:
-            filename, media_type, data = render_einvoice_pdf(
+            filename, media_type, data = await asyncio.to_thread(
+                render_einvoice_pdf,
                 invoice=invoice_dict,
                 line_items=line_items,
                 profile=profile,
@@ -166,7 +170,8 @@ async def generate_invoice(
                 locale=body.locale,
             )
         else:
-            filename, media_type, data = render_einvoice(
+            filename, media_type, data = await asyncio.to_thread(
+                render_einvoice,
                 invoice=invoice_dict,
                 line_items=line_items,
                 profile=profile,
@@ -175,11 +180,23 @@ async def generate_invoice(
             )
     except EInvoiceError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"invoice is not EN 16931 complete for {profile}: {exc}",
         ) from exc
 
-    headers = {"Content-Disposition": attachment_disposition(filename)}
+    # Declare the language the document was actually rendered in so the
+    # Accept-Language middleware does not silently label it with whatever
+    # the reader asked for.
+    if body.embed:
+        from app.modules.einvoice.pdf_translations import normalize_pdf_locale
+
+        content_language = normalize_pdf_locale(body.locale)
+    else:
+        content_language = "en"
+    headers = {
+        "Content-Disposition": attachment_disposition(filename),
+        "Content-Language": content_language,
+    }
     return StreamingResponse(
         io.BytesIO(data),
         media_type=media_type,

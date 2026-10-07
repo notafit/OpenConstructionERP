@@ -749,8 +749,8 @@ _SUBSCRIPTIONS: list[tuple[str, callable]] = [  # type: ignore[type-arg]
 def register_notification_subscribers() -> None:
     """Wire every entry of ``_SUBSCRIPTIONS`` into the global event bus.
 
-    Idempotent: subscribing the same handler twice is harmless because
-    the EventBus deduplicates on identity.  Called from the module
+    Idempotent: ``subscribe_once`` skips a handler already registered for
+    the same event name.  Called from the module
     ``on_startup`` hook so it runs once after the module loader has
     finished mounting routers.
 
@@ -759,7 +759,7 @@ def register_notification_subscribers() -> None:
     and lives in its own file to keep PR-sized diffs reviewable.
     """
     for event_name, handler in _SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications: subscribed to %d cross-module event(s)",
         len(_SUBSCRIPTIONS),

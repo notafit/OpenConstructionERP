@@ -89,9 +89,20 @@ import {
   type CreateSubcontractorPayload,
   type Rating,
 } from './api';
+import { WorkPackageSovPicker } from './WorkPackageSovPicker';
+import { certTypeLabel, describeComplianceReasons } from './complianceReasons';
+import { AgreementFormModal, PaymentApplicationFormModal, SignAgreementButton } from './AgreementForms';
+import { UnlinkedTwinBanner } from './UnlinkedTwinBanner';
+import { PayAppAmount, PaymentApprovalActions } from './PaymentApprovalActions';
 import { fmtPercent, fmtFixed } from '@/shared/lib/formatters';
 
 type DrawerTab = 'scope' | 'payments' | 'ratings' | 'retention';
+
+const DRAWER_TABS: readonly DrawerTab[] = ['scope', 'payments', 'ratings', 'retention'];
+
+function isDrawerTab(value: string | null): value is DrawerTab {
+  return value !== null && (DRAWER_TABS as readonly string[]).includes(value);
+}
 
 const PREQUAL_VARIANT: Record<PrequalStatus, 'neutral' | 'blue' | 'success' | 'warning' | 'error'> = {
   pending: 'warning',
@@ -347,6 +358,31 @@ export function SubcontractorsPage() {
     );
   }, [highlightId, subsQ.data, setSearchParams]);
 
+  // Addressable drawer: /subcontractors?sub=<id>&subtab=<tab> opens that
+  // subcontractor on that drawer tab, so a guide step or a case can link to
+  // one firm's payments or retention. Unlike ?highlight above, ?sub stays in
+  // the URL while the drawer is open, the drawer keeps ?subtab in step with
+  // the tab shown, and a reload lands on the same place. The drawer fetches
+  // its own record, so the id need not be in the page of the list that
+  // loaded. Closing takes both params out. A row click and ?highlight open
+  // the drawer without touching the URL, as before.
+  // `||`, not `??`: a bare ?sub= must not shadow the row the user clicks.
+  const linkedSubId = searchParams.get('sub') || null;
+  const drawerId = linkedSubId ?? selectedId;
+  const closeDrawer = () => {
+    setSelectedId(null);
+    if (!linkedSubId) return;
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete('sub');
+        next.delete('subtab');
+        return next;
+      },
+      { replace: true },
+    );
+  };
+
   const filtered = useMemo(() => {
     const items = subsQ.data?.items ?? [];
     const s = search.toLowerCase();
@@ -549,8 +585,8 @@ export function SubcontractorsPage() {
           worth stating is how much of the register that page was. */}
       {subsQ.data && <TruncationNotice page={subsQ.data} className="mt-2" />}
 
-      {selectedId && (
-        <DetailDrawer id={selectedId} onClose={() => setSelectedId(null)} />
+      {drawerId && (
+        <DetailDrawer key={drawerId} id={drawerId} onClose={closeDrawer} />
       )}
 
       {createOpen && (
@@ -670,7 +706,29 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
-  const [tab, setTab] = useState<DrawerTab>('scope');
+  // A drawer opened through ?sub=<id> takes its tab from ?subtab= and writes
+  // each switch back (replace, not push), so the link it was opened with and
+  // the URL after a switch both say where the reader is. An unknown value
+  // falls back to Scope. Any other drawer keeps its tab in local state.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const linked = searchParams.get('sub') === id;
+  const rawSubTab = searchParams.get('subtab');
+  const [localTab, setLocalTab] = useState<DrawerTab>('scope');
+  const tab: DrawerTab = linked ? (isDrawerTab(rawSubTab) ? rawSubTab : 'scope') : localTab;
+  const setTab = (next: DrawerTab) => {
+    if (!linked) {
+      setLocalTab(next);
+      return;
+    }
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set('subtab', next);
+        return params;
+      },
+      { replace: true },
+    );
+  };
   // Edit + delete UI state — both gated to the loaded subcontractor so
   // the header buttons can't fire stale operations against a different id.
   const [editOpen, setEditOpen] = useState(false);
@@ -923,7 +981,7 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                   {t('subcontractors.blocked_label', {
                     defaultValue: 'Payments blocked:',
                   })}{' '}
-                  {dashboard.block_reasons.join('; ')}
+                  {describeComplianceReasons(dashboard.block_reasons, t)}
                 </p>
               )}
             </div>
@@ -1115,7 +1173,11 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
 
             <div className="p-5 space-y-3">
               {tab === 'scope' && (
-                <ScopeTab agreements={agreements} loading={agreementsQ.isLoading} />
+                <ScopeTab
+                  subcontractorId={id}
+                  agreements={agreements}
+                  loading={agreementsQ.isLoading}
+                />
               )}
               {tab === 'payments' && (
                 <PaymentsTab
@@ -1169,7 +1231,7 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                               : 'success'
                         }
                       >
-                        {c.cert_type}
+                        {certTypeLabel(c.cert_type, t)}
                         {c.valid_until ? ` · ${c.valid_until}` : ''}
                       </Badge>
                     );
@@ -1181,7 +1243,7 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                 + list. Mounted always (not behind a tab) so the list
                 is one scroll away from the Certificates summary. */}
             <div className="border-t border-border-light px-5 py-4">
-              <LienWaiverPanel subcontractorId={sub.id} />
+              <LienWaiverPanel subcontractorId={sub.id} country={sub.country} />
             </div>
           </>
         )}
@@ -1231,32 +1293,46 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
 }
 
 function ScopeTab({
+  subcontractorId,
   agreements,
   loading,
 }: {
+  subcontractorId: string;
   agreements: Agreement[];
   loading: boolean;
 }) {
   const { t } = useTranslation();
+  const [creating, setCreating] = useState(false);
   if (loading) return <SkeletonTable rows={3} columns={4} />;
-  if (agreements.length === 0) {
-    return (
-      <EmptyState
-        icon={<FileText size={20} />}
-        title={t('subcontractors.no_agreements', {
-          defaultValue: 'No agreements yet',
-        })}
-        description={t('subcontractors.no_agreements_desc', {
-          defaultValue: 'Subcontract agreements link this vendor to specific projects.',
-        })}
-      />
-    );
-  }
+  const newButton = (
+    <Button size="sm" icon={<Plus size={14} />} onClick={() => setCreating(true)}>
+      {t('subcontractors.new_agreement')}
+    </Button>
+  );
   return (
     <div className="space-y-3">
-      {agreements.map((a) => (
-        <AgreementRow key={a.id} agreement={a} />
-      ))}
+      {agreements.length === 0 ? (
+        <EmptyState
+          icon={<FileText size={20} />}
+          title={t('subcontractors.no_agreements', {
+            defaultValue: 'No agreements yet',
+          })}
+          description={t('subcontractors.no_agreements_desc', {
+            defaultValue: 'Subcontract agreements link this vendor to specific projects.',
+          })}
+          action={newButton}
+        />
+      ) : (
+        <>
+          <div className="flex justify-end">{newButton}</div>
+          {agreements.map((a) => (
+            <AgreementRow key={a.id} agreement={a} />
+          ))}
+        </>
+      )}
+      {creating && (
+        <AgreementFormModal subcontractorId={subcontractorId} onClose={() => setCreating(false)} />
+      )}
     </div>
   );
 }
@@ -1278,9 +1354,15 @@ function AgreementRow({ agreement }: { agreement: Agreement }) {
             {agreement.start_date || '—'} → {agreement.end_date || '—'}
           </p>
         </div>
-        <Badge variant={AGREEMENT_VARIANT[agreement.status]} dot>
-          {agreement.status}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <SignAgreementButton agreement={agreement} />
+          <Badge variant={AGREEMENT_VARIANT[agreement.status]} dot>
+            {agreement.status}
+          </Badge>
+        </div>
+      </div>
+      <div className="mt-2 empty:hidden">
+        <UnlinkedTwinBanner projectId={agreement.project_id} agreementId={agreement.id} />
       </div>
       <div className="mt-2 flex items-center justify-between text-xs text-content-secondary">
         <span>
@@ -1303,6 +1385,7 @@ function AgreementRow({ agreement }: { agreement: Agreement }) {
               className="flex items-center justify-between text-xs text-content-secondary"
             >
               <span className="truncate">{wp.name}</span>
+              <WorkPackageSovPicker agreement={agreement} workPackage={wp} />
               <span className="ml-2 tabular-nums">
                 {fmtPercent(toNum(wp.completion_percent), 0)}
               </span>
@@ -1413,7 +1496,9 @@ function PaymentsTab({
 }) {
   const { t } = useTranslation();
   const [agreementId, setAgreementId] = useState(agreement?.id ?? '');
+  const [creating, setCreating] = useState(false);
   const effectiveId = agreementId || agreement?.id || '';
+  const selected = agreements.find((a) => a.id === effectiveId);
 
   const paymentsQ = useQuery({
     queryKey: ['subcontractors', 'payments', effectiveId],
@@ -1434,17 +1519,38 @@ function PaymentsTab({
   }
   return (
     <div className="space-y-3">
-      <select
-        value={effectiveId}
-        onChange={(e) => setAgreementId(e.target.value)}
-        className={inputCls}
-      >
-        {agreements.map((a) => (
-          <option key={a.id} value={a.id}>
-            {a.title}
-          </option>
-        ))}
-      </select>
+      <div className="flex items-center gap-2">
+        <select
+          value={effectiveId}
+          onChange={(e) => setAgreementId(e.target.value)}
+          className={inputCls}
+        >
+          {agreements.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.title}
+            </option>
+          ))}
+        </select>
+        {/* A payment application is taken only against a signed agreement,
+            which is what the server enforces too. */}
+        <Button
+          size="sm"
+          icon={<Plus size={14} />}
+          onClick={() => setCreating(true)}
+          disabled={!selected || (selected.status !== 'active' && selected.status !== 'completed')}
+          title={
+            selected && selected.status === 'draft'
+              ? t('subcontractors.pay_app_needs_signed')
+              : undefined
+          }
+          className="shrink-0"
+        >
+          {t('subcontractors.new_pay_app')}
+        </Button>
+      </div>
+      {creating && selected && (
+        <PaymentApplicationFormModal agreement={selected} onClose={() => setCreating(false)} />
+      )}
       {paymentsQ.isLoading && <SkeletonTable rows={3} columns={3} />}
       {paymentsQ.isError && (
         <p className="text-sm text-semantic-error">
@@ -1464,6 +1570,7 @@ function PaymentsTab({
           requiresWaiver={
             agreements.find((a) => a.id === effectiveId)?.requires_lien_waiver ?? false
           }
+          retentionPercent={agreements.find((a) => a.id === effectiveId)?.retention_percent}
         />
       )}
     </div>
@@ -1473,9 +1580,11 @@ function PaymentsTab({
 function PaymentList({
   rows,
   requiresWaiver,
+  retentionPercent,
 }: {
   rows: PaymentApplication[];
   requiresWaiver: boolean;
+  retentionPercent?: number | string;
 }) {
   const { t } = useTranslation();
   return (
@@ -1498,6 +1607,9 @@ function PaymentList({
             <th className="px-3 py-2 text-left">
               {t('subcontractors.col_status', { defaultValue: 'Status' })}
             </th>
+            <th className="px-3 py-2 text-left">
+              {t('common.actions', { defaultValue: 'Actions' })}
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -1508,15 +1620,17 @@ function PaymentList({
                 {p.period_start || '—'} → {p.period_end || '—'}
               </td>
               <td className="px-3 py-2 text-right">
-                <MoneyDisplay
-                  amount={toNum(p.gross_amount)}
-                  currency={p.currency || undefined}
+                <PayAppAmount
+                  claimed={p.gross_amount}
+                  approved={p.approved_gross_amount}
+                  currency={p.currency}
                 />
               </td>
               <td className="px-3 py-2 text-right font-medium">
-                <MoneyDisplay
-                  amount={toNum(p.net_amount)}
-                  currency={p.currency || undefined}
+                <PayAppAmount
+                  claimed={p.net_amount}
+                  approved={p.approved_net_amount}
+                  currency={p.currency}
                 />
               </td>
               <td className="px-3 py-2">
@@ -1528,6 +1642,13 @@ function PaymentList({
                     <WaiverBadge paymentId={p.id} status={p.status} />
                   )}
                 </div>
+              </td>
+              <td className="px-3 py-2">
+                <PaymentApprovalActions
+                  payment={p}
+                  requiresWaiver={requiresWaiver}
+                  retentionPercent={retentionPercent}
+                />
               </td>
             </tr>
           ))}

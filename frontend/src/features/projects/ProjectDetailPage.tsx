@@ -69,7 +69,9 @@ import {
   ProjectWidgetsRollupProvider,
 } from './components/ProjectWidgets';
 import { useWidgetSettingsStore } from '@/stores/useWidgetSettingsStore';
-import { apiGet, apiPatch, ApiError, extractErrorMessageFromBody, type Page } from '@/shared/lib/api';
+import { activeLanguageTag, apiGet, apiPatch, ApiError, extractErrorMessageFromBody, type Page } from '@/shared/lib/api';
+import { importIssueText, type ImportIssue } from '@/features/boq/importIssueText';
+import { importFailureFromBody } from '@/features/boq/importFailureText';
 import clsx from 'clsx';
 import { projectsApi, type Project } from './api';
 import { PhotosTab } from './PhotosTab';
@@ -80,7 +82,7 @@ import { useRecentStore } from '@/stores/useRecentStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { useModuleStore } from '@/stores/useModuleStore';
-import { fmtPercent, fmtFixed } from '@/shared/lib/formatters';
+import { fmtList, fmtPercent, fmtFixed, formatDateValue } from '@/shared/lib/formatters';
 import { formatCurrency as formatMoney, toNum } from '@/shared/lib/money';
 
 // ---------------------------------------------------------------------------
@@ -117,6 +119,7 @@ interface BOQDetail {
 interface PositionSummary {
   id: string;
   description: string;
+  unit: string;
   quantity: number | string;
   unit_rate: number | string;
   total: number | string;
@@ -158,13 +161,31 @@ export function isPositionUnpriced(
   return toNum(unitRate) === 0;
 }
 
+/**
+ * Section headers are structural grouping elements with no unit/quantity/rate.
+ * They must not be counted as leaf positions needing pricing.
+ *
+ * Mirrors the backend `_is_section` in `boq/service.py`: a position is a
+ * section when its unit is `""` or `"section"` and both quantity and unit_rate
+ * are zero.
+ */
+const SECTION_UNITS = new Set(['', 'section']);
+
+export function isSection(pos: Pick<PositionSummary, 'unit' | 'quantity' | 'unit_rate'>): boolean {
+  const unit = (pos.unit ?? '').trim().toLowerCase();
+  return SECTION_UNITS.has(unit) && toNum(pos.quantity) === 0 && toNum(pos.unit_rate) === 0;
+}
+
 interface ImportResult {
   imported: number;
+  updated?: number;
   skipped?: number;
-  errors: { row?: number; item?: string; error: string; data?: Record<string, string> }[];
+  errors: (ImportIssue & { item?: string; data?: Record<string, string> })[];
+  warnings?: ImportIssue[];
   total_rows?: number;
   total_items?: number;
-  method?: 'direct' | 'ai' | 'cad_ai';
+  /** `native` and `smart_fallback` come from /import/auto/, the others from the smart route it falls back to. */
+  method?: 'direct' | 'native' | 'smart_fallback' | 'ai' | 'cad_ai';
   model_used?: string | null;
   cad_format?: string;
   cad_elements?: number;
@@ -237,17 +258,27 @@ async function fetchBoqDetail(boqId: string): Promise<BOQDetail> {
   return apiGet<BOQDetail>(`/v1/boq/boqs/${boqId}`);
 }
 
-async function smartImportFile(boqId: string, file: File): Promise<ImportResult> {
+// The same route the bill editor's import dialog posts to. It tries the
+// native readers first (GAEB, BC3, the spreadsheet reader with the national
+// workbook profiles and every item sheet of a workbook), validates what it
+// imported, and only hands a file it cannot read to the AI path. This page
+// used to post to the deprecated smart route, which read a spreadsheet's item
+// sheet on its own: a Hungarian chapter workbook lost its item codes and its
+// sections, and nothing it imported was validated.
+async function importFileToBoq(boqId: string, file: File): Promise<ImportResult> {
   const form = new FormData();
   form.append('file', file);
-  const res = await fetch(`/api/v1/boq/boqs/${boqId}/import/smart/`, {
+  const lang = activeLanguageTag();
+  const res = await fetch(`/api/v1/boq/boqs/${boqId}/import/auto/`, {
     method: 'POST',
-    headers: getAuthHeaders(),
+    headers: { ...getAuthHeaders(), ...(lang ? { 'Accept-Language': lang } : {}) },
     body: form,
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(extractErrorMessageFromBody(body) ?? 'Import failed');
+    const t = (key: string, opts?: Record<string, unknown>): string => String(i18n.t(key, opts));
+    const failed = t('boq.import_failed', { defaultValue: 'Import failed' });
+    throw new Error(importFailureFromBody(body, t, failed) ?? extractErrorMessageFromBody(body) ?? failed);
   }
   return res.json();
 }
@@ -271,11 +302,8 @@ export function formatCurrency(value: number, currency?: string): string {
 }
 
 function formatDate(iso: string, locale = 'en-US'): string {
-  return new Date(iso).toLocaleDateString(locale, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  });
+  // Milestone and activity dates are plain calendar dates: keep their day.
+  return formatDateValue(iso, { year: 'numeric', month: 'short', day: 'numeric' }, locale);
 }
 
 const statusVariant: Record<string, 'neutral' | 'blue' | 'success' | 'warning' | 'error'> = {
@@ -308,6 +336,7 @@ const standardLabels: Record<string, string> = {
   sekisan: 'Sekisan',
   kbim: 'KBIM',
   birimfiyat: 'Birim Fiyat',
+  nlsfb: 'NL/SfB',
 };
 
 // ---------------------------------------------------------------------------
@@ -356,10 +385,15 @@ function computeProjectHealth(
   let errorCount = 0;
   let validatedCount = 0;
   let totalPositions = 0;
+  let hasAnyPosition = false;
 
   if (boqDetails) {
     for (const detail of boqDetails) {
       for (const pos of detail.positions) {
+        hasAnyPosition = true;
+        // Section headers are structural grouping elements - they carry no
+        // unit rate by design and must not inflate the "unpriced" count.
+        if (isSection(pos)) continue;
         totalPositions++;
         if (isPositionUnpriced(pos.unit_rate)) unpricedCount++;
         if (pos.validation_status === 'error') errorCount++;
@@ -371,8 +405,10 @@ function computeProjectHealth(
   }
 
   const hasBoq = (boqs?.length ?? 0) > 0;
-  const hasPositions = totalPositions > 0;
-  const allPriced = hasPositions && unpricedCount === 0;
+  // "Positions added" is true when any position exists, including sections -
+  // sections mean the user started structuring their BOQ.
+  const hasPositions = hasAnyPosition;
+  const allPriced = totalPositions > 0 && unpricedCount === 0;
   const validationRun = validatedCount > 0;
   const noErrors = validationRun && errorCount === 0;
 
@@ -621,16 +657,10 @@ function ProjectLocationPanel({ project }: { project: Project }) {
     // map's alone, and with the map widget off there is nothing left to show.
     if (!mapEnabled) return null;
     return (
-      <Card padding="lg">
-        <EmptyState
-          icon={<MapPin size={28} strokeWidth={1.5} />}
-          title={t('projects.map_no_location', { defaultValue: 'No location set' })}
-          description={t('projects.map_no_location_hint', {
-            defaultValue:
-              'This project has no site address or coordinates yet, so there is nothing to place on the map.',
-          })}
-        />
-      </Card>
+      <div className="flex items-center gap-3 rounded-lg border border-dashed border-border-medium p-3 text-sm text-content-secondary">
+        <MapPin size={16} className="shrink-0 text-content-tertiary" />
+        <span>{t('projects.map_no_location', { defaultValue: 'No location set' })}</span>
+      </div>
     );
   }
 
@@ -950,7 +980,7 @@ function DropZone({
       <input
         ref={inputRef}
         type="file"
-        accept=".xlsx,.csv,.pdf,.jpg,.jpeg,.png,.tiff,.rvt,.ifc,.dwg,.dgn"
+        accept=".xlsx,.xls,.csv,.pdf,.jpg,.jpeg,.png,.tiff,.rvt,.ifc,.dwg,.dgn"
         className="hidden"
         onChange={handleChange}
         disabled={disabled}
@@ -976,33 +1006,51 @@ function ImportDialog({
   const [result, setResult] = useState<ImportResult | null>(null);
 
   const SUPPORTED_EXTENSIONS = [
-    '.xlsx', '.csv', '.pdf', '.jpg', '.jpeg', '.png', '.tiff',
+    '.xlsx', '.xls', '.csv', '.pdf', '.jpg', '.jpeg', '.png', '.tiff',
     '.rvt', '.ifc', '.dwg', '.dgn',
   ];
 
   const mutation = useMutation({
-    mutationFn: (file: File) => smartImportFile(boqId, file),
+    mutationFn: (file: File) => importFileToBoq(boqId, file),
     onSuccess: (data) => {
       setResult(data);
       onSuccess();
-      addToast({ type: 'success', title: t('toasts.import_success', { defaultValue: 'Import completed' }) });
+      // A file that imported nothing is not a success, whatever the status code.
+      const landed = (data.imported ?? 0) + (data.updated ?? 0) > 0;
+      addToast({
+        type: landed ? 'success' : 'warning',
+        title: landed
+          ? t('toasts.import_success', { defaultValue: 'Import completed' })
+          : t('import.nothing_imported', { defaultValue: 'Nothing was imported from this file' }),
+      });
     },
     onError: (error: Error) => {
       addToast({ type: 'error', title: t('toasts.import_failed', { defaultValue: 'Import failed' }), message: error.message });
     },
   });
 
+  const [rejected, setRejected] = useState<string | null>(null);
+
   const handleFileSelect = useCallback(
     (file: File) => {
       const name = file.name.toLowerCase();
       if (!SUPPORTED_EXTENSIONS.some((ext) => name.endsWith(ext))) {
+        // Dropping a file this dialog cannot take used to do nothing at all.
+        setRejected(
+          t('import.unsupported_type', {
+            defaultValue: '{{name}} is not a file type this import reads. Supported: {{types}}',
+            name: file.name,
+            types: fmtList(SUPPORTED_EXTENSIONS),
+          }),
+        );
         return;
       }
+      setRejected(null);
       setSelectedFile(file);
       setResult(null);
       mutation.reset();
     },
-    [mutation],
+    [mutation, t],
   );
 
   const handleImport = useCallback(() => {
@@ -1081,6 +1129,16 @@ function ImportDialog({
                 </div>
               )}
 
+              {rejected && (
+                <div
+                  role="alert"
+                  className="mt-3 flex items-start gap-2 rounded-lg bg-semantic-error-bg px-4 py-3 text-sm text-semantic-error"
+                >
+                  <AlertCircle size={16} className="shrink-0 mt-0.5 text-semantic-error" />
+                  <p>{rejected}</p>
+                </div>
+              )}
+
               {mutation.isError && (
                 <div className="mt-3 flex items-start gap-2 rounded-lg bg-semantic-error-bg px-4 py-3">
                   <AlertCircle size={16} className="shrink-0 mt-0.5 text-semantic-error" />
@@ -1139,7 +1197,7 @@ function ImportDialog({
                       : (result.model_used ?? 'AI')}
                   </span>
                 )}
-                {result.method === 'direct' && (
+                {(result.method === 'direct' || result.method === 'native') && (
                   <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-surface-secondary px-2 py-0.5 text-2xs font-medium text-content-tertiary">
                     {t('import.method_direct', { defaultValue: 'Direct' })}
                   </span>
@@ -1168,7 +1226,7 @@ function ImportDialog({
                 </div>
                 <div className="rounded-lg bg-surface-secondary px-3 py-2 text-center">
                   <p className="text-lg font-bold text-content-primary">
-                    {result.total_items ?? result.total_rows ?? 0}
+                    {result.total_items ?? result.total_rows ?? result.imported + (result.updated ?? 0) + (result.skipped ?? 0)}
                   </p>
                   <p className="text-2xs text-content-tertiary uppercase tracking-wide">
                     {t('import.stat_total_items', { defaultValue: 'Total items' })}
@@ -1187,8 +1245,25 @@ function ImportDialog({
                   <div className="max-h-32 overflow-y-auto space-y-1">
                     {result.errors.map((err, i) => (
                       <p key={`${err.row || err.item || ''}-${i}`} className="text-xs text-semantic-error">
-                        {err.row ? `${t('import.error_row', { defaultValue: 'Row {{row}}', row: err.row })}: ` : err.item ? `${err.item}: ` : ''}
-                        {err.error}
+                        {err.row == null && err.item ? `${err.item}: ` : ''}
+                        {importIssueText(err, t, (v) => fmtFixed(v, 2))}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* What the reader left out and why: sheets not read, total lines,
+                  numbers read with dot thousands. */}
+              {(result.warnings ?? []).length > 0 && (
+                <div className="rounded-lg border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/20 px-4 py-3">
+                  <p className="text-xs font-medium text-amber-800 dark:text-amber-300 mb-2">
+                    {t('import.notes_title', { defaultValue: 'Notes' })} ({(result.warnings ?? []).length})
+                  </p>
+                  <div className="max-h-32 overflow-y-auto space-y-1">
+                    {(result.warnings ?? []).map((w, i) => (
+                      <p key={`${w.sheet ?? ''}-${w.row ?? ''}-${i}`} className="text-xs text-amber-700 dark:text-amber-400">
+                        {importIssueText(w, t, (v) => fmtFixed(v, 2))}
                       </p>
                     ))}
                   </div>
@@ -1541,7 +1616,10 @@ export function ProjectDetailPage() {
         boqCount: boqs?.length ?? 0,
         totalPositions: 0,
         avgValidationScore: 0,
-        unavailable,
+        // When there are genuinely no BOQs (not a fetch error), the total is
+        // "not yet calculated", not "0.00 EUR". Mark as unavailable so the
+        // display shows a dash instead of a misleading zero.
+        unavailable: unavailable || (boqs?.length ?? 0) === 0,
         partial: false,
       };
     }
@@ -2146,6 +2224,14 @@ export function ProjectDetailPage() {
             />
           );
         })()}
+        {project.budget_estimate && (
+          <SummaryCard
+            label={t('projects.budget_target', { defaultValue: 'Budget target' })}
+            value={formatCurrency(parseFloat(project.budget_estimate) || 0, currency)}
+            icon={<DollarSign size={20} strokeWidth={1.75} />}
+            variant="default"
+          />
+        )}
         <SummaryCard
           label={t('boq.title')}
           value={stats.unavailable ? '\u2014' : String(stats.boqCount)}

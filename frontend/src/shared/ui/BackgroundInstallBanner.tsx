@@ -75,7 +75,7 @@ export function BackgroundInstallBanner() {
     void qc.invalidateQueries({ queryKey: ['partner-pack-applied'] });
     // Applying a pack enables and disables modules, and the backend scopes the
     // project listing to the pack the instant it is applied.
-    void qc.invalidateQueries({ queryKey: ['modules'] });
+    void qc.invalidateQueries({ queryKey: ['system-modules'] });
     void qc.invalidateQueries({ queryKey: ['projects'] });
   }, [settledSteps, qc]);
 
@@ -88,16 +88,24 @@ export function BackgroundInstallBanner() {
   const pct = total > 0 ? Math.round((finished / total) * 100) : 0;
   const runningStep = install.steps.find((s) => s.status === 'running');
 
+  // A step that failed is not "ready, with some items skipped": that line read
+  // next to a red cross on a cost database that never loaded.
+  const anyStepFailed = install.steps.some((s) => s.status === 'error');
   const headline = install.done
-    ? install.hadError
-      ? t('onboarding.bg_install_done_issues', {
-          defaultValue: '{{country}} workspace ready, with some items skipped',
+    ? anyStepFailed
+      ? t('onboarding.bg_install_done_failed', {
+          defaultValue: '{{country}} setup finished with errors',
           country: install.country,
         })
-      : t('onboarding.bg_install_done', {
-          defaultValue: '{{country}} workspace is ready',
-          country: install.country,
-        })
+      : install.hadError
+        ? t('onboarding.bg_install_done_issues', {
+            defaultValue: '{{country}} workspace ready, with some items skipped',
+            country: install.country,
+          })
+        : t('onboarding.bg_install_done', {
+            defaultValue: '{{country}} workspace is ready',
+            country: install.country,
+          })
     : t('onboarding.bg_install_running', {
         defaultValue: 'Setting up {{country}} in the background',
         country: install.country,
@@ -107,7 +115,7 @@ export function BackgroundInstallBanner() {
     <div
       role="status"
       aria-live="polite"
-      className="fixed bottom-4 right-4 z-[9998] w-80 max-w-[calc(100vw-2rem)] rounded-2xl border border-border-light/70 bg-surface-elevated/95 shadow-xl shadow-black/10 backdrop-blur-md dark:border-white/10"
+      className="oe-dock-aware fixed bottom-4 right-4 z-[9998] w-80 max-w-[calc(100vw-2rem)] rounded-2xl border border-border-light/70 bg-surface-elevated/95 shadow-xl shadow-black/10 backdrop-blur-md dark:border-white/10"
     >
       {/* Header row: status icon, headline, percent, collapse + dismiss. */}
       <div className="flex items-center gap-2.5 px-4 pt-3.5 pb-2">

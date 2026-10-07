@@ -62,6 +62,12 @@ from app.core.validation.engine import (
     rule_registry,
     validation_engine,
 )
+
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, so two findings on one screen cannot disagree
+# about what an amount looks like. Importing it registers nothing.
+from app.core.validation.rules import _fmt_money
 from app.modules.formwork.schemas import FormworkFinding, FormworkValidationReport
 
 logger = logging.getLogger(__name__)
@@ -564,7 +570,13 @@ class FormworkBoqPositionLinked(ValidationRule):
                 False,
                 (
                     f"'{_label(a)}' is not linked to a BOQ position, so its "
-                    f"{a.get('computed_total')} never reaches the bill of quantities."
+                    # The payload carries money as a decimal string, so the
+                    # figure is parsed before it reaches the renderer rather
+                    # than handed over as text. The currency is the catalogue
+                    # system's own; blank stays blank rather than becoming a
+                    # guess.
+                    f"{_fmt_money(_dec(a.get('computed_total')), str(a.get('currency') or '').strip())} "
+                    "never reaches the bill of quantities."
                 ),
                 element_ref=ref,
                 # Names the action that fixes it. The rule used to say "link

@@ -23,6 +23,9 @@ def register_contracts_permissions() -> None:
             "contracts.certify_claim": Role.MANAGER,
             "contracts.mark_paid": Role.MANAGER,
             "contracts.close": Role.MANAGER,
+            # Approving a retention release commits money back to the
+            # contractor, the same weight as certifying a claim.
+            "contracts.approve_retention_release": Role.MANAGER,
             # Extension-of-time claims: raising / withdrawing is an editor
             # action, while deciding (grant / reject) is reserved to managers.
             "contracts.submit_eot": Role.EDITOR,

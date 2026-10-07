@@ -11,8 +11,18 @@ from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
+from app.modules.costs.buildup import buildup_rate as _buildup_rate
+from app.modules.costs.hazards import hazards_in as _hazards_in
 from app.modules.costs.region_currency import REGION_CURRENCY
 
 # Round-7 audit (2026-05-24): money / rate / factor fields are exchanged as
@@ -288,6 +298,32 @@ class CostItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def buildup_rate(self) -> str | None:
+        """The unit rate a bill line receives when this item is added.
+
+        The catalogue ``rate`` and the sum of the item's components are two
+        figures in the source data. The add flow prices the line from its
+        components, so a picker that shows only ``rate`` promises one price and
+        delivers another. ``None`` when the item has no components (it is added
+        at ``rate``) or has a variant slot (the rate follows the variant
+        picked). Decimal-string, like ``rate``.
+        """
+        value = _buildup_rate(self.components, self.metadata)
+        return None if value is None else str(value)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def hazards(self) -> list[str]:
+        """Hazardous materials the item is made of, as ids (``["asbestos"]``).
+
+        Read from the description in every language the row carries, against
+        the terms in ``hazard_terms.json``. The picker shows a warning badge
+        for each; an empty list means none was recognised, not a guarantee.
+        """
+        return _hazards_in([self.description, *self.descriptions.values()])
+
     @model_validator(mode="after")
     def _resolve_currency_from_region(self) -> CostItemResponse:
         """Backfill currency from region for legacy CWICR rows.
@@ -436,6 +472,9 @@ class CostAutocompleteItem(BaseModel):
     autocomplete payload firmly under the lazy-fetch threshold.
     """
 
+    # The item's id, so a bill line picked from the list links to it and
+    # carries its price-list block. None when a vector hit has no row.
+    id: str | None = None
     code: str
     description: str
     unit: str
@@ -1068,3 +1107,10 @@ class RepriceResponse(BaseModel):
     unreadable_resource_count: int = 0
     unreadable_resources_sample: list[str] = Field(default_factory=list)
     dry_run: bool
+    # True when the region held more work items than one pass walks. The counts
+    # above then describe the first ``items_cap`` of the region rather than the
+    # region, and the rest still carries its previous rates - so a caller that
+    # reads ``coverage`` has to read this first.
+    items_truncated: bool = False
+    #: The per-pass ceiling the counts above were collected under.
+    items_cap: int = 0

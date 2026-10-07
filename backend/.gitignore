@@ -94,6 +94,10 @@
 /_pdfreport/
 /_report_pages/
 /app/_frontend_dist_prev/
+# The local interpreter shim (sitecustomize.py) and one-off key-insertion
+# scripts. Once written at the repo root as backend/.scratchpad/, which git
+# honoured and the build did not.
+/.scratchpad/
 
 # Runtime user data
 /uploads/

@@ -65,6 +65,7 @@ from app.modules.contracts.models import (
     ProgressClaimLine,
     RetentionSchedule,
 )
+from app.modules.contracts.periods import claim_dates_for_write
 from app.modules.projects.models import Project
 
 logger = logging.getLogger(__name__)
@@ -339,13 +340,19 @@ async def seed_progress_claims_demo(
             is_approved = status in ("approved", "certified", "paid")
 
             number = f"AZ-{seq:02d}" if contract.project_id in german_projects else f"PC-{seq:04d}"
+            period = {
+                "period_start": period_start.isoformat(),
+                "period_end": min(period_end, today).isoformat(),
+                "claim_date": submitted_day.isoformat() if is_submitted else None,
+            }
             session.add(
                 ProgressClaim(
                     contract_id=contract.id,
                     claim_number=number,
-                    period_start=period_start.isoformat(),
-                    period_end=min(period_end, today).isoformat(),
-                    claim_date=submitted_day.isoformat() if is_submitted else None,
+                    **period,
+                    # The service writes the dates beside the strings, so the
+                    # seed does too rather than leaving them to the boot repair.
+                    **claim_dates_for_write(period),
                     gross_amount=gross,
                     retention_amount=retention,
                     prior_claims_total=prior_total,
@@ -1303,7 +1310,7 @@ async def seed_contracts_demo(
             total_value=total_value,
             currency="EUR",
             retention_percent=Decimal("5"),
-            retention_release_event="practical_completion",
+            retention_release_event="substantial_completion",
             status="active",
             terms=terms,
         )
@@ -1387,13 +1394,17 @@ async def seed_contracts_demo(
         for ci, st in enumerate(statuses):
             gross = total_value * Decimal(str(0.1 * (ci + 1)))
             retention = gross * Decimal("0.05")
+            period = {
+                "period_start": f"2026-0{ci + 1}-01",
+                "period_end": f"2026-0{ci + 1}-28",
+                "claim_date": f"2026-0{ci + 1}-28",
+            }
             session.add(
                 ProgressClaim(
                     contract_id=contract.id,
                     claim_number=f"PC-{ci + 1:04d}",
-                    period_start=f"2026-0{ci + 1}-01",
-                    period_end=f"2026-0{ci + 1}-28",
-                    claim_date=f"2026-0{ci + 1}-28",
+                    **period,
+                    **claim_dates_for_write(period),
                     gross_amount=gross,
                     retention_amount=retention,
                     prior_claims_total=gross * Decimal(str(ci)),

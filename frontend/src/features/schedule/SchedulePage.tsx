@@ -3,6 +3,7 @@
 import { Fragment, useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Calendar,
@@ -30,16 +31,27 @@ import {
   Network,
   ArrowRight,
   ListPlus,
+  Trash2,
+  PlayCircle,
+  FileSpreadsheet,
 } from 'lucide-react';
 import { Button, Card, Badge, Input, SkeletonTable, Breadcrumb, DismissibleInfo, IntroRichText, GanttChart as SVGGanttChart, ViewInBIMButton, ConfirmDialog, ModuleGuideButton, CollapsibleSection } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import type { GanttActivity as SVGGanttActivity, GanttViewMode } from '@/shared/ui';
-import { apiGet } from '@/shared/lib/api';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import type { GanttLinkType } from '@/shared/ui/Gantt';
+import { scheduleErrorDetail, scheduleErrorMessage } from './errors';
+import { useGanttLinking } from './useGanttLinking';
+import { replaceInstalmentSentences } from './confirmations';
+import { ScheduleLifecycleActions } from './ScheduleLifecycleActions';
+import { ActivityDeleteDialog, activityDeleteTarget, type ActivityDeleteTarget } from './ActivityDeleteDialog';
+import { GenerationPreviewPanel, isBudgetEstimate } from './GenerationPreviewPanel';
+import { ApiError, apiGet } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
+import { fmtDate, getIntlLocale } from '@/shared/lib/formatters';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
-import { scheduleApi } from './api';
+import { scheduleApi, type GenerationPreview } from './api';
 import { PlanningCrossLinks } from './PlanningCrossLinks';
 import { EvmPanel } from './EvmPanel';
 import { Snapshot4DView } from './Snapshot4DView';
@@ -53,8 +65,24 @@ import { ScheduleCodesPanel } from './ScheduleCodesPanel';
 import { ScheduleResourcePanel } from './ScheduleResourcePanel';
 import { ScheduleRealtimePanel } from './ScheduleRealtimePanel';
 import { DependencyEditor } from './DependencyEditor';
+import { MilestoneClientToggle } from './MilestoneClientToggle';
+import { BoqLinkEditor } from './BoqLinkEditor';
+import {
+  generateInWindow,
+  generationStamp,
+  generationWarnings,
+  generationWorkers,
+  MAX_WORKERS_PER_POSITION,
+  parseWorkers,
+  previewInWindow,
+  projectWindowDays,
+  refreshAfterGenerate,
+} from './generateWindow';
 import { ActivityGrid } from './ActivityGrid';
+import { ancestorsOf, hideCollapsed, orderAsTree, parentIdsOf } from './activityTree';
 import { WorkCalendarManager } from './WorkCalendarManager';
+import { ScheduleSpreadsheetImportDialog } from './tabularImport/ScheduleSpreadsheetImportDialog';
+import { SpreadsheetImportEntry } from './tabularImport/SpreadsheetImportEntry';
 import { scheduleGuide } from './scheduleGuide';
 import { fetchBIMModels } from '@/features/bim/api';
 import type {
@@ -80,6 +108,7 @@ interface BOQListItem {
   name: string;
   description: string;
   status: string;
+  estimate_type?: string | null;
 }
 
 interface CreateScheduleForm {
@@ -95,16 +124,13 @@ interface CreateActivityForm {
   start_date: string;
   end_date: string;
   activity_type: 'task' | 'milestone' | 'summary';
+  parent_id?: string;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
 function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString(getIntlLocale(), {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-  });
+  return fmtDate(dateStr, { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
 /**
@@ -126,8 +152,8 @@ function neutraliseFormula(value: unknown): string {
 }
 
 function daysBetween(start: string, end: string): number {
-  const s = new Date(start).getTime();
-  const e = new Date(end).getTime();
+  const s = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(start) ? start + 'T00:00:00Z' : start);
+  const e = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(end) ? end + 'T00:00:00Z' : end);
   if (isNaN(s) || isNaN(e)) return 1;
   return Math.max(1, Math.ceil((e - s) / (1000 * 60 * 60 * 24)));
 }
@@ -483,8 +509,9 @@ function GanttChart({
       };
     }
 
-    const starts = activities.map((a) => new Date(a.start_date).getTime()).filter((t) => !isNaN(t));
-    const ends = activities.map((a) => new Date(a.end_date).getTime()).filter((t) => !isNaN(t));
+    const parseDate = (s: string) => Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00Z' : s);
+    const starts = activities.map((a) => parseDate(a.start_date)).filter((t) => !isNaN(t));
+    const ends = activities.map((a) => parseDate(a.end_date)).filter((t) => !isNaN(t));
     if (starts.length === 0 || ends.length === 0) {
       const now = new Date();
       const fallbackStart = new Date(now);
@@ -496,9 +523,10 @@ function GanttChart({
     const minStart = new Date(Math.min(...starts));
     const maxEnd = new Date(Math.max(...ends));
 
-    // Add padding of 2 days on each side
-    minStart.setDate(minStart.getDate() - 2);
-    maxEnd.setDate(maxEnd.getDate() + 2);
+    // Add padding of 2 days on each side — use UTC methods so the day
+    // arithmetic is not shifted by the browser's local timezone offset.
+    minStart.setUTCDate(minStart.getUTCDate() - 2);
+    maxEnd.setUTCDate(maxEnd.getUTCDate() + 2);
 
     const days = daysBetween(minStart.toISOString(), maxEnd.toISOString());
 
@@ -517,19 +545,23 @@ function GanttChart({
     const markers: Array<{ label: string; offsetPct: number }> = [];
     const current = new Date(timelineStart);
 
+    // All date arithmetic below uses UTC methods so the timeline stays
+    // day-stable regardless of the viewer's local timezone offset.
+    const utcDateOpts = { timeZone: 'UTC' as const };
+
     if (zoomLevel === 'day') {
       // One marker per day
-      current.setDate(current.getDate() + 1);
+      current.setUTCDate(current.getUTCDate() + 1);
       while (current <= timelineEnd) {
         const dayOffset = daysBetween(timelineStart.toISOString(), current.toISOString());
         const pct = (dayOffset / totalDays) * 100;
         if (pct >= 0 && pct <= 100) {
           markers.push({
-            label: current.toLocaleDateString(getIntlLocale(), { day: '2-digit', month: 'short' }),
+            label: current.toLocaleDateString(getIntlLocale(), { day: '2-digit', month: 'short', ...utcDateOpts }),
             offsetPct: pct,
           });
         }
-        current.setDate(current.getDate() + 1);
+        current.setUTCDate(current.getUTCDate() + 1);
       }
     } else if (zoomLevel === 'week') {
       // One marker per week (advance to next Monday). Monday is deliberate
@@ -537,9 +569,9 @@ function GanttChart({
       // the ISO week columns in `Gantt/ganttUtils`: these gridlines sit under
       // a programme whose weeks are ISO weeks, and rotating them per language
       // would put the same task in two different weeks for two readers.
-      const dayOfWeek = current.getDay();
+      const dayOfWeek = current.getUTCDay();
       const daysUntilMonday = dayOfWeek === 0 ? 1 : 8 - dayOfWeek;
-      current.setDate(current.getDate() + daysUntilMonday);
+      current.setUTCDate(current.getUTCDate() + daysUntilMonday);
       while (current <= timelineEnd) {
         const dayOffset = daysBetween(timelineStart.toISOString(), current.toISOString());
         const pct = (dayOffset / totalDays) * 100;
@@ -548,16 +580,17 @@ function GanttChart({
             label: current.toLocaleDateString(getIntlLocale(), {
               day: '2-digit',
               month: 'short',
+              ...utcDateOpts,
             }),
             offsetPct: pct,
           });
         }
-        current.setDate(current.getDate() + 7);
+        current.setUTCDate(current.getUTCDate() + 7);
       }
     } else if (zoomLevel === 'month') {
       // Month view — one marker per month
-      current.setDate(1);
-      current.setMonth(current.getMonth() + 1);
+      current.setUTCDate(1);
+      current.setUTCMonth(current.getUTCMonth() + 1);
       while (current <= timelineEnd) {
         const dayOffset = daysBetween(timelineStart.toISOString(), current.toISOString());
         const pct = (dayOffset / totalDays) * 100;
@@ -567,43 +600,43 @@ function GanttChart({
             // this axis where a year is written at all, and a programme that
             // runs from 2026 into 2028 is exactly the one where "Aug 26" has
             // to be read twice - the first reading is a day of the month.
-            label: current.toLocaleDateString(getIntlLocale(), { month: 'short', year: 'numeric' }),
+            label: current.toLocaleDateString(getIntlLocale(), { month: 'short', year: 'numeric', ...utcDateOpts }),
             offsetPct: pct,
           });
         }
-        current.setMonth(current.getMonth() + 1);
+        current.setUTCMonth(current.getUTCMonth() + 1);
       }
     } else if (zoomLevel === 'quarter') {
       // Quarter view — one marker per quarter
-      current.setDate(1);
-      current.setMonth(Math.floor(current.getMonth() / 3) * 3 + 3);
+      current.setUTCDate(1);
+      current.setUTCMonth(Math.floor(current.getUTCMonth() / 3) * 3 + 3);
       while (current <= timelineEnd) {
         const dayOffset = daysBetween(timelineStart.toISOString(), current.toISOString());
         const pct = (dayOffset / totalDays) * 100;
         if (pct >= 0 && pct <= 100) {
-          const q = Math.floor(current.getMonth() / 3) + 1;
+          const q = Math.floor(current.getUTCMonth() / 3) + 1;
           markers.push({
-            label: `Q${q} ${current.getFullYear()}`,
+            label: `Q${q} ${current.getUTCFullYear()}`,
             offsetPct: pct,
           });
         }
-        current.setMonth(current.getMonth() + 3);
+        current.setUTCMonth(current.getUTCMonth() + 3);
       }
     } else {
       // Year view — one marker per year
-      current.setDate(1);
-      current.setMonth(0);
-      current.setFullYear(current.getFullYear() + 1);
+      current.setUTCDate(1);
+      current.setUTCMonth(0);
+      current.setUTCFullYear(current.getUTCFullYear() + 1);
       while (current <= timelineEnd) {
         const dayOffset = daysBetween(timelineStart.toISOString(), current.toISOString());
         const pct = (dayOffset / totalDays) * 100;
         if (pct >= 0 && pct <= 100) {
           markers.push({
-            label: current.getFullYear().toString(),
+            label: current.getUTCFullYear().toString(),
             offsetPct: pct,
           });
         }
-        current.setFullYear(current.getFullYear() + 1);
+        current.setUTCFullYear(current.getUTCFullYear() + 1);
       }
     }
 
@@ -1098,12 +1131,14 @@ function RiskAnalysisCard({ data }: { data: RiskAnalysisResponse }) {
 
 /* ── Schedule Detail View ──────────────────────────────────────────────── */
 
-function ScheduleDetail({
+/** Exported for the page-level tests of the Table and Gantt views. */
+export function ScheduleDetail({
   schedule,
   projectId,
   onBack,
   generateBoqId,
   onConsumeGenerateBoq,
+  onOpenSchedule,
 }: {
   schedule: Schedule;
   projectId: string;
@@ -1112,16 +1147,40 @@ function ScheduleDetail({
   generateBoqId?: string | null;
   /** Called once the generate modal has consumed the deep-link BOQ id. */
   onConsumeGenerateBoq?: () => void;
+  /**
+   * Switch the page to another schedule of the project. Without it the
+   * "generate into a new schedule" choice is not offered.
+   */
+  onOpenSchedule?: (schedule: Schedule) => void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const { confirm, ...confirmProps } = useConfirm();
+  // A generation the server refused because the schedule already has
+  // activities: the reader chooses to replace them or to use a new schedule.
+  const [generateConflict, setGenerateConflict] = useState<{
+    boqId: string;
+    activityCount: number;
+    startedCount: number;
+    instalmentsRelinked: number;
+    instalmentsUnlinked: number;
+  } | null>(null);
+  // The generation run whose warnings the reader dismissed.
+  const [dismissedStamp, setDismissedStamp] = useState<string | null>(null);
+  // What the generation would write, shown for the reader to confirm.
+  const [generationPreview, setGenerationPreview] = useState<GenerationPreview | null>(null);
+  // The activity whose delete is being confirmed.
+  const [deleteTarget, setDeleteTarget] = useState<ActivityDeleteTarget | null>(null);
+  // A viewer sees the plan but none of the buttons the server would refuse.
+  const canEditSchedule = useHasPermission('schedule.update');
+  const canDeleteSchedule = useHasPermission('schedule.delete');
   const [zoomLevel, setZoomLevel] = useState<ZoomLevel>('week');
   const [viewMode, setViewMode] = useState<
     'table' | 'gantt' | 'evm' | '4d' | 'quality' | 'risk' | 'compare' | 'progress' | 'delay' | 'codes' | 'calendars' | 'resources' | 'realtime' | 'interchange'
   >('gantt');
   const [showAddActivity, setShowAddActivity] = useState(false);
+  const [showBaseline, setShowBaseline] = useState(false);
   // #348: activity whose dependency editor is open (click a Gantt bar to edit).
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [showGenerateBOQ, setShowGenerateBOQ] = useState(false);
@@ -1129,7 +1188,29 @@ function ScheduleDetail({
   const [generateStartDate, setGenerateStartDate] = useState(
     () => schedule.start_date?.slice(0, 10) || new Date().toISOString().slice(0, 10),
   );
+  const [generateEndDate, setGenerateEndDate] = useState('');
+  const generateWindowDays = projectWindowDays(generateStartDate, generateEndDate);
+  // An end date is optional; one that is given has to come after the start.
+  const generateWindowInvalid = generateEndDate !== '' && generateWindowDays == null;
+  // Workers per position where the bill gives no crew. Empty asks the server
+  // for the fewest that fit the dates; a number is sent as it is.
+  const [generateWorkers, setGenerateWorkers] = useState('');
+  const generateWorkersValue = parseWorkers(generateWorkers);
+  const generateWorkersInvalid = generateWorkers.trim() !== '' && generateWorkersValue == null;
+  // A preview answers for one bill, one pair of dates and one number of
+  // workers; any change asks again.
+  useEffect(() => {
+    setGenerationPreview(null);
+  }, [selectedBOQId, generateStartDate, generateEndDate, generateWorkers]);
   const [activityFilter, setActivityFilter] = useState('all');
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
+  const toggleCollapse = useCallback((id: string) => {
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }, []);
   const [activityForm, setActivityForm] = useState<CreateActivityForm>({
     name: '',
     wbs_code: '',
@@ -1137,13 +1218,59 @@ function ScheduleDetail({
     end_date: '',
     activity_type: 'task',
   });
+  // Set once the user types a WBS code of their own, so choosing a section
+  // afterwards does not overwrite it with the suggested one.
+  const wbsTouchedRef = useRef(false);
+  // A WBS code the server refused as already used, shown next to the field.
+  const [wbsError, setWbsError] = useState<string | null>(null);
+  const chooseParentSection = useCallback(
+    (parentId: string | undefined) => {
+      setActivityForm((f) => ({ ...f, parent_id: parentId }));
+      setWbsError(null);
+      if (wbsTouchedRef.current) return;
+      scheduleApi
+        .suggestWbsCode(schedule.id, parentId)
+        .then(({ wbs_code }) => {
+          if (wbsTouchedRef.current) return;
+          // A late answer for a section the user has since changed is dropped.
+          setActivityForm((f) => (f.parent_id === parentId ? { ...f, wbs_code } : f));
+        })
+        .catch(() => {
+          // No suggestion; the field stays editable and the server fills a
+          // blank code under a section on its own.
+        });
+    },
+    [schedule.id],
+  );
 
   // Fetch project data for region / work calendar / currency
   const { data: projectData } = useQuery({
     queryKey: ['project', projectId],
-    queryFn: () => apiGet<{ id: string; region: string; currency?: string }>(`/v1/projects/${projectId}`),
+    queryFn: () =>
+      apiGet<{
+        id: string;
+        region: string;
+        currency?: string;
+        planned_start_date?: string | null;
+        planned_end_date?: string | null;
+      }>(`/v1/projects/${projectId}`),
     staleTime: 300_000,
   });
+  // The generate dialog fits the plan between the project's planned dates.
+  // They are filled in once, when the project first arrives, the start only
+  // when the schedule has none of its own, so a later refetch never overwrites
+  // a date the planner typed. The schedule's own end
+  // date is not used: generation writes it, so it would feed a previous run's
+  // result back in as the window.
+  const plannedDatesAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!projectData || plannedDatesAppliedRef.current) return;
+    plannedDatesAppliedRef.current = true;
+    const plannedStart = projectData.planned_start_date?.slice(0, 10);
+    const plannedEnd = projectData.planned_end_date?.slice(0, 10);
+    if (plannedStart && !schedule.start_date) setGenerateStartDate(plannedStart);
+    if (plannedEnd) setGenerateEndDate((cur) => cur || plannedEnd);
+  }, [projectData, schedule.start_date]);
   // Project ISO currency drives EVM money formatting; blank -> no symbol
   // (never mislabel a non-EUR amount). The activity cost columns are all
   // project-scoped so they share this single currency.
@@ -1173,6 +1300,30 @@ function ScheduleDetail({
     queryFn: () => scheduleApi.getGantt(schedule.id),
   });
 
+  // The schedule as stored now: the prop is the list row it was opened from,
+  // and generation writes its outcome (and any warning) onto the record.
+  const { data: scheduleRecord } = useQuery({
+    queryKey: ['schedule-record', schedule.id],
+    queryFn: () => scheduleApi.getSchedule(schedule.id),
+  });
+  const planWarnings = generationWarnings(scheduleRecord);
+  // Generating again starts from the workers the last generation was asked
+  // for, once per opening of the dialog, so the same plan comes back.
+  const workersPrefilledRef = useRef(false);
+  useEffect(() => {
+    if (!showGenerateBOQ) {
+      workersPrefilledRef.current = false;
+      return;
+    }
+    if (workersPrefilledRef.current) return;
+    const recorded = generationWorkers(scheduleRecord);
+    if (recorded == null) return;
+    workersPrefilledRef.current = true;
+    setGenerateWorkers((cur) => cur || String(recorded));
+  }, [showGenerateBOQ, scheduleRecord]);
+  const planStamp = generationStamp(scheduleRecord);
+  const showPlanWarnings = planWarnings.length > 0 && dismissedStamp !== planStamp;
+
   // Fetch BOQs for the project (for Generate from BOQ dialog)
   const { data: boqs } = useQuery({
     queryKey: ['boqs', projectId],
@@ -1198,10 +1349,12 @@ function ScheduleDetail({
   useEffect(() => {
     if (!generateBoqId || generateDeepLinkRef.current) return;
     generateDeepLinkRef.current = true;
-    setSelectedBOQId(generateBoqId);
-    setShowGenerateBOQ(true);
+    if (canEditSchedule) {
+      setSelectedBOQId(generateBoqId);
+      setShowGenerateBOQ(true);
+    }
     onConsumeGenerateBoq?.();
-  }, [generateBoqId, onConsumeGenerateBoq]);
+  }, [generateBoqId, onConsumeGenerateBoq, canEditSchedule]);
 
   // CPM state
   const [cpmResult, setCpmResult] = useState<CriticalPathResponse | null>(null);
@@ -1220,9 +1373,22 @@ function ScheduleDetail({
         start_date: data.start_date,
         end_date: data.end_date,
         activity_type: data.activity_type,
+        ...(data.parent_id ? { parent_id: data.parent_id } : {}),
       }),
-    onSuccess: () => {
+    onSuccess: (_created, data) => {
       queryClient.invalidateQueries({ queryKey: ['gantt', schedule.id] });
+      // Open the section the activity went into (and every section above
+      // it), or the new row would be created out of sight.
+      if (data.parent_id) {
+        const open = ancestorsOf(data.parent_id, ganttData?.activities ?? []);
+        setCollapsedIds((prev) => {
+          if (!open.some((id) => prev.has(id))) return prev;
+          const next = new Set(prev);
+          for (const id of open) next.delete(id);
+          return next;
+        });
+      }
+      wbsTouchedRef.current = false;
       setShowAddActivity(false);
       setActivityForm({
         name: '',
@@ -1233,31 +1399,131 @@ function ScheduleDetail({
       });
       addToast({ type: 'success', title: t('toasts.activity_created', { defaultValue: 'Activity created' }) });
     },
-    onError: (error: Error) => {
+    onError: (error: Error, data) => {
+      // A code another activity already uses is the user's to fix in the
+      // field, so it is said there, in their language, not in a toast.
+      if (error instanceof ApiError && error.status === 409) {
+        setWbsError(wbsTakenMessage(data.wbs_code));
+        return;
+      }
       addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: error.message });
     },
   });
+  const wbsTakenMessage = (code: string) =>
+    t('schedule.wbs_code_taken', {
+      defaultValue: 'WBS code {{code}} is already used by another activity in this schedule.',
+      code: code.trim(),
+    });
+
+  // Opening the dialog suggests the next code for the section it is set to
+  // (the top level when none), as long as the user has not typed their own.
+  useEffect(() => {
+    if (showAddActivity && !wbsTouchedRef.current && !activityForm.wbs_code) {
+      chooseParentSection(activityForm.parent_id);
+    }
+    // Only on opening; later section changes go through chooseParentSection.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAddActivity]);
+
+  const generateFailed = (error: unknown) =>
+    addToast({
+      type: 'error',
+      title: t('schedule.generate_failed_title', { defaultValue: 'The schedule was not generated' }),
+      message: scheduleErrorMessage(error, t),
+    });
+
+  // Generate writes the plan the preview showed: with the workers it
+  // reported, even when the server chose them.
+  const workersToWrite = generationPreview?.workers_per_position ?? generateWorkersValue;
 
   const generateFromBOQ = useMutation({
-    mutationFn: async (boqId: string) => {
-      // Update the schedule start_date before generating so activities use the chosen date
-      if (generateStartDate) {
-        await scheduleApi.updateSchedule(schedule.id, { start_date: generateStartDate });
-      }
-      return scheduleApi.generateFromBOQ(schedule.id, boqId);
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['gantt', schedule.id] });
-      queryClient.invalidateQueries({ queryKey: ['schedules'] });
+    mutationFn: ({ boqId, replace }: { boqId: string; replace: boolean }) =>
+      generateInWindow(schedule.id, boqId, generateStartDate, generateEndDate, replace, workersToWrite),
+    onSuccess: async () => {
+      // The dialog stays open with its button spinning until the new plan is
+      // loaded, so the toast lands on the generated schedule and not on the
+      // empty one it replaces.
+      await refreshAfterGenerate(queryClient, schedule.id);
       setShowGenerateBOQ(false);
+      setGenerateConflict(null);
+      setGenerationPreview(null);
       setSelectedBOQId('');
       // Reset CPM/risk results since activities changed
       setCpmResult(null);
       setRiskResult(null);
       addToast({ type: 'success', title: t('toasts.schedule_generated', { defaultValue: 'Schedule generated from BOQ' }) });
     },
+    onError: (error: Error, { boqId, replace }) => {
+      // A populated schedule is not overwritten unasked: the server refuses
+      // and the reader chooses what happens to the activities already there.
+      const detail = scheduleErrorDetail(error);
+      if (detail?.error === 'schedule_has_activities' && !replace) {
+        setShowGenerateBOQ(false);
+        setGenerateConflict({
+          boqId,
+          activityCount: Number(detail.activity_count ?? 0),
+          startedCount: Number(detail.started_count ?? 0),
+          instalmentsRelinked: Number(detail.instalments_relinked ?? 0),
+          instalmentsUnlinked: Number(detail.instalments_unlinked ?? 0),
+        });
+        return;
+      }
+      generateFailed(error);
+    },
+  });
+
+  // Nothing is written until the reader has seen what would be: the counts,
+  // the dates against the window and the positions whose durations are guesses.
+  const previewGeneration = useMutation({
+    mutationFn: (boqId: string) =>
+      previewInWindow(schedule.id, boqId, generateStartDate, generateEndDate, generateWorkersValue),
+    onSuccess: (preview) => setGenerationPreview(preview),
+    onError: (error: Error) => generateFailed(error),
+  });
+
+  // The other answer to a populated schedule: leave it as it is and generate
+  // into a new schedule of the same project, then open that one.
+  const generateIntoNewSchedule = useMutation({
+    mutationFn: async (boqId: string) => {
+      const created = await scheduleApi.createSchedule({
+        project_id: projectId,
+        name: t('schedule.new_schedule_from_boq_name', { defaultValue: '{{name}} (new)', name: schedule.name }),
+        start_date: generateStartDate || undefined,
+      });
+      try {
+        await generateInWindow(created.id, boqId, generateStartDate, generateEndDate, false, workersToWrite);
+      } catch (error) {
+        // Retain the failed attempt in the archive; never silently purge it.
+        try {
+          await scheduleApi.archiveSchedule(created.id);
+          addToast({ type: 'info', title: t('schedule.generation_cleanup_archived') });
+        } catch {
+          addToast({ type: 'warning', title: t('schedule.generation_cleanup_failed') });
+        }
+        await queryClient.invalidateQueries({ queryKey: ['schedules'] });
+        throw error;
+      }
+      return created;
+    },
+    onSuccess: async (created) => {
+      await queryClient.invalidateQueries({ queryKey: ['schedules'] });
+      setGenerateConflict(null);
+      setShowGenerateBOQ(false);
+      setGenerationPreview(null);
+      setSelectedBOQId('');
+      addToast({
+        type: 'success',
+        title: t('toasts.schedule_generated', { defaultValue: 'Schedule generated from BOQ' }),
+        message: t('schedule.generated_into_new_schedule', {
+          defaultValue: 'The plan is in the new schedule "{{name}}". The schedule you were on is unchanged.',
+          name: created.name,
+        }),
+      });
+      onOpenSchedule?.(created);
+    },
     onError: (error: Error) => {
-      addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: error.message });
+      queryClient.invalidateQueries({ queryKey: ['schedules'] });
+      generateFailed(error);
     },
   });
 
@@ -1346,6 +1612,9 @@ function ScheduleDetail({
     [resizeActivity],
   );
 
+  // Drawing and removing links on the Gantt (only for people who may edit the schedule).
+  const ganttLinking = useGanttLinking(schedule.id, canEditSchedule);
+
   const resetSchedule = useMutation({
     mutationFn: () => scheduleApi.clearActivities(schedule.id),
     onSuccess: () => {
@@ -1353,7 +1622,41 @@ function ScheduleDetail({
       setCpmResult(null);
       setRiskResult(null);
       setActivityFilter('all');
-      addToast({ type: 'success', title: t('schedule.reset_success', { defaultValue: 'Schedule reset' }) });
+      addToast({ type: 'success', title: t('schedule.clear_all_success', { defaultValue: 'All activities deleted' }) });
+    },
+    onError: (error: Error) => {
+      addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: scheduleErrorMessage(error, t) });
+    },
+  });
+
+  // Deleting from the side panel. A section asks whether its activities go
+  // with it or stay, moving up to the section's own parent.
+  const deleteActivity = useMutation({
+    mutationFn: ({ activityId, cascade }: { activityId: string; cascade: boolean }) =>
+      scheduleApi.deleteActivity(activityId, cascade),
+    onSuccess: () => {
+      setDeleteTarget(null);
+      setSelectedActivityId(null);
+      setCpmResult(null);
+      setRiskResult(null);
+      queryClient.invalidateQueries({ queryKey: ['gantt', schedule.id] });
+      queryClient.invalidateQueries({ queryKey: ['schedule-relationships', schedule.id] });
+      addToast({ type: 'success', title: t('schedule.activity_deleted', { defaultValue: 'Activity deleted' }) });
+    },
+    onError: (error: Error) => {
+      addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: scheduleErrorMessage(error, t) });
+    },
+  });
+  const handleDeleteActivity = (activity: Activity) => {
+    setDeleteTarget(activityDeleteTarget(activity, ganttData?.activities ?? []));
+  };
+
+  const activateSchedule = useMutation({
+    mutationFn: () => scheduleApi.updateSchedule(schedule.id, { status: 'active' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['gantt', schedule.id] });
+      queryClient.invalidateQueries({ queryKey: ['schedules'] });
+      addToast({ type: 'success', title: t('schedule.activated', { defaultValue: 'Schedule activated' }) });
     },
     onError: (error: Error) => {
       addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: error.message });
@@ -1386,19 +1689,28 @@ function ScheduleDetail({
 
   // Filtered activities for the Gantt chart (Improvement #5)
   const filteredActivities = useMemo(() => {
-    const activities = ganttData?.activities ?? [];
-    if (activityFilter === 'all') return activities;
+    let activities = ganttData?.activities ?? [];
     if (activityFilter === 'critical') {
-      return activities.filter((a) => criticalActivityIds?.has(a.id));
+      activities = activities.filter((a) => criticalActivityIds?.has(a.id));
+    } else if (activityFilter === 'delayed') {
+      activities = activities.filter((a) => a.status === 'delayed');
+    } else if (activityFilter === 'in_progress') {
+      activities = activities.filter((a) => a.status === 'in_progress');
     }
-    if (activityFilter === 'delayed') {
-      return activities.filter((a) => a.status === 'delayed');
-    }
-    if (activityFilter === 'in_progress') {
-      return activities.filter((a) => a.status === 'in_progress');
-    }
-    return activities;
+    // Every child directly under its section, whatever its place in the
+    // flat server order.
+    return orderAsTree(activities);
   }, [ganttData, activityFilter, criticalActivityIds]);
+
+  // Collapsing is a Table view control, so only the table hides the rows
+  // under a collapsed section; the Gantt views have no toggle to reopen it.
+  const gridActivities = useMemo(
+    () => hideCollapsed(filteredActivities, collapsedIds),
+    [filteredActivities, collapsedIds],
+  );
+  // Which rows can collapse is read from the whole schedule. Reading it from
+  // the rows left visible lost a collapsed section's chevron with its children.
+  const sectionIds = useMemo(() => parentIdsOf(ganttData?.activities ?? []), [ganttData]);
 
   // Map activities to SVG Gantt format
   const svgGanttActivities = useMemo<SVGGanttActivity[]>(() => {
@@ -1413,6 +1725,13 @@ function ScheduleDetail({
       isGroup: a.activity_type === 'summary',
       parentId: a.parent_id,
       dependencies: a.dependencies?.map((d) => d.activity_id) ?? [],
+      // So the chart anchors each arrow by its type; an unknown type is left
+      // out and drawn as FS.
+      dependencyTypes: Object.fromEntries(
+        (a.dependencies ?? [])
+          .filter((d) => ['FS', 'SS', 'FF', 'SF'].includes(d.type))
+          .map((d) => [d.activity_id, d.type as GanttLinkType]),
+      ),
       color: a.color || undefined,
     }));
   }, [filteredActivities, criticalActivityIds]);
@@ -1464,14 +1783,41 @@ function ScheduleDetail({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            variant="secondary"
-            icon={<FileBarChart size={16} />}
-            onClick={() => setShowGenerateBOQ(true)}
-            data-guide="schedule-generate"
-          >
-            {t('schedule.generate_from_boq', 'Generate from BOQ')}
-          </Button>
+          {canEditSchedule && (
+            <Button
+              variant="secondary"
+              icon={<FileBarChart size={16} />}
+              onClick={() => setShowGenerateBOQ(true)}
+              data-guide="schedule-generate"
+            >
+              {hasActivities
+                ? t('schedule.regenerate_from_boq', { defaultValue: 'Regenerate from BOQ' })
+                : t('schedule.generate_from_boq', 'Generate from BOQ')}
+            </Button>
+          )}
+          {/* Clear all activities, next to Regenerate: the schedule itself stays */}
+          {hasActivities && canDeleteSchedule && (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<RotateCcw size={14} />}
+              onClick={async () => {
+                const ok = await confirm({
+                  title: t('schedule.confirm_clear_all_title', { defaultValue: 'Clear all activities?' }),
+                  message: t('schedule.confirm_clear_all', {
+                    defaultValue:
+                      'Delete all {{count}} activities of this schedule and the links between them? The schedule itself stays, and you can generate it again from a BOQ. This cannot be undone.',
+                    count: ganttData?.summary.total_activities ?? 0,
+                  }),
+                  confirmLabel: t('schedule.clear_all', { defaultValue: 'Clear all' }),
+                });
+                if (ok) resetSchedule.mutate();
+              }}
+              loading={resetSchedule.isPending}
+            >
+              {t('schedule.clear_all_activities', { defaultValue: 'Clear all activities' })}
+            </Button>
+          )}
           {hasActivities && (
             <>
               {/* View mode toggle: Table / Gantt / EVM / 4D */}
@@ -1530,6 +1876,19 @@ function ScheduleDetail({
                   </button>
                 ))}
               </div>
+              <button
+                type="button"
+                aria-pressed={showBaseline}
+                onClick={() => setShowBaseline((v) => !v)}
+                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                  showBaseline
+                    ? 'bg-oe-blue text-white'
+                    : 'text-content-secondary hover:bg-surface-secondary'
+                }`}
+                title={t('schedule.baseline_tooltip', { defaultValue: 'Toggle baseline comparison overlay' })}
+              >
+                {t('schedule.baseline', { defaultValue: 'Baseline' })}
+              </button>
               <Button
                 variant="secondary"
                 icon={<Zap size={16} />}
@@ -1591,33 +1950,73 @@ function ScheduleDetail({
               >
                 {t('common.export', { defaultValue: 'Export' })}
               </Button>
-              {/* Reset schedule */}
-              <Button
-                variant="ghost"
-                size="sm"
-                icon={<RotateCcw size={14} />}
-                onClick={async () => {
-                  const ok = await confirm({
-                    title: t('schedule.confirm_reset_title', { defaultValue: 'Reset schedule?' }),
-                    message: t('schedule.confirm_reset', { defaultValue: 'Delete all activities in this schedule? This cannot be undone. You can regenerate them afterwards from a BOQ.' }),
-                  });
-                  if (ok) resetSchedule.mutate();
-                }}
-                loading={resetSchedule.isPending}
-              >
-                {t('schedule.reset', { defaultValue: 'Reset' })}
-              </Button>
             </>
           )}
-          <Button
-            variant="primary"
-            icon={<Plus size={16} />}
-            onClick={() => setShowAddActivity(true)}
-          >
-            {t('schedule.add_activity', 'Add Activity')}
-          </Button>
+          {schedule.status === 'draft' && (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<PlayCircle size={14} />}
+              onClick={() => activateSchedule.mutate()}
+              loading={activateSchedule.isPending}
+            >
+              {t('schedule.activate', { defaultValue: 'Activate' })}
+            </Button>
+          )}
+          <ScheduleLifecycleActions schedule={{ ...schedule, ...scheduleRecord }} onChanged={onBack} />
+          {canEditSchedule && (
+            <Button
+              variant="primary"
+              icon={<Plus size={16} />}
+              onClick={() => setShowAddActivity(true)}
+            >
+              {t('schedule.add_activity', 'Add Activity')}
+            </Button>
+          )}
         </div>
       </div>
+
+      {/* What the last generation could not do as asked. It stays until the
+          reader dismisses it, because the dates on screen alone do not say
+          that the plan overran the window or that durations were cut. */}
+      {showPlanWarnings && (
+        <div
+          role="status"
+          data-testid="generation-warning"
+          className="mb-4 flex items-start gap-3 rounded-lg border border-semantic-warning/40 bg-semantic-warning-bg px-4 py-3"
+        >
+          <AlertTriangle size={16} className="mt-0.5 shrink-0 text-semantic-warning" />
+          <div className="min-w-0 flex-1 space-y-1 text-sm text-content-primary">
+            {planWarnings.map((w) =>
+              w.code === 'plan_exceeds_window' ? (
+                <p key={w.code}>
+                  {t('schedule.warning_plan_exceeds_window', {
+                    defaultValue:
+                      'The plan does not fit the dates you asked for: it ends on {{planned}}, you asked for {{requested}}. Four crews work side by side and every duration is already cut to half of its estimate, the shortest a plan is squeezed to. Move the end date, or shorten the plan by hand.',
+                    planned: formatDate(w.planned_end),
+                    requested: formatDate(w.requested_end),
+                  })}
+                </p>
+              ) : (
+                <p key={w.code}>
+                  {t('schedule.warning_durations_shortened', {
+                    defaultValue:
+                      'To fit the dates you asked for, every duration was shortened to {{percent}}% of its estimate. Check that the crews can keep that pace.',
+                    percent: w.percent,
+                  })}
+                </p>
+              ),
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setDismissedStamp(planStamp)}
+            className="shrink-0 rounded-md px-2 py-0.5 text-xs font-medium text-content-secondary hover:bg-surface-secondary"
+          >
+            {t('common.dismiss', { defaultValue: 'Dismiss' })}
+          </button>
+        </div>
+      )}
 
       {/* Content area: either the populated schedule or the empty state */}
       {hasActivities ? (
@@ -1747,7 +2146,10 @@ function ScheduleDetail({
                 activitiesById={activitiesById}
               />
             ) : viewMode === 'interchange' ? (
-              <ScheduleInterchangePanel scheduleId={schedule.id} projectId={projectId} />
+              <div className="space-y-4">
+                <SpreadsheetImportEntry projectId={projectId} schedule={schedule} variant="card" />
+                <ScheduleInterchangePanel scheduleId={schedule.id} projectId={projectId} />
+              </div>
             ) : viewMode === 'progress' ? (
               <ProgressRigorPanel
                 scheduleId={schedule.id}
@@ -1789,21 +2191,27 @@ function ScheduleDetail({
                 <SVGGanttChart
                   activities={svgGanttActivities}
                   viewMode={zoomLevel as GanttViewMode}
-                  showBaseline={false}
+                  showBaseline={showBaseline}
                   showDependencies={true}
                   showCriticalPath={!!cpmResult}
                   todayLine={true}
                   onActivityResize={handleActivityResize}
+                  onCreateLink={ganttLinking.onCreateLink}
+                  onDeleteLink={ganttLinking.onDeleteLink}
                   onActivityClick={(id) => setSelectedActivityId(id)}
                 />
               ) : viewMode === 'table' ? (
                 <ActivityGrid
                   scheduleId={schedule.id}
                   projectId={projectId}
-                  activities={filteredActivities}
+                  activities={gridActivities}
                   criticalActivityIds={criticalActivityIds}
                   onEditDependencies={(id) => setSelectedActivityId(id)}
                   onAddActivity={() => setShowAddActivity(true)}
+                  sectionIds={sectionIds}
+                  allActivities={ganttData?.activities}
+                  collapsedIds={collapsedIds}
+                  onToggleCollapse={toggleCollapse}
                 />
               ) : (
                 <GanttChart
@@ -1837,8 +2245,9 @@ function ScheduleDetail({
                 </p>
 
                 {/* Quick-start options */}
-                <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-4 w-full max-w-lg">
+                <div className="mt-8 grid grid-cols-1 sm:grid-cols-3 gap-4 w-full max-w-2xl">
                   <button
+                    disabled={!canEditSchedule}
                     onClick={() => setShowGenerateBOQ(true)}
                     className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border-light bg-surface-secondary/30 p-6 transition-all hover:border-oe-blue/50 hover:bg-oe-blue-subtle/30"
                   >
@@ -1855,8 +2264,9 @@ function ScheduleDetail({
                     </div>
                   </button>
                   <button
+                    disabled={!canEditSchedule}
                     onClick={() => setShowAddActivity(true)}
-                    className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border-light bg-surface-secondary/30 p-6 transition-all hover:border-oe-blue/50 hover:bg-oe-blue-subtle/30"
+                    className="group flex flex-col items-center gap-3 rounded-xl border-2 border-dashed border-border-light bg-surface-secondary/30 p-6 transition-all hover:border-oe-blue/50 hover:bg-oe-blue-subtle/30 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-surface-secondary text-content-secondary transition-transform group-hover:scale-110">
                       <Plus size={24} />
@@ -1870,6 +2280,7 @@ function ScheduleDetail({
                       </p>
                     </div>
                   </button>
+                  <SpreadsheetImportEntry projectId={projectId} schedule={schedule} variant="tile" />
                 </div>
 
                 {/* Feature hints */}
@@ -1906,6 +2317,11 @@ function ScheduleDetail({
         <form
           onSubmit={(e) => {
             e.preventDefault();
+            const code = activityForm.wbs_code.trim();
+            if (code && (ganttData?.activities ?? []).some((a) => (a.wbs_code ?? '').trim() === code)) {
+              setWbsError(wbsTakenMessage(code));
+              return;
+            }
             addActivity.mutate(activityForm);
           }}
           className="space-y-4"
@@ -1917,11 +2333,45 @@ function ScheduleDetail({
             onChange={(e) => setActivityForm((f) => ({ ...f, name: e.target.value }))}
             required aria-required="true"
           />
+          {/* Parent section - insert under a summary */}
+          {(() => {
+            const summaries = orderAsTree(ganttData?.activities ?? []).filter((a) => a.activity_type === 'summary');
+            if (summaries.length === 0) return null;
+            return (
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm font-medium text-content-primary">
+                  {t('schedule.parent_section', { defaultValue: 'Parent section' })}
+                </label>
+                <select
+                  className="h-9 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue"
+                  value={activityForm.parent_id ?? ''}
+                  onChange={(e) => chooseParentSection(e.target.value || undefined)}
+                >
+                  <option value="">{t('schedule.no_parent', { defaultValue: 'Top level (no parent)' })}</option>
+                  {summaries.map((s) => (
+                    <option key={s.id} value={s.id}>{s.wbs_code ? `${s.wbs_code} ${s.name}` : s.name}</option>
+                  ))}
+                </select>
+              </div>
+            );
+          })()}
           <Input
             label={t('schedule.wbs_code', 'WBS Code')}
             placeholder={t('schedule.wbs_code_placeholder', 'e.g. 01.02.003')}
             value={activityForm.wbs_code}
-            onChange={(e) => setActivityForm((f) => ({ ...f, wbs_code: e.target.value }))}
+            onChange={(e) => {
+              wbsTouchedRef.current = e.target.value.trim() !== '';
+              setWbsError(null);
+              setActivityForm((f) => ({ ...f, wbs_code: e.target.value }));
+            }}
+            error={wbsError ?? undefined}
+            hint={
+              activityForm.parent_id && !wbsTouchedRef.current
+                ? t('schedule.wbs_code_suggested_hint', {
+                    defaultValue: 'Continues the numbering of the chosen section. You can change it.',
+                  })
+                : undefined
+            }
           />
           <div className="grid grid-cols-2 gap-3">
             <Input
@@ -1975,7 +2425,7 @@ function ScheduleDetail({
       <Modal
         open={!!selectedActivity}
         onClose={() => setSelectedActivityId(null)}
-        title={t('schedule.edit_dependencies', { defaultValue: 'Edit dependencies' })}
+        title={t('schedule.edit_activity_links', { defaultValue: 'Dependencies and BOQ links' })}
       >
         {selectedActivity && (
           <div className="space-y-4">
@@ -1985,12 +2435,32 @@ function ScheduleDetail({
                 {formatDate(selectedActivity.start_date)} &ndash; {formatDate(selectedActivity.end_date)}
               </p>
             </div>
+            {selectedActivity.activity_type === 'milestone' && (
+              <MilestoneClientToggle scheduleId={schedule.id} activity={selectedActivity} />
+            )}
             <DependencyEditor
               scheduleId={schedule.id}
               activity={selectedActivity}
               activities={ganttData?.activities ?? []}
             />
-            <div className="flex items-center justify-end pt-1">
+            <div className="border-t border-border-light pt-4">
+              <BoqLinkEditor scheduleId={schedule.id} projectId={projectId} activity={selectedActivity} />
+            </div>
+            <div className="flex items-center justify-between pt-1">
+              {canDeleteSchedule ? (
+                <Button
+                  variant="ghost"
+                  type="button"
+                  icon={<Trash2 size={14} />}
+                  onClick={() => handleDeleteActivity(selectedActivity)}
+                  loading={deleteActivity.isPending}
+                  className="text-semantic-error"
+                >
+                  {t('schedule.delete_activity', { defaultValue: 'Delete activity' })}
+                </Button>
+              ) : (
+                <span />
+              )}
               <Button variant="ghost" type="button" onClick={() => setSelectedActivityId(null)}>
                 {t('common.done', { defaultValue: 'Done' })}
               </Button>
@@ -2003,14 +2473,18 @@ function ScheduleDetail({
       <Modal
         open={showGenerateBOQ}
         onClose={() => setShowGenerateBOQ(false)}
-        title={t('schedule.generate_from_boq', 'Generate from BOQ')}
+        title={
+          hasActivities
+            ? t('schedule.regenerate_from_boq', { defaultValue: 'Regenerate from BOQ' })
+            : t('schedule.generate_from_boq', 'Generate from BOQ')
+        }
       >
         <div className="space-y-4">
           <p className="text-sm text-content-secondary">
-            {t(
-              'schedule.generate_from_boq_description',
-              'Select a BOQ to auto-generate schedule activities. One activity will be created per BOQ section with cost-proportional durations.',
-            )}
+            {t('schedule.generate_from_boq_tree_description', {
+              defaultValue:
+                'Select a BOQ. Every section becomes a summary and every position with a quantity one activity, sized from its labour, else from its unit with a gang of two to four people, else from its cost. Within a section up to four crews work side by side, and each next section starts once half of the work before it is done. You see the plan before anything is written.',
+            })}
           </p>
 
           {/* Start date picker */}
@@ -2029,13 +2503,72 @@ function ScheduleDetail({
             </p>
           </div>
 
+          {/* End date: the generated plan is fitted between the two dates. */}
+          <div>
+            <label className="block text-sm font-medium text-content-primary mb-1.5">
+              {t('schedule.project_end_date', { defaultValue: 'Project End Date' })}
+            </label>
+            <input
+              type="date"
+              data-testid="generate-end-date"
+              value={generateEndDate}
+              min={generateStartDate || undefined}
+              onChange={(e) => setGenerateEndDate(e.target.value)}
+              className="h-10 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue"
+            />
+            <p className="mt-1 text-xs text-content-tertiary">
+              {!generateEndDate
+                ? t('schedule.end_date_optional', {
+                    defaultValue:
+                      'No end date: the plan takes as long as the work needs and nothing is shortened. Enter one to fit the plan between the two dates.',
+                  })
+                : generateWindowDays == null
+                  ? t('schedule.end_before_start', { defaultValue: 'The end date must be after the start date.' })
+                  : t('schedule.end_date_hint', { defaultValue: 'The generated plan is fitted between these two dates.' })}
+            </p>
+          </div>
+
+          {/* Workers: what a bill of hours without crews is worked by. */}
+          <div>
+            <label
+              htmlFor="generate-workers"
+              className="block text-sm font-medium text-content-primary mb-1.5"
+            >
+              {t('schedule.generate_workers_label', { defaultValue: 'Workers per position' })}
+            </label>
+            <input
+              id="generate-workers"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={MAX_WORKERS_PER_POSITION}
+              step={1}
+              data-testid="generate-workers"
+              value={generateWorkers}
+              placeholder={t('schedule.generate_workers_auto', { defaultValue: 'Auto' })}
+              onChange={(e) => setGenerateWorkers(e.target.value)}
+              aria-invalid={generateWorkersInvalid || undefined}
+              className="h-10 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm focus:outline-none focus:ring-2 focus:ring-oe-blue/30 focus:border-oe-blue"
+            />
+            <p className="mt-1 text-xs text-content-tertiary">
+              {generateWorkersInvalid
+                ? t('schedule.generate_workers_invalid', { defaultValue: 'Enter a whole number from 1 to 20.' })
+                : t('schedule.generate_workers_hint', {
+                    defaultValue:
+                      'For positions whose bill gives hours but no crew. Leave it empty to use the fewest that fit the dates. A crew the bill names is kept.',
+                  })}
+            </p>
+          </div>
+
           {!boqs || boqs.length === 0 ? (
             <p className="text-sm text-content-tertiary">
               {t('schedule.no_boqs_available', 'No BOQs available for this project.')}
             </p>
           ) : (
             <div className="space-y-2">
-              {boqs.map((boq) => (
+              {[...boqs]
+                .sort((a, b) => Number(isBudgetEstimate(a.estimate_type)) - Number(isBudgetEstimate(b.estimate_type)))
+                .map((boq) => (
                 <button
                   key={boq.id}
                   type="button"
@@ -2059,29 +2592,172 @@ function ScheduleDetail({
                   >
                     {t(`boq.${boq.status}`, { defaultValue: boq.status })}
                   </Badge>
+                  {isBudgetEstimate(boq.estimate_type) && (
+                    <Badge variant="warning" size="sm" className="mt-1 ml-1">
+                      {t('schedule.boq_budget_badge', {
+                        defaultValue: 'Budget estimate: one bar per lump sum',
+                      })}
+                    </Badge>
+                  )}
                 </button>
               ))}
             </div>
           )}
-          <div className="flex items-center justify-end gap-3 pt-2">
+          {generationPreview && <GenerationPreviewPanel preview={generationPreview} />}
+          {generationPreview && generationPreview.existing_activity_count > 0 && (
+            <div className="space-y-1 text-sm">
+              <p className="text-content-primary">
+                {t('schedule.error_schedule_has_activities', {
+                  defaultValue: 'This schedule already has {{count}} activities.',
+                  count: generationPreview.existing_activity_count,
+                })}{' '}
+                {t('schedule.generate_conflict_replace_hint', {
+                  defaultValue:
+                    'Replacing them deletes them and their links, then builds the plan again from the BOQ. A new schedule leaves this one as it is.',
+                })}
+              </p>
+              {generationPreview.existing_started_count > 0 && (
+                <p className="flex items-start gap-2 text-semantic-warning">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  {t('schedule.generate_conflict_started', {
+                    defaultValue: '{{count}} of them have progress recorded. Replacing them loses that progress.',
+                    count: generationPreview.existing_started_count,
+                  })}
+                </p>
+              )}
+              {replaceInstalmentSentences(
+                t,
+                generationPreview.instalments_relinked,
+                generationPreview.instalments_unlinked,
+              ).map((line) => (
+                <p key={line} className="text-content-secondary" data-testid="replace-instalments">
+                  {line}
+                </p>
+              ))}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
             <Button variant="ghost" onClick={() => setShowGenerateBOQ(false)}>
               {t('common.cancel', 'Cancel')}
             </Button>
-            <Button
-              variant="primary"
-              disabled={!selectedBOQId || !generateStartDate}
-              loading={generateFromBOQ.isPending}
-              onClick={() => {
-                if (selectedBOQId) {
-                  generateFromBOQ.mutate(selectedBOQId);
-                }
-              }}
-            >
-              {t('schedule.generate', 'Generate')}
-            </Button>
+            {!generationPreview ? (
+              <Button
+                variant="primary"
+                data-testid="generate-preview"
+                disabled={!selectedBOQId || generateWindowInvalid || generateWorkersInvalid}
+                loading={previewGeneration.isPending}
+                onClick={() => {
+                  if (selectedBOQId) previewGeneration.mutate(selectedBOQId);
+                }}
+              >
+                {t('schedule.generate_preview', { defaultValue: 'Check the plan' })}
+              </Button>
+            ) : generationPreview.existing_activity_count > 0 ? (
+              <>
+                {onOpenSchedule && (
+                  <Button
+                    variant="secondary"
+                    type="button"
+                    loading={generateIntoNewSchedule.isPending}
+                    disabled={generateFromBOQ.isPending}
+                    onClick={() => generateIntoNewSchedule.mutate(generationPreview.boq_id)}
+                  >
+                    {t('schedule.generate_conflict_new_schedule', { defaultValue: 'Create a new schedule' })}
+                  </Button>
+                )}
+                <Button
+                  variant="danger"
+                  type="button"
+                  data-testid="generate-replace"
+                  loading={generateFromBOQ.isPending}
+                  disabled={generateIntoNewSchedule.isPending}
+                  onClick={() => generateFromBOQ.mutate({ boqId: generationPreview.boq_id, replace: true })}
+                >
+                  {t('schedule.generate_replace_and_create', { defaultValue: 'Replace them and create the plan' })}
+                </Button>
+              </>
+            ) : (
+              <Button
+                variant="primary"
+                data-testid="generate-create"
+                loading={generateFromBOQ.isPending}
+                onClick={() => generateFromBOQ.mutate({ boqId: generationPreview.boq_id, replace: false })}
+              >
+                {t('schedule.generate_create', { defaultValue: 'Create the plan' })}
+              </Button>
+            )}
           </div>
         </div>
       </Modal>
+
+      {/* The schedule already has activities: replace them, or generate into a new schedule */}
+      <Modal
+        open={!!generateConflict}
+        onClose={() => setGenerateConflict(null)}
+        title={t('schedule.generate_conflict_title', { defaultValue: 'This schedule already has activities' })}
+      >
+        {generateConflict && (
+          <div className="space-y-4">
+            <p className="text-sm text-content-primary">
+              {t('schedule.error_schedule_has_activities', {
+                defaultValue: 'This schedule already has {{count}} activities.',
+                count: generateConflict.activityCount,
+              })}{' '}
+              {t('schedule.generate_conflict_replace_hint', {
+                defaultValue:
+                  'Replacing them deletes them and their links, then builds the plan again from the BOQ. A new schedule leaves this one as it is.',
+              })}
+            </p>
+            {generateConflict.startedCount > 0 && (
+              <p className="flex items-start gap-2 text-sm text-semantic-warning">
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                {t('schedule.generate_conflict_started', {
+                  defaultValue: '{{count}} of them have progress recorded. Replacing them loses that progress.',
+                  count: generateConflict.startedCount,
+                })}
+              </p>
+            )}
+            {replaceInstalmentSentences(t, generateConflict.instalmentsRelinked, generateConflict.instalmentsUnlinked).map(
+              (line) => (
+                <p key={line} className="text-sm text-content-secondary">
+                  {line}
+                </p>
+              ),
+            )}
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
+              <Button variant="ghost" type="button" onClick={() => setGenerateConflict(null)}>
+                {t('common.cancel', 'Cancel')}
+              </Button>
+              {onOpenSchedule && (
+                <Button
+                  variant="secondary"
+                  type="button"
+                  loading={generateIntoNewSchedule.isPending}
+                  disabled={generateFromBOQ.isPending}
+                  onClick={() => generateIntoNewSchedule.mutate(generateConflict.boqId)}
+                >
+                  {t('schedule.generate_conflict_new_schedule', { defaultValue: 'Create a new schedule' })}
+                </Button>
+              )}
+              <Button
+                variant="danger"
+                type="button"
+                loading={generateFromBOQ.isPending}
+                disabled={generateIntoNewSchedule.isPending}
+                onClick={() => generateFromBOQ.mutate({ boqId: generateConflict.boqId, replace: true })}
+              >
+                {t('schedule.generate_conflict_replace', { defaultValue: 'Replace them' })}
+              </Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+      <ActivityDeleteDialog
+        target={deleteTarget}
+        loading={deleteActivity.isPending}
+        onCancel={() => setDeleteTarget(null)}
+        onDelete={(cascade) => deleteTarget && deleteActivity.mutate({ activityId: deleteTarget.id, cascade })}
+      />
       <ConfirmDialog {...confirmProps} />
     </div>
   );
@@ -2089,7 +2765,7 @@ function ScheduleDetail({
 
 /* ── Schedule List for a Project ───────────────────────────────────────── */
 
-function ProjectSchedules({
+export function ProjectSchedules({
   project,
   onBack,
   generateBoqId,
@@ -2107,6 +2783,17 @@ function ProjectSchedules({
   const addToast = useToastStore((s) => s.addToast);
   const [selectedSchedule, setSelectedSchedule] = useState<Schedule | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showSpreadsheetImport, setShowSpreadsheetImport] = useState(false);
+  const [archiveState, setArchiveState] = useState<'current' | 'archived' | 'all'>('current');
+  const [scheduleOffset, setScheduleOffset] = useState(0);
+  const schedulePageSize = 50;
+  // Creating a schedule is editor work (schedule.create). A viewer reads the
+  // list; the create button stays visible but disabled, with the reason.
+  const canCreateSchedule = useHasPermission('schedule.create');
+  const canGenerate = useHasPermission('schedule.update');
+  const createHint = canCreateSchedule
+    ? undefined
+    : t('errors.forbidden', { defaultValue: "You don't have permission to perform this action." });
   const [form, setForm] = useState<CreateScheduleForm>({
     name: '',
     description: '',
@@ -2114,10 +2801,16 @@ function ProjectSchedules({
     end_date: '',
   });
 
-  const { data: schedules, isLoading } = useQuery({
-    queryKey: ['schedules', project.id],
-    queryFn: () => scheduleApi.listSchedules(project.id).then((page) => page.items),
+  const { data: schedulePage, isLoading, isError: isScheduleListError } = useQuery({
+    queryKey: ['schedules', project.id, archiveState, scheduleOffset],
+    queryFn: () => scheduleApi.listSchedules(project.id, { archiveState, offset: scheduleOffset, limit: schedulePageSize }),
   });
+  const schedules = schedulePage?.items;
+  useEffect(() => {
+    if (schedulePage && scheduleOffset > 0 && scheduleOffset >= schedulePage.total) {
+      setScheduleOffset(Math.max(0, Math.ceil(schedulePage.total / schedulePageSize) - 1) * schedulePageSize);
+    }
+  }, [schedulePage, scheduleOffset]);
 
   // CONN-34: when arriving via the BOQ "Build schedule from this BOQ" deep
   // link, drill straight to a schedule so the Generate-from-BOQ modal (which
@@ -2125,16 +2818,27 @@ function ProjectSchedules({
   // one schedule exists, open the first; if none exist, open the Create modal
   // so the user makes one first — the param survives so generation continues
   // once the schedule is created and selected.
+  //
+  // With schedules already there the reader picks one (or a new one): taking
+  // the first silently sent the BOQ into whatever schedule sorted first, which
+  // usually already had activities, and the generation was refused.
   const generateHandledRef = useRef(false);
+  const [showGenerateTarget, setShowGenerateTarget] = useState(false);
+  const openCreateForGenerate = useCallback(() => {
+    setForm((f) =>
+      f.name ? f : { ...f, name: t('schedule.default_schedule_name', { defaultValue: 'Construction schedule' }) },
+    );
+    setShowCreate(true);
+  }, [t]);
   useEffect(() => {
     if (!generateBoqId || generateHandledRef.current) return;
     if (selectedSchedule) return;
     if (!schedules) return; // wait for the list to load
     generateHandledRef.current = true;
-    if (schedules.length > 0) {
-      setSelectedSchedule(schedules[0]!);
-    } else {
-      setShowCreate(true);
+    if (schedules.some((item) => item.status !== 'archived')) {
+      if (canGenerate) setShowGenerateTarget(true);
+    } else if (canCreateSchedule) {
+      openCreateForGenerate();
       addToast({
         type: 'info',
         title: t('schedule.create_before_generate', {
@@ -2142,7 +2846,7 @@ function ProjectSchedules({
         }),
       });
     }
-  }, [generateBoqId, schedules, selectedSchedule, addToast, t]);
+  }, [generateBoqId, schedules, selectedSchedule, addToast, t, canCreateSchedule, canGenerate, openCreateForGenerate]);
 
   const createSchedule = useMutation({
     mutationFn: (data: CreateScheduleForm) =>
@@ -2170,12 +2874,16 @@ function ProjectSchedules({
   // If a schedule is selected, show its detail
   if (selectedSchedule) {
     return (
+      // Keyed by id: switching to another schedule (a plan generated into a
+      // new one) starts its page fresh instead of carrying this one's state.
       <ScheduleDetail
+        key={selectedSchedule.id}
         schedule={selectedSchedule}
         projectId={project.id}
         onBack={() => setSelectedSchedule(null)}
         generateBoqId={generateBoqId}
         onConsumeGenerateBoq={onConsumeGenerateBoq}
+        onOpenSchedule={setSelectedSchedule}
       />
     );
   }
@@ -2199,19 +2907,49 @@ function ProjectSchedules({
             {t('schedule.project_schedules', 'Schedules for this project')}
           </p>
         </div>
-        <Button
-          variant="primary"
-          size="lg"
-          icon={<Plus size={18} />}
-          onClick={() => setShowCreate(true)}
-        >
-          {t('schedule.create_schedule', 'Create Schedule')}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="lg"
+            icon={<FileSpreadsheet size={18} />}
+            onClick={() => setShowSpreadsheetImport(true)}
+            disabled={!canCreateSchedule}
+            title={createHint}
+          >
+            {t('schedule.tabular_import.open', { defaultValue: 'Import spreadsheet' })}
+          </Button>
+          <Button
+            variant="primary"
+            size="lg"
+            icon={<Plus size={18} />}
+            onClick={() => setShowCreate(true)}
+            disabled={!canCreateSchedule}
+            title={createHint}
+          >
+            {t('schedule.create_schedule', 'Create Schedule')}
+          </Button>
+        </div>
       </div>
 
+      <label className="mb-4 flex flex-wrap items-center gap-2 text-sm text-content-secondary">
+        {t('schedule.archive_filter')}
+        <select aria-label={t('schedule.archive_filter')} value={archiveState}
+          onChange={(event) => { setArchiveState(event.target.value as typeof archiveState); setScheduleOffset(0); }}
+          className="rounded-md border border-border bg-surface-primary px-3 py-2 text-content-primary">
+          <option value="current">{t('schedule.archive_filter_current')}</option>
+          <option value="archived">{t('schedule.status_archived')}</option>
+          <option value="all">{t('common.all')}</option>
+        </select>
+      </label>
       {/* Schedule list */}
       {isLoading ? (
         <SkeletonTable rows={3} columns={4} />
+      ) : isScheduleListError ? (
+        <div className="w-full py-8 text-center">
+          <p className="text-content-secondary">{t('schedule.load_error', { defaultValue: 'Failed to load schedules. Please try again.' })}</p>
+        </div>
+      ) : archiveState === 'archived' && !schedules?.length ? (
+        <p className="py-8 text-center text-content-secondary">{t('schedule.archive_empty')}</p>
       ) : !schedules || schedules.length === 0 ? (
         <div className="max-w-3xl mx-auto py-6">
           {/* Hero */}
@@ -2286,12 +3024,24 @@ function ProjectSchedules({
           </div>
 
           {/* CTA */}
-          <div className="text-center">
+          <div className="flex flex-wrap items-center justify-center gap-3">
+            <Button
+              variant="secondary"
+              size="lg"
+              icon={<FileSpreadsheet size={18} />}
+              onClick={() => setShowSpreadsheetImport(true)}
+              disabled={!canCreateSchedule}
+              title={createHint}
+            >
+              {t('schedule.tabular_import.hero_cta', { defaultValue: 'Import from Excel or CSV' })}
+            </Button>
             <Button
               variant="primary"
               size="lg"
               icon={<Plus size={18} />}
               onClick={() => setShowCreate(true)}
+              disabled={!canCreateSchedule}
+              title={createHint}
             >
               {t('schedule.create_schedule', { defaultValue: 'Create Schedule' })}
             </Button>
@@ -2325,12 +3075,112 @@ function ProjectSchedules({
                 <Badge variant={schedule.status === 'active' ? 'blue' : 'neutral'} size="sm">
                   {t(`schedule.status_${schedule.status}`, { defaultValue: schedule.status })}
                 </Badge>
+                <ScheduleLifecycleActions schedule={schedule} compact />
                 <ChevronRight size={16} className="shrink-0 text-content-tertiary" />
               </div>
             </Card>
           ))}
         </div>
       )}
+
+      {!isScheduleListError && (scheduleOffset > 0 || (schedulePage?.total ?? 0) > schedulePageSize) && (
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <Button variant="secondary" disabled={isLoading || scheduleOffset === 0}
+            onClick={() => setScheduleOffset(Math.max(0, scheduleOffset - schedulePageSize))}>
+            {t('common.previous_page')}
+          </Button>
+          <Button variant="secondary" disabled={isLoading || scheduleOffset + schedulePageSize >= (schedulePage?.total ?? 0)}
+            onClick={() => setScheduleOffset(scheduleOffset + schedulePageSize)}>
+            {t('common.next_page')}
+          </Button>
+        </div>
+      )}
+
+      {/* BOQ deep link: which schedule should the plan go into? */}
+      <Modal
+        open={showGenerateTarget}
+        onClose={() => {
+          setShowGenerateTarget(false);
+          onConsumeGenerateBoq?.();
+        }}
+        title={t('schedule.generate_target_title', { defaultValue: 'Which schedule should the BOQ go into?' })}
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-content-secondary">
+            {t('schedule.generate_target_hint', {
+              defaultValue:
+                'Pick a schedule to generate into, or start a new one. A schedule that already has activities asks before anything is replaced.',
+            })}
+          </p>
+          <div className="max-h-72 space-y-2 overflow-y-auto">
+            {(schedules ?? []).filter((item) => item.status !== 'archived').map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => {
+                  setShowGenerateTarget(false);
+                  setSelectedSchedule(s);
+                }}
+                className="flex w-full items-center gap-3 rounded-lg border border-border bg-surface-primary px-4 py-3 text-left transition-all hover:bg-surface-secondary"
+              >
+                <CalendarDays size={16} className="shrink-0 text-oe-blue" />
+                <span className="min-w-0 flex-1 truncate text-sm font-medium text-content-primary">{s.name}</span>
+                <Badge variant={s.status === 'active' ? 'blue' : 'neutral'} size="sm">
+                  {t(`schedule.status_${s.status}`, { defaultValue: s.status })}
+                </Badge>
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center justify-end gap-2 pt-2">
+            {(scheduleOffset > 0 || (schedulePage?.total ?? 0) > schedulePageSize) && <>
+              <Button variant="secondary" type="button" disabled={isLoading || scheduleOffset === 0}
+                onClick={() => setScheduleOffset(Math.max(0, scheduleOffset - schedulePageSize))}>
+                {t('common.previous_page')}
+              </Button>
+              <Button variant="secondary" type="button"
+                disabled={isLoading || scheduleOffset + schedulePageSize >= (schedulePage?.total ?? 0)}
+                onClick={() => setScheduleOffset(scheduleOffset + schedulePageSize)}>
+                {t('common.next_page')}
+              </Button>
+            </>}
+            <Button
+              variant="ghost"
+              type="button"
+              onClick={() => {
+                setShowGenerateTarget(false);
+                onConsumeGenerateBoq?.();
+              }}
+            >
+              {t('common.cancel', 'Cancel')}
+            </Button>
+            <Button
+              variant="primary"
+              type="button"
+              icon={<Plus size={14} />}
+              disabled={!canCreateSchedule}
+              title={createHint}
+              onClick={() => {
+                setShowGenerateTarget(false);
+                openCreateForGenerate();
+              }}
+            >
+              {t('schedule.new_schedule', { defaultValue: 'New schedule' })}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+      <ScheduleSpreadsheetImportDialog
+        open={showSpreadsheetImport}
+        onClose={() => setShowSpreadsheetImport(false)}
+        projectId={project.id}
+        onImported={() => queryClient.invalidateQueries({ queryKey: ['schedules', project.id] })}
+        onOpenSchedule={(result) => {
+          setShowSpreadsheetImport(false);
+          scheduleApi.getSchedule(result.schedule_id).then(setSelectedSchedule, (error: Error) =>
+            addToast({ type: 'error', title: t('toasts.error', { defaultValue: 'Error' }), message: error.message }),
+          );
+        }}
+      />
 
       {/* Create Schedule Modal */}
       <Modal
@@ -2521,7 +3371,7 @@ export function SchedulePage() {
 
   const { data: projects, isLoading } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 

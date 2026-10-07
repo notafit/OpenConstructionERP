@@ -33,7 +33,7 @@ Shape
 
 No network calls live in this package. Every platform is an adapter, because
 eight SOAP clients and their dependency trees inside core would end the promise
-that core runs on a 2 GB VPS.
+that core runs on a 3 GB server.
 """
 
 

@@ -88,7 +88,12 @@ class Findings(NamedTuple):
 
 def git(*args: str) -> str:
     return subprocess.run(
-        ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=os.getcwd()
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=os.getcwd(),
     ).stdout
 
 
@@ -184,7 +189,12 @@ def toplevel_names(tree: ast.Module) -> tuple[set[str], bool]:
             # names that way, `collect_rule_issues` and `ClashGeometryProvider`
             # among them. Reading only the unguarded body would call an import of
             # any of those unresolved, which is a false red on a healthy commit.
-            for block in (node.body, node.orelse, node.finalbody, *(h.body for h in node.handlers)):
+            for block in (
+                node.body,
+                node.orelse,
+                node.finalbody,
+                *(h.body for h in node.handlers),
+            ):
                 bind_block(block, names)
     return names, star
 
@@ -215,7 +225,9 @@ def rebound_names(tree: ast.Module, ours: set[ast.stmt]) -> set[str]:
 
 
 def module_bindings(
-    tree: ast.Module, defined: dict[str, tuple[set[str], bool]], optional: list[tuple[int, int]]
+    tree: ast.Module,
+    defined: dict[str, tuple[set[str], bool]],
+    optional: list[tuple[int, int]],
 ) -> dict[str, str]:
     """Local names in this file that hold an app module, and the module each holds.
 
@@ -382,7 +394,12 @@ def self_test() -> None:
     sessions share.
     """
     events = '"""fixture module."""\n\n\ndef publish(topic: str) -> None:\n    return None\n'
-    core = dict([_module("app", '"""fixture package."""\n', package=True), _module("app.core", "", package=True)])
+    core = dict(
+        [
+            _module("app", '"""fixture package."""\n', package=True),
+            _module("app.core", "", package=True),
+        ]
+    )
     base = dict(core, **dict([_module("app.core.events", events)]))
     router = "app.modules.rfi.router"
 
@@ -401,7 +418,10 @@ def self_test() -> None:
     # so the import statement alone says nothing about whether it is there.
     use = "\n\n\ndef handle() -> None:\n    {expr}\n"
     aliased = "import app.core.events as ev" + use.format(expr="ev.record_activity('rfi')")
-    for source in (aliased, "from app.core import events" + use.format(expr="events.record_activity('rfi')")):
+    for source in (
+        aliased,
+        "from app.core import events" + use.format(expr="events.record_activity('rfi')"),
+    ):
         found = scan(dict(base, **dict([_module(router, source)])))
         if len(found.broken) != 1 or "record_activity" not in found.broken[0]:
             _fail(f"an attribute reached through a bound module read as {found.broken}, from:\n{source}")

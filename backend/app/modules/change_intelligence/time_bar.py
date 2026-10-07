@@ -12,8 +12,9 @@ overdue). It is the deterministic core behind a per-project "notice register".
 
 The mapping from a contract standard to its notice periods is a code-level
 config (:data:`NOTICE_PERIODS`): a small table of standard -> {notice_type:
-period_days}. The standards named here (FIDIC, NEC, JCT, AIA, ConsensusDocs) are
-international contract standards, named as such; none is a commercial product.
+period_days}. The standards named here (FIDIC, NEC, JCT, AIA, ConsensusDocs,
+CCDC) are international contract standards, named as such; none is a commercial
+product.
 The day counts encode the well-known windows for each standard and are documented
 inline; a deployment can localise them without touching the engine's logic.
 
@@ -63,8 +64,7 @@ STANDARD_NEC = "NEC"
 STANDARD_JCT = "JCT"
 STANDARD_AIA = "AIA"
 STANDARD_CONSENSUSDOCS = "CONSENSUSDOCS"
-#: The Canadian CCDC family. Recognised, and deliberately carrying no periods -
-#: see :data:`NOTICE_PERIODS_HELD`.
+#: The Canadian CCDC family (CCDC 2-2020 Stipulated Price Contract).
 STANDARD_CCDC = "CCDC"
 STANDARD_UNKNOWN = "UNKNOWN"
 
@@ -162,6 +162,18 @@ NOTICE_PERIODS: dict[str, dict[str, int]] = {
         NOTICE_ASSESSMENT: 14,
         NOTICE_RESPONSE: 14,
     },
+    # CCDC 2-2020 (Stipulated Price Contract). Claims notice within 10 working
+    # days of the event (GC 6.6). Change orders: the Contractor proceeds and
+    # adjusts the price within 14 calendar days (GC 6.1). EOT notice follows
+    # the same 10-working-day discipline as claims (GC 6.5). The Consultant
+    # responds within 15 calendar days of receiving a quotation (GC 6.3).
+    STANDARD_CCDC: {
+        NOTICE_CLAIM: 10,
+        NOTICE_EOT: 10,
+        NOTICE_QUOTATION: 14,
+        NOTICE_ASSESSMENT: 15,
+        NOTICE_RESPONSE: 15,
+    },
 }
 
 #: Standards that are recognised but deliberately carry no periods yet, so a
@@ -176,15 +188,7 @@ NOTICE_PERIODS: dict[str, dict[str, int]] = {
 #: is known about the contract at all. A standard *named* on the record is a
 #: different case - the reader can see which contract governs, so a number
 #: presented next to that name reads as that contract's number.
-#:
-#: CCDC is held rather than populated because no period here has been sourced
-#: from the contract text. CCDC documents are copyrighted and not in this
-#: repository, and a notice period is a legal deadline: getting one wrong loses
-#: an entitlement, which is worse than showing that we do not have it. Whoever
-#: sources them should add a row to :data:`NOTICE_PERIODS` with the
-#: corresponding :data:`NOTICE_PERIOD_BASES` entry naming :data:`BUSINESS`, and
-#: remove the standard from this set.
-NOTICE_PERIODS_HELD: frozenset[str] = frozenset({STANDARD_CCDC})
+NOTICE_PERIODS_HELD: frozenset[str] = frozenset()
 
 #: Fallback periods used when the project's contract standard is unknown, so a
 #: clock can still be derived from an event date. Conservative, standard-neutral
@@ -217,14 +221,21 @@ GENERIC_PERIODS: dict[str, int] = {
 # due "forthwith", with no day count at all), so "calendar" remains the honest
 # label for what they are.
 #
-# A standard whose periods are stated in working days - the Canadian CCDC
-# family counts every notice period that way - is expressed by naming
-# :data:`BUSINESS` here next to its day count. Nothing else has to change.
+# A standard whose periods mix working and calendar days - the Canadian CCDC
+# family counts claims and EOT in working days, others in calendar - is
+# expressed by overriding the relevant entries after the comprehension.
 # --------------------------------------------------------------------------- #
 
 NOTICE_PERIOD_BASES: dict[str, dict[str, str]] = {
     standard: dict.fromkeys(periods, CALENDAR) for standard, periods in NOTICE_PERIODS.items()
 }
+
+# CCDC counts claims and EOT in working days (GC 6.5, GC 6.6), while the
+# quotation, assessment and response windows are calendar days (GC 6.1, 6.3).
+# The comprehension above defaulted every entry to CALENDAR; override the two
+# working-day periods here.
+NOTICE_PERIOD_BASES[STANDARD_CCDC][NOTICE_CLAIM] = BUSINESS
+NOTICE_PERIOD_BASES[STANDARD_CCDC][NOTICE_EOT] = BUSINESS
 
 #: Basis for each fallback period, in the same shape as :data:`GENERIC_PERIODS`.
 GENERIC_PERIOD_BASES: dict[str, str] = dict.fromkeys(GENERIC_PERIODS, CALENDAR)
@@ -290,6 +301,13 @@ DEFAULT_CLAUSE_REFS: dict[str, dict[str, str]] = {
         NOTICE_QUOTATION: "6",
         NOTICE_ASSESSMENT: "6",
         NOTICE_RESPONSE: "6",
+    },
+    STANDARD_CCDC: {
+        NOTICE_CLAIM: "GC 6.6",
+        NOTICE_EOT: "GC 6.5",
+        NOTICE_QUOTATION: "GC 6.1",
+        NOTICE_ASSESSMENT: "GC 6.3",
+        NOTICE_RESPONSE: "GC 6.3",
     },
 }
 

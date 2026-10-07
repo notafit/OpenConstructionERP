@@ -221,24 +221,27 @@ async def test_transmittals_smoke_full_lifecycle(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_transmittals_rbac_viewer_denied(client: AsyncClient):
-    """A viewer must hit 403 on every gated transmittal route.
+async def test_transmittals_rbac_viewer_cannot_create(client: AsyncClient):
+    """A viewer is refused the write surface, and only the write surface.
 
-    The transmittals module does NOT register its permissions with
-    ``permission_registry`` (no ``permissions.py`` file ships in the
-    package), so for non-admin roles the live-registry fallback in
-    ``RequirePermission`` returns False ("Unknown permission") and the
-    request is denied with 403. Admins still pass via the role bypass.
+    This used to assert 403 on the read route too, on the premise that the
+    module shipped no ``permissions.py`` and every non-admin role fell through
+    ``RequirePermission``'s unknown-permission deny. The module registers its
+    permissions now - ``transmittals.read`` at VIEWER, create and update at
+    EDITOR, delete at MANAGER - so a viewer passes the read gate and the
+    answer is then decided by project access: 404 for a project id that
+    belongs to nobody, which is the no-leak answer rather than an RBAC
+    verdict. Create is the gate that still refuses a viewer outright.
     """
     _, viewer_hdr = await _login_as(client, "viewer")
 
-    # Random project_id — auth/RBAC check fires BEFORE any project lookup.
-    forbidden = await client.get(
+    # Read gate passes at VIEWER, so the random project id decides this one.
+    unknown_project = await client.get(
         "/api/v1/transmittals/",
         params={"project_id": str(uuid.uuid4())},
         headers=viewer_hdr,
     )
-    assert forbidden.status_code == 403, forbidden.text
+    assert unknown_project.status_code == 404, unknown_project.text
 
     # Same for write surface — create attempt must also 403.
     forbidden_create = await client.post(

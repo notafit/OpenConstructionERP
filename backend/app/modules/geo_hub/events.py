@@ -911,7 +911,7 @@ def register_subscribers() -> None:
     if flag:
         return
     for event_name, handler in _SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("geo_hub: %d cross-module subscribers registered", len(_SUBSCRIPTIONS))
 

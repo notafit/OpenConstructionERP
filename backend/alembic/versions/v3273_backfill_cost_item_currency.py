@@ -205,6 +205,16 @@ def _open_side_connection(bind: sa.engine.Connection) -> sa.engine.Connection | 
             logger.info("%s not visible to a second connection, filling in-transaction", _ITEM)
             conn.close()
             return None
+        # Visible is not the same as reachable, and only this second probe can
+        # tell them apart. ``to_regclass`` deliberately takes no lock, so it
+        # answers just as promptly when the migration's own transaction is
+        # sitting on an ACCESS EXCLUSIVE lock from an earlier ALTER TABLE in
+        # the same run - which is the third case this function documents and,
+        # until this line, could never actually reach. Touching one row takes
+        # ACCESS SHARE, so it waits on that lock and ``lock_timeout`` turns the
+        # wait into the clean in-transaction fallback rather than an
+        # OperationalError raised out of the backfill further down.
+        conn.execute(sa.text(f"SELECT 1 FROM {_ITEM} LIMIT 1"))  # noqa: S608 - constant
     except Exception as exc:
         logger.info("second connection unusable (%s), filling in-transaction", exc)
         conn.close()

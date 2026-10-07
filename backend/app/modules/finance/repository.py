@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.orm_write import apply_update
 from app.modules.finance.models import (
+    EVM_SNAPSHOT_SOURCE_SCHEDULE_PROGRESS,
     EVMSnapshot,
     Invoice,
     InvoiceLineItem,
@@ -499,6 +500,11 @@ class BudgetRepository:
         accessible-projects scope of a non-admin caller) when ``project_id`` is
         not given. An empty set aggregates nothing - the safe default for a
         caller with no projects, never every tenant's rows.
+
+        A change order's budget row is a delta (``original`` 0, ``revised`` the
+        effect). For a project whose rows are all such deltas the original
+        budget comes from the project itself, see
+        :meth:`_change_order_only_baselines`.
         """
         from sqlalchemy import Numeric, case, cast
 
@@ -510,15 +516,15 @@ class BudgetRepository:
         # This mirrors `expected_outturn` in `variance.py` and has to be read
         # against it. A `case` rather than GREATEST so the expression does not
         # depend on which database is underneath, and the casts sit inside the
-        # comparisons: `MoneyType` is NUMERIC on PostgreSQL but a string column
-        # elsewhere, and comparing money as text makes 9 larger than 33.40.
+        # comparison and the sum: `MoneyType` is NUMERIC on PostgreSQL but a
+        # string column elsewhere, and comparing money as text makes 9 larger
+        # than 33.40.
         forecast_col = cast(ProjectBudget.forecast_final, Numeric)
         committed_col = cast(ProjectBudget.committed, Numeric)
         actual_col = cast(ProjectBudget.actual, Numeric)
         outturn_col = case(
             (forecast_col > 0, forecast_col),
-            (committed_col > actual_col, committed_col),
-            else_=actual_col,
+            else_=committed_col + actual_col,
         )
 
         # Group by currency so the caller can FX-convert each currency's
@@ -553,6 +559,15 @@ class BudgetRepository:
             actual_by_currency[code] = actual_by_currency.get(code, 0.0) + float(actual)
             outturn_by_currency[code] = outturn_by_currency.get(code, 0.0) + float(outturn)
 
+        # A project whose only budget rows are change order deltas has no row
+        # carrying its original budget, so the sums above would show it as
+        # zero. Its budget lives on the project instead; add it to both columns.
+        for code, baseline in (
+            await self._change_order_only_baselines(project_id=project_id, project_ids=project_ids)
+        ).items():
+            original_by_currency[code] = original_by_currency.get(code, 0.0) + float(baseline)
+            revised_by_currency[code] = revised_by_currency.get(code, 0.0) + float(baseline)
+
         # Resolve the dominant currency for the dashboard so the UI does
         # not have to hardcode one. We pick the most-used non-empty
         # currency_code among this project's budget lines. Empty when no
@@ -582,6 +597,122 @@ class BudgetRepository:
             "outturn_by_currency": outturn_by_currency,
             "currency": currency,
         }
+
+    async def _change_order_only_baselines(
+        self,
+        *,
+        project_id: uuid.UUID | None,
+        project_ids: set[uuid.UUID] | None,
+    ) -> dict[str, Decimal]:
+        """Original budgets for projects whose only budget rows are change order deltas.
+
+        An approved change order writes a delta row: ``original`` 0 and
+        ``revised`` the order's effect. Summed with a project's baseline rows
+        that is exactly right. A project that has no baseline rows at all - its
+        budget is the figure on the project, nothing was locked into the cost
+        model - is left with no row carrying the original budget, and its
+        Finance tab read a total budget of zero after its first change order.
+
+        17.7.0 answered that by carrying the project budget forward into each
+        delta row's ``original``, and every reader sums every row, so the budget
+        was counted once per change order. The answer here is to leave the rows
+        as deltas and supply the missing baseline once, from the project.
+
+        ``Project.budget_estimate`` already includes every change order the
+        approval could write back to it, so the original budget is that figure
+        less those changes. The approval writes a change back only when it is in
+        the project's base currency or can be converted with a configured FX
+        rate, and the same test is applied here: a foreign change order with no
+        rate never reached the figure, so it is not taken out of it either. A
+        converted one is taken out at today's rate, which is the rate the
+        dashboard converts the delta row at too.
+
+        Only projects with at least one change order row and no other row are
+        touched. A project with no budget rows at all keeps its empty totals,
+        and a project with any baseline row is read from its rows alone.
+
+        Args:
+            project_id: Single project scope, as passed to the aggregate.
+            project_ids: Accessible-projects scope, as passed to the aggregate.
+
+        Returns:
+            ``{currency_code: original_budget}`` in each project's own base
+            currency, summed per currency. Empty when no project qualifies. A
+            project whose budget figure is missing, unreadable, or not above the
+            change orders it already carries contributes nothing.
+        """
+        from decimal import InvalidOperation
+
+        from sqlalchemy import case
+
+        from app.modules.projects.models import Project
+
+        # Every row of the project is linked to a change order, and there is at
+        # least one row, which grouping guarantees.
+        linked = ProjectBudget.metadata_["change_order_id"].as_string().is_not(None)
+        stmt = (
+            select(ProjectBudget.project_id)
+            .group_by(ProjectBudget.project_id)
+            .having(func.count() == func.sum(case((linked, 1), else_=0)))
+        )
+        if project_id is not None:
+            stmt = stmt.where(ProjectBudget.project_id == project_id)
+        elif project_ids is not None:
+            stmt = stmt.where(ProjectBudget.project_id.in_(project_ids))
+        candidates = set((await self.session.execute(stmt)).scalars().all())
+        if not candidates:
+            return {}
+
+        from app.modules.finance.service import _convert_to_base, _project_fx_map
+
+        deltas: dict[uuid.UUID, list[tuple[str, Decimal]]] = {}
+        for row_project_id, row_currency, original, revised in (
+            await self.session.execute(
+                select(
+                    ProjectBudget.project_id,
+                    ProjectBudget.currency_code,
+                    ProjectBudget.original_budget,
+                    ProjectBudget.revised_budget,
+                ).where(ProjectBudget.project_id.in_(candidates))
+            )
+        ).all():
+            # The row's effect is what it adds to the revised budget over the
+            # original, which is the whole of ``revised`` on a delta row.
+            effect = Decimal(str(revised or 0)) - Decimal(str(original or 0))
+            deltas.setdefault(row_project_id, []).append(((row_currency or "").strip().upper(), effect))
+
+        projects = (
+            await self.session.execute(
+                select(Project.id, Project.currency, Project.budget_estimate, Project.fx_rates).where(
+                    Project.id.in_(candidates)
+                )
+            )
+        ).all()
+
+        out: dict[str, Decimal] = {}
+        for project in projects:
+            try:
+                budget = Decimal(str(project.budget_estimate)) if project.budget_estimate else None
+            except (InvalidOperation, ValueError):
+                budget = None
+            if budget is None:
+                continue
+            base = (project.currency or "").strip().upper()
+            fx_map = _project_fx_map(project)
+            written_back = Decimal("0")
+            for code, effect in deltas.get(project.id, []):
+                if code and base and code != base:
+                    converted, missing = _convert_to_base({code: effect}, base_currency=base, fx_rates_map=fx_map)
+                    if code in missing:
+                        # The approval could not convert it, so it never
+                        # reached the project's budget figure.
+                        continue
+                    effect = Decimal(converted)
+                written_back += effect
+            baseline = budget - written_back
+            if baseline > 0:
+                out[base] = out.get(base, Decimal("0")) + baseline
+        return out
 
     async def create(self, budget: ProjectBudget) -> ProjectBudget:
         """Insert a new budget line."""
@@ -622,7 +753,9 @@ class EVMSnapshotRepository:
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self.session.execute(count_stmt)).scalar_one()
 
-        stmt = base.order_by(EVMSnapshot.snapshot_date.desc())
+        # created_at breaks a tie on the date, so the newest row for a day
+        # comes first, the same order every "latest snapshot" reader uses.
+        stmt = base.order_by(EVMSnapshot.snapshot_date.desc(), EVMSnapshot.created_at.desc())
         result = await self.session.execute(stmt)
         items = list(result.scalars().all())
 
@@ -633,6 +766,32 @@ class EVMSnapshotRepository:
         self.session.add(snapshot)
         await self.session.flush()
         return snapshot
+
+    async def delete_automatic_for_date(self, project_id: uuid.UUID, snapshot_date: str) -> int:
+        """Remove the schedule progress subscriber's rows for one project and day.
+
+        Returns how many rows went. Rows a person recorded are never touched.
+        """
+        rows = (
+            (
+                await self.session.execute(
+                    select(EVMSnapshot).where(
+                        EVMSnapshot.project_id == project_id,
+                        EVMSnapshot.snapshot_date == snapshot_date,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        automatic = [
+            row for row in rows if (row.metadata_ or {}).get("source") == EVM_SNAPSHOT_SOURCE_SCHEDULE_PROGRESS
+        ]
+        for row in automatic:
+            await self.session.delete(row)
+        if automatic:
+            await self.session.flush()
+        return len(automatic)
 
 
 class LedgerAccountRepository:

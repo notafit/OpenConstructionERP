@@ -47,11 +47,17 @@ _ARTEFACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # @' or @" swallowed into -m. Two shapes, and both have to match: the opener
     # can end the line, or the real subject can follow it on the same line, which
     # is why the twelve below read almost correctly and got pushed.
-    (re.compile(r"^@[\"']?(?=\s|$)"), "PowerShell here-string opener leaked into the subject"),
+    (
+        re.compile(r"^@[\"']?(?=\s|$)"),
+        "PowerShell here-string opener leaked into the subject",
+    ),
     # The matching closer, alone on the line git took as the subject.
     (re.compile(r"^[\"']@\s*$"), "PowerShell here-string closer used as the subject"),
     (re.compile(r"^<<"), "shell heredoc operator leaked into the subject"),
-    (re.compile(r"^(?:EOF|EOM|END|PY|SQL|MSG)[\"']?\s*$"), "heredoc delimiter used as the subject"),
+    (
+        re.compile(r"^(?:EOF|EOM|END|PY|SQL|MSG)[\"']?\s*$"),
+        "heredoc delimiter used as the subject",
+    ),
 ]
 
 _DANGLING_BACKTICK_WHY = "PowerShell line-continuation backtick at the end of the subject"
@@ -144,8 +150,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Reject a shell quoting artefact in a commit subject line.",
     )
-    parser.add_argument("message_file", nargs="?", help="a single commit-message file to scan (commit-msg hook mode)")
-    parser.add_argument("--range", dest="rev_range", help="a git revision range to scan, e.g. origin/main..HEAD")
+    parser.add_argument(
+        "message_file",
+        nargs="?",
+        help="a single commit-message file to scan (commit-msg hook mode)",
+    )
+    parser.add_argument(
+        "--range",
+        dest="rev_range",
+        help="a git revision range to scan, e.g. origin/main..HEAD",
+    )
     args = parser.parse_args()
 
     offenders: list[str] = []
@@ -168,7 +182,10 @@ def main() -> int:
         where = args.rev_range or "all commits reachable from HEAD"
 
     if offenders:
-        print(f"ERROR: commit message rejected in {where} ({len(offenders)}):", file=sys.stderr)
+        print(
+            f"ERROR: commit message rejected in {where} ({len(offenders)}):",
+            file=sys.stderr,
+        )
         for line in offenders:
             print(f"  {line}", file=sys.stderr)
         # Two rules with two different remedies, so print only the advice that

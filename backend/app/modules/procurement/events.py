@@ -10,6 +10,10 @@ modules and creates a draft Purchase Order pre-populated from the winner:
 * ``bid_management.package.awarded`` (oe_bid_management) - see
   :func:`_create_po_from_bid_award`.
 
+A third award path, ``rfq.awarded`` (oe_rfq_bidding), drafts its order in
+:mod:`app.modules.procurement.rfq_award` and is registered at the bottom of
+this file with the other two.
+
 Both close the long-standing workflow gap where an award updated the BOQ
 unit rates but left procurement empty, forcing the PM to retype the
 supplier and every line item by hand.
@@ -65,6 +69,7 @@ from app.modules.procurement.repository import (
     POItemRepository,
     PurchaseOrderRepository,
 )
+from app.modules.procurement.rfq_award import on_rfq_awarded
 from app.modules.tendering.models import TenderBid, TenderPackage
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,11 @@ async def _find_existing_po(
     tender and bid_management paths converge on a single PO when they both
     reference the same tendering package.
 
+    A cancelled PO does not count. Withdrawing an award is refused while its
+    PO stands, so the way to re-award is to cancel that PO first, and the
+    re-award must then raise a PO for the new supplier rather than find the
+    cancelled one and skip.
+
     Args:
         session: Active async session.
         project_id: Project to scope the scan to.
@@ -109,6 +119,8 @@ async def _find_existing_po(
         return None
     rows = (await session.execute(select(PurchaseOrder).where(PurchaseOrder.project_id == project_id))).scalars().all()
     for po in rows:
+        if po.status == "cancelled":
+            continue
         md = po.metadata_ if isinstance(po.metadata_, dict) else {}
         for field, value in wanted.items():
             if md.get(field) == value:
@@ -265,9 +277,27 @@ async def _create_po_from_award(event: Event) -> None:
             # with manually-created POs.
             po_number = await po_repo.next_po_number(package.project_id)
 
+            # The vendor is the awarded firm. A tender bid carries only a
+            # free-text company and an email, but a bidder invited from the
+            # subcontractor directory is on the package's distribution list
+            # under that email, and its directory entry names its contact. The
+            # contract drafted from the same award resolves the firm this way,
+            # so the order and the contract name the same firm. A bidder typed
+            # in by hand has no contact and the order keeps its company name in
+            # ``supplier_name``, which the order list shows in its place.
+            from app.modules.bid_management.award_contract import resolve_award_counterparty  # noqa: PLC0415
+            from app.modules.bid_management.events import _recipient_subcontractor  # noqa: PLC0415
+
+            counterparty = await resolve_award_counterparty(
+                session,
+                subcontractor_id=_recipient_subcontractor(package.metadata_, bid.contact_email),
+                contact_id=None,
+                company_name=bid.company_name,
+            )
+
             po = PurchaseOrder(
                 project_id=package.project_id,
-                vendor_contact_id=None,  # bid is a free-text supplier; no FK
+                vendor_contact_id=str(counterparty.contact_id) if counterparty.contact_id else None,
                 po_number=po_number,
                 po_type="standard",
                 issue_date=None,
@@ -463,7 +493,9 @@ async def _create_po_from_bid_award(event: Event) -> None:
 
             po = PurchaseOrder(
                 project_id=package.project_id,
-                vendor_contact_id=None,  # bidder is a denormalised snapshot; no FK
+                # The contact the bidder was invited as, when it was picked
+                # from the directory; a bidder typed in by hand has none.
+                vendor_contact_id=str(bidder.contact_id) if bidder.contact_id else None,
                 po_number=po_number,
                 po_type="standard",
                 issue_date=None,
@@ -675,9 +707,11 @@ PUBLISHED_EVENTS = (
 
 # Register subscribers at module import - module_loader picks this up
 # automatically when ``oe_procurement`` is loaded.
-event_bus.subscribe("tendering.package.awarded", _on_tender_awarded)
-event_bus.subscribe("bid_management.package.awarded", _on_bid_management_awarded)
-event_bus.subscribe(
+event_bus.subscribe_once("tendering.package.awarded", _on_tender_awarded)
+event_bus.subscribe_once("bid_management.package.awarded", _on_bid_management_awarded)
+# An awarded RFQ drafts its purchase order; see ``procurement/rfq_award.py``.
+event_bus.subscribe_once("rfq.awarded", on_rfq_awarded)
+event_bus.subscribe_once(
     "procurement.supplier_rating_update",
     _on_supplier_rating_update,
 )

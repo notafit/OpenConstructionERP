@@ -330,7 +330,7 @@ describe('timeoutMs is not a token - it really outranks both defaults', () => {
     await expect(settled).resolves.toBe('rejected');
   });
 
-  it('still aborts the same request at 45 s without it', async () => {
+  it('still aborts the same request at 90 s without it', async () => {
     // The control: without `timeoutMs` the budget really is the short one, so
     // the case above measures the option and not some ambient default.
     vi.useFakeTimers();
@@ -342,7 +342,7 @@ describe('timeoutMs is not a token - it really outranks both defaults', () => {
       () => 'rejected',
     );
 
-    await vi.advanceTimersByTimeAsync(44_000);
+    await vi.advanceTimersByTimeAsync(89_000);
     expect(only(signals).aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(only(signals).aborted).toBe(true);

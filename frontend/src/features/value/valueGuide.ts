@@ -5,8 +5,9 @@
 // Consumed by <ModuleGuideButton content={valueGuide} /> on ValueDashboardPage.
 //
 // i18n: every key carries its inline English default and is read via
-// t(key, { defaultValue }). These keys are NOT added to en.ts or any locale
-// file; the inline defaults are the single source of truth. No spotlight
+// t(key, { defaultValue }). The keys are not in en.ts, the inline defaults
+// are the English source; their translations live in the other locale files,
+// so a changed default needs its translations redone too. No spotlight
 // selectors are set because the page exposes no stable data-testid hooks, so
 // each card renders centred.
 

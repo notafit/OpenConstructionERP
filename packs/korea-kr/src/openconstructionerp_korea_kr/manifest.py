@@ -26,9 +26,13 @@ MANIFEST = PartnerPackManifest(
     ],
     default_currency="KRW",
     default_tax_template="kr_vat_10",
-    default_methodology=None,
-    validation_rule_packs=[],
-    # No Korean rule set exists in the engine yet.
+    default_methodology="south_korea",
+    validation_rule_packs=[
+        "kbc_building_code",
+        "ks_standards",
+        "molit_specifications",
+        "construction_cost_estimation",
+    ],
     validation_rule_sets=[],
     default_modules=[],
     hidden_modules=[],

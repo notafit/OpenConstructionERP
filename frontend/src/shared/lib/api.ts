@@ -30,12 +30,11 @@ export const API_BASE = BASE_URL;
  *
  * The deployed app often runs on a small single-core box where, under
  * concurrent multi-user load or a cold cache, ordinary reads can briefly take
- * 20-40s. A 45s budget tolerates those without a false "timed out" abort while
- * still failing a genuinely hung request promptly. Crucially, timeouts are NO
- * LONGER retried by React Query (see the retry predicate in main.tsx), so the
- * worst-case wait is a single 45s attempt - shorter than the old 30s + retry
- * (~60s) path - and a slow-but-valid 30-45s response now succeeds instead of
- * being killed mid-flight.
+ * 20-40s. A 90s budget tolerates those without a false "timed out" abort while
+ * still failing a genuinely hung request. Crucially, timeouts are NO LONGER
+ * retried by React Query (see the retry predicate in main.tsx), so the
+ * worst-case wait is a single 90s attempt, and a slow-but-valid response now
+ * succeeds instead of being killed mid-flight.
  *
  * The long budget is kept for genuinely heavy operations (CWICR import, AI
  * estimation, CAD/BIM conversion) and must be opted into via `longRunning`.
@@ -112,6 +111,16 @@ export interface ApiRequestInit extends RequestInit {
    * must not consume the one toast other requests on the screen are entitled to.
    */
   suppressTimeoutToast?: boolean;
+  /**
+   * The POST is a read. It travels as a POST only because its question does
+   * not fit in a URL, such as a batch of ids, and it changes nothing.
+   *
+   * Offline it is treated as the GET it stands in for: the answer a previous
+   * call left in the cache is served, and the call is never queued for replay.
+   * Queueing it would tell the reader that a list they merely opened was
+   * "saved offline", and hand the screen `undefined` for its data.
+   */
+  readOnly?: boolean;
 }
 
 /** Retrieve the stored JWT token from the auth store. */
@@ -462,9 +471,13 @@ function isAuthEndpoint(path: string): boolean {
  * must never reach this path; that distinction is what stops a single
  * incidental error from logging the whole session out.
  */
-function forceLogoutRedirect(path: string, statusText: string): void {
+function forceLogoutRedirect(path: string, statusText: string, everywhere = false): void {
   logApiError(path, 401, statusText);
-  useAuthStore.getState().logout();
+  // Only a refresh token the server refused ends the session for every tab.
+  // Any other 401 (one endpoint refusing a fresh token, a stray auth call)
+  // is this tab's problem, and the others carry on.
+  if (everywhere) useAuthStore.getState().logout();
+  else useAuthStore.getState().logoutThisTab();
   if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
     window.location.href = '/login';
   }
@@ -507,6 +520,15 @@ async function request<TResponse>(
     path = path.slice(BASE_URL.length);
   }
 
+  // A read is a GET, or a POST that says it is one (see `readOnly`). Only
+  // reads are cached for offline use and only non-reads are queued offline.
+  // A POST read's answer depends on its body, so the body is part of its
+  // cache key; a GET keeps the bare path it has always been cached under.
+  // Nothing is computed for a request that did not opt in, so every other
+  // caller behaves exactly as before.
+  const isRead = method === 'GET' || (method === 'POST' && init?.readOnly === true);
+  const cacheKey = isRead && method !== 'GET' ? `POST ${path} ${JSON.stringify(body ?? null)}` : path;
+
   // Abort budget: fast by default, long only when explicitly opted in for
   // heavy import / AI / CAD work. GET and mutations get distinct defaults.
   // An explicit `timeoutMs` outranks both, for the few endpoints whose server
@@ -541,6 +563,10 @@ async function request<TResponse>(
     clearTimeout(timeoutId);
   } catch (err) {
     clearTimeout(timeoutId);
+    // A caller's cancellation (including its own deadline) is not an
+    // offline write to replay later. In particular, cancelling an AI run
+    // while connectivity drops must not silently schedule another run.
+    if (init?.signal?.aborted) throw err;
     // A timeout fired by our own controller (not a caller-supplied signal).
     // Surface it as a clear, actionable timeout error rather than a generic
     // "Failed to fetch", and notify the user so the screen doesn't just sit
@@ -585,13 +611,13 @@ async function request<TResponse>(
     );
     // Network error — likely offline
     if (!navigator.onLine) {
-      // For GET requests: try to serve from IndexedDB cache
-      if (method === 'GET') {
-        const cached = await getCachedResponse<TResponse>(path);
+      // For reads: try to serve from IndexedDB cache
+      if (isRead) {
+        const cached = await getCachedResponse<TResponse>(cacheKey);
         if (cached !== null) return cached;
       }
       // For mutating requests: queue for later replay
-      if (method !== 'GET') {
+      if (!isRead) {
         await queueMutation({
           method: method as 'POST' | 'PUT' | 'PATCH' | 'DELETE',
           path,
@@ -626,17 +652,26 @@ async function request<TResponse>(
       throw new ApiError(response.status, response.statusText, undefined);
     }
 
-    const newToken = await useAuthStore.getState().refreshAccessToken();
-    if (newToken) {
+    const refreshed = await useAuthStore.getState().refreshSession();
+    if (refreshed.token) {
       // Refresh succeeded — replay the original request with the fresh token.
       // buildHeaders() inside the recursive call reads the now-updated store,
       // so the retry carries the new Authorization header automatically.
       return request<TResponse>(method, path, body, init, true);
     }
 
+    // The server or the network did not answer the refresh (a deploy, a
+    // blip). The session may be perfectly good, and signing out now would
+    // sign out every open tab with it: fail this one request instead.
+    if (refreshed.reason === 'transient') {
+      logApiError(path, 401, response.statusText);
+      throw new ApiError(response.status, response.statusText, undefined);
+    }
+
     // No refresh token, or the refresh token is itself invalid/expired →
-    // the session is genuinely unrecoverable. Log out and redirect.
-    forceLogoutRedirect(path, response.statusText);
+    // the session is genuinely unrecoverable. Log out and redirect; a refused
+    // refresh token signs out every tab, since they all hold the same one.
+    forceLogoutRedirect(path, response.statusText, refreshed.reason === 'rejected');
     throw new ApiError(response.status, response.statusText, undefined);
   }
 
@@ -682,9 +717,9 @@ async function request<TResponse>(
 
   const data = (await response.json()) as TResponse;
 
-  // Cache successful GET responses for offline use
-  if (method === 'GET') {
-    cacheResponse(path, data).catch(() => {});
+  // Cache successful reads for offline use
+  if (isRead) {
+    cacheResponse(cacheKey, data).catch(() => {});
   }
 
   return data;
@@ -785,6 +820,36 @@ export async function apiDelete<TResponse = void>(
 }
 
 /**
+ * `fetch` with the bearer token and the same one silent refresh `request()`
+ * does, for callers that need the raw `Response` (a stream, a file upload
+ * with progress, a binary body).
+ *
+ * On a 401 it refreshes once and replays the call with the new token. When
+ * the refresh token itself is refused it signs out every tab and leaves for
+ * the login page, like `request()`; any other failure hands the 401 back to
+ * the caller untouched. The body must be replayable (a string, Blob,
+ * FormData or ArrayBuffer), not a one-shot ReadableStream.
+ *
+ * @param input - Absolute or API-relative URL.
+ * @param init - As for `fetch`; an `Authorization` header set here wins.
+ */
+export async function fetchWithAuth(input: string, init: RequestInit = {}): Promise<Response> {
+  const send = () => {
+    const headers = new Headers(init.headers);
+    const token = getToken();
+    if (token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(input, { ...init, headers });
+  };
+  const response = await send();
+  if (response.status !== 401 || new Headers(init.headers).has('Authorization')) return response;
+
+  const refreshed = await useAuthStore.getState().refreshSession();
+  if (refreshed.token) return send();
+  if (refreshed.reason === 'rejected') forceLogoutRedirect(input, response.statusText, true);
+  return response;
+}
+
+/**
  * Trigger a browser file download from a Blob.
  *
  * Uses a hidden anchor with the `download` attribute, appended to the DOM.
@@ -836,6 +901,17 @@ export async function downloadWithAuth(url: string, fallbackFilename: string): P
 
   const blob = await response.blob();
   const disposition = response.headers.get('Content-Disposition');
-  const filename = disposition?.match(/filename="?(.+?)"?$/)?.[1] || fallbackFilename;
+  // Try RFC 5987 filename* first (UTF-8 encoded), then plain filename.
+  // The old regex matched `filename*=UTF-8''name.md` as a single capture
+  // when both forms were present, producing artifact names like
+  // "filename*=UTF-8''report.md".
+  let filename = fallbackFilename;
+  const starMatch = disposition?.match(/filename\*=UTF-8''(.+?)(?:;|$)/i);
+  if (starMatch?.[1]) {
+    filename = decodeURIComponent(starMatch[1].replace(/^"/, '').replace(/"$/, ''));
+  } else {
+    const plainMatch = disposition?.match(/filename="?([^";]+)"?/);
+    if (plainMatch?.[1]) filename = plainMatch[1];
+  }
   triggerDownload(blob, filename);
 }

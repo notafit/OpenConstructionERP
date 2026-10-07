@@ -347,7 +347,7 @@ def register_wave1_notification_subscribers() -> None:
     Idempotent - event bus deduplicates handlers by identity.
     """
     for event_name, handler in _WAVE1_SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications/Wave1: subscribed to %d cross-module event(s)",
         len(_WAVE1_SUBSCRIPTIONS),

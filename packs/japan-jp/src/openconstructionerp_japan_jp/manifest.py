@@ -27,10 +27,14 @@ MANIFEST = PartnerPackManifest(
     ],
     default_currency="JPY",
     default_tax_template="jp_consumption_10",
-    default_methodology=None,
-    validation_rule_packs=[],
-    # No sekisan rule set exists in the engine yet.
-    validation_rule_sets=[],
+    default_methodology="japan",
+    validation_rule_packs=[
+        "building_standard_law",
+        "jis_construction",
+        "jass",
+        "sekisan_kijun",
+    ],
+    validation_rule_sets=["sekisan"],
     default_modules=[],
     hidden_modules=[],
     demo_template_ids=["office-tokyo"],

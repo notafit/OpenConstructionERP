@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "ab04_contract",
+  "name": "AB 04 — Allmanna Bestammelser for byggnads-, anlaggnings- och installationsentreprenader",
+  "standard": "AB 04",
+  "jurisdiction": "SE",
+  "regulator": "Byggandets Kontraktskommitte (BKK)",
+  "publication_year": 2004,
+  "applies_to": [
+    "contract",
+    "tender",
+    "validation"
+  ],
+  "description": "Reference document for AB 04, the Swedish general conditions for building, civil and installation contracts, and for what the form leaves a contract to settle. Naming the form does not by itself settle the reference and the edition in force, the payment terms, the notification provisions the form makes conditional, or the defects liability period. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swedish quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared four ids under the ab04 prefix (contract_reference_present, payment_terms_valid, notification_provisions, warranty_period_check), and the engine defines none of them and registers no rule set by that name, so each one read as a check that ran when nothing ran. The platform implements contract-terms checks for the UK regime only and those rules read UK concepts, so borrowing a UK rule id would report a Swedish contract against the wrong regime. An empty list is the honest answer until Swedish contract rules are written.",
+  "enables_rule_ids": []
+}

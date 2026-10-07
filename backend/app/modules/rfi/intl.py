@@ -19,9 +19,12 @@ International
     SLA against the same code.
 
 Clarity
-    Status and discipline words localise into English, German and Russian with
-    an English fallback, and one-line explainers describe each concept in plain
-    language so a site engineer understands every number in under a minute.
+    Status and discipline words localise into every language the RFI PDF
+    renders (see :data:`app.modules.rfi.pdf_translations.SUPPORTED_PDF_LOCALES`)
+    with an English fallback, so the printed status never stays English under a
+    translated heading. Status words match the RFI screens. One-line explainers
+    describe each concept in plain language, in English, German and Russian, so
+    a site engineer understands every number in under a minute.
 
 Well defined at the edges
     Division by zero, empty sets, negative counts and a response dated before
@@ -68,8 +71,6 @@ RFI_DISCIPLINES: tuple[str, ...] = (
 # contract-specific by default.
 DEFAULT_RESPONSE_SLA_DAYS: int = 14
 
-_SUPPORTED_LOCALES: frozenset[str] = frozenset({"en", "de", "ru"})
-
 # ── Localised labels (English fallback) ───────────────────────────────────────
 
 _STATUS_LABELS: dict[str, dict[str, str]] = {
@@ -85,7 +86,7 @@ _STATUS_LABELS: dict[str, dict[str, str]] = {
         "open": "Offen",
         "answered": "Beantwortet",
         "closed": "Geschlossen",
-        "void": "Ungueltig",
+        "void": "Ungültig",
     },
     "ru": {
         "draft": "Черновик",
@@ -94,6 +95,74 @@ _STATUS_LABELS: dict[str, dict[str, str]] = {
         "closed": "Закрыт",
         "void": "Аннулирован",
     },
+    # The languages below read the words the RFI screens show, from the
+    # frontend's rfi.status_* keys, so the printed form and the screen agree.
+    "bg": {
+        "draft": "Чернова",
+        "open": "Отворено",
+        "answered": "Отговорено",
+        "closed": "Затворено",
+        "void": "Анулирано",
+    },
+    "cs": {"draft": "Koncept", "open": "Otevřeno", "answered": "Zodpovězeno", "closed": "Uzavřeno", "void": "Neplatné"},
+    "da": {"draft": "Kladde", "open": "Åben", "answered": "Besvaret", "closed": "Lukket", "void": "Ugyldig"},
+    "el": {"draft": "Πρόχειρο", "open": "Ανοιχτό", "answered": "Απαντήθηκε", "closed": "Έκλεισε", "void": "Άκυρο"},
+    "es": {"draft": "Borrador", "open": "Abierto", "answered": "Respondido", "closed": "Cerrado", "void": "Anulado"},
+    "et": {"draft": "Mustand", "open": "Avatud", "answered": "Vastatud", "closed": "Suletud", "void": "Kehtetu"},
+    "fi": {"draft": "Luonnos", "open": "Avoin", "answered": "Vastattu", "closed": "Suljettu", "void": "Mitätöity"},
+    "fil": {"draft": "Borador", "open": "Bukas", "answered": "Nasagot", "closed": "Sarado", "void": "Walang Bisa"},
+    "fr": {"draft": "Brouillon", "open": "Ouvert", "answered": "Répondu", "closed": "Clôturé", "void": "Annulé"},
+    "hi": {"draft": "मसौदा", "open": "खुला", "answered": "उत्तरित", "closed": "बंद", "void": "अमान्य"},
+    "hr": {"draft": "Nacrt", "open": "Otvoreno", "answered": "Odgovoreno", "closed": "Zatvoreno", "void": "Ništavno"},
+    "hu": {
+        "draft": "Piszkozat",
+        "open": "Nyitott",
+        "answered": "Megválaszolva",
+        "closed": "Lezárva",
+        "void": "Érvénytelen",
+    },
+    "id": {"draft": "Draf", "open": "Terbuka", "answered": "Terjawab", "closed": "Ditutup", "void": "Batal"},
+    "it": {"draft": "Bozza", "open": "Aperto", "answered": "Risposto", "closed": "Chiuso", "void": "Nullo"},
+    "ja": {"draft": "下書き", "open": "未対応", "answered": "回答済み", "closed": "クローズ", "void": "無効"},
+    "kk": {"draft": "Жоба", "open": "Ашық", "answered": "Жауап берілді", "closed": "Жабылды", "void": "Күші жойылды"},
+    "ko": {"draft": "초안", "open": "미결", "answered": "답변됨", "closed": "종료됨", "void": "무효"},
+    "ky": {
+        "draft": "Долбоор",
+        "open": "Ачык",
+        "answered": "Жооп берилди",
+        "closed": "Жабылды",
+        "void": "Күчүн жоготту",
+    },
+    "nl": {"draft": "Concept", "open": "Open", "answered": "Beantwoord", "closed": "Gesloten", "void": "Ongeldig"},
+    "no": {"draft": "Utkast", "open": "Åpen", "answered": "Besvart", "closed": "Lukket", "void": "Ugyldig"},
+    "pl": {
+        "draft": "Wersja robocza",
+        "open": "Otwarte",
+        "answered": "Udzielono odpowiedzi",
+        "closed": "Zamknięte",
+        "void": "Nieważne",
+    },
+    "pt": {"draft": "Rascunho", "open": "Aberto", "answered": "Respondido", "closed": "Fechado", "void": "Anulado"},
+    "ro": {"draft": "Ciornă", "open": "Deschis", "answered": "Răspuns", "closed": "Închis", "void": "Anulat"},
+    "sv": {"draft": "Utkast", "open": "Öppen", "answered": "Besvarad", "closed": "Stängd", "void": "Ogiltig"},
+    "th": {"draft": "ร่าง", "open": "เปิดอยู่", "answered": "ตอบแล้ว", "closed": "ปิดแล้ว", "void": "เป็นโมฆะ"},
+    "tr": {"draft": "Taslak", "open": "Açık", "answered": "Yanıtlandı", "closed": "Kapalı", "void": "Geçersiz"},
+    "uk": {
+        "draft": "Чернетка",
+        "open": "Відкрито",
+        "answered": "Відповідь надано",
+        "closed": "Закрито",
+        "void": "Анульовано",
+    },
+    "uz": {
+        "draft": "Qoralama",
+        "open": "Ochiq",
+        "answered": "Javob berilgan",
+        "closed": "Yopilgan",
+        "void": "Bekor qilingan",
+    },
+    "vi": {"draft": "Bản nháp", "open": "Đang mở", "answered": "Đã trả lời", "closed": "Đã đóng", "void": "Vô hiệu"},
+    "zh": {"draft": "草稿", "open": "未关闭", "answered": "已回答", "closed": "已关闭", "void": "已作废"},
 }
 
 _DISCIPLINE_LABELS: dict[str, dict[str, str]] = {
@@ -109,9 +178,9 @@ _DISCIPLINE_LABELS: dict[str, dict[str, str]] = {
     "de": {
         "architectural": "Architektur",
         "structural": "Tragwerk",
-        "mep": "Gebaeudetechnik",
+        "mep": "Gebäudetechnik",
         "electrical": "Elektro",
-        "plumbing": "Sanitaer",
+        "plumbing": "Sanitär",
         "civil": "Tiefbau",
         "landscape": "Landschaft",
     },
@@ -124,7 +193,284 @@ _DISCIPLINE_LABELS: dict[str, dict[str, str]] = {
         "civil": "Гражданское строительство",
         "landscape": "Ландшафт",
     },
+    # The RFI screens have no discipline words of their own yet (they fall back
+    # to the English code), so these are the trade terms a construction reader
+    # in each language uses for the design disciplines.
+    "bg": {
+        "architectural": "Архитектура",
+        "structural": "Конструкции",
+        "mep": "Инсталации",
+        "electrical": "Електроинсталации",
+        "plumbing": "ВиК",
+        "civil": "Инфраструктура",
+        "landscape": "Ландшафт",
+    },
+    "cs": {
+        "architectural": "Architektura",
+        "structural": "Stavební konstrukce",
+        "mep": "Technická zařízení budov",
+        "electrical": "Elektroinstalace",
+        "plumbing": "Zdravotechnika",
+        "civil": "Inženýrské stavby",
+        "landscape": "Sadové úpravy",
+    },
+    "da": {
+        "architectural": "Arkitektur",
+        "structural": "Konstruktion",
+        "mep": "Installationer",
+        "electrical": "El",
+        "plumbing": "VVS",
+        "civil": "Anlæg",
+        "landscape": "Landskab",
+    },
+    "el": {
+        "architectural": "Αρχιτεκτονικά",
+        "structural": "Στατικά",
+        "mep": "Η/Μ εγκαταστάσεις",
+        "electrical": "Ηλεκτρολογικά",
+        "plumbing": "Υδραυλικά",
+        "civil": "Έργα πολιτικού μηχανικού",
+        "landscape": "Διαμόρφωση περιβάλλοντος",
+    },
+    "es": {
+        "architectural": "Arquitectura",
+        "structural": "Estructuras",
+        "mep": "Instalaciones",
+        "electrical": "Electricidad",
+        "plumbing": "Instalaciones sanitarias",
+        "civil": "Obra civil",
+        "landscape": "Paisajismo",
+    },
+    "et": {
+        "architectural": "Arhitektuur",
+        "structural": "Konstruktsioonid",
+        "mep": "Tehnosüsteemid",
+        "electrical": "Elekter",
+        "plumbing": "Veevarustus ja kanalisatsioon",
+        "civil": "Rajatised",
+        "landscape": "Maastikuarhitektuur",
+    },
+    "fi": {
+        "architectural": "Arkkitehtuuri",
+        "structural": "Rakennetekniikka",
+        "mep": "Talotekniikka",
+        "electrical": "Sähkö",
+        "plumbing": "Putkitekniikka",
+        "civil": "Maa- ja vesirakennus",
+        "landscape": "Viherrakentaminen",
+    },
+    "fil": {
+        "architectural": "Arkitektural",
+        "structural": "Istruktural",
+        "mep": "MEP",
+        "electrical": "Elektrikal",
+        "plumbing": "Plumbing",
+        "civil": "Sibil",
+        "landscape": "Landscape",
+    },
+    "fr": {
+        "architectural": "Architecture",
+        "structural": "Structure",
+        "mep": "Lots techniques",
+        "electrical": "Électricité",
+        "plumbing": "Plomberie",
+        "civil": "Génie civil",
+        "landscape": "Paysage",
+    },
+    "hi": {
+        "architectural": "वास्तुकला",
+        "structural": "संरचना",
+        "mep": "एमईपी",
+        "electrical": "विद्युत",
+        "plumbing": "प्लंबिंग",
+        "civil": "सिविल",
+        "landscape": "लैंडस्केप",
+    },
+    "hr": {
+        "architectural": "Arhitektura",
+        "structural": "Konstrukcija",
+        "mep": "Instalacije",
+        "electrical": "Elektroinstalacije",
+        "plumbing": "Vodovod i odvodnja",
+        "civil": "Niskogradnja",
+        "landscape": "Krajobrazno uređenje",
+    },
+    "hu": {
+        "architectural": "Építészet",
+        "structural": "Tartószerkezet",
+        "mep": "Épületgépészet",
+        "electrical": "Villamos",
+        "plumbing": "Víz- és csatornaszerelés",
+        "civil": "Mélyépítés",
+        "landscape": "Tájépítészet",
+    },
+    "id": {
+        "architectural": "Arsitektur",
+        "structural": "Struktur",
+        "mep": "MEP",
+        "electrical": "Elektrikal",
+        "plumbing": "Plambing",
+        "civil": "Sipil",
+        "landscape": "Lanskap",
+    },
+    "it": {
+        "architectural": "Architettura",
+        "structural": "Strutture",
+        "mep": "Impianti",
+        "electrical": "Impianti elettrici",
+        "plumbing": "Impianti idraulici",
+        "civil": "Opere civili",
+        "landscape": "Paesaggio",
+    },
+    "ja": {
+        "architectural": "意匠",
+        "structural": "構造",
+        "mep": "設備",
+        "electrical": "電気設備",
+        "plumbing": "給排水衛生設備",
+        "civil": "土木",
+        "landscape": "造園",
+    },
+    "kk": {
+        "architectural": "Сәулет",
+        "structural": "Конструкциялар",
+        "mep": "Инженерлік жүйелер",
+        "electrical": "Электр",
+        "plumbing": "Сантехника",
+        "civil": "Азаматтық құрылыс",
+        "landscape": "Ландшафт",
+    },
+    "ko": {
+        "architectural": "건축",
+        "structural": "구조",
+        "mep": "설비",
+        "electrical": "전기",
+        "plumbing": "배관",
+        "civil": "토목",
+        "landscape": "조경",
+    },
+    "ky": {
+        "architectural": "Архитектура",
+        "structural": "Конструкциялар",
+        "mep": "Инженердик тутумдар",
+        "electrical": "Электр",
+        "plumbing": "Сантехника",
+        "civil": "Жарандык курулуш",
+        "landscape": "Ландшафт",
+    },
+    "nl": {
+        "architectural": "Architectuur",
+        "structural": "Constructie",
+        "mep": "Installaties",
+        "electrical": "Elektrotechniek",
+        "plumbing": "Sanitair",
+        "civil": "Civiele techniek",
+        "landscape": "Landschap",
+    },
+    "no": {
+        "architectural": "Arkitektur",
+        "structural": "Konstruksjon",
+        "mep": "Tekniske fag",
+        "electrical": "Elektro",
+        "plumbing": "Rør og sanitær",
+        "civil": "Anlegg",
+        "landscape": "Landskap",
+    },
+    "pl": {
+        "architectural": "Architektura",
+        "structural": "Konstrukcja",
+        "mep": "Instalacje budowlane",
+        "electrical": "Instalacje elektryczne",
+        "plumbing": "Instalacje sanitarne",
+        "civil": "Inżynieria lądowa",
+        "landscape": "Architektura krajobrazu",
+    },
+    "pt": {
+        "architectural": "Arquitetura",
+        "structural": "Estruturas",
+        "mep": "Instalações prediais",
+        "electrical": "Elétrica",
+        "plumbing": "Hidráulica",
+        "civil": "Obras civis",
+        "landscape": "Paisagismo",
+    },
+    "ro": {
+        "architectural": "Arhitectură",
+        "structural": "Structuri",
+        "mep": "Instalații",
+        "electrical": "Instalații electrice",
+        "plumbing": "Instalații sanitare",
+        "civil": "Inginerie civilă",
+        "landscape": "Peisagistică",
+    },
+    "sv": {
+        "architectural": "Arkitektur",
+        "structural": "Konstruktion",
+        "mep": "Installationer",
+        "electrical": "El",
+        "plumbing": "VS",
+        "civil": "Anläggning",
+        "landscape": "Landskap",
+    },
+    "th": {
+        "architectural": "สถาปัตยกรรม",
+        "structural": "โครงสร้าง",
+        "mep": "งานระบบ",
+        "electrical": "ไฟฟ้า",
+        "plumbing": "สุขาภิบาล",
+        "civil": "โยธา",
+        "landscape": "ภูมิสถาปัตยกรรม",
+    },
+    "tr": {
+        "architectural": "Mimari",
+        "structural": "Statik",
+        "mep": "Elektromekanik tesisat",
+        "electrical": "Elektrik",
+        "plumbing": "Sıhhi tesisat",
+        "civil": "Altyapı",
+        "landscape": "Peyzaj",
+    },
+    "uk": {
+        "architectural": "Архітектура",
+        "structural": "Конструкції",
+        "mep": "Інженерні системи",
+        "electrical": "Електрика",
+        "plumbing": "Сантехніка",
+        "civil": "Цивільне будівництво",
+        "landscape": "Ландшафт",
+    },
+    "uz": {
+        "architectural": "Arxitektura",
+        "structural": "Konstruksiyalar",
+        "mep": "Muhandislik tizimlari",
+        "electrical": "Elektr",
+        "plumbing": "Santexnika",
+        "civil": "Fuqarolik qurilishi",
+        "landscape": "Landshaft",
+    },
+    "vi": {
+        "architectural": "Kiến trúc",
+        "structural": "Kết cấu",
+        "mep": "Cơ điện",
+        "electrical": "Điện",
+        "plumbing": "Cấp thoát nước",
+        "civil": "Hạ tầng",
+        "landscape": "Cảnh quan",
+    },
+    "zh": {
+        "architectural": "建筑",
+        "structural": "结构",
+        "mep": "机电",
+        "electrical": "电气",
+        "plumbing": "给排水",
+        "civil": "土木",
+        "landscape": "景观",
+    },
 }
+
+#: Languages the status and discipline words exist in; anything else reads
+#: English. Derived from the table so the two cannot drift apart.
+_SUPPORTED_LOCALES: frozenset[str] = frozenset(_STATUS_LABELS)
 
 # One-line, plain-language explainers keyed by topic then locale.
 _EXPLAINERS: dict[str, dict[str, str]] = {
@@ -135,7 +481,7 @@ _EXPLAINERS: dict[str, dict[str, str]] = {
         ),
         "de": (
             "Ein RFI (Request for Information) ist eine formelle schriftliche Frage, die das "
-            "Planungsteam bittet, etwas zu klaeren oder zu bestaetigen, bevor die Arbeit weitergeht."
+            "Planungsteam bittet, etwas zu klären oder zu bestätigen, bevor die Arbeit weitergeht."
         ),
         "ru": (
             "RFI (запрос информации) - это официальный письменный вопрос, который просит проектную "
@@ -149,7 +495,7 @@ _EXPLAINERS: dict[str, dict[str, str]] = {
         ),
         "de": (
             "Die durchschnittliche Antwortzeit ist die mittlere Anzahl Tage zwischen dem Stellen "
-            "eines RFI und der offiziellen Antwort, gemittelt ueber alle beantworteten RFIs."
+            "eines RFI und der offiziellen Antwort, gemittelt über alle beantworteten RFIs."
         ),
         "ru": (
             "Среднее время ответа - это среднее число дней между подачей RFI и получением "
@@ -162,8 +508,8 @@ _EXPLAINERS: dict[str, dict[str, str]] = {
             "date, so it is holding up the work and needs chasing."
         ),
         "de": (
-            "Ein ueberfaelliges RFI ist noch offen und seine Antwort liegt nun nach dem "
-            "Faelligkeitsdatum, es haelt also die Arbeit auf und muss nachgefasst werden."
+            "Ein überfälliges RFI ist noch offen und seine Antwort liegt nun nach dem "
+            "Fälligkeitsdatum, es hält also die Arbeit auf und muss nachgefasst werden."
         ),
         "ru": (
             "Просроченный RFI все еще открыт, а его ответ уже позже установленного срока, поэтому "
@@ -176,7 +522,7 @@ _EXPLAINERS: dict[str, dict[str, str]] = {
             "now, so everyone can see who the answer is waiting on."
         ),
         "de": (
-            "Ball in court benennt die Partei, die aktuell fuer den naechsten Schritt bei einem RFI "
+            "Ball in court benennt die Partei, die aktuell für den nächsten Schritt bei einem RFI "
             "verantwortlich ist, damit jeder sieht, auf wen die Antwort wartet."
         ),
         "ru": (

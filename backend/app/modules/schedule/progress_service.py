@@ -23,6 +23,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cpm import readable_exception_dates, readable_work_days
+from app.core.events import publish_after_commit
+from app.modules.schedule.milestone_events import announce_if_milestone_reached
 from app.modules.schedule.models import Activity, ProgressStep, Schedule
 from app.modules.schedule.progress_math import (
     DEFAULT_CALENDAR,
@@ -89,7 +91,7 @@ class ScheduleProgressService:
             raise _not_found("Progress step not found")
         return step
 
-    async def _resolve_calendar(
+    async def resolve_calendar(
         self,
         calendar_id: uuid.UUID | None,
         cache: dict[uuid.UUID | None, WorkCalendar] | None = None,
@@ -166,7 +168,13 @@ class ScheduleProgressService:
                 warnings.append(warning)
         return warnings
 
-    async def set_typed_progress(self, activity_id: uuid.UUID, req: TypedProgressRequest) -> ProgressOutcome:
+    async def set_typed_progress(
+        self,
+        activity_id: uuid.UUID,
+        req: TypedProgressRequest,
+        *,
+        actor_id: uuid.UUID | str | None = None,
+    ) -> ProgressOutcome:
         """Resolve and persist progress for one activity via the per-type engine."""
         activity = await self.get_activity(activity_id)
         schedule = await self.get_schedule(activity.schedule_id)
@@ -175,7 +183,7 @@ class ScheduleProgressService:
         if pct_type not in PERCENT_COMPLETE_TYPES:
             pct_type = DEFAULT_PERCENT_COMPLETE_TYPE
 
-        calendar = await self._resolve_calendar(activity.calendar_id)
+        calendar = await self.resolve_calendar(activity.calendar_id)
         data_date = req.data_date or schedule.data_date or activity.start_date
 
         percent_in = req.percent if req.percent is not None else _str_to_float(activity.progress_pct)
@@ -227,7 +235,10 @@ class ScheduleProgressService:
             fields["installed_units"] = req.installed_units
         await self.base.activity_repo.update_fields(activity_id, **fields)
 
-        await _safe_publish(
+        # Deferred to the commit, as in ScheduleService.update_progress: the
+        # EVM snapshot subscriber reads from its own session.
+        publish_after_commit(
+            self.session,
             "schedule.activity.progress_updated",
             {
                 "activity_id": str(activity_id),
@@ -239,19 +250,20 @@ class ScheduleProgressService:
         )
 
         refreshed = await self.get_activity(activity_id)
+        await announce_if_milestone_reached(self.session, refreshed, was_completed=was_completed, actor_id=actor_id)
         return ProgressOutcome(activity=refreshed, pct_type=pct_type, result=result, warnings=warnings)
 
-    async def change_percent_type(self, activity_id: uuid.UUID, pct_type: str) -> tuple[Activity, list[str]]:
-        """Change the percent-complete type; return the activity + warnings preview."""
+    async def preview_percent_type(self, activity_id: uuid.UUID, pct_type: str) -> list[str]:
+        """Return the EVM-distortion warnings a type change would raise, writing nothing."""
         activity = await self.get_activity(activity_id)
         if pct_type not in PERCENT_COMPLETE_TYPES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown percent_complete_type {pct_type!r}",
             )
         orm_steps = await self.list_steps(activity_id) if pct_type == "physical" else []
         engine_steps = self._engine_steps(orm_steps)
-        warnings = evm_distortion_warnings(
+        return evm_distortion_warnings(
             pct_type=pct_type,
             budgeted_units=activity.budgeted_units,
             has_steps=bool(orm_steps),
@@ -259,6 +271,10 @@ class ScheduleProgressService:
             steps_total_weight=steps_total_weight(engine_steps) if engine_steps else 0,
             cost_is_nonlinear=False,
         )
+
+    async def change_percent_type(self, activity_id: uuid.UUID, pct_type: str) -> tuple[Activity, list[str]]:
+        """Change the percent-complete type; return the activity + warnings preview."""
+        warnings = await self.preview_percent_type(activity_id, pct_type)
         await self.base.activity_repo.update_fields(activity_id, percent_complete_type=pct_type)
         return await self.get_activity(activity_id), warnings
 
@@ -320,7 +336,7 @@ class ScheduleProgressService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Cannot suspend an activity in status '{activity.status}'",
             )
-        calendar = await self._resolve_calendar(activity.calendar_id)
+        calendar = await self.resolve_calendar(activity.calendar_id)
         remaining = activity.remaining_duration
         if remaining is None:
             od = original_duration(calendar, activity.start_date, activity.end_date)
@@ -350,7 +366,7 @@ class ScheduleProgressService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Activity is not suspended",
             )
-        calendar = await self._resolve_calendar(activity.calendar_id)
+        calendar = await self.resolve_calendar(activity.calendar_id)
         remaining = activity.remaining_duration if activity.remaining_duration is not None else 0
         when = effective_date or schedule.data_date or activity.start_date
         new_end = forecast_finish(calendar, activity.start_date, when, remaining)
@@ -396,7 +412,7 @@ class ScheduleProgressService:
         cache: dict[uuid.UUID | None, WorkCalendar] = {}
         rows: list[dict[str, object]] = []
         for act in activities:
-            calendar = await self._resolve_calendar(act.calendar_id, cache)
+            calendar = await self.resolve_calendar(act.calendar_id, cache)
             rows.append(
                 {
                     "baseline_start_iso": act.start_date,

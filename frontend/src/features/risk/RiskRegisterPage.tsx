@@ -18,11 +18,13 @@ import { PlanningCrossLinks } from '@/features/schedule/PlanningCrossLinks';
 import SimilarItemsPanel from '@/shared/ui/SimilarItemsPanel';
 import { UserSearchInput } from '@/shared/ui/UserSearchInput';
 import { apiGet, apiPost, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fmtPercent, fmtFixed } from '@/shared/lib/formatters';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useTabKeyboardNav } from '@/shared/hooks/useTabKeyboardNav';
 import { MonteCarloTab } from './MonteCarloTab';
+import { ContingencyCard } from './ContingencyCard';
 import { riskGuide } from './riskGuide';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildRiskInsights } from './riskInsights';
@@ -390,7 +392,7 @@ function DetailView({ riskId, onBack }: { riskId: string; onBack: () => void }) 
 
   const upd = useMutation({
     mutationFn: (p: Record<string, unknown>) => apiPatch<RiskItem>(`/v1/risk/${riskId}`, p),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['risk'] }); qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); setEditing(false); addToast({ type: 'success', title: t('risk.updated', { defaultValue: 'Risk updated' }) }); },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['risk'] }); qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); qc.invalidateQueries({ queryKey: ['risk-contingency'] }); setEditing(false); addToast({ type: 'success', title: t('risk.updated', { defaultValue: 'Risk updated' }) }); },
     onError: (e: Error) => addToast({ type: 'error', title: t('common.error', { defaultValue: 'Error' }), message: e.message }),
   });
 
@@ -637,7 +639,11 @@ function HowRiskWork() {
           <ModLink to="/project-controls">
             {t('risk.mod_controls', { defaultValue: 'Project Controls' })}
           </ModLink>{' '}
-          · <ModLink to="/reports">{t('risk.mod_reports', { defaultValue: 'Reports' })}</ModLink>
+          · <ModLink to="/reports">{t('risk.mod_reports', { defaultValue: 'Reports' })}</ModLink>{' '}
+          ·{' '}
+          <ModLink to="/finance?tab=budgets">
+            {t('risk.mod_finance_budget', { defaultValue: 'Finance budget' })}
+          </ModLink>
         </span>
       </div>
     </CollapsibleSection>
@@ -698,7 +704,7 @@ export function RiskRegisterPage() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
-  const { data: projects = [] } = useQuery({ queryKey: ['projects'], queryFn: () => apiGet<Project[]>('/v1/projects/'), staleTime: 5 * 60_000 });
+  const { data: projects = [] } = useQuery({ queryKey: ['projects'], queryFn: () => fetchProjectList<Project[]>(), staleTime: 5 * 60_000 });
   const projectId = activeProjectId || projects[0]?.id || '';
   const project = useMemo(() => projects.find((p) => p.id === projectId), [projects, projectId]);
 
@@ -722,11 +728,11 @@ export function RiskRegisterPage() {
 
   const delMut = useMutation({
     mutationFn: (id: string) => apiDelete(`/v1/risk/${id}`),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); setDeleteTarget(null); addToast({ type: 'success', title: t('risk.deleted', { defaultValue: 'Risk deleted' }) }); },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); qc.invalidateQueries({ queryKey: ['risk-contingency'] }); setDeleteTarget(null); addToast({ type: 'success', title: t('risk.deleted', { defaultValue: 'Risk deleted' }) }); },
     onError: (e: Error) => { setDeleteTarget(null); addToast({ type: 'error', title: t('common.error', { defaultValue: 'Error' }), message: e.message }); },
   });
 
-  const refresh = useCallback(() => { qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); }, [qc]);
+  const refresh = useCallback(() => { qc.invalidateQueries({ queryKey: ['risks'] }); qc.invalidateQueries({ queryKey: ['risk-summary'] }); qc.invalidateQueries({ queryKey: ['risk-matrix'] }); qc.invalidateQueries({ queryKey: ['risk-contingency'] }); }, [qc]);
 
   // Module Insights - the toggleable visualization panel for this module. Its
   // charts are built client-side from the risks already loaded; when the
@@ -865,6 +871,11 @@ export function RiskRegisterPage() {
           ))}
         </div>
       )}
+
+      {/* Contingency: the register's expected value against the contingency
+          lines of the finance budget, with drawdowns a manager confirms when
+          a risk occurs. Links through to Finance > Budgets. */}
+      {projectId && <ContingencyCard projectId={projectId} />}
 
       {/* ── Tabs: Register (qualitative) vs Monte Carlo (quantitative) ──
           The register tab keeps the existing 5x5 matrix + heatmap +

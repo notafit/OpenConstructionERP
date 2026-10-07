@@ -90,6 +90,6 @@ async def _on_correspondence_deleted(event: Event) -> None:
     await _delete_correspondence_vector(event)
 
 
-event_bus.subscribe("correspondence.created", _on_correspondence_created)
-event_bus.subscribe("correspondence.updated", _on_correspondence_updated)
-event_bus.subscribe("correspondence.deleted", _on_correspondence_deleted)
+event_bus.subscribe_once("correspondence.created", _on_correspondence_created)
+event_bus.subscribe_once("correspondence.updated", _on_correspondence_updated)
+event_bus.subscribe_once("correspondence.deleted", _on_correspondence_deleted)

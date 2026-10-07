@@ -90,7 +90,7 @@ def register_subscribers() -> None:
     global _SUBSCRIBERS_REGISTERED
     if _SUBSCRIBERS_REGISTERED:
         return
-    event_bus.subscribe(
+    event_bus.subscribe_once(
         event_taxonomy.SNAPSHOT_REFRESHED,
         _on_snapshot_refreshed,
     )

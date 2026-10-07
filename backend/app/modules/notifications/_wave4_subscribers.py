@@ -123,7 +123,7 @@ _BI_DASHBOARDS_SUBSCRIPTIONS: list[tuple[str, Callable[[Event], object]]] = [
 def register_bi_dashboards_notification_subscribers() -> None:
     """Wire BI Dashboards events into the in-app notification fan-out."""
     for event_name, handler in _BI_DASHBOARDS_SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications (Wave 4): subscribed to %d BI-Dashboards event(s)",
         len(_BI_DASHBOARDS_SUBSCRIPTIONS),
@@ -424,7 +424,7 @@ _SUPPLIER_CATALOGS_SUBSCRIPTIONS: list[tuple[str, Callable[[Event], object]]] = 
 def register_supplier_catalogs_notification_subscribers() -> None:
     """Wire Supplier Catalogs Wave 4 subscribers onto the global event bus."""
     for event_name, handler in _SUPPLIER_CATALOGS_SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications (Wave 4): subscribed to %d Supplier-Catalogs event(s)",
         len(_SUPPLIER_CATALOGS_SUBSCRIPTIONS),

@@ -1,0 +1,50 @@
+# Sweden Construction Pack — first-login onboarding wizard.
+# Streamed by /api/v1/partner-pack/onboarding-script and rendered by
+# the OnboardingWizard React component in place of the default steps.
+
+version: 2
+pack: sweden-se
+locale: sv
+title: "Valkommen till OpenConstructionERP — Sverige"
+title_en: "Welcome to OpenConstructionERP — Sweden Edition"
+subtitle: "Fyra steg for att stalla in din arbetsyta for svensk kalkylpraxis (AMA, BSAB, AB 04). Four quick steps to align your workspace with Swedish estimating practice."
+
+steps:
+  - id: company_profile
+    title: "Foretagsprofil / Company profile"
+    body: "Ange ditt foretags uppgifter. De visas i rapporter, anbud och upphandlingsdokument. Enter your company details so reports, tenders and invoices are correctly attributed."
+    fields:
+      - { key: company_name, label: "Foretagsnamn / Company name", type: text, required: true }
+      - { key: org_number, label: "Organisationsnummer / Organisation number", type: text, required: false, placeholder: "XXXXXX-XXXX", help: "Ditt organisationsnummer registrerat hos Bolagsverket. Your organisation number registered with the Swedish Companies Registration Office." }
+      - { key: legal_form, label: "Bolagsform / Legal form", type: select, options: ["Aktiebolag (AB)", "Handelsbolag (HB)", "Kommanditbolag (KB)", "Enskild firma", "Ekonomisk forening", "Annan / Other"], default: "Aktiebolag (AB)", required: true }
+      - { key: f_tax, label: "F-skattsedel / F-tax certificate", type: checkbox, default: true, help: "Bekrafta att foretaget har F-skattsedel. Confirm the company holds an F-tax certificate." }
+
+  - id: standards_classification
+    title: "Standarder och klassifikation / Standards and classification"
+    body: "Valj vilka svenska standarder som ska galla for dina projekt. BOQ-validering anpassas darefter. Confirm which Swedish standards apply to your projects. BOQ validation will align accordingly."
+    fields:
+      - { key: classification_standard, label: "Klassifikationssystem / Classification system", type: radio, options: ["BSAB 96 (Standard)", "CoClass (nyare klassifikation / newer classification)"], default: "BSAB 96 (Standard)", required: true }
+      - { key: ama_edition, label: "AMA-utgava / AMA edition", type: radio, options: ["AMA Hus 21 (aktuell / current)", "AMA Hus 18", "AMA Anlaggning 20"], default: "AMA Hus 21 (aktuell / current)", required: true }
+      - { key: contract_form, label: "Standardavtal / Standard contract form", type: select, options: ["AB 04 — Utforandeentreprenad (general contracting)", "ABT 06 — Totalentreprenad (design-build)", "ABK 09 — Konsultuppdrag (consultant engagement)"], default: "AB 04 — Utforandeentreprenad (general contracting)", required: true }
+
+  - id: tax_procurement
+    title: "Skatt och upphandling / Tax and procurement"
+    body: "Momssats och upphandlingsprofil. Standardsatsen ar 25% moms. Confirm your tax rate and procurement profile. The default is 25% moms."
+    fields:
+      - { key: default_moms_rate, label: "Momssats / VAT rate", type: radio, options: ["25% (standardsats / standard rate)", "12% (reducerad sats for bostadsrenovering / reduced rate for residential renovation)", "0% (momsfri / VAT exempt)"], default: "25% (standardsats / standard rate)", required: true }
+      - { key: procurement_type, label: "Overvagande uppdragsgivare / Predominant client type", type: radio, options: ["Offentlig upphandling (LOU bindande) / Public procurement (LOU mandatory)", "Privat byggherre / Private client", "Blandat / Mixed"], default: "Blandat / Mixed", required: true }
+      - { key: cwicr_regions, label: "CWICR-kostnadsregioner / CWICR cost regions", type: multiselect, options: ["Stockholm (SEK)"], default: ["Stockholm (SEK)"], required: true }
+
+  - id: review
+    title: "Granska och slutfor / Review and finish"
+    body: "Vi skapar din arbetsyta med AMA, BSAB och dina valda installningar. Allt kan andras senare under Installningar. We will create your workspace with AMA, BSAB and your chosen settings. Everything can be changed later in Settings."
+    action:
+      label: "Skapa min arbetsyta / Create my workspace"
+      apply:
+        - set_default_currency: SEK
+        - set_tax_template: se_moms_25
+        - enable_rule_packs:
+            - ama_specification
+            - bsab_classification
+            - ab04_contract
+        - preload_cwicr_regions_from: cwicr_regions

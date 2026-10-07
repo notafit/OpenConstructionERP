@@ -1,0 +1,159 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "pay_application": {
+    "period_present": {
+      "fail": "Abschlagsrechnung {claim} hat kein Enddatum des Abrechnungszeitraums und lässt sich daher nicht in die Reihenfolge der Abschlagsrechnungen des Vertrags einordnen",
+      "suggestion": "Geben Sie den letzten Tag des Abrechnungszeitraums dieser Abschlagsrechnung ein"
+    },
+    "period_order": {
+      "fail": "Abschlagsrechnung {claim} beginnt am {period_from} und endet am {period_to}, der Abrechnungszeitraum endet also vor seinem Beginn",
+      "suggestion": "Korrigieren Sie Beginn oder Ende des Abrechnungszeitraums, sodass der Beginn zuerst liegt"
+    },
+    "period_overlap": {
+      "fail": "Abschlagsrechnung {claim} beginnt am {period_from}, die vorherige Abschlagsrechnung {previous} läuft aber bis zum {previous_to}, sodass beide dieselben Tage abrechnen",
+      "suggestion": "Lassen Sie diese Abschlagsrechnung am Tag nach dem Ende des vorherigen Abrechnungszeitraums beginnen"
+    },
+    "period_gap": {
+      "fail": "Abschlagsrechnung {claim} beginnt am {period_from}, die vorherige Abschlagsrechnung {previous} endete aber am {previous_to}, sodass die Tage dazwischen in keiner Abschlagsrechnung abgerechnet werden (nicht abgerechnete Tage: {days})",
+      "suggestion": "Lassen Sie diese Abschlagsrechnung am Tag nach dem Ende des vorherigen Abrechnungszeitraums beginnen, oder prüfen Sie, ob eine Abschlagsrechnung fehlt"
+    },
+    "period_unparsed": {
+      "fail": "Abschlagsrechnung {claim} enthält als {field} den Wert '{value}', der sich nicht als Datum lesen lässt",
+      "suggestion": "Geben Sie das Datum als Jahr, Monat und Tag ein, zum Beispiel 2026-03-31",
+      "fields": {
+        "period_start": "Beginn des Abrechnungszeitraums",
+        "period_end": "Ende des Abrechnungszeitraums",
+        "claim_date": "Rechnungsdatum"
+      }
+    },
+    "line_overbilled": {
+      "fail": "Position {line} ist kumuliert mit {billed} abgerechnet, mehr als ihr Vertragswert von {scheduled}; führen Sie „Aus Leistungsstand befüllen“ erneut aus oder senken Sie den Betrag dieses Zeitraums auf der Position",
+      "suggestion": "„Aus Leistungsstand befüllen“ rechnet auf jeder Position nur ab, was seit den früheren Abschlagsrechnungen neu ist. Ist ihr Umfang tatsächlich gewachsen, erfassen Sie zuerst den Nachtrag, der ihren Vertragswert erhöht"
+    },
+    "percent_regressed": {
+      "fail": "Position {line} steht kumuliert bei {percent} % Fertigstellung, also {requested}, weniger als die {previous}, die frühere Abschlagsrechnungen auf ihr bereits abgerechnet haben, daher wird auf ihr in diesem Zeitraum nichts abgerechnet",
+      "suggestion": "Prüfen Sie den Fertigstellungsgrad dieser Position oder berichtigen Sie die frühere Abschlagsrechnung, die zu viel ausgewiesen hat"
+    },
+    "errors": {
+      "submission_blocked": "Diese Abschlagsrechnung kann erst eingereicht werden, wenn Folgendes behoben ist: {findings}",
+      "rules_unavailable": "Die Prüfregeln für Abschlagsrechnungen sind in dieser Installation nicht geladen, daher kann diese Abschlagsrechnung vor dem Einreichen nicht geprüft werden.",
+      "later_claim_already_issued": "Abschlagsrechnung {claims} folgt auf diese und ist bereits eingereicht. Sie wurde erstellt, als diese noch ein Entwurf war, und rechnet diese Leistung daher bereits ab. Löschen Sie diesen Entwurf oder legen Sie seinen Zeitraum hinter die letzte eingereichte Abschlagsrechnung"
+    },
+    "totals_match_lines": {
+      "fail": "Zahlungsantrag {claim} fordert {gross}, die zugehörigen Positionen ergeben aber {lines_total}: der Antrag wurde nach der Änderung seiner Positionen nicht neu berechnet",
+      "suggestion": "Speichern Sie eine beliebige Position dieses Antrags oder führen Sie die Übernahme aus dem Baufortschritt erneut aus, dann folgen die Summen"
+    },
+    "totals_below_lines": {
+      "fail": "Zahlungsantrag {claim} fordert {gross} auf Basis erfasster Kosten, weniger als die {lines_total}, die seine eigenen Positionen ergeben: die Aufgliederung kann nicht mehr fordern als der Antrag selbst",
+      "suggestion": "Bei einem auf Kostenbasis abgerechneten Antrag sind die Positionen eine Aufgliederung des Betrags und nicht dessen Quelle. Verringern oder entfernen Sie die Positionen, die ihn übersteigen, oder erzeugen Sie den Antrag erneut aus den erfassten Kosten, damit beide übereinstimmen"
+    },
+    "prior_matches_earlier_claims": {
+      "line_fail": "Zahlungsantrag {claim} weist {stored} als bisher abgerechnet für Position {line} aus, die früheren Anträge rechnen dafür jetzt {now} ab",
+      "total_fail": "Zahlungsantrag {claim} weist {stored} als bisher bescheinigt aus, die früheren Anträge bescheinigen jetzt {now}",
+      "suggestion": "Erzeugen Sie diesen Antrag erneut, damit er den heutigen Stand der vorherigen Anträge übernimmt"
+    },
+    "within_nte_cap": {
+      "fail": "Zahlungsantrag {claim} fordert {this} zusätzlich zu den bereits abgerechneten {billed} und überschreitet damit die Höchstgrenze von {cap}",
+      "suggestion": "Rechnen Sie mit diesem Antrag bis zur Höchstgrenze ab und vereinbaren Sie für den Rest einen Nachtrag"
+    },
+    "retention_matches_policy": {
+      "fail": "Abschlagsrechnung {claim} weist {held} Sicherheitseinbehalt aus, nach der Einbehaltsregel sind es jetzt {expected}: Eine frühere Abschlagsrechnung, eine Freigabe oder die Regel hat sich geändert, nachdem diese Abschlagsrechnung berechnet wurde",
+      "suggestion": "Führen Sie „Aus Leistungsstand befüllen“ erneut aus oder speichern Sie eine beliebige Position dieser Abschlagsrechnung, dann wird der Einbehalt neu berechnet"
+    },
+    "retention_above_cap": {
+      "fail": "Abschlagsrechnung {claim} weist {held} Sicherheitseinbehalt aus und liegt damit über der in der Einbehaltsregel festgelegten Grenze von {percent}%, die bei diesem Vertrag {cap} beträgt",
+      "suggestion": "Berechnen Sie die Abschlagsrechnung neu oder heben Sie die Grenze in der Einbehaltsregel des Vertrags an, wenn die Parteien einen höheren Betrag vereinbart haben",
+      "state_cap_unread": "Abschlagsrechnung {claim}: Die Einbehaltsregel nennt keine Obergrenze, und in {country} begrenzt das Recht der Bundesstaaten den Einbehalt. Der Bundesstaat ließ sich nicht bestimmen, weil das Projekt keinen Subdivision-Code führt, daher wurde keine gesetzliche Obergrenze geprüft",
+      "state_cap_suggestion": "Tragen Sie die Grenze des Bundesstaats als Obergrenze in die Einbehaltsregel des Vertrags ein, dann wird jede Abschlagsrechnung dieses Vertrags daran geprüft"
+    },
+    "retention_release_within_held": {
+      "fail": "Die bis einschließlich Abschlagsrechnung {claim} abgerechneten Freigaben zahlen {released} aus, mehr als die bis dahin einbehaltenen {accrued}",
+      "suggestion": "Stornieren Sie die zu hohe Freigabe oder rechnen Sie sie in einer späteren Abschlagsrechnung ab, wenn mehr einbehalten ist"
+    },
+    "sov_reconciles_contract_sum": {
+      "fail": "Der Zahlungsplan ergibt {scheduled}, die Auftragssumme bis heute beträgt jedoch {contract_sum}: {difference} des Auftrags stehen auf keiner Position, gegen die abgerechnet wird",
+      "suggestion": "Ergänzen oder korrigieren Sie Positionen im Zahlungsplan, bis sie die Auftragssumme ergeben",
+      "suggestion_reconcile": "{count} genehmigte Nachträge oder Änderungen haben die Auftragssumme verändert, bevor sie in den Zahlungsplan gelangten. Nutzen Sie am Vertrag „Nachträge abgleichen“, um für jeden eine Position anzulegen"
+    }
+  },
+  "retention_release": {
+    "documents_attached": {
+      "fail": "Diese Freigabe benötigt folgendes Dokument: {document}; es ist keines angehängt",
+      "suggestion": "Erfassen Sie das Dokument am Vertrag, hängen Sie es an die Freigabe an und genehmigen Sie sie erneut"
+    },
+    "within_available": {
+      "fail": "Diese Freigabe zahlt {amount} aus, es sind aber nur noch {available} einbehalten und keiner anderen Freigabe zugeordnet",
+      "suggestion": "Stornieren Sie diese Freigabe und schlagen Sie sie erneut vor, damit sie nach dem jetzt einbehaltenen Betrag bemessen wird"
+    },
+    "document_roles": {
+      "certificate_substantial_completion": "Bescheinigung der wesentlichen Fertigstellung",
+      "acceptance_protocol": "Abnahmeprotokoll",
+      "affidavit_payment_of_debts": "Erklärung über die Bezahlung von Verbindlichkeiten",
+      "affidavit_release_of_liens": "Erklärung über die Freigabe von Sicherungsrechten",
+      "consent_of_surety": "Zustimmung des Bürgen",
+      "final_lien_waiver": "abschließender Verzicht auf Sicherungsrechte",
+      "final_invoice": "Schlussrechnung"
+    },
+    "errors": {
+      "approval_blocked": "Diese Freigabe des Einbehalts kann erst genehmigt werden, wenn Folgendes behoben ist: {findings}",
+      "rules_unavailable": "Die Prüfregeln für Freigaben des Einbehalts sind in dieser Installation nicht geladen, daher kann diese Freigabe vor der Genehmigung nicht geprüft werden."
+    }
+  },
+  "aia": {
+    "g703": {
+      "billed_not_on_a_schedule_line": "Abgerechnete Leistung ohne Position im Zahlungsplan"
+    }
+  },
+  "sov_reconcile": {
+    "errors": {
+      "not_active": "Nachträge werden nur in den Zahlungsplan eines aktiven Vertrags übernommen; dieser Vertrag hat den Status {status}",
+      "preview_stale": "Die Liste der abzugleichenden Nachträge hat sich geändert, seit Sie sie geöffnet haben. Öffnen Sie die Vorschau erneut und bestätigen Sie den aktuellen Stand"
+    }
+  },
+  "compliance_gate": {
+    "errors": {
+      "signature_blocked": "Dieser Vertrag kann erst unterschrieben werden, wenn Folgendes behoben ist: {findings}"
+    }
+  },
+  "payment_plan": {
+    "triggers": {
+      "completion": "Fertigstellung",
+      "approval": "Abnahme"
+    },
+    "total_within_contract": {
+      "fail": "Die Raten ergeben zusammen {scheduled} und damit mehr als die Vertragssumme von {total}",
+      "suggestion": "Verringern Sie die Raten, sodass sie die Vertragssumme nicht übersteigen"
+    },
+    "percent_sum": {
+      "fail": "Die Raten ergeben zusammen {scheduled} von der Vertragssumme {total} ({percent} %), ein Teil des Preises hat also keine Rate",
+      "suggestion": "Legen Sie eine Rate für den Rest der Vertragssumme an oder passen Sie die Beträge an"
+    },
+    "completion_trigger_linked": {
+      "fail": "Rate {milestone} wird bei {trigger} fällig, ist aber mit keinem Vorgang im Terminplan verknüpft, daher verschiebt sich ihr Datum nicht mit der Arbeit",
+      "suggestion": "Verknüpfen Sie die Rate mit dem Meilenstein im Terminplan, auf den sie wartet"
+    },
+    "schedule_done_plan_pending": {
+      "fail": "Laut Terminplan ist {milestone} erreicht, die Rate {instalment} steht aber noch aus und kann nicht abgerechnet werden",
+      "suggestion": "Markieren Sie die Rate als erreicht oder prüfen Sie, warum der Vertrag nicht aktiv ist"
+    },
+    "client_visible_requires_active": {
+      "fail": "Rate {milestone} wird dem Auftraggeber angezeigt, der Vertrag ist aber {status}; der Auftraggeber sieht nur den Zahlungsplan eines aktiven oder abgeschlossenen Vertrags",
+      "suggestion": "Blenden Sie die Rate für den Auftraggeber aus, bis der Vertrag in Kraft ist"
+    },
+    "consumer_deposit_cap": {
+      "fail": "Die Anzahlung von {deposit} liegt über den {ceiling}, die {reference} in {jurisdiction} erlaubt (Quelle: {source_url}, geprüft am {checked_on}, nicht juristisch geprüft)",
+      "suggestion": "Verringern Sie die Anzahlung oder lassen Sie rechtlich prüfen, ob für diesen Vertrag eine Ausnahme gilt",
+      "below_threshold": {
+        "fail": "Die Vertragssumme liegt bei oder unter dem Betrag, ab dem {reference} Anzahlungen in {jurisdiction} begrenzt, die Anzahlung wurde daher nicht geprüft (Quelle: {source_url})"
+      },
+      "other_currency": {
+        "fail": "Der Vertrag lautet auf {currency}, {reference} nennt die Grenze aber in {limit_currency}, die Anzahlung in {jurisdiction} wurde daher nicht geprüft (Quelle: {source_url})"
+      },
+      "unchecked": {
+        "suggestion": "Falls die Vorschrift für diesen Vertrag gilt, prüfen Sie die Anzahlung von Hand"
+      }
+    }
+  }
+}

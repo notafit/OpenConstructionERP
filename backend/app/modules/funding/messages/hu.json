@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "Rendben"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "A tevékenység munkái {start} napján megkezdődtek, még a pályázat {filed} napján történt benyújtása előtt - a legtöbb program a már megkezdett tevékenységet egyáltalán nem támogatja",
+      "unevidenced": "A munkák a benyújtás előtt, {start} napján kezdődtek. A pályázat adatai szerint ezt a hatóság engedélyezte, de az írásos engedély iktatószáma nincs megadva",
+      "evidence": "Rögzítse a korábbi kezdésre adott írásos engedély iktatószámát, hogy a dokumentáció egy ellenőrzésen is önmagában megálljon",
+      "suggestion": "További kiadás előtt ellenőrizze a program feltételeit. Ha a korábbi kezdést írásban engedélyezték, rögzítse az engedélyt; ha nem, kérdezze meg a hatóságot, mielőtt a pályázattal továbblépne"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "A(z) {draw} azonosítójú lehívás a támogatási időszak kezdete ({period_start}) előtti költségeket is tartalmaz",
+      "after": "A(z) {draw} azonosítójú lehívás a támogatási időszak vége ({period_end}) utáni költségeket is tartalmaz",
+      "spans": "A(z) {draw} azonosítójú lehívás mindkét végén túlnyúlik a támogatási időszakon ({period_start} - {period_end})",
+      "suggestion": "Az időszakon kívül eső költségeket tegye át egy külön lehívásba, és egyeztesse őket a hatósággal, ahelyett hogy egyetlen lehívás tartalmazná mindkettőt"
+    },
+    "own_share_is_covered": {
+      "fail": "A program {rate} százalékos önerőt ír elő, ami {required}, a pályázatban azonban {recorded} szerepel",
+      "suggestion": "Benyújtás előtt nevezze meg, honnan származik a hiányzó önerő, mert a program az elszámolható költségalapra vetítve számolja, nem a projekt teljes költségére"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "A projekt {count} pályázatának együttes támogatási intenzitása az elszámolható költségek {intensity} százaléka, ez meghaladja a programjaik közül a legszigorúbb által előírt {cap} százalékos felső határt",
+      "suggestion": "Az állami támogatások programokon és kormányzati szinteken át halmozódnak. Csökkentse valamelyik igényelt összeget, vagy tisztázza, szétválaszthatók-e a tevékenységek úgy, hogy mindegyik a saját költségeit viselje"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "A támogatási időszak {period_end} napján lezárult, de a végső elszámolás elkészítése még nem kezdődött el",
+      "late": "A végső elszámolás határideje {due} volt, de csak {submitted} napján nyújtották be",
+      "overdue": "A végső elszámolás határideje {due} volt, és még nem nyújtották be",
+      "suggestion": "Nyújtsa be, ami elkészült, ahelyett hogy megvárná, amíg teljes lesz. A legtöbb hatóság kérésre meghosszabbítja a határidőt, de a már lejárt határidőt egyik sem"
+    },
+    "errors": {
+      "application_not_found": "A pályázat nem található",
+      "programme_code_taken": "Ebben az országban már van program ezzel az azonosítóval",
+      "programme_not_found": "A program nem található",
+      "programme_has_applications": "Ehhez a programhoz pályázatok tartoznak, ezért nem törölhető. Helyette zárja le.",
+      "application_code_taken": "Ebben a projektben már van pályázat ezzel az azonosítóval",
+      "approved_application_not_deletable": "Jóváhagyott pályázat nem törölhető. Helyette állítsa az állapotát „Visszavonva” vagy „Lezárva” értékre.",
+      "approval_needs_period_end": "A jóváhagyáshoz meg kell adni a támogatási időszak végét, mert minden későbbi határidő ettől számít",
+      "draw_needs_approval": "Lehívás csak jóváhagyott pályázat alapján lehetséges",
+      "draw_not_found": "A lehívás nem található",
+      "paid_draw_not_deletable": "Kifizetett lehívás nem törölhető",
+      "proof_not_found": "Az elszámolás nem található",
+      "obligation_not_found": "A kötelezettség nem található",
+      "eligible_exceeds_amount": "Az elszámolható összeg nem haladhatja meg a teljes összeget",
+      "allocation_not_found": "Az elszámolási tétel nem található"
+    }
+  }
+}

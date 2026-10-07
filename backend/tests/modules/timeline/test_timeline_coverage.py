@@ -31,6 +31,18 @@ whose name is a string literal. At the time of writing ``app/`` also has 72
 publish sites whose name is computed at runtime; those are invisible here and
 are not part of any count this file makes. A "captures N of M" figure quoted
 from this test is therefore about literal publishes only.
+
+One blind spot is left on purpose, and it is large enough to name. Most modules
+publish through their own ``_safe_publish`` wrapper - 326 call sites against
+the 11 that call ``publish_after_commit`` directly - and this scan does not
+follow them. Measured 2026-09-22: counting them too takes the scan from 227
+literal names to 435 and the captured set from 91 to 126, and it lands 16 more
+captured names that carry no ``project_id`` in a literal payload at the call
+site, which would turn :func:`test_every_captured_event_is_routable` red. Some
+of those 16 build their payload in a variable, where this scan cannot see the
+keys at all, so a red there would be a mix of real gaps and scan blindness that
+has to be read one by one rather than closed in a batch. Widening the scan is
+worth doing; doing it means triaging those 16 in the same change, not now.
 """
 
 from __future__ import annotations
@@ -55,7 +67,18 @@ mapping = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mapping)
 
 _PROJECT_KEYS = {"project_id", "projectId"}
-_PUBLISH_FUNCS = {"publish", "publish_detached"}
+
+# Which calls publish, and WHERE each one carries the event name. The position
+# matters: ``publish_after_commit`` takes the session first, so a scan that
+# always reads ``args[0]`` finds a Name node there, skips the call, and reports
+# the event as published nowhere. That is not hypothetical - it is what the
+# 2026-09-22 nightly reported, three times, and every one of the three was
+# wrong: ``bid_management.package.awarded``, ``qms.audit.finding_raised`` and
+# ``validation.results.errors_found`` are all published, deferred to the
+# commit, and so is the whole ``inspection.`` family that the same run called a
+# dead prefix. An instrument that cannot see a call form reports absence, and
+# absence here reads as "delete that allowlist entry".
+_PUBLISH_NAME_ARG = {"publish": 0, "publish_detached": 0, "publish_after_commit": 1}
 
 
 def _publish_sites() -> dict[str, list[dict]]:
@@ -75,13 +98,14 @@ def _publish_sites() -> dict[str, list[dict]]:
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if name not in _PUBLISH_FUNCS:
+            at = _PUBLISH_NAME_ARG.get(name)
+            if at is None or len(node.args) <= at:
                 continue
-            first = node.args[0]
+            first = node.args[at]
             if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
                 continue
 
-            payload = node.args[1] if len(node.args) > 1 else None
+            payload = node.args[at + 1] if len(node.args) > at + 1 else None
             for kw in node.keywords:
                 if kw.arg in ("data", "payload"):
                     payload = kw.value

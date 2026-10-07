@@ -11,16 +11,20 @@ Stateless service layer. Handles:
 - Event publishing on create/update/delete/status-transition (slice E)
 """
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
+from app.core.calendar_day import calendar_day_iso
 from app.core.events import event_bus
 from app.core.json_merge import merge_metadata
 from app.core.party_names import resolve_party_names
@@ -126,8 +130,33 @@ VALID_TRANSITIONS: dict[str, list[str]] = {
 # Terminal statuses trigger a reopen_history entry when transitioning back
 # to an active status.
 # Statuses that require special role checks:
-# resolved -> verified: must be a different user than the resolver
+# resolved -> verified: must be a different user than the resolver, unless the
+#   deployment allows self-verification (``punchlist_verify_policy``)
+# in_progress -> verified: only under the self-verification policy; the
+#   four-eyes rule needs a recorded resolver to compare against
 # verified -> closed: admin/manager only (handled via permissions in router)
+# Closing, one by one or in bulk, always starts from ``verified``.
+
+
+def verification_refusal(item: PunchItem, user_id: str, *, policy: str) -> str | None:
+    """Why ``user_id`` may not verify ``item`` under ``policy``, or None when they may.
+
+    Pure so both the single transition and anything that verifies in bulk read
+    the same rule. The caller has already checked ``punchlist.verify``.
+
+    Returns:
+        ``"resolve_first"`` when the four-eyes rule needs a resolver and the item
+        was never resolved, ``"same_user"`` when the verifier resolved it
+        themselves, None when verification may go ahead.
+    """
+    if policy == "verify_permission":
+        return None
+    if item.status != "resolved":
+        return "resolve_first"
+    resolved_by = (getattr(item, "metadata_", None) or {}).get("resolved_by")
+    if resolved_by and resolved_by == user_id:
+        return "same_user"
+    return None
 
 
 class PunchListService:
@@ -139,14 +168,49 @@ class PunchListService:
 
     # ── Create ────────────────────────────────────────────────────────────
 
+    async def _rework_currency(self, data: PunchItemCreate) -> str:
+        """The ISO code a new item's rework cost is denominated in.
+
+        A caller that names the currency is taken at its word, including when
+        it names USD. One that does not gets the project's own currency: the
+        schema default is USD, and a snag raised from a clash, an inspection
+        or an NCR never names a currency, so on a euro job every such item
+        used to be stamped USD. That is invisible until somebody prices it,
+        and then the amount drops out of both readers - the QMS cost of poor
+        quality folds only the project's currency, and the retainage
+        withholding counts a foreign-currency item as unpriced.
+
+        Falls back to USD when the project has no usable currency, which is a
+        legitimate state: ``Project.currency`` may be empty while nobody has
+        decided yet.
+        """
+        # getattr, not attribute access: the create path has always tolerated
+        # a payload object from another module that carries fewer fields.
+        if "rework_cost_currency" in getattr(data, "model_fields_set", ()):
+            return getattr(data, "rework_cost_currency", "USD") or "USD"
+        try:
+            # Lazy import: punchlist must stay loadable without the projects
+            # module in a minimal fixture, as QMS does for the reverse read.
+            from app.modules.projects.repository import ProjectRepository  # noqa: PLC0415
+
+            project = await ProjectRepository(self.session).get_by_id(data.project_id)
+            code = str(getattr(project, "currency", "") or "").strip().upper()
+            if len(code) == 3 and code.isalpha():
+                return code
+        except Exception:  # noqa: BLE001 - defensive log-and-degrade
+            logger.exception("punchlist: project currency lookup failed for %s", data.project_id)
+        return "USD"
+
     async def create_item(
         self,
         data: PunchItemCreate,
         user_id: str | None = None,
     ) -> PunchItem:
         """Create a new punch list item."""
+        await self._verify_contract_project(data.contract_id, data.project_id)
         item = PunchItem(
             project_id=data.project_id,
+            contract_id=data.contract_id,
             title=data.title,
             description=data.description,
             document_id=data.document_id,
@@ -162,7 +226,7 @@ class PunchListService:
             geo_lat=data.geo_lat,
             geo_lon=data.geo_lon,
             rework_cost=getattr(data, "rework_cost", None),
-            rework_cost_currency=getattr(data, "rework_cost_currency", "USD") or "USD",
+            rework_cost_currency=await self._rework_currency(data),
             created_by=user_id,
             metadata_=data.metadata,
         )
@@ -245,6 +309,16 @@ class PunchListService:
 
     # ── Update ────────────────────────────────────────────────────────────
 
+    async def _verify_contract_project(self, contract_id: uuid.UUID | None, project_id: uuid.UUID) -> None:
+        """Accept only a contract from the item's project; hide foreign ids."""
+        if contract_id is None:
+            return
+        from app.modules.contracts.models import Contract
+
+        contract = await self.session.get(Contract, contract_id)
+        if contract is None or contract.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
     async def update_item(
         self,
         item_id: uuid.UUID,
@@ -254,6 +328,8 @@ class PunchListService:
         item = await self.get_item(item_id)
 
         fields = data.model_dump(exclude_unset=True)
+        if "contract_id" in fields:
+            await self._verify_contract_project(fields["contract_id"], item.project_id)
         if "metadata" in fields:
             _incoming = fields.pop("metadata")
             fields["metadata_"] = (
@@ -403,11 +479,19 @@ class PunchListService:
         # resolved the item. A null assignee must not disable the guard, so we compare
         # against the recorded resolver (metadata_.resolved_by) instead of assigned_to.
         if target == "verified":
-            resolved_by = (getattr(item, "metadata_", None) or {}).get("resolved_by")
-            if resolved_by and resolved_by == user_id:
+            refusal = verification_refusal(item, user_id, policy=get_settings().punchlist_verify_policy)
+            if refusal == "same_user":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Verification must be done by a different user than the resolver",
+                )
+            if refusal == "resolve_first":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Mark the item resolved first: verification is done by a different user "
+                        "than the one who resolved it"
+                    ),
                 )
             update_fields["verified_at"] = now
             update_fields["verified_by"] = user_id
@@ -522,6 +606,10 @@ class PunchListService:
         """Close many punch items at once.
 
         - Items already ``closed`` are counted as ``skipped``.
+        - Only ``verified`` items are closed. Anything earlier in the lifecycle
+          is returned in ``errors`` as ``not_verified`` and keeps its status:
+          a bulk close is the last step for many items, not a way round the
+          verification the single close requires.
         - Items not found, owned by another project, or violating close rules
           (e.g. critical items with open peers) are returned in ``errors``.
         - Successful closes emit ``punchlist.item.status_changed`` events.
@@ -541,6 +629,9 @@ class PunchListService:
                     continue
                 if item.status == "closed":
                     skipped += 1
+                    continue
+                if item.status != "verified":
+                    errors.append({"id": str(item_id), "error": "not_verified"})
                     continue
 
                 # Critical-with-open-peers guard mirrors transition_status().
@@ -745,10 +836,16 @@ class PunchListService:
         # column cannot even be clicked.
         names = await self.resolve_party_names(item.assigned_to for item in items)
 
+        # The list has no limit and the rich renderer reads a photo from disk
+        # and draws it for every item, so a large snag list is seconds of
+        # rendering. It runs in a worker thread; the event loop keeps serving
+        # every other request meanwhile. The renderers get plain copies of the
+        # rows and the name map, so no ORM instance crosses into the thread.
+        plain = [_pdf_snapshot(item) for item in items]
         if _REPORTLAB_AVAILABLE:
-            pdf = _build_reportlab_pdf(project_id, items, names)
+            pdf = await asyncio.to_thread(_build_reportlab_pdf, project_id, plain, names)
         else:
-            pdf = _build_minimal_pdf(_render_punchlist_text(project_id, items, names))
+            pdf = await asyncio.to_thread(_build_minimal_pdf, _render_punchlist_text(project_id, plain, names))
 
         logger.info(
             "Punch list PDF exported for project %s (%d items, reportlab=%s)",
@@ -768,98 +865,98 @@ class PunchListService:
         """
         items = await self.repo.all_for_project(project_id)
         names = await self.resolve_party_names(item.assigned_to for item in items)
-
-        if _OPENPYXL_AVAILABLE:
-            import io
-
-            assert _openpyxl is not None  # for type-checkers
-            assert _OpenpyxlFont is not None
-            wb = _openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "Punch List"
-
-            headers = [
-                "No.",
-                "Title",
-                "Status",
-                "Priority",
-                "Category",
-                "Trade",
-                "Assigned To",
-                "Due Date",
-                "Description",
-                "Resolution Notes",
-                "Created",
+        rows = [
+            [
+                item.title,
+                item.status,
+                item.priority,
+                item.category or "",
+                item.trade or "",
+                _party_label(item, names),
+                calendar_day_iso(item.due_date) or "",
+                (item.description or "")[:500],
+                (item.resolution_notes or "")[:500],
+                str(item.created_at) if item.created_at else "",
             ]
+            for item in items
+        ]
 
-            bold = _OpenpyxlFont(bold=True)
-            for col_idx, header in enumerate(headers, 1):
-                cell = ws.cell(row=1, column=col_idx, value=header)
-                cell.font = bold
-
-            for row_idx, item in enumerate(items, 2):
-                ws.cell(row=row_idx, column=1, value=row_idx - 1)
-                ws.cell(row=row_idx, column=2, value=item.title)
-                ws.cell(row=row_idx, column=3, value=item.status)
-                ws.cell(row=row_idx, column=4, value=item.priority)
-                ws.cell(row=row_idx, column=5, value=item.category or "")
-                ws.cell(row=row_idx, column=6, value=item.trade or "")
-                ws.cell(row=row_idx, column=7, value=_party_label(item, names))
-                ws.cell(row=row_idx, column=8, value=str(item.due_date) if item.due_date else "")
-                ws.cell(row=row_idx, column=9, value=(item.description or "")[:500])
-                ws.cell(row=row_idx, column=10, value=(item.resolution_notes or "")[:500])
-                ws.cell(row=row_idx, column=11, value=str(item.created_at) if item.created_at else "")
-
-            output = io.BytesIO()
-            wb.save(output)
-            excel_bytes = output.getvalue()
+        # Writing the file walks every item and is pure CPU, so it runs in a
+        # worker thread instead of holding up every other request on the event loop.
+        if _OPENPYXL_AVAILABLE:
+            excel_bytes = await asyncio.to_thread(_render_punchlist_xlsx, rows)
 
             logger.info("Punch list Excel exported for project %s (%d items)", project_id, len(items))
             return excel_bytes
 
         # Fallback: return CSV bytes if openpyxl is not installed
-        import csv
-        import io as _io
-
-        output = _io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(
-            [
-                "No.",
-                "Title",
-                "Status",
-                "Priority",
-                "Category",
-                "Trade",
-                "Assigned To",
-                "Due Date",
-                "Description",
-                "Resolution Notes",
-                "Created",
-            ]
-        )
-        for idx, item in enumerate(items, 1):
-            writer.writerow(
-                [
-                    idx,
-                    item.title,
-                    item.status,
-                    item.priority,
-                    item.category or "",
-                    item.trade or "",
-                    _party_label(item, names),
-                    str(item.due_date) if item.due_date else "",
-                    (item.description or "")[:500],
-                    (item.resolution_notes or "")[:500],
-                    str(item.created_at) if item.created_at else "",
-                ]
-            )
+        csv_bytes = await asyncio.to_thread(_render_punchlist_csv, rows)
         logger.info(
             "Punch list CSV exported (openpyxl not available) for project %s (%d items)",
             project_id,
             len(items),
         )
-        return output.getvalue().encode("utf-8")
+        return csv_bytes
+
+
+_PUNCHLIST_EXPORT_HEADERS = [
+    "No.",
+    "Title",
+    "Status",
+    "Priority",
+    "Category",
+    "Trade",
+    "Assigned To",
+    "Due Date",
+    "Description",
+    "Resolution Notes",
+    "Created",
+]
+
+
+def _render_punchlist_xlsx(rows: list[list[object]]) -> bytes:
+    """Build the punch list workbook from plain cell values (pure CPU, no DB)."""
+    import io
+
+    assert _openpyxl is not None  # for type-checkers
+    assert _OpenpyxlFont is not None
+    wb = _openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Punch List"
+
+    bold = _OpenpyxlFont(bold=True)
+    for col_idx, header in enumerate(_PUNCHLIST_EXPORT_HEADERS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = bold
+
+    for row_idx, values in enumerate(rows, 2):
+        ws.cell(row=row_idx, column=1, value=row_idx - 1)
+        for col_idx, value in enumerate(values, 2):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Company letterhead above the table; a no-op without a company profile.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(ws, title=ws.title)
+
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+def _render_punchlist_csv(rows: list[list[object]]) -> bytes:
+    """Write the punch list as UTF-8 CSV bytes, the fallback without openpyxl."""
+    import csv
+    import io as _io
+
+    output = _io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(_PUNCHLIST_EXPORT_HEADERS)
+    for idx, values in enumerate(rows, 1):
+        writer.writerow([idx, *values])
+    return output.getvalue().encode("utf-8")
 
 
 def _build_minimal_pdf(text: str) -> bytes:
@@ -960,7 +1057,7 @@ def _render_punchlist_text(
         if item.assigned_to:
             lines.append(f"   Assigned to: {_party_label(item, names)}")
         if item.due_date:
-            lines.append(f"   Due: {item.due_date}")
+            lines.append(f"   Due: {calendar_day_iso(item.due_date)}")
         if item.description:
             lines.append(f"   Description: {item.description[:200]}")
         if item.resolution_notes:
@@ -990,6 +1087,38 @@ def _resolve_photo_path(rel_or_abs: str) -> Path | None:
         return find_existing_upload(p, _PHOTOS_BASE)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _pdf_snapshot(item: PunchItem) -> SimpleNamespace:
+    """Copy the fields the PDF renderers read off a punch item into plain values.
+
+    The PDF is drawn in a worker thread, and a live ORM row must not cross into
+    it. Attributes the renderer reads with ``getattr`` and a default are copied
+    the same way, so a row without them still reads as ``None``.
+    """
+    metadata = getattr(item, "metadata_", None)
+    photos = getattr(item, "photos", None)
+    history = getattr(item, "reopen_history", None)
+    return SimpleNamespace(
+        title=item.title,
+        description=item.description,
+        status=item.status,
+        priority=item.priority,
+        category=item.category,
+        trade=item.trade,
+        assigned_to=item.assigned_to,
+        due_date=item.due_date,
+        created_at=item.created_at,
+        resolution_notes=item.resolution_notes,
+        metadata_=dict(metadata) if isinstance(metadata, dict) else metadata,
+        page=getattr(item, "page", None),
+        location_x=getattr(item, "location_x", None),
+        location_y=getattr(item, "location_y", None),
+        document_id=getattr(item, "document_id", None),
+        photo_path=getattr(item, "photo_path", None),
+        photos=list(photos) if photos is not None else None,
+        reopen_history=list(history) if history is not None else None,
+    )
 
 
 def _build_reportlab_pdf(
@@ -1027,6 +1156,7 @@ def _build_reportlab_pdf(
         TableStyle,
     )
 
+    from app.core.pdf_branding import branded_doc_metadata, branded_header_logo, branded_letterhead
     from app.core.pdf_fonts import (
         BODY_FONT,
         BOLD_FONT,
@@ -1046,6 +1176,7 @@ def _build_reportlab_pdf(
         topMargin=18 * mm,
         bottomMargin=18 * mm,
         title=f"Punch List {project_id}",
+        **branded_doc_metadata(),
     )
 
     styles = getSampleStyleSheet()
@@ -1123,7 +1254,7 @@ def _build_reportlab_pdf(
                 "Assignee",
                 _party_label(item, names) or "-",
                 "Due Date",
-                item.due_date.strftime("%Y-%m-%d") if item.due_date else "-",
+                calendar_day_iso(item.due_date) or "-",
             ],
             [
                 "Category",
@@ -1220,5 +1351,15 @@ def _build_reportlab_pdf(
     if not items:
         story.append(Paragraph("No punch list items recorded for this project.", body))
 
-    doc.build(story)
+    # The frame pads 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(doc.width - 12, doc_type="punch_list")
+    if letterhead is not None:
+        story.insert(0, letterhead)
+
+    def _first_page(canvas, page_doc) -> None:
+        # A letterhead already carries the logo; the header copy would print it twice.
+        if letterhead is None:
+            branded_header_logo(canvas, page_doc)
+
+    doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
     return buffer.getvalue()

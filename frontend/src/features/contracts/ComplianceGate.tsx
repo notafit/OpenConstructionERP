@@ -14,6 +14,7 @@
 // "Re-check", and the gate clears.
 
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ShieldCheck,
@@ -310,18 +311,28 @@ export function ComplianceGate({
             <span className="hidden h-4 w-px bg-border-light sm:block" />
             <div className="flex items-center gap-3 text-sm">
               <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
-                <CheckCircle2 size={14} /> {passedCount}{' '}
-                {t('contracts.compliance.passed_label', { defaultValue: 'passed' })}
+                <CheckCircle2 size={14} />{' '}
+                {t('contracts.compliance.passed_count', {
+                  count: passedCount,
+                  defaultValue_one: '{{count}} passed',
+                  defaultValue_other: '{{count}} passed',
+                })}
               </span>
               <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
-                <ShieldAlert size={14} /> {warnings.length}{' '}
-                {t('contracts.compliance.warnings_label', {
-                  defaultValue: 'warnings',
+                <ShieldAlert size={14} />{' '}
+                {t('contracts.compliance.warnings_count', {
+                  count: warnings.length,
+                  defaultValue_one: '{{count}} warning',
+                  defaultValue_other: '{{count}} warnings',
                 })}
               </span>
               <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
-                <ShieldX size={14} /> {errors.length}{' '}
-                {t('contracts.compliance.errors_label', { defaultValue: 'errors' })}
+                <ShieldX size={14} />{' '}
+                {t('contracts.compliance.errors_count', {
+                  count: errors.length,
+                  defaultValue_one: '{{count}} error',
+                  defaultValue_other: '{{count}} errors',
+                })}
               </span>
             </div>
           </div>
@@ -375,6 +386,24 @@ export function ComplianceGate({
   );
 }
 
+/**
+ * What a person calls the rule set a finding came from.
+ *
+ * A finding's id is the rule set joined to the rule (`boq_quality.unrealistic_rate`),
+ * which is for support and not for a reader, so the row names the set in the
+ * reader's language and keeps the id in the tooltip. A set with no name in the
+ * bundle shows its own name with the underscores dropped, never nothing: the
+ * gate promises to say which rule set a finding comes from, and a Romanian or
+ * GESN finding used to arrive with no source at all. The element reference is treated
+ * the same way: the server sends a label for every line and for the contract,
+ * and a finding pointing at anything else shows no bare UUID.
+ */
+function findingSource(t: TFunction, v: ComplianceViolation): string {
+  const set = (v.rule_id || '').split('.')[0];
+  if (!set) return '';
+  return t(`validation.rs_label_${set}`, { defaultValue: set.replace(/_/g, ' ') });
+}
+
 function ViolationGroup({
   tone,
   title,
@@ -384,6 +413,7 @@ function ViolationGroup({
   title: string;
   violations: ComplianceViolation[];
 }) {
+  const { t } = useTranslation();
   const isError = tone === 'error';
   const keys = findingKeys(violations);
   return (
@@ -423,10 +453,16 @@ function ViolationGroup({
               )}
               <div className="min-w-0">
                 <p className="text-content-primary">{v.message}</p>
-                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-content-tertiary">
-                  <span className="font-mono">{v.rule_id}</span>
-                  {v.element_ref && (
-                    <span className="font-mono">· {v.element_ref}</span>
+                <div
+                  className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-content-tertiary"
+                  title={[v.rule_id, v.element_ref].filter(Boolean).join(' · ')}
+                >
+                  {findingSource(t, v) && <span>{findingSource(t, v)}</span>}
+                  {v.element_label && (
+                    <span>
+                      {findingSource(t, v) ? '· ' : ''}
+                      {v.element_label}
+                    </span>
                   )}
                 </div>
                 {v.suggestion && (

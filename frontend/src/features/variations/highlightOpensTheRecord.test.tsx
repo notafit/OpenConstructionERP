@@ -190,7 +190,16 @@ describe('a deep link into the variations workspace', () => {
     search = '?tab=orders&highlight=vo-1';
     renderPage();
 
-    fireEvent.click(await inDrawer('Contract'));
+    // "Contract" appears both as a chain breadcrumb label and as the
+    // linked-record pill. The pill is a button; the breadcrumb is a span.
+    const pill = await waitFor(() => {
+      const dialog = screen.getByRole('dialog');
+      const matches = within(dialog).getAllByText('Contract');
+      const btn = matches.find((el) => el.closest('button'));
+      if (!btn) throw new Error('Contract pill not yet rendered');
+      return btn;
+    });
+    fireEvent.click(pill);
 
     expect(navigateSpy).toHaveBeenCalledWith('/contracts?highlight=ct-7');
     expect(navigateSpy).not.toHaveBeenCalledWith('/contracts');

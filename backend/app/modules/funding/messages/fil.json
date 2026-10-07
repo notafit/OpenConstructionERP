@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Nagsimula ang trabaho sa gawaing ito noong {start}, bago naisampa ang aplikasyon noong {filed} - karamihan ng programa ay hindi na nagpopondo ng kahit ano kapag nasimulan na ang gawain",
+      "unevidenced": "Maagang nagsimula ang trabaho, noong {start}, at nakasaad sa rekord na pinayagan ito ng awtoridad, pero walang nakatalang nakasulat na pahintulot",
+      "evidence": "Itala ang reperensya ng nakasulat na pahintulot para sa maagang pagsisimula, para may patunay ang rekord kapag ito ay sinuri",
+      "suggestion": "Suriin ang mga tuntunin ng programa bago gumastos pa. Kung pinayagan nang nakasulat ang maagang pagsisimula, itala ito; kung hindi, magtanong muna sa awtoridad bago ituloy ang aplikasyon"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Ang pagkuha ng pondo na {draw} ay may kasamang gastos mula bago ang {period_start}, ang araw na nagbubukas ang yugto ng gawad",
+      "after": "Ang pagkuha ng pondo na {draw} ay may kasamang gastos mula pagkatapos ng {period_end}, ang araw na nagsasara ang yugto ng gawad",
+      "spans": "Lumalampas ang pagkuha ng pondo na {draw} sa magkabilang dulo ng yugto ng gawad, {period_start} hanggang {period_end}",
+      "suggestion": "Ilipat ang mga gastos na nasa labas ng yugto ng gawad sa hiwalay na pagkuha ng pondo at pag-usapan ito sa awtoridad, sa halip na isama ang dalawa sa iisang kahilingan"
+    },
+    "own_share_is_covered": {
+      "fail": "Nangangailangan ang programa ng sariling kontribusyon na {rate} porsyento, na katumbas ng {required}, pero ang nakatala sa aplikasyon ay {recorded}",
+      "suggestion": "Tukuyin kung saan manggagaling ang natitirang sariling kontribusyon bago magsumite, dahil kinukuwenta ito ng programa mula sa batayan ng karapat-dapat na gastos at hindi mula sa kabuuang gastos ng proyekto"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Ang {count} aplikasyon sa proyektong ito ay umaabot sa {intensity} porsyento ng karapat-dapat na gastos, lampas sa {cap} porsyentong limitasyon ng intensidad ng tulong na itinakda ng pinakamahigpit sa kanilang mga programa",
+      "suggestion": "Nagpapatong-patong ang pampublikong pondo sa iba't ibang programa at antas ng pamahalaan. Bawasan ang halagang hinihiling sa isang aplikasyon, o alamin kung maaaring paghiwalayin ang mga gawain para may kani-kaniyang gastos ang bawat isa"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Natapos ang yugto ng gawad noong {period_end} at wala pang nasisimulang huling patunay ng paggamit",
+      "late": "Ang takdang petsa ng huling patunay ng paggamit ay {due} at isinumite ito noong {submitted}",
+      "overdue": "Ang takdang petsa ng huling patunay ng paggamit ay {due} at hindi pa ito naisusumite",
+      "suggestion": "Isumite ang mayroon na sa halip na hintaying makumpleto ito. Karamihan ng awtoridad ay nagbibigay ng palugit kapag hiniling, pero walang nagbibigay nito kapag lumipas na ang takdang petsa"
+    },
+    "errors": {
+      "application_not_found": "Hindi natagpuan ang aplikasyon",
+      "programme_code_taken": "May programa nang gumagamit ng reperensyang ito sa bansang ito",
+      "programme_not_found": "Hindi natagpuan ang programa",
+      "programme_has_applications": "May mga aplikasyon ang programang ito kaya hindi ito matatanggal. Sa halip, isara ito.",
+      "application_code_taken": "May aplikasyon nang gumagamit ng reperensyang ito sa proyektong ito",
+      "approved_application_not_deletable": "Hindi matatanggal ang inaprubahang aplikasyon. Sa halip, gawing binawi o sarado ang katayuan nito.",
+      "approval_needs_period_end": "Kailangan ng pag-apruba ang katapusan ng yugto ng gawad nito, dahil mula roon binibilang ang bawat susunod na takdang petsa",
+      "draw_needs_approval": "Makakakuha lamang ng pondo laban sa inaprubahang aplikasyon",
+      "draw_not_found": "Hindi natagpuan ang pagkuha ng pondo",
+      "paid_draw_not_deletable": "Hindi matatanggal ang pagkuha ng pondo na nabayaran na",
+      "proof_not_found": "Hindi natagpuan ang patunay ng paggamit",
+      "obligation_not_found": "Hindi natagpuan ang obligasyon",
+      "eligible_exceeds_amount": "Hindi maaaring lumampas ang karapat-dapat na halaga sa kabuuang halaga",
+      "allocation_not_found": "Hindi natagpuan ang gastos"
+    }
+  }
+}

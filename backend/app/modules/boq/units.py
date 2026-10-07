@@ -25,6 +25,7 @@ this validator, is responsible for that mapping.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Final
 
 # ── Curated unit catalogue ────────────────────────────────────────────
@@ -194,6 +195,26 @@ _UNIT_ALIASES: Final[dict[str, str]] = {
 }
 
 
+# Running metre written with a prime after the "m": "m'" in Croatian,
+# Serbian, Slovenian and Bosnian bills, and the same with a typographic
+# apostrophe or prime when the file came out of a word processor.  The
+# apostrophe is a forbidden character in the shape check below, so these are
+# resolved as whole strings BEFORE that check: only these exact spellings
+# pass, and an apostrophe anywhere else is still refused.
+_RUNNING_METRE_PRIME_FORMS: Final[frozenset[str]] = frozenset(
+    {
+        "m'",  # ASCII apostrophe
+        "m’",  # right single quotation mark
+        "m′",  # prime
+        "mʼ",  # modifier letter apostrophe
+        "m´",  # acute accent, a common keyboard stand-in
+    }
+)
+
+# The canonical running-metre token; the frontend shows it as "m'" in hr.
+RUNNING_METRE_UNIT: Final[str] = "lm"
+
+
 # Maximum acceptable unit length.  Anything longer is almost certainly an
 # accidentally pasted description, not a unit of measurement.
 _MAX_UNIT_LEN: Final[int] = 30
@@ -261,6 +282,8 @@ def normalise_unit(unit: str | None) -> str | None:
     if not unit:
         return None
     stripped = unit.strip()
+    if stripped.lower() in _RUNNING_METRE_PRIME_FORMS:
+        return RUNNING_METRE_UNIT
     if not _is_safe_unit_shape(stripped):
         return None
     lower = stripped.lower()
@@ -288,6 +311,75 @@ def normalise_unit(unit: str | None) -> str | None:
     return lower
 
 
+# Lump-sum and complete-set units across markets, in the folded form
+# :func:`is_lump_sum_unit` compares ("pauš." -> "paus").  A row priced in one
+# of these is a whole piece of work at one price, so its rate is not
+# comparable with the per-metre and per-piece rates around it.
+LUMP_SUM_UNITS: Final[frozenset[str]] = frozenset(
+    {
+        # international / English
+        "lsum",
+        "ls",
+        "lump",
+        "lump sum",
+        "lumpsum",
+        "lump-sum",
+        "item",
+        # German (GAEB "psch")
+        "psch",
+        "pausch",
+        "pauschal",
+        # Croatian, Serbian, Bosnian, Slovenian
+        "paus",
+        "pausal",
+        "pausalno",
+        # French, Belgian
+        "forfait",
+        "fft",
+        "ens",
+        # Spanish, Portuguese, Italian
+        "pa",
+        "gl",
+        "global",
+        "vb",
+        "verba",
+        "a corpo",
+        "corpo",
+        # Polish
+        "rycz",
+        "ryczalt",
+        # complete sets priced as one ("komplet"), per the brief on P-59
+        "kpl",
+        "kompl",
+        "komplet",
+        "compl",
+        "cpl",
+        "компл",
+        "комплект",
+        # Hungarian "komplett" and "átalány" (lump sum)
+        "klt",
+        "atalany",
+        # Japanese, Chinese, Korean "one lot"
+        "式",
+        "项",
+        "식",
+    }
+)
+
+
+def is_lump_sum_unit(unit: str | None) -> bool:
+    """Return True when ``unit`` is a lump-sum or complete-set unit.
+
+    Case, accents and trailing dots are ignored, so "pauš.", "PAUS", "Psch"
+    and "kpl." all count.
+    """
+    if not unit:
+        return False
+    decomposed = unicodedata.normalize("NFKD", unit.strip().lower().rstrip("."))
+    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).replace("ł", "l")
+    return unicodedata.normalize("NFC", folded) in LUMP_SUM_UNITS
+
+
 def is_approved_unit(unit: str | None) -> bool:
     """Return True when ``unit`` has a safe shape (i.e.
     :func:`normalise_unit` doesn't reject it).
@@ -299,6 +391,34 @@ def is_approved_unit(unit: str | None) -> bool:
     specific spellings round-trip without 422 errors.
     """
     return normalise_unit(unit) is not None
+
+
+_SUPERSCRIPT_DIGITS: Final[dict[int, str]] = {ord("²"): "2", ord("³"): "3"}
+
+
+def unit_identity_key(unit: str) -> str:
+    """Return the key two unit spellings are compared by for identity.
+
+    Trimmed, case-folded, with the superscript squared / cubed glyphs folded
+    to digits, so ``M3``, ``m3`` and ``m³`` are one unit. Aliases are NOT
+    applied here: ``tonne`` and ``t`` stay distinct keys, because this key
+    answers "did the user type the same thing", not "do they measure the same
+    thing".
+    """
+    return unit.strip().translate(_SUPERSCRIPT_DIGITS).casefold()
+
+
+def is_registry_unit(unit: str | None) -> bool:
+    """Return True when ``unit`` is one the platform already knows.
+
+    That is a member of :data:`APPROVED_UNITS` or a synonym in the alias
+    table, compared through :func:`unit_identity_key`. A user's personal
+    custom-unit list never needs such a unit, since every picker offers it.
+    """
+    if not unit:
+        return False
+    key = unit_identity_key(unit)
+    return key in APPROVED_UNITS or key in _UNIT_ALIASES
 
 
 # ── Internal unit token → GAEB ``<QU>`` code ──────────────────────────────

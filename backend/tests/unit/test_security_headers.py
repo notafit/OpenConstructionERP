@@ -85,6 +85,43 @@ def test_csp_header_present_and_has_key_directives(client: TestClient) -> None:
     assert "style-src 'self' 'unsafe-inline';" in csp
 
 
+def test_csp_frames_the_privacy_enhanced_video_host_only(client: TestClient) -> None:
+    """The Videos page plays tutorials in an iframe from the no-cookie host.
+
+    Without the host on frame-src the player renders blank. Only the no-cookie
+    host is allowed: the regular host sets tracking cookies on embed, which is
+    the reason the page uses the other one.
+    """
+    r = client.get("/ping")
+    csp = r.headers["Content-Security-Policy"]
+    frame_src = next(d for d in csp.split(";") if d.strip().startswith("frame-src"))
+
+    assert "https://www.youtube-nocookie.com" in frame_src.split()
+    assert "https://www.youtube.com" not in frame_src.split()
+
+
+def _admits(sources: list[str], url: str) -> bool:
+    """Whether a CSP source list admits ``url`` by scheme or by exact host."""
+    scheme, _, rest = url.partition("://")
+    host = rest.split("/", 1)[0]
+    return f"{scheme}:" in sources or f"{scheme}://{host}" in sources or host in sources
+
+
+def test_csp_admits_the_video_thumbnail_host(client: TestClient) -> None:
+    """The Videos page shows a published video's cover from the YouTube image host.
+
+    The covers are plain <img> tags pointing at i.ytimg.com, so img-src has to
+    admit that host, or every published video renders with a blank cover.
+    """
+    r = client.get("/ping")
+    csp = r.headers["Content-Security-Policy"]
+    img_src = next(d for d in csp.split(";") if d.strip().startswith("img-src")).split()[1:]
+
+    assert _admits(img_src, "https://i.ytimg.com/vi/WjDK-uk9b1w/maxresdefault.jpg")
+    # The helper itself tells a closed list from an open one.
+    assert not _admits(["'self'", "data:"], "https://i.ytimg.com/vi/x/hqdefault.jpg")
+
+
 def test_csp_skipped_for_swagger_docs(client: TestClient) -> None:
     """Swagger UI needs inline scripts from a CDN, so we skip CSP on docs paths."""
     r = client.get("/api/docs")

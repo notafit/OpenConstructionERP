@@ -31,6 +31,20 @@ export type InspectionResult = 'pass' | 'fail' | 'conditional';
 export type DamageSeverity = 'minor' | 'major' | 'critical';
 export type DamageStatus = 'reported' | 'under_repair' | 'repaired';
 
+/** English fallbacks for `equipment.damage.severity_*` and `equipment.damage.status_*`.
+ *  The damage badges and pickers printed the raw enum (`under_repair`) to every reader. */
+export const DAMAGE_SEVERITY_LABELS: Record<DamageSeverity, string> = {
+  minor: 'Minor',
+  major: 'Major',
+  critical: 'Critical',
+};
+
+export const DAMAGE_STATUS_LABELS: Record<DamageStatus, string> = {
+  reported: 'Reported',
+  under_repair: 'Under repair',
+  repaired: 'Repaired',
+};
+
 export interface Equipment {
   id: string;
   code: string;
@@ -246,6 +260,21 @@ export interface EquipmentDashboard {
   last_telemetry_at?: string | null;
 }
 
+export interface EquipmentCostSummary {
+  equipment_id: string;
+  project_id: string | null;
+  rental_cost: string;
+  rental_days: number;
+  fuel_cost: string;
+  fuel_litres: string;
+  maintenance_cost: string;
+  maintenance_orders: number;
+  parts_cost: string;
+  total_cost: string;
+  plant_hours: string;
+  cost_per_hour: string | null;
+}
+
 /* ── Predictive maintenance / fleet analytics ──────────────────────────── */
 
 export type HealthBand = 'green' | 'amber' | 'red';
@@ -352,6 +381,16 @@ export function deleteEquipment(id: string): Promise<void> {
 
 export function getEquipmentDashboard(id: string): Promise<EquipmentDashboard> {
   return apiGet<EquipmentDashboard>(`/v1/equipment/equipment/${id}/dashboard`);
+}
+
+export function getEquipmentCostSummary(
+  id: string,
+  projectId?: string,
+): Promise<EquipmentCostSummary> {
+  const qs = projectId ? `?project_id=${projectId}` : '';
+  return apiGet<EquipmentCostSummary>(
+    `/v1/equipment/equipment/${id}/cost-summary${qs}`,
+  );
 }
 
 export function getHealthAnalytics(id: string): Promise<HealthAnalytics> {

@@ -30,8 +30,9 @@
  * same vector style once into an offscreen MapLibre instance, reads the
  * canvas as a data URL and destroys the context, so the card shows real
  * street cartography from a still image with nothing left streaming. The
- * card therefore normally shows streets and building footprints, and falls
- * back to the relief tile below when the snapshot cannot be produced (no
+ * card therefore normally shows streets and building footprints, shows a
+ * neutral placeholder while the snapshot is queued, and falls back to the
+ * relief tile below only when the snapshot cannot be produced (no
  * WebGL, a blocked style, a render that times out). Which of the two it is
  * showing decides which credit it must carry, and both are exported from
  * this file.
@@ -43,7 +44,10 @@
  * taken because every keyless raster street basemap has stopped being
  * keyless, and a coarse honest tile beats a detailed one with "API KEY
  * REQUIRED" printed across it. It is also what the card falls back to, so
- * the relief source stays load-bearing rather than legacy.
+ * the relief source stays load-bearing rather than legacy. An operator with
+ * a raster street server of their own opts the globe into streets with
+ * ``OE_GLOBE_STREET_TILES_URL`` and its attribution; the globe asks the
+ * backend through ``fetchGlobeImagery`` below and keeps relief otherwise.
  *
  * This paragraph used to state, as settled fact, that the card could not
  * show streets and that this was a permanent property of an ``<img>``. It
@@ -51,6 +55,8 @@
  * about the tag: an image tag shows whatever bytes it is given, and the
  * bytes can be rendered on this side.
  */
+
+import { useThemeStore } from '@/stores/useThemeStore';
 
 /**
  * XYZ template for the raster relief basemap the backend proxies.
@@ -82,12 +88,39 @@ export const RELIEF_MAX_ZOOM = 6;
  * runtime would leave any field we forgot pointing at the tile host, and
  * the map would still render, so the leak would be invisible.
  */
-export function basemapStyleUrl(name: 'liberty' | 'positron'): string {
+export function basemapStyleUrl(name: BasemapStyleName): string {
   return `/api/v1/geo-hub/basemap-style/${name}.json`;
 }
 
+/**
+ * The vendored OpenFreeMap styles the backend serves. All three are street
+ * maps with named roads and place labels in the local script: ``liberty`` is
+ * full colour, ``positron`` light and desaturated, ``dark`` the same streets
+ * for the dark theme. None of them draws shaded relief; the backend strips
+ * that layer when vendoring, because blended under a zoomed-out map it made
+ * the street map read as a terrain map.
+ */
+export type BasemapStyleName = 'liberty' | 'positron' | 'dark';
+
 /** Full-colour street cartography. The default for every interactive map. */
 export const VECTOR_BASEMAP_STYLE_URL = basemapStyleUrl('liberty');
+
+/** The same streets for the dark theme. */
+export const DARK_VECTOR_BASEMAP_STYLE_URL = basemapStyleUrl('dark');
+
+/**
+ * The street style for a theme. Every interactive street map picks its style
+ * through this (or ``useStreetBasemapStyleUrl``) so a page never hardcodes a
+ * style of its own.
+ */
+export function streetBasemapStyleUrl(theme: 'light' | 'dark'): string {
+  return theme === 'dark' ? DARK_VECTOR_BASEMAP_STYLE_URL : VECTOR_BASEMAP_STYLE_URL;
+}
+
+/** ``streetBasemapStyleUrl`` for the theme the app is showing right now. */
+export function useStreetBasemapStyleUrl(): string {
+  return streetBasemapStyleUrl(useThemeStore((s) => s.resolved));
+}
 
 /**
  * Plain-text credit for the raster relief tiles, for consumers that render
@@ -144,3 +177,70 @@ export const TILE_ATTRIBUTION_TEXT = TILE_ATTRIBUTION_HTML.replace(/<[^>]*>/g, '
   .replace(/&copy;/g, '©')
   .replace(/\s+/g, ' ')
   .trim();
+
+/**
+ * What the Cesium globe draws: raster XYZ, the credit that goes with it, the
+ * deepest level the source has, and whether it is streets or relief.
+ */
+export interface GlobeImagery {
+  url: string;
+  credit: string;
+  maxZoom: number;
+  streets: boolean;
+}
+
+/** The built-in globe imagery: public-domain shaded relief. */
+export const RELIEF_GLOBE_IMAGERY: GlobeImagery = {
+  url: PROXY_TILE_URL,
+  credit: RELIEF_ATTRIBUTION,
+  maxZoom: RELIEF_MAX_ZOOM,
+  streets: false,
+};
+
+/** Backend answer saying whether the operator configured raster street tiles. */
+export const GLOBE_IMAGERY_CONFIG_URL = '/api/v1/geo-hub/globe-imagery/';
+
+/**
+ * Turn the ``/globe-imagery/`` answer into what the globe draws.
+ *
+ * Streets only when the operator configured a raster street server
+ * (``OE_GLOBE_STREET_TILES_URL`` with its attribution) and the answer is
+ * well formed: a same-origin tile path and a non-empty credit. Anything else
+ * is relief, because a globe with no picture or an uncredited one is worse
+ * than the coarse default.
+ */
+export function resolveGlobeImagery(config: unknown): GlobeImagery {
+  const streets = (config as { streets?: unknown } | null | undefined)?.streets as
+    | { tile_url?: unknown; attribution?: unknown; max_zoom?: unknown }
+    | null
+    | undefined;
+  if (!streets) return RELIEF_GLOBE_IMAGERY;
+  const { tile_url: url, attribution: credit, max_zoom: maxZoom } = streets;
+  if (typeof url !== 'string' || !url.startsWith('/api/') || typeof credit !== 'string' || !credit.trim()) {
+    return RELIEF_GLOBE_IMAGERY;
+  }
+  return {
+    url,
+    credit: credit.trim(),
+    maxZoom: typeof maxZoom === 'number' && maxZoom >= 0 ? maxZoom : RELIEF_MAX_ZOOM,
+    streets: true,
+  };
+}
+
+/**
+ * Ask the backend which imagery the globe should draw. Never throws: a
+ * failed or slow answer means relief, so the globe always gets a picture.
+ */
+export async function fetchGlobeImagery(timeoutMs = 3000): Promise<GlobeImagery> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(GLOBE_IMAGERY_CONFIG_URL, { signal: controller.signal });
+    if (!res.ok) return RELIEF_GLOBE_IMAGERY;
+    return resolveGlobeImagery(await res.json());
+  } catch {
+    return RELIEF_GLOBE_IMAGERY;
+  } finally {
+    clearTimeout(timer);
+  }
+}

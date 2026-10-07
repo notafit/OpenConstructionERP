@@ -3,23 +3,32 @@
 //
 // ProgressClaimLineTable — line-item breakdown of a progress claim.
 //
-// Read-only by default. When the claim is draft/submitted (editable) each
-// row exposes an inline Edit → Save flow that PATCHes a single claim line
-// and refetches. Money values are Decimal-as-string from the API and are
-// rendered via the shared MoneyDisplay so currency formatting stays
+// Read-only by default. While the claim is a draft (editable) each row
+// exposes an inline Edit → Save flow that PATCHes a single claim line and
+// refetches. A claim that has gone out for approval keeps the breakdown it
+// was billed on, so the caller passes editable={false} and the server
+// refuses the write anyway. Money values are Decimal-as-string from the API
+// and are rendered via the shared MoneyDisplay so currency formatting stays
 // consistent (and we never blend currencies — every line is in the claim
 // currency).
 
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Pencil, Check, X } from 'lucide-react';
+import { Pencil, Check, X, Plus } from 'lucide-react';
 
 import { Button, EmptyState } from '@/shared/ui';
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
 import { useToastStore } from '@/stores/useToastStore';
 import { getErrorMessage } from '@/shared/lib/api';
-import { updateClaimLine, type ProgressClaimLine } from './api';
+import {
+  updateClaimLine,
+  createClaimLine,
+  type ProgressClaimLine,
+  type ContractLine,
+} from './api';
+import { invalidateClaimAfterLineWrite } from './claimQueries';
+import { billingModeErrorMessage } from './billingModeErrors';
 import { getIntlLocale, fmtPercent } from '@/shared/lib/formatters';
 
 function toNum(v: number | string | null | undefined): number {
@@ -38,6 +47,9 @@ export interface ProgressClaimLineTableProps {
   /** When false the table is strictly read-only (no edit affordances). */
   editable: boolean;
   isLoading?: boolean;
+  /** Contract lines for description lookup (OC-30). When provided the
+   *  "Line" column shows the description instead of a truncated UUID. */
+  contractLines?: ContractLine[];
 }
 
 export function ProgressClaimLineTable({
@@ -46,8 +58,21 @@ export function ProgressClaimLineTable({
   currency,
   editable,
   isLoading = false,
+  contractLines,
 }: ProgressClaimLineTableProps) {
   const { t } = useTranslation();
+  const [adding, setAdding] = useState(false);
+  // Build a lookup map so claim lines can show the contract line description
+  // instead of a truncated UUID (OC-30).
+  const clMap = new Map<string, ContractLine>();
+  if (contractLines) {
+    for (const cl of contractLines) clMap.set(cl.id, cl);
+  }
+  // A claim carries one line per schedule-of-values line, so what is already
+  // billed here cannot be picked again; edit that row instead.
+  const pickable = (contractLines ?? []).filter(
+    (cl) => !lines.some((l) => l.contract_line_id === cl.id),
+  );
 
   if (isLoading) {
     return (
@@ -57,15 +82,41 @@ export function ProgressClaimLineTable({
     );
   }
 
-  if (lines.length === 0) {
+  if (lines.length === 0 && !adding) {
     return (
-      <EmptyState
-        title={t('contracts.claim_no_lines', { defaultValue: 'No claim lines yet' })}
-        description={t('contracts.claim_no_lines_desc', {
-          defaultValue:
-            'Populate this claim from progress observations to bill completed work.',
-        })}
-      />
+      <>
+        <EmptyState
+          title={t('contracts.claim_no_lines', { defaultValue: 'No claim lines yet' })}
+          description={t('contracts.claim_no_lines_desc', {
+            defaultValue:
+              'Populate this claim from progress observations to bill completed work.',
+          })}
+        />
+        {/* Populating needs the schedule of values tied to bid positions and
+            observations from site. A contract written by hand has neither, and
+            without this its claim could never be billed at all. */}
+        {editable && pickable.length > 0 && (
+          <div className="mt-2 flex justify-center">
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Plus size={12} />}
+              onClick={() => setAdding(true)}
+              data-testid="claim-add-line"
+            >
+              {t('contracts.claim_add_line', { defaultValue: 'Add a line by hand' })}
+            </Button>
+          </div>
+        )}
+        {editable && pickable.length === 0 && (
+          <p className="mt-2 text-center text-xs text-content-tertiary">
+            {t('contracts.claim_no_sov', {
+              defaultValue:
+                'There is nothing to bill yet: the contract has no schedule of values. Add its lines on the contract first.',
+            })}
+          </p>
+        )}
+      </>
     );
   }
 
@@ -97,11 +148,151 @@ export function ProgressClaimLineTable({
               line={line}
               currency={currency}
               editable={editable}
+              clMap={clMap}
             />
           ))}
         </tbody>
+        {editable && (adding || pickable.length > 0) && (
+          <tfoot>
+            {adding ? (
+              <ClaimLineAddRow
+                claimId={claimId}
+                pickable={pickable}
+                onDone={() => setAdding(false)}
+              />
+            ) : (
+              <tr>
+                <td colSpan={5} className="pt-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<Plus size={12} />}
+                    onClick={() => setAdding(true)}
+                    data-testid="claim-add-line"
+                  >
+                    {t('contracts.claim_add_line', { defaultValue: 'Add a line by hand' })}
+                  </Button>
+                </td>
+              </tr>
+            )}
+          </tfoot>
+        )}
       </table>
     </div>
+  );
+}
+
+/**
+ * Bill one schedule-of-values line on this claim, by hand.
+ *
+ * The percent and the money are both asked for because neither follows from
+ * the other here: a line can be half done and billed at a rate agreed later.
+ * What is billed to date and column D of the G703 are worked out by the
+ * server from the claims before this one, so they are not on this form.
+ */
+function ClaimLineAddRow({
+  claimId,
+  pickable,
+  onDone,
+}: {
+  claimId: string;
+  pickable: ContractLine[];
+  onDone: () => void;
+}) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const addToast = useToastStore((s) => s.addToast);
+  const [lineId, setLineId] = useState('');
+  const [pct, setPct] = useState('');
+  const [value, setValue] = useState('');
+
+  const createMut = useMutation({
+    mutationFn: () =>
+      createClaimLine({
+        progress_claim_id: claimId,
+        contract_line_id: lineId,
+        period_completed_pct: Number(pct) || 0,
+        period_completed_value: Number(value) || 0,
+      }),
+    onSuccess: () => {
+      invalidateClaimAfterLineWrite(qc, claimId);
+      addToast({
+        type: 'success',
+        title: t('contracts.claim_line_saved', { defaultValue: 'Line saved' }),
+      });
+      onDone();
+    },
+    onError: (err) =>
+      addToast({ type: 'error', title: billingModeErrorMessage(t, err) ?? getErrorMessage(err) }),
+  });
+
+  return (
+    <tr className="border-t border-border-light">
+      <td className="px-3 py-2">
+        <select
+          value={lineId}
+          onChange={(e) => setLineId(e.target.value)}
+          className="h-8 w-full rounded-md border border-border bg-surface-primary px-2 text-sm"
+          aria-label={t('contracts.line', { defaultValue: 'Line' })}
+        >
+          <option value="">
+            — {t('common.select', { defaultValue: 'Select' })} —
+          </option>
+          {pickable.map((cl) => (
+            <option key={cl.id} value={cl.id}>
+              {[cl.code, cl.description].filter(Boolean).join(' — ') || cl.id.slice(0, 8)}
+            </option>
+          ))}
+        </select>
+      </td>
+      <td className="px-3 py-2" />
+      <td className="px-3 py-2">
+        <input
+          type="number"
+          min={0}
+          max={100}
+          step="0.01"
+          value={pct}
+          onChange={(e) => setPct(e.target.value)}
+          className={inputCls}
+          aria-label={t('contracts.pct_complete', { defaultValue: '% complete' })}
+        />
+      </td>
+      <td className="px-3 py-2">
+        <input
+          type="number"
+          min={0}
+          step="0.01"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          className={inputCls}
+          aria-label={t('contracts.period_value', { defaultValue: 'Period value' })}
+        />
+      </td>
+      <td className="px-3 py-2 text-right">
+        <div className="flex justify-end gap-1">
+          <Button
+            size="sm"
+            variant="primary"
+            icon={<Check size={12} />}
+            onClick={() => createMut.mutate()}
+            loading={createMut.isPending}
+            disabled={!lineId}
+          >
+            {t('common.save', { defaultValue: 'Save' })}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={<X size={12} />}
+            onClick={onDone}
+            disabled={createMut.isPending}
+          >
+            {t('common.cancel', { defaultValue: 'Cancel' })}
+          </Button>
+        </div>
+      </td>
+    </tr>
   );
 }
 
@@ -110,11 +301,13 @@ function ClaimLineRow({
   line,
   currency,
   editable,
+  clMap,
 }: {
   claimId: string;
   line: ProgressClaimLine;
   currency: string;
   editable: boolean;
+  clMap: Map<string, ContractLine>;
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -134,8 +327,10 @@ function ClaimLineRow({
         // the AIA 'previous' column).
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['contracts', 'claim-lines', claimId] });
-      qc.invalidateQueries({ queryKey: ['contracts', 'claim', claimId] });
+      // The line is not the only thing that moved: the claim's stored gross,
+      // retention and net follow its lines, and so do the G702 face and the
+      // register's row. Re-read them rather than keep what is on screen.
+      invalidateClaimAfterLineWrite(qc, claimId);
       addToast({
         type: 'success',
         title: t('contracts.claim_line_saved', { defaultValue: 'Line saved' }),
@@ -154,7 +349,7 @@ function ClaimLineRow({
   return (
     <tr className="border-t border-border-light hover:bg-surface-secondary">
       <td className="px-3 py-2 font-mono text-xs text-content-secondary">
-        {line.contract_line_id.slice(0, 8)}
+        {clMap.get(line.contract_line_id)?.description || clMap.get(line.contract_line_id)?.code || line.contract_line_id.slice(0, 8)}
       </td>
       <td className="px-3 py-2 text-right text-content-secondary">
         {toNum(line.period_completed_qty).toLocaleString(getIntlLocale())}

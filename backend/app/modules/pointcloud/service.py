@@ -112,7 +112,7 @@ def guard_proxied_size(size_bytes: int) -> None:
     core. This guard exists only for the rare FALLBACK path where a body would
     be proxied through FastAPI (a worker-less or misrouted deployment). It
     raises 413 with an explanatory reason so a multi-GB body can never push the
-    2 GB core into swap. A non-positive cap is treated as "0 allowed" (proxying
+    3 GB core into swap. A non-positive cap is treated as "0 allowed" (proxying
     fully disabled) so the safe default never silently lifts the limit.
     """
     cap = int(getattr(get_settings(), "pointcloud_max_proxied_bytes", 0))
@@ -161,7 +161,7 @@ async def _spill_stream_to_temp(
     """Spool an async byte stream to a temp file, capped at ``max_bytes``.
 
     Writes each chunk straight to disk so the whole object never lands in RAM
-    (reading it all into memory is what OOMs the 2 GB core on a multi-GB scan).
+    (reading it all into memory is what OOMs the 3 GB core on a multi-GB scan).
     Raises HTTP 413 - and removes the partial temp file - as soon as the running
     total exceeds ``max_bytes`` (a non-positive cap disables the guard). Returns
     the temp-file path; the caller owns cleanup on the success path.
@@ -306,7 +306,7 @@ class PointCloudService:
         rejection = format_rejection_reason(fmt)
         if rejection is not None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "reason": rejection,
                     "format": fmt,
@@ -325,7 +325,7 @@ class PointCloudService:
         tier = getattr(raw_tier, "value", raw_tier)
         if not is_valid_tier(tier):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "reason": "invalid_accuracy_tier",
                     "tier": tier,
@@ -410,7 +410,7 @@ class PointCloudService:
         count = max(1, math.ceil(total_size_bytes / part_size_bytes))
         if count > _S3_MAX_PARTS:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "reason": "too_many_parts",
                     "part_count": count,
@@ -567,7 +567,7 @@ class PointCloudService:
         expected = list(range(1, len(ordered) + 1))
         if [p.part_number for p in ordered] != expected:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "reason": "parts_not_contiguous",
                     "message": "Multipart parts must be contiguous starting at part 1.",
@@ -586,7 +586,7 @@ class PointCloudService:
             stored = await self.storage.complete_multipart(session_obj, part_infos)
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "reason": "multipart_complete_failed",
                     "message": (f"The upload could not be finalised. Re-upload any missing parts and retry. ({exc})"),
@@ -650,7 +650,7 @@ class PointCloudService:
         ``crs_confidence``. This is the cheap preview half of the pipeline: it
         reads only the header (a few KB), never the point payload, and on the
         object-storage backend it range-reads only a bounded prefix so a 200 GB
-        cloud is never pulled into the 2 GB core.
+        cloud is never pulled into the 3 GB core.
 
         Best-effort by contract - any failure resolves to an honest
         ``scan_metadata.status`` ("pending" when no reader is installed,
@@ -1009,7 +1009,7 @@ class PointCloudService:
                 ) from exc
             except PointDecodeError as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail={"reason": "decode_failed", "message": str(exc)},
                 ) from exc
 

@@ -335,3 +335,156 @@ class TestLienWaiverUpload:
         rows = ls.json()
         assert len(rows) == 1
         assert rows[0]["waiver_type"] == "w9"
+
+
+# ── 7. A waiver filed against a pay application ─────────────────────────
+
+
+async def _make_pay_app(session, *, owner_id: str, sub_id: uuid.UUID, currency: str = "USD"):
+    """One pay application of ``sub_id`` under an agreement that requires a waiver."""
+    from datetime import date
+    from decimal import Decimal
+
+    from app.modules.projects.models import Project
+    from app.modules.subcontractors.models import PaymentApplication, SubcontractAgreement
+
+    project = Project(id=uuid.uuid4(), name="Waiver probe", owner_id=uuid.UUID(owner_id), currency=currency)
+    session.add(project)
+    await session.flush()
+    agreement = SubcontractAgreement(
+        id=uuid.uuid4(),
+        subcontractor_id=sub_id,
+        project_id=project.id,
+        title="Concrete subcontract",
+        currency=currency,
+        total_value=Decimal("8000"),
+        status="active",
+        requires_lien_waiver=True,
+    )
+    session.add(agreement)
+    await session.flush()
+    pay_app = PaymentApplication(
+        id=uuid.uuid4(),
+        agreement_id=agreement.id,
+        application_number="PA-1",
+        status="finance_approved",
+        currency=currency,
+        gross_amount=Decimal("2000"),
+        net_amount=Decimal("1800"),
+        period_start=date(2026, 4, 1),
+        period_end=date(2026, 4, 30),
+    )
+    session.add(pay_app)
+    await session.flush()
+    return pay_app.id
+
+
+class TestWaiverAgainstAPayApplication:
+    """The panel now files a payment waiver against the pay application it releases.
+
+    What makes that worth anything is the release gate reading it: a waiver
+    whose amount covers the net clears the payment, so the upload must only
+    ever attach a sub's own pay application, in its currency.
+    """
+
+    PDF = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
+
+    # The subcontractor named in the URL is the identity under test: whose
+    # pay applications its paper may reach. These two are the allow and the
+    # deny side of that one gate, so both carry the marker.
+    @pytest.mark.tenant_isolation
+    @pytest.mark.asyncio
+    async def test_a_waiver_for_the_subs_own_pay_application_releases_it(
+        self, db_session, tmp_path, monkeypatch
+    ) -> None:
+        from app.modules.subcontractors import router as subs_router_mod
+        from app.modules.subcontractors.service import SubcontractorService
+
+        monkeypatch.setattr(subs_router_mod, "LIEN_WAIVERS_DIR", tmp_path / "waivers")
+        caller = await _make_user(db_session)
+        sub_id = await _make_subcontractor(db_session)
+        pay_app_id = await _make_pay_app(db_session, owner_id=caller, sub_id=sub_id)
+        await db_session.commit()
+
+        svc = SubcontractorService(db_session)
+        _required, before = await svc.lien_waiver_status(pay_app_id)
+        assert before.blocked
+
+        transport = httpx.ASGITransport(app=_build_app(db_session, caller_id=caller))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/v1/subcontractors/subcontractors/{sub_id}/lien-waivers/upload",
+                # No currency sent: it is the pay application's.
+                data={
+                    "waiver_type": "conditional_partial",
+                    "payment_application_id": str(pay_app_id),
+                    "amount": "1800.00",
+                    "through_date": "2026-04-30",
+                },
+                files={"file": ("waiver.pdf", self.PDF, "application/pdf")},
+            )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["payment_application_id"] == str(pay_app_id)
+        assert body["currency"] == "USD"
+        assert body["through_date"] == "2026-04-30"
+
+        required, after = await svc.lien_waiver_status(pay_app_id)
+        assert required and not after.blocked
+
+    @pytest.mark.tenant_isolation
+    @pytest.mark.asyncio
+    async def test_another_subs_or_an_unknown_pay_application_is_refused(
+        self, db_session, tmp_path, monkeypatch
+    ) -> None:
+        from app.modules.subcontractors import router as subs_router_mod
+
+        monkeypatch.setattr(subs_router_mod, "LIEN_WAIVERS_DIR", tmp_path / "waivers")
+        caller = await _make_user(db_session)
+        sub_id = await _make_subcontractor(db_session)
+        other_sub = await _make_subcontractor(db_session)
+        others_pay_app = await _make_pay_app(db_session, owner_id=caller, sub_id=other_sub)
+        await db_session.commit()
+
+        transport = httpx.ASGITransport(app=_build_app(db_session, caller_id=caller))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for target in (others_pay_app, uuid.uuid4()):
+                resp = await client.post(
+                    f"/v1/subcontractors/subcontractors/{sub_id}/lien-waivers/upload",
+                    data={
+                        "waiver_type": "unconditional_partial",
+                        "payment_application_id": str(target),
+                        "amount": "1800.00",
+                    },
+                    files={"file": ("waiver.pdf", self.PDF, "application/pdf")},
+                )
+                assert resp.status_code == 422, resp.text
+                assert resp.json()["detail"]["code"] == "payment_application_other_subcontractor"
+            listed = await client.get(f"/v1/subcontractors/subcontractors/{sub_id}/lien-waivers")
+        # Refused before the file was stored: nothing is on record.
+        assert listed.json() == []
+
+    @pytest.mark.asyncio
+    async def test_a_waiver_in_another_currency_is_refused(self, db_session, tmp_path, monkeypatch) -> None:
+        from app.modules.subcontractors import router as subs_router_mod
+
+        monkeypatch.setattr(subs_router_mod, "LIEN_WAIVERS_DIR", tmp_path / "waivers")
+        caller = await _make_user(db_session)
+        sub_id = await _make_subcontractor(db_session)
+        pay_app_id = await _make_pay_app(db_session, owner_id=caller, sub_id=sub_id)
+        await db_session.commit()
+
+        transport = httpx.ASGITransport(app=_build_app(db_session, caller_id=caller))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                f"/v1/subcontractors/subcontractors/{sub_id}/lien-waivers/upload",
+                data={
+                    "waiver_type": "conditional_partial",
+                    "payment_application_id": str(pay_app_id),
+                    "amount": "1800.00",
+                    "currency": "EUR",
+                },
+                files={"file": ("waiver.pdf", self.PDF, "application/pdf")},
+            )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"]["code"] == "currency_mismatch"

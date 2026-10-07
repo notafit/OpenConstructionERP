@@ -28,6 +28,11 @@
  * Writing needs admin. A non-admin sees the same panel read-only rather than
  * an empty space, because knowing how documents are configured is useful even
  * when you cannot change it.
+ *
+ * The panel sits in two places: here, above the built-in templates, and in the
+ * Company & documents settings tab, which has no templates under it. The copy
+ * that points "below" is swapped there, and that tab mirrors the unsaved draft
+ * into its letterhead preview through `onDraftChange`.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -64,8 +69,19 @@ const PAGE_WIDTH_MM: Record<string, number> = {
 const SELECT_CLS =
   'h-8 w-full rounded border border-border bg-surface-primary px-2 text-xs disabled:opacity-60';
 
-export function DocumentAppearancePanel() {
+interface DocumentAppearancePanelProps {
+  /** Where the panel is shown; decides whether the copy may point at templates below it. */
+  placement?: 'templates' | 'settings';
+  /** Called with the unsaved draft whenever it changes, so a sibling preview can follow it. */
+  onDraftChange?: (draft: DocumentAppearance) => void;
+}
+
+export function DocumentAppearancePanel({
+  placement = 'templates',
+  onDraftChange,
+}: DocumentAppearancePanelProps = {}) {
   const { t } = useTranslation();
+  const inSettings = placement === 'settings';
   const addToast = useToastStore((s) => s.addToast);
   const qc = useQueryClient();
   const userRole = useAuthStore((s) => s.userRole);
@@ -91,6 +107,10 @@ export function DocumentAppearancePanel() {
   useEffect(() => {
     if (appearanceQ.data) setDraft(appearanceQ.data);
   }, [appearanceQ.data]);
+
+  useEffect(() => {
+    if (draft) onDraftChange?.(draft);
+  }, [draft, onDraftChange]);
 
   const dirty = useMemo(() => {
     if (!draft || !appearanceQ.data) return false;
@@ -151,10 +171,14 @@ export function DocumentAppearancePanel() {
     return (
       <Card padding="md">
         <p className="text-xs text-content-secondary">
-          {t('property_dev.doc_appearance.load_failed', {
-            defaultValue:
-              'Could not load the document appearance settings. Templates below are unaffected.',
-          })}
+          {inSettings
+            ? t('settings.company.appearance_load_failed', {
+                defaultValue: 'Could not load the document appearance settings.',
+              })
+            : t('property_dev.doc_appearance.load_failed', {
+                defaultValue:
+                  'Could not load the document appearance settings. Templates below are unaffected.',
+              })}
         </p>
       </Card>
     );
@@ -177,10 +201,15 @@ export function DocumentAppearancePanel() {
             })}
           </h2>
           <p className="mt-0.5 max-w-3xl text-xs text-content-secondary">
-            {t('property_dev.doc_appearance.subtitle', {
-              defaultValue:
-                'Applies to every PDF the platform generates, not just the templates below. Your logo and company name are set in workspace branding.',
-            })}
+            {inSettings
+              ? t('settings.company.appearance_subtitle', {
+                  defaultValue:
+                    'Applies to every PDF the platform generates. The logo and company details above head the first page.',
+                })
+              : t('property_dev.doc_appearance.subtitle', {
+                  defaultValue:
+                    'Applies to every PDF the platform generates, not just the templates below. Your logo and company name are set in workspace branding.',
+                })}
           </p>
         </div>
       </div>
@@ -375,6 +404,21 @@ export function DocumentAppearancePanel() {
               })}
             />
           </div>
+
+          <div className="sm:col-span-2">
+            <Toggle
+              checked={draft.show_letterhead}
+              onChange={(next) => set('show_letterhead', next)}
+              disabled={!canEdit || busy}
+              label={t('property_dev.doc_appearance.show_letterhead', {
+                defaultValue: 'Print the company letterhead on the first page',
+              })}
+              description={t('property_dev.doc_appearance.show_letterhead_hint', {
+                defaultValue:
+                  'Turn off when you print on paper that already carries your letterhead.',
+              })}
+            />
+          </div>
         </div>
 
         {/* ── Live preview ── */}
@@ -435,10 +479,14 @@ export function DocumentAppearancePanel() {
             </div>
           </div>
           <p className="mt-1.5 text-[11px] leading-snug text-content-secondary">
-            {t('property_dev.doc_appearance.preview_note', {
-              defaultValue:
-                'Layout only. Use Preview on a template below to render a real PDF.',
-            })}
+            {inSettings
+              ? t('settings.company.appearance_preview_note', {
+                  defaultValue: 'Layout only. Open the sample PDF above to see a real one.',
+                })
+              : t('property_dev.doc_appearance.preview_note', {
+                  defaultValue:
+                    'Layout only. Use Preview on a template below to render a real PDF.',
+                })}
           </p>
         </div>
       </div>
@@ -466,6 +514,16 @@ export function DocumentAppearancePanel() {
             defaultValue: 'Reset to platform look',
           })}
         </Button>
+        {/* The reset clears the workspace look only. A document type that sets
+            its own look in Settings keeps it, and an admin who expected the
+            reset to reach every document would otherwise find one unchanged. */}
+        {canEdit && (
+          <span className="text-xs text-content-tertiary" data-testid="appearance-reset-note">
+            {t('settings.document_templates.workspace_reset_note', {
+              defaultValue: 'Document types with their own look keep it after a reset.',
+            })}
+          </span>
+        )}
         {!canEdit && (
           <span className="text-xs text-content-secondary">
             {t('property_dev.doc_appearance.admin_only', {

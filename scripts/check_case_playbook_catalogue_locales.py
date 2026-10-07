@@ -145,7 +145,10 @@ def selftest() -> int:
         locs = os.path.join(tmp, "locales")
         os.makedirs(data)
         os.makedirs(locs)
-        _write(os.path.join(data, "a.playbook.ts"), 'titleKey: "cases.a.title",\ndescKey: "cases.a.desc",\n')
+        _write(
+            os.path.join(data, "a.playbook.ts"),
+            'titleKey: "cases.a.title",\ndescKey: "cases.a.desc",\n',
+        )
         # xx has the title and not the description.
         _write(os.path.join(locs, "xx.ts"), '  "cases.a.title": "t",\n')
         missing = check(data, locs, ("xx",))

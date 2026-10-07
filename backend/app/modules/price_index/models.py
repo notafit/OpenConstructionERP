@@ -6,6 +6,9 @@ Tables:
     oe_price_index_series          - a named construction cost index series
     oe_price_index_point           - one period/value point within a series
     oe_price_index_location_factor - a regional cost factor keyed by region code
+    oe_price_index_resource_index  - a resource-index value per region, quarter and group
+    oe_price_index_overhead_norm   - NR and SP percentages of the wage fund per work type
+    oe_price_index_seed_marker     - which sample seeds have already run on this install
 
 The reference data is platform-wide (not project-scoped): an index series and
 its regional factors are shared across every estimate. Every NOT NULL column
@@ -19,7 +22,7 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import GUID, Base
@@ -123,3 +126,82 @@ class LocationFactor(Base):
 
     def __repr__(self) -> str:
         return f"<LocationFactor {self.region_code} factor={self.factor}>"
+
+
+class ResourceIndexValue(Base):
+    """One index of the resource-index method: a group, a region, a quarter.
+
+    The Minstroy publishes these quarterly per region: an index for workers'
+    wages, for machine operation, for machine operators' wages and for
+    materials. A row is the value one letter gives for one group. ``source``
+    names the letter; ``is_sample`` marks the rows the platform ships for
+    demonstration, which are not official and have to be replaced.
+    """
+
+    __tablename__ = "oe_price_index_resource_index"
+    __table_args__ = (
+        UniqueConstraint(
+            "region_code",
+            "quarter",
+            "resource_group",
+            name="uq_price_index_resource_index_key",
+        ),
+    )
+
+    region_code: Mapped[str] = mapped_column(String(64), nullable=False, index=True, server_default="")
+    # ``YYYY-Qn``, e.g. ``2026-Q1``.
+    quarter: Mapped[str] = mapped_column(String(7), nullable=False, server_default="")
+    # One of ``resource_index_math.INDEX_GROUPS``.
+    resource_group: Mapped[str] = mapped_column(String(32), nullable=False, server_default="")
+    index_value: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False, server_default="1")
+    source: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    is_sample: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    def __repr__(self) -> str:
+        return f"<ResourceIndexValue {self.region_code} {self.quarter} {self.resource_group}={self.index_value}>"
+
+
+class WorkTypeOverheadNorm(Base):
+    """Overheads (NR) and estimated profit (SP) for one type of work.
+
+    Both are percentages of the wage fund (workers' plus machine operators'
+    wages), set per type of work by Minstroy orders 812/pr (NR) and 774/pr (SP).
+    ``is_sample`` marks the rows the platform ships for demonstration.
+    """
+
+    __tablename__ = "oe_price_index_overhead_norm"
+
+    work_type_code: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+        server_default="",
+    )
+    label: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    nr_pct: Mapped[Decimal] = mapped_column(Numeric(9, 4), nullable=False, server_default="0")
+    sp_pct: Mapped[Decimal] = mapped_column(Numeric(9, 4), nullable=False, server_default="0")
+    source: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    is_sample: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    def __repr__(self) -> str:
+        return f"<WorkTypeOverheadNorm {self.work_type_code} NR={self.nr_pct} SP={self.sp_pct}>"
+
+
+class PriceIndexSeedMarker(Base):
+    """A record that one of the module's sample seeds has run on this install.
+
+    The resource-index samples go into empty tables once. "Empty" alone cannot
+    say whether that once has happened: a person who deletes every sample row
+    before entering the official letter leaves the tables empty again, and the
+    next boot would put the samples back. One row per ``seed_key``, written by
+    the seeder whether or not it inserted anything; once its row is here the
+    seeder does nothing.
+    """
+
+    __tablename__ = "oe_price_index_seed_marker"
+
+    seed_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True, server_default="")
+
+    def __repr__(self) -> str:
+        return f"<PriceIndexSeedMarker {self.seed_key}>"

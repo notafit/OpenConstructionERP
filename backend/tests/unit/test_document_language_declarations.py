@@ -44,9 +44,14 @@ APP_ROOT = pathlib.Path(app_pkg.__file__).resolve().parent
 #: Routes that render a document in the request and must declare its language.
 #: Each entry is ``module path relative to app/`` -> function name.
 RENDERING_ROUTES: dict[str, set[str]] = {
-    "modules/boq/router.py": {"export_boq_pdf"},
+    "core/branding_router.py": {"get_document_appearance_sample", "get_document_type_sample"},
+    # The Excel export is not a PDF, but it builds a document in the request, and
+    # the search below finds it through a comment that mentions the PDF export.
+    # Listing it here rather than narrowing the search keeps the search broad.
+    "modules/boq/router.py": {"export_boq_pdf", "export_boq_excel"},
     "modules/contracts/router.py": {"export_aia_application_pdf"},
     "modules/daily_diary/router.py": {"diary_pdf"},
+    "modules/einvoice/router.py": {"generate_invoice"},
     "modules/fieldreports/router.py": {"export_pdf"},
     "modules/finance/router.py": {"export_invoice_br_pdf", "export_invoice_einvoice"},
     "modules/forms/router.py": {"export_submission_pdf"},
@@ -59,6 +64,7 @@ RENDERING_ROUTES: dict[str, set[str]] = {
     },
     "modules/punchlist/router.py": {"export_pdf"},
     "modules/reporting/router.py": {"download_report"},
+    "modules/rfi/router.py": {"export_rfi_pdf"},
     "modules/tendering/router.py": {
         "export_award_letter_pdf",
         "export_award_record_pdf",

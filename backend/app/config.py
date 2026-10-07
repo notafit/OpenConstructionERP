@@ -35,6 +35,11 @@ _CONFIG_BUILD_TAG: str = "a5e797ddb2104903"
 # forgery via brute-force is computationally infeasible.
 _JWT_SECRET_MIN_LENGTH = 32
 
+# Range accepted for an AI provider timeout, in seconds, from the environment
+# and from Settings > AI alike (issue #499).
+AI_TIMEOUT_MIN_S = 10.0
+AI_TIMEOUT_MAX_S = 1800.0
+
 # Known-weak default values the validator MUST reject in non-development
 # environments. The bundled dev default is here too because anyone reading
 # the open-source repo can forge admin tokens against any deployment that
@@ -291,7 +296,25 @@ class Settings(BaseSettings):
     app_name: str = "OpenConstructionERP"
     app_version: str = Field(default_factory=_detect_version)
     app_env: Literal["development", "staging", "production"] = "development"
-    app_debug: bool = True
+    # Off unless asked for. Debug switches on verbose 422 bodies (the raw
+    # input echoed back) and the dev console log renderer, so a server that
+    # never set APP_DEBUG must not get it. Development gets it from .env
+    # (``.env.example`` sets APP_DEBUG=true) and the test suite from conftest.
+    app_debug: bool = False
+    # Dev-only: return the plaintext field magic-link token and PIN in the
+    # request-magic-link response and in the mock SMS log line, and log the
+    # password-reset URL when the email fails, so these flows can be driven
+    # without an SMS or SMTP provider. Separate from APP_DEBUG on
+    # purpose: operators turn debug on to chase a problem and must not hand
+    # out login secrets with it. Never honoured when APP_ENV=production.
+    # Env: EXPOSE_DEV_AUTH_SECRETS / OE_EXPOSE_DEV_AUTH_SECRETS.
+    expose_dev_auth_secrets: bool = False
+    # Peers whose X-Forwarded-For / X-Real-IP headers are believed when
+    # resolving the client address (rate limits, audit rows). Comma-separated
+    # IPs or CIDR ranges. The default covers a reverse proxy on the same host
+    # or on a private docker / LAN network; any other peer is identified by
+    # its socket address. Env: TRUSTED_PROXIES / OE_TRUSTED_PROXIES.
+    trusted_proxies: str = "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     allowed_origins: str = "http://localhost:5173"
     # Optional allowlist for self-hosted AI provider endpoints (Ollama / vLLM).
@@ -301,6 +324,19 @@ class Settings(BaseSettings):
     # "ollama.internal,10.20.0.0/16") to lock AI provider URLs to a known set;
     # anything outside it is then rejected. Binds OE_AI_PROVIDER_ALLOWLIST.
     ai_provider_allowlist: str = ""
+    # Seconds to wait for an AI provider to answer. Unset keeps the built-in
+    # values (240 s for AI calls, 120 s for the assistant chat's own Anthropic
+    # and OpenAI calls). A per-provider value saved in Settings > AI wins over
+    # these. Values outside 10..1800 are pulled into that range. Binds
+    # OE_AI_TIMEOUT and OE_CHAT_AI_TIMEOUT (issue #499).
+    ai_timeout: float | None = None
+    chat_ai_timeout: float | None = None
+    # Self-hosted AI providers ("vllm", "ollama", comma-separated) that the
+    # assistant offers its tool schema to by default ("auto": try with tools,
+    # fall back without them if the endpoint refuses). Empty keeps tool calling
+    # off unless a user turns it on for their endpoint in Settings > AI. Binds
+    # OE_AI_TOOLS_SELF_HOSTED (issue #499).
+    ai_tools_self_hosted: str = ""
 
     # ── Database ─────────────────────────────────────────────────────────
     # PostgreSQL is required; embedded PostgreSQL boots by default (no Docker),
@@ -370,9 +406,33 @@ class Settings(BaseSettings):
     s3_bucket: str = "openestimate"
     s3_region: str = "us-east-1"
 
+    # ── Basemap ──────────────────────────────────────────────────────────
+    # Base URL of the OpenFreeMap-compatible tile server the geo-hub proxy
+    # reads vector tiles, glyphs, sprites and relief from. Empty means the
+    # public OpenFreeMap instance. Point it at a self-hosted copy for an
+    # offline or high-volume install; the server must expose the same paths
+    # (``/planet`` TileJSON, ``/fonts``, ``/sprites``, ``/natural_earth``).
+    # The browser never talks to it, so no CSP change is needed.
+    # Env: ``OE_BASEMAP_UPSTREAM`` / ``BASEMAP_UPSTREAM``.
+    basemap_upstream: str = ""
+    # Raster street tiles for the 3D globe. The globe can only draw raster
+    # XYZ imagery, and no keyless public raster street service permits app
+    # use, so by default it shows public-domain shaded relief. An operator
+    # with a raster tile server of their own (or a licensed provider) sets
+    # an XYZ template here, e.g. ``https://tiles.example.internal/{z}/{x}/{y}.png``,
+    # and the credit the provider requires. Both are needed: a template
+    # without an attribution is ignored, because a map must not ship
+    # uncredited. Tiles are proxied through ``/api/v1/geo-hub/globe-streets/``,
+    # so the browser never contacts the tile server and no CSP change is needed.
+    # Env: ``OE_GLOBE_STREET_TILES_URL``, ``OE_GLOBE_STREET_TILES_ATTRIBUTION``,
+    # ``OE_GLOBE_STREET_TILES_MAX_ZOOM``.
+    globe_street_tiles_url: str = ""
+    globe_street_tiles_attribution: str = ""
+    globe_street_tiles_max_zoom: int = 19
+
     # ── Point Cloud ingest ───────────────────────────────────────────────
     # Reality-capture scans are 5-200 GB. They are uploaded
-    # presigned-direct-to-MinIO so the 2 GB FastAPI core never proxies the
+    # presigned-direct-to-MinIO so the 3 GB FastAPI core never proxies the
     # bytes; the backend only mints the key, hands back presigned part URLs
     # and finalises the multipart upload. These tunables bound the rare
     # fallback proxied path and apply back-pressure on the init endpoint.
@@ -390,7 +450,7 @@ class Settings(BaseSettings):
     # Hard ceiling (bytes) on ANY proxied upload that falls back through the
     # FastAPI core instead of going direct to object storage. The direct
     # presigned path has no such limit; this cap exists only so a misrouted
-    # or worker-less deployment cannot push a multi-GB body through the 2 GB
+    # or worker-less deployment cannot push a multi-GB body through the 3 GB
     # core and OOM the box. Default 512 MiB. Env:
     # ``OE_POINTCLOUD_MAX_PROXIED_BYTES``.
     pointcloud_max_proxied_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=0)
@@ -417,6 +477,18 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
     jwt_refresh_expire_days: int = 30
+    # OIDC / Keycloak (all optional - local auth remains the default)
+    oidc_enabled: bool = False
+    oidc_issuer_url: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_scopes: str = "openid email profile"
+    oidc_auto_create_users: bool = True
+    # Group-to-role mapping: JSON object mapping OIDC group names to local roles.
+    # Example: {"admins": "admin", "estimators": "editor", "viewers": "viewer"}
+    # Groups are read from the userinfo "groups" claim (Keycloak sends this when
+    # the groups client scope is included). First matching group wins.
+    oidc_group_role_map: str = ""
     # Default role handed to users who self-register after the very first
     # (bootstrap) user. ``viewer`` is the safe default - read-only across
     # the app. Can be raised to ``editor`` or ``manager`` for trusted
@@ -444,6 +516,15 @@ class Settings(BaseSettings):
     # without chicken-and-egg. Self-hosters who explicitly want open
     # registration can set ``OE_REGISTRATION_MODE=open`` in their .env.
     registration_mode: Literal["open", "email-verify", "admin-approve", "closed"] = "admin-approve"
+
+    # Who may verify a punch item. ``different_user`` (default) is the
+    # four-eyes rule: the verifier must hold ``punchlist.verify`` and must not
+    # be the person who resolved the item, so an item has to be resolved
+    # before it can be verified. ``verify_permission`` lets anyone holding
+    # ``punchlist.verify`` verify their own work, for a small site team with
+    # one supervisor. Closing always needs a verified item, under either
+    # policy. Env: ``OE_PUNCHLIST_VERIFY_POLICY``.
+    punchlist_verify_policy: Literal["different_user", "verify_permission"] = "different_user"
 
     # ── Multi-tenant row-level security ──────────────────────────────────
     # When True, each request sets a transaction-local ``app.current_tenant``
@@ -628,6 +709,13 @@ class Settings(BaseSettings):
         default=10,
         description="Maximum login attempts per minute per IP",
     )
+    register_rate_limit_per_hour: int = Field(
+        default=20,
+        description=(
+            "Maximum self-registration and field magic-link requests per hour per IP. Sits on top of "
+            "the per-minute login limit so the 409 for a taken email cannot sweep an address list."
+        ),
+    )
     ai_rate_limit: int = Field(
         default=20,
         description="Maximum AI requests per minute per user",
@@ -705,6 +793,19 @@ class Settings(BaseSettings):
     def _canonical_sync_db_url(cls, value: str) -> str:
         """Accept any postgres:// form for the sync engine, normalize to psycopg2."""
         return _canonicalize_db_url(value, driver="psycopg2")
+
+    @field_validator("ai_timeout", "chat_ai_timeout", mode="after")
+    @classmethod
+    def _clamp_ai_timeout(cls, value: float | None) -> float | None:
+        """Pull an AI timeout into the supported range instead of refusing to boot.
+
+        A typo in an env var should not take the whole server down; a value of
+        5 s would fail every call and one of a day would pin a worker, so both
+        ends are clamped.
+        """
+        if value is None:
+            return None
+        return min(max(float(value), AI_TIMEOUT_MIN_S), AI_TIMEOUT_MAX_S)
 
     @model_validator(mode="after")
     def _compose_db_url_from_parts(self) -> "Settings":

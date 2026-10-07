@@ -35,7 +35,7 @@ how to brief an AI coding assistant on it.
 ## Quick Start
 
 ```bash
-# 1. Clone (fork first if you intend to keep your own changes)
+# 1. Clone
 git clone https://github.com/datadrivenconstruction/OpenConstructionERP.git
 cd OpenConstructionERP
 
@@ -107,7 +107,7 @@ you. The check you run before you push is the one that counts.
 ## Module Development
 
 Each module lives in `backend/app/modules/` as a directory carrying a `manifest.py`.
-There were 189 such directories at the last count, which you can recount with
+There were 193 such directories at the last count, which you can recount with
 `ls backend/app/modules/*/manifest.py | wc -l`.
 
 Only `manifest.py` and `__init__.py` are required. Everything else is convention, and
@@ -128,10 +128,10 @@ modules/my_module/
 └── validators.py    # Validation rules this module contributes
 ```
 
-How common each one is across those 189 modules, so you can see what a normal module
-actually carries: `router.py` 188, `service.py` 172, `schemas.py` 171,
-`permissions.py` 151, `models.py` 150, `repository.py` 110, `events.py` 57,
-`validators.py` 41. To recount one, run
+How common each one is across those 193 modules, so you can see what a normal module
+actually carries: `router.py` 192, `service.py` 175, `schemas.py` 175,
+`permissions.py` 153, `models.py` 152, `repository.py` 114, `events.py` 58,
+`validators.py` 44. To recount one, run
 
 ```bash
 for d in backend/app/modules/*/; do
@@ -139,10 +139,10 @@ for d in backend/app/modules/*/; do
 done | wc -l
 ```
 
-The `manifest.py` test in there is what makes the count mean "modules". The plainer
-`ls backend/app/modules/*/service.py | wc -l` returns one more, because a few helper
-packages live under the same directory and carry the same file names without being
-modules themselves.
+The `manifest.py` test in there is what makes the count mean "modules". Two packages
+live under the same directory without being modules, `measurement` and
+`price_breakdown`, so a plain glob counts files rather than modules. It agrees with
+the recipe above for `service.py` today only because neither helper carries one.
 
 A module with no persistence of its own has no `models.py` or `repository.py`, and that
 is normal rather than incomplete.

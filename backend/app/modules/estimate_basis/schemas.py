@@ -27,6 +27,7 @@ class QualificationItem(BaseModel):
     basis: str = Field(default="", description="Why the line was drafted: present/absent/flag/standard.")
     source: Literal["auto", "manual"] = "auto"
     enabled: bool = True
+    linked_task_id: str | None = Field(default=None, description="OC-14: linked review task id.")
 
 
 class TradePresenceOut(BaseModel):
@@ -146,14 +147,16 @@ class ProvenanceSummaryOut(BaseModel):
 
 
 class EstimateClassOption(BaseModel):
-    """One AACE 18R-97 estimate class, as the platform publishes it.
+    """One estimate class option, as the platform publishes it.
 
-    Served so the client never hardcodes a standard's numbers. The label and
+    Supports both AACE 18R-97 (int classes 1-5) and jurisdiction-specific
+    systems like Canadian CCA (string classes D/C/B/A). The label and
     methodology are English source strings; the client keys its own translated
     copy off ``estimate_class`` and falls back to these.
     """
 
-    estimate_class: int = Field(..., ge=1, le=5)
+    estimate_class: int | str = Field(..., description="Class identifier: int for AACE (1-5), str for others")
+    classification_system: str = Field(default="aace", description="System that defines this class")
     label: str = ""
     accuracy_low: str = ""
     accuracy_high: str = ""
@@ -163,7 +166,7 @@ class EstimateClassOption(BaseModel):
 
 
 class EstimateClassCatalog(BaseModel):
-    """The five estimate classes, most defined first."""
+    """All estimate classes across registered classification systems."""
 
     items: list[EstimateClassOption] = Field(default_factory=list)
 
@@ -211,6 +214,10 @@ class UpdateRequest(BaseModel):
     accuracy_high_pct: str | None = Field(default=None, max_length=20)
     market_conditions: str | None = Field(default=None, max_length=8000)
     contingency_rationale: str | None = Field(default=None, max_length=8000)
+    budget_target: dict | None = Field(
+        default=None,
+        description="Client budget target: {type, amount, currency, gross_net, contingency_mode, contingency_amount, source, date, notes}.",
+    )
 
 
 class EstimateBasisResponse(BaseModel):
@@ -243,6 +250,10 @@ class EstimateBasisResponse(BaseModel):
     accuracy_high_amount: str = ""
     market_conditions: str = ""
     contingency_rationale: str = ""
+    budget_target: dict | None = Field(
+        default=None,
+        description="Client budget target alongside the calculated estimate.",
+    )
     generated_at: str | None
     created_at: str | None
     updated_at: str | None

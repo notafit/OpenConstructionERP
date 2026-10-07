@@ -23,17 +23,19 @@ pass review and gate nothing.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import AsyncIterator
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import get_args
+from urllib.parse import urlparse
 
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.payment_clock import clock, schemas, service
 from app.modules.payment_clock import data as payment_clock_data
@@ -73,7 +75,7 @@ from app.modules.payment_clock.validators import (
 )
 from app.modules.projects.models import Project
 from app.modules.users.models import User
-from tests._pg import transactional_session
+from tests._pg import isolated_engine, transactional_session
 
 
 @pytest.fixture(autouse=True)
@@ -220,7 +222,7 @@ class TestNoticeDeadlinesAndInterest:
         assert "prescribed" in text.lower()
 
     def test_money_formatting_never_produces_scientific_notation(self):
-        assert clock.format_money(Decimal("1240000.00"), "GBP") == "1240000.00 GBP"
+        assert clock.format_money(Decimal("1240000.00"), "GBP") == "1,240,000.00 GBP"
         assert clock.format_money(None) == "an unstated amount"
 
 
@@ -443,6 +445,258 @@ class TestGermanRegimes:
         assert "21 days after the application date 2026-03-02" in joined
 
 
+_US_REGIMES = [entry for entry in PAYMENT_REGIMES if entry["country_code"] == "US"]
+
+
+def _pure_snapshot(regime: dict, schedule: clock.ClockSchedule, *, as_of: date) -> dict:
+    """A clock snapshot built without a database, in the shape clock_snapshot writes."""
+    dates = schedule.as_dict()
+    dates.pop("derivation")
+    return {
+        "as_of": as_of.isoformat(),
+        "application": {
+            **dates,
+            "reference": "PAY-APP-07",
+            "applied_amount": "250000.00",
+            "currency": "USD",
+            "status": "open",
+            "paid_at": None,
+            "paid_amount": None,
+        },
+        "regime": regime,
+        "notices": [],
+    }
+
+
+def _rules_by_id(results: list) -> dict[str, list]:
+    grouped: dict[str, list] = {}
+    for result in results:
+        grouped.setdefault(result.rule_id, []).append(result)
+    return grouped
+
+
+# The hosts the US figures were read from: the federal code on law.cornell.edu,
+# the FAR on acquisition.gov, and each state's own legislature. A row citing any
+# other host cites a secondary source, which is exactly what the table refuses.
+_US_SOURCE_HOSTS = frozenset(
+    {
+        "www.law.cornell.edu",
+        "www.acquisition.gov",
+        "statutes.capitol.texas.gov",
+        "leginfo.legislature.ca.gov",
+        "www.nysenate.gov",
+        "www.flsenate.gov",
+        "www.ilga.gov",
+        "app.leg.wa.gov",
+        "www.legis.state.pa.us",
+        "malegislature.gov",
+        "www.azleg.gov",
+        "law.lis.virginia.gov",
+    }
+)
+
+# The four rows whose statute makes an application nobody answered in time
+# deemed approved. Pinned both ways: a row that gains the effect without the
+# statute saying so tells a user a sum is payable when it is not, and a row that
+# loses it hides the one consequence the statute actually attaches.
+_US_DEEMED_APPROVAL = frozenset(
+    {"us_il_private_603", "us_pa_private_caspa", "us_az_public_34221", "us_az_private_1182"}
+)
+
+
+class TestUnitedStatesRegimes:
+    """The federal act and the state prompt payment statutes, worked by hand.
+
+    Each worked example starts on Monday 2 March 2026, the date the other
+    worked examples in this file use, and the dates are written out rather
+    than derived. Business-day regimes are counted over weekends only, with no
+    holiday calendar supplied, the same way the New South Wales example is.
+    """
+
+    def test_every_us_regime_names_its_section_and_the_url_it_was_read_from(self):
+        section = re.compile(r"§|\bsections?\b|\bILCS\b|\bRCW\b|\bU\.S\.C\.", re.IGNORECASE)
+        for entry in _US_REGIMES:
+            reference = entry["statute_reference"]
+            assert section.search(reference), f"{entry['code']} cites no section: {reference!r}"
+            urls = re.findall(r"https://\S+", reference)
+            assert urls, f"{entry['code']} names no source URL: {reference!r}"
+            for url in urls:
+                host = urlparse(url.rstrip(".,;")).netloc
+                assert host in _US_SOURCE_HOSTS, f"{entry['code']} cites {host!r}, not an official source"
+
+    def test_every_us_regime_imposes_a_sensible_payment_period(self):
+        for entry in _US_REGIMES:
+            code = entry["code"]
+            assert entry["country_code"] == "US"
+            assert entry["final_date_days"] is not None, f"{code} must impose a payment period"
+            assert 1 <= entry["final_date_days"] <= 120, code
+            if entry["payment_notice_days"] is not None:
+                assert 1 <= entry["payment_notice_days"] <= entry["final_date_days"], code
+            # New York private is the one row that counts its final date from
+            # an approval deadline rather than from the application.
+            if code == "us_ny_private_756a":
+                assert entry["due_date_days"] > 0 and entry["final_date_basis"] == "due_date"
+            else:
+                assert entry["due_date_basis"] == "application_date", code
+                assert entry["due_date_days"] == 0, code
+                assert entry["final_date_basis"] == "application_date", code
+
+    def test_the_notice_never_falls_after_the_final_date(self):
+        for start in (date(2026, 3, 2), date(2026, 3, 6)):
+            for entry in _US_REGIMES:
+                schedule = clock.compute_schedule(entry, application_date=start)
+                assert schedule.final_date > start, entry["code"]
+                if schedule.payment_notice_deadline is not None:
+                    assert schedule.payment_notice_deadline <= schedule.final_date, f"{entry['code']} on {start}"
+
+    def test_only_the_deemed_approval_statutes_make_silence_count(self):
+        for entry in _US_REGIMES:
+            effect = entry["no_notice_effect"]
+            if entry["code"] in _US_DEEMED_APPROVAL:
+                assert effect == "applied_sum_becomes_notified_sum", entry["code"]
+                assert entry["payment_notice_days"] is not None, entry["code"]
+            else:
+                assert effect == "none", entry["code"]
+
+    def test_every_us_regime_states_interest_it_can_render(self):
+        for entry in _US_REGIMES:
+            code = entry["code"]
+            basis = entry["interest_basis"]
+            if basis == "fixed_rate":
+                assert entry["interest_fixed_percent"] is not None, code
+            elif basis == "reference_rate_plus_margin":
+                assert entry["interest_reference_rate"].strip() and entry["interest_margin_percent"] is not None
+            elif basis == "prescribed_rate":
+                assert entry["interest_reference_rate"].strip(), code
+            else:
+                assert basis == "contract", code
+            if basis != "contract":
+                assert entry["interest_statute"].strip(), f"{code} states interest with no statute behind it"
+            assert clock.interest_description(entry).strip(), code
+
+    def test_every_text_value_fits_its_column(self):
+        # The seeder writes these into bounded VARCHAR columns, and PostgreSQL
+        # refuses an overlong value at seed time, not at import. Checked over
+        # the whole catalogue, since the URLs made the references longer.
+        bounded = {
+            column.name: column.type.length
+            for column in PaymentRegime.__table__.columns
+            if getattr(column.type, "length", None)
+        }
+        for entry in PAYMENT_REGIMES:
+            for name, limit in bounded.items():
+                value = entry.get(name)
+                if isinstance(value, str):
+                    assert len(value) <= limit, f"{entry['code']}.{name} is {len(value)} long, the column holds {limit}"
+
+    @pytest.mark.parametrize(
+        ("code", "notice", "final"),
+        [
+            # 14 calendar days after the proper payment request; 7 to return a bad one.
+            ("us_fed_ppa_construction", date(2026, 3, 9), date(2026, 3, 16)),
+            # 30 calendar days (legal holidays excluded by hand); 15 to notify defects.
+            ("us_ny_public_state_179f", date(2026, 3, 17), date(2026, 4, 1)),
+            ("us_ny_public_local_106b", None, date(2026, 4, 1)),
+            # 20 business days after the stamped date, rejection in the same window.
+            ("us_fl_public_local_218735", date(2026, 3, 30), date(2026, 3, 30)),
+            # 90 days from the proper bill; 30 to flag a defective construction bill.
+            ("us_il_public_state_540", date(2026, 4, 1), date(2026, 5, 31)),
+            # 30 days to approve plus 30 to pay.
+            ("us_il_public_local_505", date(2026, 4, 1), date(2026, 5, 1)),
+            # Deemed approved on day 25, paid 15 calendar days later.
+            ("us_il_private_603", date(2026, 3, 27), date(2026, 4, 11)),
+            # 30 days; withholding notice within 8 working days.
+            ("us_wa_public_3976", date(2026, 3, 12), date(2026, 4, 1)),
+            # 45 calendar days where the contract is silent; 15 to flag a deficiency.
+            ("us_pa_public_3932", date(2026, 3, 17), date(2026, 4, 16)),
+            # 20 days after the invoice; 14 calendar days to explain a deficiency.
+            ("us_pa_private_caspa", date(2026, 3, 16), date(2026, 3, 22)),
+            ("us_ma_public_local_39k", None, date(2026, 3, 17)),
+            ("us_ma_public_state_39k", None, date(2026, 4, 1)),
+            # 15 days to approve or reject, 45 to pay.
+            ("us_ma_private_29e", date(2026, 3, 17), date(2026, 5, 1)),
+            # Deemed certified on day 7, paid 14 days later.
+            ("us_az_public_34221", date(2026, 3, 9), date(2026, 3, 23)),
+            # Deemed certified on day 14, paid 7 days later.
+            ("us_az_private_1182", date(2026, 3, 16), date(2026, 3, 23)),
+            ("us_va_public_state_4347", date(2026, 3, 17), date(2026, 4, 1)),
+            ("us_va_public_local_4352", date(2026, 3, 22), date(2026, 4, 16)),
+            ("us_va_private_1146", date(2026, 4, 16), date(2026, 5, 1)),
+        ],
+    )
+    def test_the_worked_example(self, code, notice, final):
+        schedule = clock.compute_schedule(regime_by_code(code), application_date=date(2026, 3, 2))
+        assert schedule.due_date == date(2026, 3, 2), code
+        assert schedule.payment_notice_deadline == notice, code
+        assert schedule.final_date == final, code
+        assert schedule.pay_less_deadline is None, code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [entry["code"] for entry in _US_REGIMES])
+    async def test_interest_starts_the_day_after_the_final_date(self, code):
+        regime = regime_by_code(code)
+        schedule = clock.compute_schedule(regime, application_date=date(2026, 3, 2))
+        on_the_day = _rules_by_id(await evaluate_clock(_pure_snapshot(regime, schedule, as_of=schedule.final_date)))
+        assert "payment_clock.statutory_interest" not in on_the_day, code
+
+        next_day = schedule.final_date + timedelta(days=1)
+        late = _rules_by_id(await evaluate_clock(_pure_snapshot(regime, schedule, as_of=next_day)))
+        finding = late["payment_clock.statutory_interest"][0]
+        assert finding.details["days_overdue"] == 1, code
+        assert finding.details["interest_rate"] == clock.interest_description(regime), code
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("code", [entry["code"] for entry in _US_REGIMES if entry["payment_notice_days"]])
+    async def test_silence_past_the_notice_window_counts_only_where_the_statute_deems_approval(self, code):
+        regime = regime_by_code(code)
+        schedule = clock.compute_schedule(regime, application_date=date(2026, 3, 2))
+        as_of = schedule.payment_notice_deadline + timedelta(days=1)
+        findings = _rules_by_id(await evaluate_clock(_pure_snapshot(regime, schedule, as_of=as_of)))
+        if code in _US_DEEMED_APPROVAL:
+            assert "becomes the notified sum" in findings["payment_clock.notified_sum"][0].message, code
+        else:
+            assert "payment_clock.notified_sum" not in findings, code
+
+    def test_new_york_private_splits_the_approval_from_the_payment(self):
+        # Twelve business days from Monday 2 March is Wednesday 18 March; the
+        # thirty calendar days to pay then run from that approval deadline.
+        schedule = clock.compute_schedule(regime_by_code("us_ny_private_756a"), application_date=date(2026, 3, 2))
+        assert schedule.due_date == date(2026, 3, 18)
+        assert schedule.payment_notice_deadline == date(2026, 3, 18)
+        assert schedule.final_date == date(2026, 4, 17)
+        joined = " ".join(schedule.derivation)
+        assert "12 business days after the application date 2026-03-02" in joined
+        assert "30 days after the due date 2026-03-18" in joined
+
+    def test_a_florida_count_that_starts_on_a_friday_skips_both_weekends_it_crosses(self):
+        schedule = clock.compute_schedule(
+            regime_by_code("us_fl_public_local_218735"), application_date=date(2026, 3, 6)
+        )
+        assert schedule.final_date == date(2026, 4, 3)
+
+    def test_the_existing_texas_and_california_clocks_are_unchanged(self):
+        # Adding the source URLs must not have moved a date.
+        start = date(2026, 3, 2)
+        assert clock.compute_schedule(regime_by_code("us_tx_public_2251"), application_date=start).final_date == date(
+            2026, 4, 1
+        )
+        assert clock.compute_schedule(regime_by_code("us_tx_private_ch28"), application_date=start).final_date == date(
+            2026, 4, 6
+        )
+        assert clock.compute_schedule(regime_by_code("us_ca_public_20104"), application_date=start).final_date == date(
+            2026, 4, 1
+        )
+
+    def test_the_interest_clauses_name_their_statute(self):
+        federal = clock.interest_description(regime_by_code("us_fed_ppa_construction"))
+        assert "41 U.S.C. 7109" in federal and "31 U.S.C. § 3902(a)" in federal
+        boston = clock.interest_description(regime_by_code("us_ma_public_local_39k"))
+        assert "Federal Reserve Bank of Boston rediscount rate plus 3 percent" in boston
+        assert clock.interest_description(regime_by_code("us_az_private_1182")).startswith("18 percent a year")
+        assert clock.interest_description(regime_by_code("us_fl_public_local_218735")).startswith("24 percent a year")
+        assert clock.interest_description(regime_by_code("us_ma_private_29e")) == "the rate the contract specifies"
+
+
 # ── Schemas (no DB) ──────────────────────────────────────────────────────────
 
 
@@ -589,6 +843,66 @@ class TestSeeding:
         total = await session.scalar(select(func.count()).select_from(PaymentRegime))
         assert total == len(PAYMENT_REGIMES)
 
+    async def test_a_regime_added_to_the_catalogue_reaches_a_table_seeded_before_it(self, session):
+        # A deployment seeded before a regime shipped has a non-empty table.
+        # The seeder used to stop at "not empty", so the new regime never
+        # arrived without a refresh that also overwrites operator corrections.
+        await service.ensure_regimes(session)
+        corrected = await service.get_regime_by_code(session, code="uk_hgcra")
+        corrected.payment_notice_days = 4
+        missing = await service.get_regime_by_code(session, code="us_fed_ppa_construction")
+        await session.delete(missing)
+        await session.flush()
+
+        result = await service.ensure_regimes(session)
+        assert result["created"] == 1
+        assert result["updated"] == 0
+        assert await service.get_regime_by_code(session, code="us_fed_ppa_construction") is not None
+        # The row an operator corrected is left as the operator left it.
+        again = await service.get_regime_by_code(session, code="uk_hgcra")
+        assert again.payment_notice_days == 4
+
+    async def test_the_loser_of_a_concurrent_seed_still_gets_its_read(self, monkeypatch):
+        # The first requests after an upgrade that ships a regime all find its
+        # code missing and all insert it. The winner has to commit for the
+        # loser to conflict, which the per-test transaction never does, so this
+        # runs on a throwaway database with real commits. Without the savepoint
+        # the loser failed on the unique code at its own commit.
+        async with isolated_engine() as engine:
+            factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+            async with factory() as setup:
+                await seed_payment_regimes(setup)
+                await setup.execute(delete(PaymentRegime).where(PaymentRegime.code == "us_fed_ppa_construction"))
+                await setup.commit()
+
+            async def seed_after_another_request_won(session, **kwargs):
+                # The winner commits first. The loser then acts on what it read
+                # before that commit: the code was missing, so it adds the row.
+                # Played in that order because the real seeder flushes before it
+                # returns, and in one thread a winner flushing second would wait
+                # on the loser's open transaction until the statement timeout.
+                async with factory() as winner:
+                    await seed_payment_regimes(winner)
+                    await winner.commit()
+                session.add(PaymentRegime(**regime_by_code("us_fed_ppa_construction")))
+                await session.flush()
+                return {"created": 1, "updated": 0, "unchanged": len(PAYMENT_REGIMES) - 1}
+
+            monkeypatch.setattr(service, "seed_payment_regimes", seed_after_another_request_won)
+            async with factory() as loser:
+                result = await service.ensure_regimes(loser)
+                assert result["created"] == 0
+                assert result["unchanged"] == len(PAYMENT_REGIMES)
+                await loser.commit()
+
+            async with factory() as check:
+                seeded = await check.scalar(
+                    select(func.count())
+                    .select_from(PaymentRegime)
+                    .where(PaymentRegime.code == "us_fed_ppa_construction")
+                )
+                assert seeded == 1
+
     async def test_a_refresh_rewrites_the_shipped_rows_in_place(self, session):
         await service.ensure_regimes(session)
         regime = await service.get_regime_by_code(session, code="uk_hgcra")
@@ -693,7 +1007,7 @@ class TestGermanDemoSeeding:
         findings = await _findings(session, overdue, regime, as_of=today)
         assert "payment_clock.notified_sum" not in findings  # no notice sequence to breach
         finding = findings["payment_clock.statutory_interest"][0]
-        assert "941618.45 EUR" in finding.message
+        assert "941,618.45 EUR" in finding.message
         assert "plus 9 percent" in finding.message
         assert finding.details["days_overdue"] == 13  # served 34 days ago, 21-day limit
 
@@ -785,7 +1099,7 @@ class TestNotifiedSum:
         assert str(finding.severity) == "error"
         # The finding has to name the amount. A rule that says "a notice was
         # missed" without saying what it now costs is a reminder, not a finding.
-        assert "124000.00 GBP" in finding.message
+        assert "124,000.00 GBP" in finding.message
         assert finding.details["applied_amount"] == "124000.00"
         assert "the sum applied for becomes the notified sum" in finding.message
 
@@ -966,7 +1280,7 @@ class TestGermanClock:
         findings = await _findings(session, application, regime, as_of=date(2026, 4, 5))
         finding = findings["payment_clock.statutory_interest"][0]
         assert str(finding.severity) == "warning"
-        assert "941618.45 EUR" in finding.message
+        assert "941,618.45 EUR" in finding.message
         assert finding.details["days_overdue"] == 13
         assert "plus 9 percent" in finding.message
         assert "§ 288 Abs. 2 BGB" in finding.message
@@ -1127,6 +1441,235 @@ class TestDateAndInterestRules:
         assert "payment_clock.statutory_interest" in findings
 
 
+# ── The sum the interest runs on ─────────────────────────────────────────────
+
+
+async def _notice(
+    session: AsyncSession,
+    application: StatutoryPaymentApplication,
+    *,
+    notice_type: str = "payment_notice",
+    issued_at: date = date(2026, 4, 10),
+    amount: Decimal | None = Decimal("90000.00"),
+    basis: str = "Measured work to 31 March, less unfixed materials.",
+    **overrides,
+) -> None:
+    body = {
+        "notice_type": notice_type,
+        "issued_at": issued_at,
+        "notified_amount": amount,
+        "basis_of_calculation": basis,
+        "reference": "PN-090",
+    }
+    body.update(overrides)
+    await service.create_notice(session, application=application, body=schemas.NoticeCreate(**body))
+
+
+@pytest.mark.asyncio
+class TestTheSumInterestRunsOn:
+    """Which figure the final date is measured against.
+
+    The clock used to measure everything against the sum applied for, so a
+    payer who notified a lower sum in time and paid it was told the difference
+    was overdue and accruing statutory interest. That is wrong in exactly the
+    situation the module exists for, and each regime shape is pinned here: a
+    notice in time, a notice out of time, silence where the statute deems the
+    applied sum approved, and silence where it does not.
+    """
+
+    async def test_a_payment_notice_in_time_is_the_sum_interest_runs_on(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "payment_notice"
+        assert finding.details["sum_due_amount"] == "90000.00"
+        assert finding.details["sum_due_reference"] == "PN-090"
+        assert finding.details["outstanding_amount"] == "90000.00"
+        # The finding names the figure, so a reader does not have to open the
+        # notices to see which sum the interest is running on.
+        assert "measured against the notified sum of 90,000.00 GBP" in finding.message
+        assert "124,000.00" not in finding.message
+        # A notice was served in time, so silence has no consequence to report.
+        assert "payment_clock.notified_sum" not in findings
+
+    async def test_paying_the_notified_sum_in_full_leaves_nothing_overdue(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        application.paid_at = date(2026, 4, 24)
+        application.paid_amount = Decimal("90000.00")
+        application.status = "paid"
+        await session.flush()
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        assert "payment_clock.statutory_interest" not in findings
+
+    async def test_the_notified_sum_paid_without_the_status_being_flipped_is_still_paid(self, session):
+        # The money is recorded as arrived even though nobody ticked the row.
+        # Interest runs on what is owed, and nothing is owed.
+        application, regime = await _application(session)
+        await _notice(session, application)
+        application.paid_amount = Decimal("90000.00")
+        await session.flush()
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        assert "payment_clock.statutory_interest" not in findings
+
+    async def test_the_shortfall_against_the_notified_sum_is_what_runs(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        application.paid_at = date(2026, 4, 24)
+        application.paid_amount = Decimal("70000.00")
+        application.status = "paid"
+        await session.flush()
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["outstanding_amount"] == "20000.00"
+        assert finding.message.startswith("20,000.00 GBP has been outstanding")
+        assert "measured against the notified sum of 90,000.00 GBP" in finding.message
+
+    async def test_a_payment_notice_out_of_time_lowers_nothing(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application, issued_at=date(2026, 4, 15))  # deadline was 2026-04-12
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "applied_sum_by_silence"
+        assert finding.details["outstanding_amount"] == "124000.00"
+        assert "payment_clock.notice_in_time" in findings
+        assert "payment_clock.notified_sum" in findings
+
+    async def test_a_pay_less_notice_in_time_lowers_what_has_to_be_paid(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        await _notice(
+            session,
+            application,
+            notice_type="pay_less_notice",
+            issued_at=date(2026, 4, 16),
+            amount=Decimal("80000.00"),
+            basis="Defective blockwork to grid C, rectification quoted at 10000.",
+            reference="PLN-080",
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "pay_less_notice"
+        assert finding.details["sum_due_amount"] == "80000.00"
+        assert finding.details["sum_due_reference"] == "PLN-080"
+        # It reduces what must be paid without displacing the notified sum, and
+        # the finding says both figures rather than silently replacing one.
+        assert "80,000.00 GBP, the sum a pay-less notice served on 2026-04-16" in finding.message
+        assert "the notified sum of 90,000.00 GBP" in finding.message
+
+    async def test_a_pay_less_notice_without_its_basis_lowers_nothing(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        await _notice(
+            session,
+            application,
+            notice_type="pay_less_notice",
+            issued_at=date(2026, 4, 16),
+            amount=Decimal("60000.00"),
+            basis="",
+            reference="PLN-060",
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_amount"] == "90000.00"
+        # Invalid under its own rule, and the sum it tried to withhold stays payable.
+        assert "payment_clock.pay_less_basis" in findings
+
+    async def test_a_pay_less_notice_out_of_time_lowers_nothing(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        await _notice(
+            session,
+            application,
+            notice_type="pay_less_notice",
+            issued_at=date(2026, 4, 20),  # pay-less deadline was 2026-04-17
+            amount=Decimal("60000.00"),
+            basis="Defective blockwork to grid C.",
+            reference="PLN-LATE",
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        assert findings["payment_clock.statutory_interest"][0].details["sum_due_amount"] == "90000.00"
+
+    async def test_a_pay_less_notice_stating_more_does_not_raise_the_sum(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application)
+        await _notice(
+            session,
+            application,
+            notice_type="pay_less_notice",
+            issued_at=date(2026, 4, 16),
+            amount=Decimal("100000.00"),
+            basis="Arithmetic corrected in the payee's favour.",
+            reference="PLN-100",
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        assert findings["payment_clock.statutory_interest"][0].details["sum_due_amount"] == "90000.00"
+
+    async def test_a_notice_in_another_currency_stays_out_of_the_arithmetic(self, session):
+        application, regime = await _application(session)
+        await _notice(session, application, currency="EUR", reference="PN-EUR")
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_amount"] == "124000.00"
+        # A notice was served, so this is not silence conceding the claim: the
+        # applied sum is simply the only figure stated in the currency owed.
+        assert finding.details["sum_due_basis"] == "applied_sum"
+        assert "payment_clock.notice_currency" in findings
+
+    async def test_a_payees_default_payment_notice_supplies_the_sum(self, session):
+        application, regime = await _application(session)
+        await _notice(
+            session,
+            application,
+            notice_type="default_payment_notice",
+            issued_at=date(2026, 4, 14),
+            amount=Decimal("124000.00"),
+            reference="DPN-01",
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "default_payment_notice"
+        assert finding.details["sum_due_amount"] == "124000.00"
+
+    async def test_silence_under_a_deemed_approval_regime_names_the_consequence(self, session):
+        application, regime = await _application(session)
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 5, 4))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "applied_sum_by_silence"
+        assert "which became the notified sum when no payment notice was served in time" in finding.message
+        assert "payment_clock.notified_sum" in findings
+
+    async def test_silence_where_the_statute_deems_nothing_is_not_dressed_up_as_approval(self, session):
+        # Florida sets a period and interest but attaches no consequence to
+        # silence, so the applied sum is the only figure anybody has stated.
+        application, regime = await _application(
+            session,
+            code="us_fl_public_local_218735",
+            currency="USD",
+            applied_amount=Decimal("250000.00"),
+        )
+
+        findings = await _findings(session, application, regime, as_of=date(2026, 6, 1))
+        finding = findings["payment_clock.statutory_interest"][0]
+        assert finding.details["sum_due_basis"] == "applied_sum"
+        assert finding.message.startswith("250,000.00 USD has been outstanding")
+        assert "measured against the sum applied for, 250,000.00 USD" in finding.message
+        assert "payment_clock.notified_sum" not in findings
+
+
 # ── The breach register ──────────────────────────────────────────────────────
 
 
@@ -1252,6 +1795,90 @@ class TestBreachRegister:
         )
         assert notices == 0
         assert events == 0
+
+
+@pytest.mark.asyncio
+class TestReadingFilesNothing:
+    """A GET on a clock is a read: the register moves only on writes and refresh.
+
+    The deadlines in ``_application`` (31 March 2026) passed long before any
+    date this suite runs on, so a read that files what it sees would leave rows
+    behind, and a read ``as_of`` the day before the deadline would delete them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_project_check(self, monkeypatch):
+        from app.modules.payment_clock import router as clock_router
+
+        async def _allow(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(clock_router, "verify_project_access", _allow)
+
+    async def _count(self, session: AsyncSession, application_id: uuid.UUID) -> int:
+        return int(
+            await session.scalar(
+                select(func.count())
+                .select_from(PaymentClockEvent)
+                .where(PaymentClockEvent.application_id == application_id)
+            )
+            or 0
+        )
+
+    async def test_reading_a_clock_writes_no_register_rows(self, session):
+        from app.modules.payment_clock.router import get_clock
+
+        application, _ = await _application(session)
+        clock_payload = await get_clock(application.id, session, str(uuid.uuid4()), as_of=None)
+
+        # The breach is reported on the screen ...
+        assert any(f.rule_id == "payment_clock.notified_sum" for f in clock_payload.findings)
+        # ... and nothing was filed by looking at it.
+        assert clock_payload.events == []
+        assert await self._count(session, application.id) == 0
+
+    async def test_reading_as_of_an_earlier_date_keeps_the_filed_breach(self, session):
+        from app.modules.payment_clock.router import get_clock
+
+        application, regime = await _application(session)
+        await service.sync_clock_register(session, application=application, regime=regime)
+        filed = await self._count(session, application.id)
+        assert filed > 0
+
+        # The day before the payment notice deadline nothing had been breached;
+        # asking that question must not erase what has been filed since.
+        await get_clock(application.id, session, str(uuid.uuid4()), as_of=date(2026, 4, 1))
+        assert await self._count(session, application.id) == filed
+
+    async def test_refresh_files_the_breaches_of_every_clock_on_the_project(self, session):
+        from app.modules.payment_clock.router import refresh_events
+
+        application, _ = await _application(session)
+        assert await self._count(session, application.id) == 0
+
+        events = await refresh_events(session, str(uuid.uuid4()), project_id=application.project_id)
+
+        assert any(event.event_type == "payment_notice_missed" for event in events)
+        assert await self._count(session, application.id) == len(events)
+
+    async def test_serving_a_notice_brings_the_register_level(self, session):
+        from app.modules.payment_clock.router import serve_notice
+
+        application, _ = await _application(session)
+        await serve_notice(
+            application.id,
+            schemas.NoticeCreate(
+                notice_type="payment_notice",
+                issued_at=date(2026, 4, 15),
+                notified_amount=Decimal("118500.00"),
+                currency="GBP",
+                basis_of_calculation="Measured work to 31 March.",
+            ),
+            session,
+            str(uuid.uuid4()),
+        )
+        filed = {e.event_type for e in await service.list_events(session, application_id=application.id)}
+        assert "notice_out_of_time" in filed
 
 
 @pytest.mark.asyncio

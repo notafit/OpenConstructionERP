@@ -145,6 +145,19 @@ APP_WINDOW_COMMANDS = (
     "set_server_choice",
 )
 
+# Prefixed (plugin or core) permissions a remote capability may carry anyway,
+# each with its reason next to it. Every other prefixed identifier is still
+# refused below. The bar for this list is that the permission reaches nothing
+# beyond how this window presents itself: no file, no process, no network.
+#
+# `core:webview:allow-set-webview-zoom` sets the zoom factor of a webview, and
+# this launcher has one. It is how the Text size choice in Settings applies
+# native zoom (`setDesktopWebviewZoom` in frontend/src/shared/lib/desktop.ts),
+# and on macOS and Linux the `zoomHotkeysEnabled` polyfill Tauri injects calls
+# the same command for the zoom shortcuts, so without it those keys are refused
+# there. The worst a page can do with it is magnify itself.
+REMOTE_PLUGIN_PERMISSIONS_ALLOWED = frozenset({"core:webview:allow-set-webview-zoom"})
+
 # The functions the Windows link-opening path is made of. Named rather than
 # discovered, because a scope that grows by itself cannot go stale and therefore
 # cannot tell you it has. If one of these is renamed or split, this gate fails
@@ -543,7 +556,7 @@ def main() -> int:
         for entry in capability.get("permissions", []):
             identifier = entry if isinstance(entry, str) else entry.get("identifier", "")
             if ":" in identifier:
-                if capability.get("remote"):
+                if capability.get("remote") and identifier not in REMOTE_PLUGIN_PERMISSIONS_ALLOWED:
                     prefixed_remote.append(f"{path.name}: {capability.get('identifier')} -> {identifier}")
                 continue
             allowed |= resolve(identifier, commands, sets)

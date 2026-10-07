@@ -44,7 +44,12 @@ URL_RE = re.compile(r"url\(\s*['\"]?([^)'\"]+)['\"]?\s*\)")
 # prose; the keys are ASCII identifiers and would dilute every count.
 VALUE_RE = re.compile(r':\s*"((?:[^"\\]|\\.)*)"')
 
-CYRILLIC_BLOCKS = ((0x0400, 0x04FF), (0x0500, 0x052F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F))
+CYRILLIC_BLOCKS = (
+    (0x0400, 0x04FF),
+    (0x0500, 0x052F),
+    (0x2DE0, 0x2DFF),
+    (0xA640, 0xA69F),
+)
 
 
 def parse_ranges(text: str) -> list[tuple[int, int]]:
@@ -158,10 +163,24 @@ def measure(locale_path: Path, faces: list[dict], mode: str, memo: dict) -> tupl
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--css", required=True, type=Path, help="stylesheet holding the @font-face rules")
-    parser.add_argument("--fonts", type=Path, default=None, help="directory holding the woff2 files the CSS names")
+    parser.add_argument(
+        "--css",
+        required=True,
+        type=Path,
+        help="stylesheet holding the @font-face rules",
+    )
+    parser.add_argument(
+        "--fonts",
+        type=Path,
+        default=None,
+        help="directory holding the woff2 files the CSS names",
+    )
     parser.add_argument("--locales", required=True, type=Path, help="directory of locale .ts files")
-    parser.add_argument("--only", default="", help="comma separated locale codes, default every locale with Cyrillic")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="comma separated locale codes, default every locale with Cyrillic",
+    )
     args = parser.parse_args()
 
     faces = load_faces(args.css, args.fonts)

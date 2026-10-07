@@ -24,6 +24,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from app.core.pdf_branding import branded_doc_metadata, branded_letterhead
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
@@ -278,6 +279,7 @@ def build_pdf_report(
         topMargin=1 * cm,
         bottomMargin=1 * cm,
         title=report_name,
+        **branded_doc_metadata(),
     )
     styles = getSampleStyleSheet()
     # The base styles default to Helvetica (Latin-1 only); point them at the
@@ -285,6 +287,13 @@ def build_pdf_report(
     styles["Title"].fontName = BOLD_FONT
     styles["BodyText"].fontName = BODY_FONT
     story: list[Any] = []
+    # The firm's letterhead, when the company profile has one, on page one only.
+    # No header logo on later pages: a 1 cm top margin leaves no band to draw
+    # it in, and it would land on the repeated table header. The frame pads
+    # 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(doc.width - 12)
+    if letterhead is not None:
+        story.append(letterhead)
     story.append(Paragraph(report_name, styles["Title"]))
     if description:
         story.append(Paragraph(description, styles["BodyText"]))

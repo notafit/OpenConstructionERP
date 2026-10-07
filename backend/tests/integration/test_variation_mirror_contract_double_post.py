@@ -97,9 +97,20 @@ class _Harness:
             return Decimal(str(contract.total_value)), dict(contract.metadata_ or {})
 
     async def deliver(self, name: str) -> None:
-        """Hand the last published *name* payload to its wave-5 handler."""
-        handler = dict(w5._SUBSCRIPTIONS)[name]
-        await handler(Event(name=name, data=self.last_event(name)))  # type: ignore[operator]
+        """Hand the last published *name* payload to every wave-5 handler
+        registered under *name*.
+
+        ``dict(w5._SUBSCRIPTIONS)[name]`` silently drops duplicate keys, so a
+        second handler on the same event name (e.g. two ``changeorder.approved``
+        entries) was never called.  Iterate all matching pairs instead, which is
+        what the production dispatcher does.
+        """
+        handlers = [h for n, h in w5._SUBSCRIPTIONS if n == name]
+        if not handlers:
+            raise AssertionError(f"no handler registered for {name!r}")
+        evt = Event(name=name, data=self.last_event(name))
+        for handler in handlers:
+            await handler(evt)  # type: ignore[operator]
 
 
 @pytest_asyncio.fixture

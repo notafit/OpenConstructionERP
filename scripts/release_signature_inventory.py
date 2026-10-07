@@ -137,7 +137,13 @@ CONSUMERS = {
     "macOS Developer ID signing": (
         "tauri-apps/tauri-action",
         None,
-        (("APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_SIGNING_IDENTITY"),),
+        (
+            (
+                "APPLE_CERTIFICATE",
+                "APPLE_CERTIFICATE_PASSWORD",
+                "APPLE_SIGNING_IDENTITY",
+            ),
+        ),
     ),
     "macOS notarisation": (
         "tauri-apps/tauri-action",
@@ -270,7 +276,12 @@ def fetch_tag_signatures() -> dict[str, str] | None:
     # construction. Both are reported, because "91 tags could never have been
     # signed" is a different fact from "234 were not signed".
     out = run(
-        ["git", "for-each-ref", "--format=%(refname:short)%09%(objecttype)%09%(contents:signature)", "refs/tags"],
+        [
+            "git",
+            "for-each-ref",
+            "--format=%(refname:short)%09%(objecttype)%09%(contents:signature)",
+            "refs/tags",
+        ],
         cwd=REPO_ROOT,
     )
     states: dict[str, str] = {}
@@ -306,7 +317,9 @@ def invokes(script: str, command: str) -> bool:
 
 
 def find_consumer(
-    uses_prefix: str | None, command: str | None, alternatives: tuple[tuple[str, ...], ...]
+    uses_prefix: str | None,
+    command: str | None,
+    alternatives: tuple[tuple[str, ...], ...],
 ) -> dict[str, object]:
     """Locate the step that runs a signing tool and report which credentials reach it.
 
@@ -474,7 +487,11 @@ def check_windows_artifacts(releases: list[Release]) -> dict[str, str] | None:
         url = f"https://github.com/{REPO}/releases/download/{tag}/{name}"
         try:
             request = urllib.request.Request(
-                url, headers={"Range": "bytes=0-8191", "User-Agent": "release-signature-inventory"}
+                url,
+                headers={
+                    "Range": "bytes=0-8191",
+                    "User-Agent": "release-signature-inventory",
+                },
             )
             with urllib.request.urlopen(request, timeout=180) as response:
                 table = certificate_table(response.read())
@@ -730,7 +747,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--all", action="store_true", help="print every release, not just the summary")
     parser.add_argument("--json", action="store_true", help="machine readable output")
-    parser.add_argument("--strict", action="store_true", help="fail if this run could not measure something")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail if this run could not measure something",
+    )
     parser.add_argument(
         "--check-artifacts",
         action="store_true",

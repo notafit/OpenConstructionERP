@@ -115,8 +115,8 @@ class GUID(TypeDecorator):
     all 598 tables, ``create_all`` emits 597 ``varchar(36)`` id columns, one
     ``varchar(64)`` and zero ``uuid``.
 
-    The claim mattered because 53 Alembic revisions declare native
-    ``UUID`` columns and 45 of those hang foreign keys off them. Read
+    The claim mattered because 50 Alembic revisions declare native
+    ``UUID`` columns and 42 of those hang foreign keys off them. Read
     against the old docstring those revisions look consistent with the
     models; against the actual behaviour they disagree, and a database
     built by walking the chain collides with one built by ``create_all``

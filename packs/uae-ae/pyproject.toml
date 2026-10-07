@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openconstructionerp-uae-ae"
 version = "0.1.0"
-description = "Country pack for the UAE market: MasterFormat classification, AED currency, 5% VAT, Abu Dhabi Building Code, Dubai Municipality Building Code, Civil Defense regulations and Estidama Pearl Rating references."
+description = "Country pack for the UAE market: trade-based classification, AED currency, 5% VAT, Abu Dhabi Building Code, Dubai Municipality Building Code, Civil Defense regulations and Estidama Pearl Rating references."
 readme = "README.md"
 license = { text = "AGPL-3.0-or-later" }
 requires-python = ">=3.11"
@@ -54,4 +54,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 openconstructionerp_uae_ae = [
     "onboarding.yaml",
+    "rule_packs/*.json",
 ]

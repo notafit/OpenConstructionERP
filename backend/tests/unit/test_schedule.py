@@ -50,8 +50,17 @@ def _session_get_project(region: str | None) -> Callable[..., Coroutine[Any, Any
 class _StubRelationshipRepo:
     """No canonical predecessor edges — the completion guard passes through."""
 
+    def __init__(self) -> None:
+        self.created: list[Any] = []
+
     async def list_predecessors(self, activity_id: uuid.UUID) -> list[Any]:
         return []
+
+    async def create_many(self, relationships: list[Any]) -> None:
+        self.created.extend(relationships)
+
+    async def delete_for_schedule(self, schedule_id: uuid.UUID) -> None:
+        self.created = [r for r in self.created if r.schedule_id != schedule_id]
 
 
 def _make_service(project_region: str | None = None) -> ScheduleService:
@@ -80,14 +89,20 @@ class _StubScheduleRepo:
     async def get_by_id(self, schedule_id: uuid.UUID) -> Any:
         return self.rows.get(schedule_id)
 
+    async def get_for_update(self, schedule_id: uuid.UUID) -> Any:
+        return self.rows.get(schedule_id)
+
     async def list_for_project(
         self,
         project_id: uuid.UUID,
         *,
         offset: int = 0,
         limit: int = 50,
+        archive_state: str = "all",
     ) -> tuple[list[Any], int]:
         rows = [r for r in self.rows.values() if r.project_id == project_id]
+        if archive_state != "all":
+            rows = [r for r in rows if (r.status == "archived") == (archive_state == "archived")]
         return rows[offset : offset + limit], len(rows)
 
     async def update_fields(self, schedule_id: uuid.UUID, **kwargs: Any) -> None:
@@ -99,6 +114,9 @@ class _StubScheduleRepo:
 
     async def delete(self, schedule_id: uuid.UUID) -> None:
         self.rows.pop(schedule_id, None)
+
+    async def delete_baselines(self, schedule_id: uuid.UUID) -> int:
+        return 0
 
 
 class _StubActivityRepo:
@@ -113,6 +131,13 @@ class _StubActivityRepo:
         activity.updated_at = now
         self.rows[activity.id] = activity
         return activity
+
+    async def create_many(self, activities: list[Any]) -> None:
+        for activity in activities:
+            await self.create(activity)
+
+    async def count_started(self, schedule_id: uuid.UUID) -> int:
+        return sum(1 for r in self.rows.values() if r.schedule_id == schedule_id and r.status != "not_started")
 
     async def get_by_id(self, activity_id: uuid.UUID) -> Any:
         return self.rows.get(activity_id)
@@ -146,6 +171,18 @@ class _StubActivityRepo:
 
     async def delete(self, activity_id: uuid.UUID) -> None:
         self.rows.pop(activity_id, None)
+
+    async def reparent_children(self, parent_id: uuid.UUID, new_parent_id: uuid.UUID | None) -> None:
+        for row in self.rows.values():
+            if row.parent_id == parent_id:
+                row.parent_id = new_parent_id
+
+    async def list_outline(self, schedule_id: uuid.UUID) -> list[tuple[uuid.UUID, uuid.UUID | None, int, str]]:
+        return [
+            (r.id, getattr(r, "parent_id", None), getattr(r, "sort_order", 0) or 0, getattr(r, "wbs_code", "") or "")
+            for r in self.rows.values()
+            if r.schedule_id == schedule_id
+        ]
 
     async def get_max_sort_order(self, schedule_id: uuid.UUID) -> int:
         rows = [r for r in self.rows.values() if r.schedule_id == schedule_id]
@@ -264,7 +301,9 @@ async def test_update_schedule() -> None:
 async def test_delete_schedule() -> None:
     svc = _make_service()
     schedule = await _create_schedule(svc)
-    await svc.delete_schedule(schedule.id)
+    await svc.delete_schedule(schedule.id, actor_payload={"role": "admin"})
+    assert (await svc.get_schedule(schedule.id)).status == "archived"
+    await svc.purge_schedule(schedule.id, actor_payload={"role": "admin"})
 
     from fastapi import HTTPException
 
@@ -446,14 +485,14 @@ def _patch_boq_repositories(monkeypatch: pytest.MonkeyPatch, positions: list[Any
             self.session = session
 
         async def get_by_id(self, wanted: uuid.UUID) -> Any:
-            return SimpleNamespace(id=wanted, metadata_={}) if wanted == boq_id else None
+            return SimpleNamespace(id=wanted, project_id=PROJECT_ID, metadata_={}) if wanted == boq_id else None
 
     class _FakePositionRepo:
         def __init__(self, session: object) -> None:
             self.session = session
 
-        async def list_for_boq(self, wanted: uuid.UUID, **_kwargs: Any) -> tuple[list[Any], int]:
-            return (positions, len(positions)) if wanted == boq_id else ([], 0)
+        async def list_all_for_boq(self, wanted: uuid.UUID) -> list[Any]:
+            return positions if wanted == boq_id else []
 
     monkeypatch.setattr(boq_repo_mod, "BOQRepository", _FakeBOQRepo)
     monkeypatch.setattr(boq_repo_mod, "PositionRepository", _FakePositionRepo)
@@ -492,6 +531,16 @@ async def test_the_same_project_is_counted_on_one_week_by_both_paths(
 
     monkeypatch.setattr(svc, "reconcile_dependency_sources", _no_reconcile)
 
+    async def _no_project_calendar(_project_id: uuid.UUID) -> None:
+        return None
+
+    async def _row_lock(_stmt: object) -> None:
+        return None
+
+    # No named calendar for the project: the regional week is the one drawn on.
+    monkeypatch.setattr(svc, "_project_default_calendar", _no_project_calendar)
+    svc.session.execute = _row_lock
+
     await svc.generate_from_boq(schedule.id, boq_id, total_project_days=120)
 
     tasks = [a for a in svc.activity_repo.rows.values() if a.activity_type == "task"]
@@ -499,9 +548,12 @@ async def test_the_same_project_is_counted_on_one_week_by_both_paths(
     spans = [_weekdays_between(t.start_date, t.end_date) for t in tasks]
     # Generation lands every end on a working day of the region...
     assert all(span[-1] not in rest_days for span in spans)
-    # ...and the first task starts on the Sunday, the day the two weeks disagree
-    # on, so a recount on the wrong week cannot come out equal by chance.
-    assert spans[0][0] == 6
+    # ...and the first task starts on the first working day at or after the
+    # Sunday the schedule starts on. For Doha that is the Sunday itself, the day
+    # the two weeks disagree on, so a recount on the wrong week cannot come out
+    # equal by chance. Berlin does not work Sundays, so its first task starts on
+    # the Monday instead of on a rest day.
+    assert spans[0][0] == (6 if region == _GULF else 0)
     if region == _GULF:
         monday_to_friday = [_working_days(t.start_date, t.end_date, _GERMAN_REST_DAYS) for t in tasks]
         regional = [_working_days(t.start_date, t.end_date, rest_days) for t in tasks]
@@ -532,9 +584,16 @@ async def test_update_progress_auto_status() -> None:
     assert updated.status == "not_started"
 
 
+async def _positions_always_in_project(_schedule_id: uuid.UUID, _position_ids: list[str]) -> None:
+    return None
+
+
 @pytest.mark.asyncio
 async def test_link_boq_position() -> None:
     svc = _make_service()
+    # The fake session runs no SQL; keeping a link inside the schedule's own
+    # project is covered against PostgreSQL in test_schedule_boq_links.py.
+    svc._assert_positions_in_project = _positions_always_in_project  # type: ignore[method-assign]
     schedule = await _create_schedule(svc)
     activity = await _create_activity(svc, schedule.id)
     boq_id = uuid.uuid4()
@@ -546,6 +605,9 @@ async def test_link_boq_position() -> None:
 @pytest.mark.asyncio
 async def test_link_boq_position_duplicate_rejected() -> None:
     svc = _make_service()
+    # The fake session runs no SQL; keeping a link inside the schedule's own
+    # project is covered against PostgreSQL in test_schedule_boq_links.py.
+    svc._assert_positions_in_project = _positions_always_in_project  # type: ignore[method-assign]
     schedule = await _create_schedule(svc)
     activity = await _create_activity(svc, schedule.id)
     boq_id = uuid.uuid4()
@@ -712,3 +774,35 @@ async def test_reject_dependency_cycles_lists_activities_only_once() -> None:
     )
 
     assert counter["n"] == 1, f"Expected one repo load for the whole batch; got {counter['n']}."
+
+
+@pytest.mark.parametrize(
+    ("meta", "unit", "source"),
+    [
+        ({"labor_hours": 2.0}, "m2", "labor_hours"),
+        ({"resources": [{"type": "labor", "unit": "hr", "quantity": 2.0}]}, "m2", "resource_sum"),
+        ({}, "m3", "estimated_fallback"),
+    ],
+)
+def test_a_position_too_big_for_the_window_is_not_cut_to_the_window(meta: dict, unit: str, source: str) -> None:
+    """A position that cannot fit the window keeps its own length.
+
+    Cutting it to the window made every big position exactly the window long
+    whatever the crew, so a plan of millions of man-hours "fitted" 200 days
+    with one worker and the shortening that should have been reported was
+    never seen. Only the cost share still uses the window, as its scale.
+    """
+    from app.modules.schedule.service import _calc_duration_from_resources
+
+    days, got = _calc_duration_from_resources(
+        meta,
+        1_000_000.0,
+        unit,
+        total_cost=10_000_000.0,
+        grand_total=40_000_000.0,
+        total_days=200,
+        hours_per_day=8.0,
+        work_days_per_week=5,
+    )
+    assert got == source
+    assert days > 200

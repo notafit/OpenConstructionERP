@@ -108,9 +108,9 @@ async def _on_risk_deleted(event: Event) -> None:
     await _delete_risk_vector(event)
 
 
-event_bus.subscribe("risk.risk.created", _on_risk_created)
-event_bus.subscribe("risk.risk.updated", _on_risk_updated)
-event_bus.subscribe("risk.risk.deleted", _on_risk_deleted)
+event_bus.subscribe_once("risk.risk.created", _on_risk_created)
+event_bus.subscribe_once("risk.risk.updated", _on_risk_updated)
+event_bus.subscribe_once("risk.risk.deleted", _on_risk_deleted)
 
 
 # ── HSE → Risk Register projection ───────────────────────────────────────
@@ -248,7 +248,7 @@ async def _on_contracts_risk_register_update(event: Event) -> None:
         )
 
 
-event_bus.subscribe(
+event_bus.subscribe_once(
     "contracts.risk_register_update",
     _on_contracts_risk_register_update,
 )

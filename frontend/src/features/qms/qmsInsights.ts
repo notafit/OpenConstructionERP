@@ -18,6 +18,7 @@
  */
 import { useTranslation } from 'react-i18next';
 import type { InsightDataset, InsightDef } from '@/features/insights';
+import { parseDateUTC } from '@/shared/lib/dates';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -75,7 +76,7 @@ function closeDays(r: PunchLite): number | '' {
 /** An item is overdue when its due date has passed and it is still live work. */
 function isOverdue(r: PunchLite, now: number): number {
   if (!r.due_date || CLOSED_STATUSES.includes(r.status)) return 0;
-  const due = new Date(r.due_date).getTime();
+  const due = parseDateUTC(r.due_date).getTime();
   return !Number.isNaN(due) && due < now ? 1 : 0;
 }
 

@@ -78,6 +78,37 @@ def _warnings(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == _LOGGER and r.levelno >= logging.WARNING]
 
 
+#: Rate tiers first shipped in 18.4, as seed keys. Neither old cohort holds any
+#: of them, and both are owed all four.
+_TIERS_ADDED_IN_18_4 = {
+    ("IE", "VAT_RED_9", "2011-07-01"),
+    ("IE", "VAT_ZERO", "1972-11-01"),
+    ("HU", "AFA_18", "2009-07-01"),
+    ("HU", "AFA_5", "2004-01-01"),
+}
+
+#: Ireland's temporary 21 % standard rate and the 23 % that came back after it.
+#: Two more windows on a rate line every cohort already holds, so they are the
+#: supersede repair's to carry forward rather than the reconciler's to deliver,
+#: exactly as Russia's 22 % window is.
+_IRISH_WINDOWS_ADDED_IN_18_4 = {
+    ("IE", "VAT", "2020-09-01"),
+    ("IE", "VAT", "2021-03-01"),
+}
+
+#: Switzerland's 2018 to 2023 rates, closed windows before the 2024 ones every
+#: cohort already holds. Nothing delivers them to an old install: the line is
+#: present, so the reconciler leaves it alone, and no window an old install
+#: holds open has been closed, so the supersede repair finds nothing either.
+_SWISS_HISTORY_ADDED_IN_18_4 = {
+    ("CH", "VAT", "2018-01-01"),
+    ("CH", "VAT_REDUCED", "2018-01-01"),
+    ("CH", "VAT_SPECIAL", "2018-01-01"),
+}
+
+#: The same four as delivery keys.
+_IRISH_AND_HUNGARIAN_TIERS = {"IE/VAT_RED_9", "IE/VAT_ZERO", "HU/AFA_18", "HU/AFA_5"}
+
 #: Rows the seed file gained after the v15.4.0-era file, by
 #: ``(country, tax_code, effective_from)``. Written out rather than derived from
 #: the reconciler's own tables on purpose: deriving the fixture from the code
@@ -103,6 +134,21 @@ _ADDED_AFTER_V15_4_0 = {
     # rate that changed belongs to the supersede repair, exactly as Nova
     # Scotia's 14 % row does.
     ("RU", "NDS", "2026-01-01"),
+    # Greece's three rate lines, first shipped with the Greek country pack.
+    ("GR", "FPA", "2016-06-01"),
+    ("GR", "FPA_RED", "2011-01-01"),
+    ("GR", "FPA_SRED", "2015-07-20"),
+    # Croatia's reduced and zero rates. Both cohorts hold the 25 % PDV row, so
+    # these land in a country-wide slot that is already taken, as tiers.
+    ("HR", "PDV_13", "2014-01-01"),
+    ("HR", "PDV_5", "2013-01-01"),
+    ("HR", "PDV_0", "2022-10-01"),
+    # Ireland's 9 % and zero tiers and Hungary's 18 % and 5 % tiers, added in
+    # 18.4. Every cohort holds the standard rate of both countries, so these
+    # join a filled country-wide slot as tiers, the Croatian way.
+    *_TIERS_ADDED_IN_18_4,
+    *_IRISH_WINDOWS_ADDED_IN_18_4,
+    *_SWISS_HISTORY_ADDED_IN_18_4,
 }
 
 #: Rows the current file has since EDITED, restored to what the old file said.
@@ -122,6 +168,9 @@ _RESTORED_TO_V15_4_0 = {
     ("CA", "HST_NS", "2010-07-01"): {"effective_to": None},
     ("IL", "VAT", "2015-10-01"): {"effective_to": None},
     ("RU", "NDS", "2019-01-01"): {"effective_to": None},
+    ("IE", "VAT", "2012-01-01"): {"effective_to": None},
+    # The old file dated Croatia's 25 % a year late.
+    ("HR", "PDV", "2012-03-01"): {"effective_from": "2013-03-01"},
 }
 
 _ADDED_AFTER_V15_9_1 = {
@@ -130,6 +179,15 @@ _ADDED_AFTER_V15_9_1 = {
     ("KW", "NONE", None),
     ("QA", "NONE", None),
     ("RU", "NDS", "2026-01-01"),
+    ("GR", "FPA", "2016-06-01"),
+    ("GR", "FPA_RED", "2011-01-01"),
+    ("GR", "FPA_SRED", "2015-07-20"),
+    ("HR", "PDV_13", "2014-01-01"),
+    ("HR", "PDV_5", "2013-01-01"),
+    ("HR", "PDV_0", "2022-10-01"),
+    *_TIERS_ADDED_IN_18_4,
+    *_IRISH_WINDOWS_ADDED_IN_18_4,
+    *_SWISS_HISTORY_ADDED_IN_18_4,
 }
 
 #: The v15.9.1 cohort needed no restorations until Israel's 18 % rate was
@@ -142,6 +200,8 @@ _ADDED_AFTER_V15_9_1 = {
 _RESTORED_TO_V15_9_1 = {
     ("IL", "VAT", "2015-10-01"): {"effective_to": None},
     ("RU", "NDS", "2019-01-01"): {"effective_to": None},
+    ("IE", "VAT", "2012-01-01"): {"effective_to": None},
+    ("HR", "PDV", "2012-03-01"): {"effective_from": "2013-03-01"},
 }
 
 #: SHA-256 of the real shipped file at each tag, over the fields the fixture
@@ -151,7 +211,17 @@ _DIGEST_V15_9_1 = "ec4106ee3f0cadcd6fce5ca0ec95fe69d55b4e51d1b4b3283daa462542038
 
 _FIELDS = ("country_code", "tax_code", "rate_pct", "tax_type", "effective_from", "effective_to", "is_default")
 
-#: The ten rate lines a pre-v15.5.0 install is missing and must be given.
+#: What Greece is delivered: all three lines. No install before the Greek pack
+#: holds a Greek row, so FPA lands in an empty country-wide slot, and the 13 and
+#: 6 percent tiers join it because neither changes the country's standard answer.
+_GREECE_LINES = {"GR/FPA", "GR/FPA_RED", "GR/FPA_SRED"}
+
+#: Croatia's reduced and zero tiers, owed to every cohort that holds its 25 % rate.
+_CROATIA_TIERS = {"HR/PDV_13", "HR/PDV_5", "HR/PDV_0"}
+
+#: The rate lines a pre-v15.5.0 install is missing and must be given. The
+#: counts below are taken from this set rather than written as numbers, so a
+#: country that joins it moves every assertion at once.
 #: Nova Scotia is deliberately not among them - it already holds the 15 % row,
 #: so the 14 % one is a rate that changed rather than a rate never delivered.
 _EXPECTED_DELIVERY = {
@@ -168,7 +238,19 @@ _EXPECTED_DELIVERY = {
     # regional stack at 5 percent.
     "KW/NONE",
     "QA/NONE",
+    *_GREECE_LINES,
+    # Croatia's reduced and zero tiers. The install holds the 25 % standard
+    # rate, so these join a filled country-wide slot, which a tier that does
+    # not change the country's answer is allowed to do.
+    *_CROATIA_TIERS,
+    # Ireland's and Hungary's tiers, on the same argument as Croatia's: the
+    # standard rate is on file and the tier does not change what either
+    # country resolves to on any date.
+    *_IRISH_AND_HUNGARIAN_TIERS,
 }
+
+#: What a v15.9.1 install is owed: the lines that shipped after it.
+_EXPECTED_AFTER_V15_9_1 = {"KW/NONE", "QA/NONE", *_GREECE_LINES, *_CROATIA_TIERS, *_IRISH_AND_HUNGARIAN_TIERS}
 
 
 def _key(row: dict) -> tuple:
@@ -385,7 +467,9 @@ async def test_a_pre_v15_5_install_is_given_the_provinces_it_never_received(repa
 
     reconcile = _outcome(report, REPAIR_ID)
     assert reconcile.status == "applied"
-    assert reconcile.rows_changed == 10, f"expected ten missing rates delivered, got {reconcile.rows_changed}"
+    assert reconcile.rows_changed == len(_EXPECTED_DELIVERY), (
+        f"expected {len(_EXPECTED_DELIVERY)} missing rates delivered, got {reconcile.rows_changed}"
+    )
     assert await _deliveries(repair_factory) == _EXPECTED_DELIVERY
 
     lines = await _lines(repair_factory)
@@ -431,8 +515,8 @@ async def test_nova_scotia_is_not_this_repairs_to_deliver(repair_factory) -> Non
     deliveries = await _deliveries(repair_factory)
     assert "CA/HST_NS" not in deliveries, "the reconciler delivered a rate line that was already on file"
     assert deliveries == _EXPECTED_DELIVERY
-    assert _outcome(report, REPAIR_ID).rows_changed == 10, (
-        "the reconciler's own count moved, so it is doing something other than the ten rate lines it owns"
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_DELIVERY), (
+        "the reconciler's own count moved, so it is doing something other than the rate lines it owns"
     )
 
     async with repair_factory() as session:
@@ -454,7 +538,7 @@ async def test_a_second_boot_delivers_nothing(repair_factory) -> None:
     await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
 
     first = _outcome(await run_data_repairs(repair_factory), REPAIR_ID)
-    assert first.rows_changed == 10
+    assert first.rows_changed == len(_EXPECTED_DELIVERY)
     settled = await _count(repair_factory)
 
     second = _outcome(await run_data_repairs(repair_factory), REPAIR_ID)
@@ -467,8 +551,8 @@ async def test_a_second_boot_delivers_nothing(repair_factory) -> None:
             await session.execute(select(DataRepairLedger).where(DataRepairLedger.repair_id == REPAIR_ID))
         ).scalar_one()
     assert ledger.runs == 2, "the second boot has to be recorded, not skipped"
-    assert ledger.rows_changed_total == 10, "the second pass applied something after all"
-    assert len(await _deliveries(repair_factory)) == 10, "a delivery was recorded twice"
+    assert ledger.rows_changed_total == len(_EXPECTED_DELIVERY), "the second pass applied something after all"
+    assert len(await _deliveries(repair_factory)) == len(_EXPECTED_DELIVERY), "a delivery was recorded twice"
 
 
 async def test_a_delivered_rate_the_customer_deletes_stays_deleted(repair_factory) -> None:
@@ -480,7 +564,7 @@ async def test_a_delivered_rate_the_customer_deletes_stays_deleted(repair_factor
     install.
     """
     await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
-    assert _outcome(await run_data_repairs(repair_factory), REPAIR_ID).rows_changed == 10
+    assert _outcome(await run_data_repairs(repair_factory), REPAIR_ID).rows_changed == len(_EXPECTED_DELIVERY)
 
     async with repair_factory() as session:
         await session.execute(
@@ -522,11 +606,11 @@ async def test_a_v15_9_1_install_that_deleted_a_rate_does_not_get_it_back(repair
     delivered = await _deliveries(repair_factory)
     assert "NG/VAT" not in delivered, "a rate deleted on a modern install was restored"
     assert ("NG", "VAT") not in await _lines(repair_factory)
-    # This cohort predates the two Gulf rate lines, so it is owed those and
-    # nothing else. Pinned rather than counted, so a future seed row cannot
-    # slip in here disguised as one of them.
-    assert delivered == {"KW/NONE", "QA/NONE"}
-    assert _outcome(report, REPAIR_ID).rows_changed == 2
+    # This cohort predates the two Gulf rate lines, Greece's lines, Croatia's three tiers and the
+    # Irish and Hungarian tiers, so it is owed those and nothing else. Pinned rather than counted, so a future
+    # seed row cannot slip in here disguised as one of them.
+    assert delivered == _EXPECTED_AFTER_V15_9_1
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_AFTER_V15_9_1)
 
 
 async def test_a_v15_9_1_install_gets_only_what_shipped_after_it(repair_factory) -> None:
@@ -560,8 +644,8 @@ async def test_a_v15_9_1_install_gets_only_what_shipped_after_it(repair_factory)
     report = await run_data_repairs(repair_factory)
 
     assert _outcome(report, REPAIR_ID).status == "applied"
-    assert _outcome(report, REPAIR_ID).rows_changed == 2
-    assert await _deliveries(repair_factory) == {"KW/NONE", "QA/NONE"}
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_AFTER_V15_9_1)
+    assert await _deliveries(repair_factory) == _EXPECTED_AFTER_V15_9_1
 
     async with repair_factory() as session:
         still = (
@@ -656,7 +740,7 @@ async def test_one_rate_re_entered_by_hand_does_not_freeze_the_seed_date(repair_
 
     Reading the newest would take that one row for the seed, date this install
     to today, and conclude that every rate added since is absent because
-    somebody removed it. The install would be refused all ten of the rates it
+    somebody removed it. The install would be refused every one of the rates it
     is owed, for good, on the evidence of a row that has nothing to do with any
     of them. The oldest surviving shipped row is the seeder's own and it still
     says June.
@@ -701,7 +785,7 @@ async def test_one_rate_re_entered_by_hand_does_not_freeze_the_seed_date(repair_
 
     report = await run_data_repairs(repair_factory)
 
-    assert _outcome(report, REPAIR_ID).rows_changed == 10, (
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_DELIVERY), (
         "one shipped rate re-entered by hand withheld every rate this install was owed"
     )
     assert await _deliveries(repair_factory) == _EXPECTED_DELIVERY
@@ -752,8 +836,8 @@ async def test_a_country_that_typed_in_its_own_rate_is_not_given_a_second_one(re
     )
     assert ("NG", "VAT") not in await _lines(repair_factory)
 
-    assert _outcome(report, REPAIR_ID).rows_changed == 9, (
-        "one country holding its own rate must not withhold the other seven rate lines"
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_DELIVERY) - 1, (
+        "one country holding its own rate must not withhold the other rate lines"
     )
 
 
@@ -791,7 +875,7 @@ async def test_a_province_that_has_a_hand_entered_rate_is_not_charged_twice(repa
 
     quebec = await _resolve_in(repair_factory, "CA", "CA-QC")
     assert quebec.combined_rate_pct == "14.975", "one province holding its own rate withheld the others"
-    assert _outcome(report, REPAIR_ID).rows_changed == 9
+    assert _outcome(report, REPAIR_ID).rows_changed == len(_EXPECTED_DELIVERY) - 1
 
 
 async def test_the_reconciler_adds_rows_and_edits_none(repair_factory) -> None:
@@ -807,7 +891,9 @@ async def test_the_reconciler_adds_rows_and_edits_none(repair_factory) -> None:
     async with repair_factory() as session:
         after = await snapshot_table(session, _TAX_TABLE)
 
-    assert len(after) == len(before) + 10, "the pass under test did not deliver, so the check below is vacuous"
+    assert len(after) == len(before) + len(_EXPECTED_DELIVERY), (
+        "the pass under test did not deliver, so the check below is vacuous"
+    )
     assert verify_additive_shape(repair, before, after) == ()
 
 
@@ -827,3 +913,121 @@ async def test_every_never_delivered_repair_adds_rows_and_edits_none(repair_fact
         async with repair_factory() as session:
             after = await snapshot_table(session, table)
         assert verify_additive_shape(repair, before, after) == (), f"{repair.repair_id} broke the additive contract"
+
+
+# ── A reduced tier beside a standard rate the install already holds ──────────
+
+
+async def _croatian_codes(factory) -> set[str]:
+    return {code for country, code in await _lines(factory) if country == "HR"}
+
+
+async def test_an_install_holding_croatias_standard_rate_is_given_its_other_rates_once(repair_factory, caplog) -> None:
+    """The production shape: HR/PDV at 25 is on file, and 13, 5 and 0 are owed.
+
+    The standard rate fills Croatia's country-wide slot, so the slot rule alone
+    refused all three tiers on every boot and logged three warnings each time.
+    A tier flagged as not the default cannot change what the country resolves
+    to, and that is measured here rather than assumed: Croatia answers 25
+    before and after, and the second boot is silent and writes nothing.
+    """
+    await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
+    assert await _croatian_codes(repair_factory) == {"PDV"}
+    before = await _resolve_in(repair_factory, "HR")
+    assert (before.status, before.combined_rate_pct) == ("national", "25")
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        await run_data_repairs(repair_factory)
+        assert _warnings(caplog) == []
+        second = _outcome(await run_data_repairs(repair_factory), REPAIR_ID)
+
+    assert _warnings(caplog) == [], "the second boot still has something to say about Croatia"
+    assert second.rows_changed == 0
+    assert await _deliveries(repair_factory) >= _CROATIA_TIERS
+    assert await _croatian_codes(repair_factory) == {"PDV", "PDV_13", "PDV_5", "PDV_0"}
+
+    after = await _resolve_in(repair_factory, "HR")
+    assert (after.status, after.combined_rate_pct) == ("national", "25")
+
+
+async def test_a_tier_that_would_change_what_the_country_resolves_to_is_refused(repair_factory, caplog) -> None:
+    """The negative control: the same tiers, into a slot they WOULD disturb.
+
+    Here the Croatian standard row carries no default flag, which is how a row
+    written before the flag mattered looks. A lone unflagged row answers as the
+    standard rate, and a second unflagged row beside it leaves the resolver
+    unable to say which of the two is standard, so Croatia would stop pricing.
+    """
+    await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
+    async with repair_factory() as session:
+        row = (
+            await session.execute(
+                select(TaxConfiguration).where(
+                    TaxConfiguration.country_code == "HR", TaxConfiguration.tax_code == "PDV"
+                )
+            )
+        ).scalar_one()
+        row.is_default = False
+        await session.commit()
+    assert (await _resolve_in(repair_factory, "HR")).combined_rate_pct == "25"
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        await run_data_repairs(repair_factory)
+
+    after = await _resolve_in(repair_factory, "HR")
+    assert after.resolved, f"the repair left Croatia unable to price ({after.status}: {after.reason})"
+    assert after.combined_rate_pct == "25"
+    assert await _croatian_codes(repair_factory) == {"PDV"}
+    assert not (_CROATIA_TIERS & await _deliveries(repair_factory)), "a refused tier was recorded as delivered"
+    assert any("HR/PDV_13" in message for message in _warnings(caplog))
+
+
+async def test_a_tier_the_customer_already_entered_is_not_added_twice(repair_factory) -> None:
+    """A 13 % the customer typed under their own code is that tier, whatever it is called."""
+    await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
+    await _own_rate(
+        repair_factory,
+        country_code="HR",
+        tax_code="PDV_SNIZENA",
+        rate_pct="13",
+        combination="national",
+        subdivision_code=None,
+        is_default=False,
+    )
+
+    await run_data_repairs(repair_factory)
+
+    assert await _croatian_codes(repair_factory) == {"PDV", "PDV_SNIZENA", "PDV_5", "PDV_0"}
+    assert "HR/PDV_13" not in await _deliveries(repair_factory)
+    assert (await _resolve_in(repair_factory, "HR")).combined_rate_pct == "25"
+
+
+async def test_a_tier_does_not_become_the_standard_rate_of_a_country_whose_standard_was_deleted(
+    repair_factory, caplog
+) -> None:
+    """Croatia's 25 % deleted by the customer: the tiers must not fill the empty slot.
+
+    With no country-wide row left there is nothing to collide with, and the
+    slot rule alone let 13 % land there, where a lone rate answers as the
+    standard one: Croatia would price at 13 %. The tier guard measures the
+    answer instead, which is "nothing" before and must stay "nothing".
+    """
+    await _install(repair_factory, pre_v15_5_0(), "2026-06-01")
+    async with repair_factory() as session:
+        row = (
+            await session.execute(
+                select(TaxConfiguration).where(
+                    TaxConfiguration.country_code == "HR", TaxConfiguration.tax_code == "PDV"
+                )
+            )
+        ).scalar_one()
+        await session.delete(row)
+        await session.commit()
+    assert not (await _resolve_in(repair_factory, "HR")).resolved
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        await run_data_repairs(repair_factory)
+
+    assert await _croatian_codes(repair_factory) == set()
+    assert not (await _resolve_in(repair_factory, "HR")).resolved
+    assert not (_CROATIA_TIERS & await _deliveries(repair_factory)), "a refused tier was recorded as delivered"

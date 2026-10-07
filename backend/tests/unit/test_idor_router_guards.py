@@ -131,6 +131,10 @@ ROUTER_HANDLERS: dict[str, list[str]] = {
         "escalate_project_risks",
         "risk_similar",
         "simulate_risks",
+        # Contingency position and drawdowns (18.4)
+        "get_contingency_position",
+        "confirm_contingency_drawdown",
+        "reverse_contingency_drawdown",
     ],
     "takeoff": [
         "delete_document",
@@ -140,6 +144,7 @@ ROUTER_HANDLERS: dict[str, list[str]] = {
         "update_measurement",
         "delete_measurement",
         "link_measurement_to_boq",
+        "create_boq_position_from_measurement",
         "measurement_summary",
         "export_measurements",
         "create_measurement",
@@ -185,6 +190,7 @@ ROUTER_HANDLERS: dict[str, list[str]] = {
         "close_rfi",
         "create_variation_from_rfi",
         "download_rfi_attachment",
+        "export_rfi_pdf",
         "get_rfi_activity",
         "get_rfi_approval",
         "respond_to_rfi",
@@ -312,6 +318,7 @@ ROUTER_HANDLERS: dict[str, list[str]] = {
         "delete_photo",
         "delete_sheet",
         "documents_similar",
+        "get_document_references",
         "get_photo",
         "get_sheet",
         "get_sheet_versions",
@@ -352,6 +359,53 @@ ROUTER_HANDLERS: dict[str, list[str]] = {
         "download_drawing",
         "list_drawing_versions",
         "upload_drawing_revision",
+    ],
+    # Post-calculation reads and the quantity check. The quantity-check routes
+    # take a bill id from the query or body, so the handler also refuses a bill
+    # of another project (pinned in tests/modules/postcalc/test_quantity_check.py).
+    "postcalc": [
+        "get_productivity",
+        "get_norm_outturn",
+        "get_quantity_check",
+        "set_quantity_baseline",
+    ],
+    # Tendering joined the census with the bidder price-entry links. Every
+    # package route funnels through _verify_package_owner (loads the package,
+    # then verify_project_access on its project), bids through
+    # _verify_bid_access, and the addenda routes call verify_project_access on
+    # the resolved package. The three public /bid-portal/{token}/ routes are
+    # excluded in _NOT_ROUTER_GATED below.
+    "tendering": [
+        "get_package",
+        "get_package_scope",
+        "update_package",
+        "create_bid",
+        "list_bids",
+        "update_bid",
+        "compare_bids",
+        "export_bid_comparison_xlsx",
+        "export_bill_for_bidders_xlsx",
+        "export_package_gaeb_x83",
+        "apply_tender_winner",
+        "list_package_recipients",
+        "add_package_recipient",
+        "remove_package_recipient",
+        "distribute_package",
+        "list_bid_invitations",
+        "create_bid_link",
+        "revoke_bid_invitation",
+        "list_package_addenda",
+        "create_package_addendum",
+        "publish_package_addendum",
+        "acknowledge_package_addendum",
+        "get_leveling_matrix",
+        "level_package_bids",
+        "get_award_record",
+        "record_award_record_note",
+        "export_award_record_pdf",
+        "export_tender_pdf",
+        "export_award_letter_pdf",
+        "export_rejection_letter_pdf",
     ],
 }
 
@@ -403,6 +457,11 @@ _GUARD_WRAPPERS = frozenset(
         # and the ``export.{ext}`` flavours. It resolves the set's owning
         # project and calls verify_project_access before reading any row.
         "_export_dispatch",
+        # tendering.router: _verify_package_owner loads the package and calls
+        # verify_project_access on its project; _verify_bid_access loads the
+        # bid and delegates to _verify_package_owner for its package.
+        "_verify_package_owner",
+        "_verify_bid_access",
     }
 )
 
@@ -605,6 +664,25 @@ _NOT_ROUTER_GATED: dict[str, str] = {
     "teams.list_restricted_entities": "Service-layer gate: TeamService.list_restricted_entities(actor_id=...).",
     "teams.get_access_matrix": "Service-layer gate: TeamService.build_access_matrix(actor_id=...).",
     "teams.validate_project_teams": "Service-layer gate: TeamService.validate_project(actor_id=...).",
+    # Bidder price-entry links. The bidder is a subcontractor with no account,
+    # so there is no user to check project access for: the 256-bit token in the
+    # path is the capability, stored only as its sha256. Each route resolves the
+    # token to exactly one invitation of one package and answers 404 for an
+    # unknown token and 410 for a revoked or expired one, with no package data.
+    # The payload is built field by field without the buyer's rates, sums or
+    # metadata (tests/modules/tendering/test_bid_portal.py asserts on it).
+    "tendering.bid_portal_view": (
+        "Public by design, the bidder link token is the capability. Returns only the unpriced bill, "
+        "the package facts and the bidder's own draft; unknown tokens 404, revoked or expired 410."
+    ),
+    "tendering.bid_portal_save_draft": (
+        "Public by design, writes only the draft of the one invitation the token resolves to, "
+        "after checking every line id belongs to that invitation's package."
+    ),
+    "tendering.bid_portal_submit": (
+        "Public by design, writes the bid of the one invitation the token resolves to through "
+        "TenderingService.create_bid/update_bid; a second submit on the same link is refused."
+    ),
 }
 
 

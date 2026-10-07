@@ -38,6 +38,7 @@ import type { FileKind } from '@/features/file-manager/types';
 import { PdfCompareDrawer } from './PdfCompareDrawer';
 import { takeoffGuide } from './takeoffGuide';
 import { apiGet, apiPost } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { formatFileSize } from '@/shared/lib/formatters';
 import { isTauri } from '@/shared/lib/desktop';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -1314,7 +1315,7 @@ export function TakeoffPage() {
 
   const { data: projects, isLoading: projectsLoading } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1564,7 +1565,8 @@ export function TakeoffPage() {
 
   const analyzeMutation = useMutation({
     mutationFn: async (docId: string) => {
-      return apiPost<AnalysisResult>(`/v1/takeoff/documents/${docId}/analyze/`);
+      // longRunning: the analysis waits for an AI provider (issue #499).
+      return apiPost<AnalysisResult>(`/v1/takeoff/documents/${docId}/analyze/`, undefined, { longRunning: true });
     },
     onMutate: (docId) => {
       setDocuments((prev) =>

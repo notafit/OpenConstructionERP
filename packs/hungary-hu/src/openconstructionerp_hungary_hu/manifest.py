@@ -23,15 +23,17 @@ MANIFEST = PartnerPackManifest(
         "public-procurement and site-diary references, forint at zero "
         "decimals."
     ),
-    # English, deliberately. There is no Hungarian bundle among the UI
-    # languages the application ships, and a pack cannot conjure one: a
-    # default_locale the app has no strings for resolves back to English
-    # anyway, so declaring "hu" here would promise a Hungarian interface and
-    # deliver an English one with no signal that it had. The Hungarian
-    # vocabulary this pack does carry lives where it is actually read: the
-    # onboarding wizard's labels and the rule-pack documents. A Hungarian UI
-    # bundle is a separate piece of work with its own quality bar.
-    default_locale="en",
+    # Hungarian. The application ships and offers a Hungarian interface
+    # (frontend/src/app/locales/hu.ts, listed in SUPPORTED_LANGUAGES), so
+    # installing the pack switches the interface to it; the install dialog
+    # reads this value. It said "en" while no Hungarian bundle existed,
+    # because a locale the app has no strings for resolves back to English
+    # and would have promised an interface it could not deliver.
+    #
+    # additional_locales stays empty on purpose: a file listed there is
+    # merged over the shipped bundle for everyone on the installation, and
+    # the shipped Hungarian bundle is the one to improve.
+    default_locale="hu",
     additional_locales={},
     cwicr_regions=[],
     default_currency="HUF",
@@ -65,7 +67,7 @@ MANIFEST = PartnerPackManifest(
         accent_color="#477050",  # green of the national flag
         logo_path=None,  # no partner logo; the UI draws the country monogram
         favicon_path=None,
-        powered_by_text=None,  # use the default co-branding string
+        powered_by_text="Developed in collaboration with Kocsis Tamás / BIM Control",
     ),
     onboarding_script_path="onboarding.yaml",
     metadata={
@@ -106,11 +108,17 @@ MANIFEST = PartnerPackManifest(
         "vat_standard_rate": 27,
         "vat_reduced_rate": 5,
         "currency_decimals": 0,
+        "collaboration": {
+            "partner": "Kocsis Tamás",
+            "organization": "BIM Control",
+            "url": "https://www.bimcontrol.hu/",
+            "role": "Domain expert for Hungarian construction standards and item orders",
+        },
         "review_status": (
             "Item orders and the money structure are derived from Hungarian "
-            "workbooks in production use. The statutory references are drawn "
-            "from public sources and are pending review by a Hungarian "
-            "quantity surveyor before they are relied on for a tender."
+            "workbooks in production use. Developed in collaboration with "
+            "Kocsis Tamás (BIM Control, bimcontrol.hu). The statutory "
+            "references are drawn from public sources."
         ),
         "support_email": "info@datadrivenconstruction.io",
     },

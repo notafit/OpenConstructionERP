@@ -107,8 +107,19 @@ async def _make_submittal(
     svc: SubmittalService,
     project_id: uuid.UUID,
     user_id: uuid.UUID,
-) -> Submittal:
-    return await svc.create_submittal(
+) -> uuid.UUID:
+    """Create a draft submittal and hand back its id, never the ORM row.
+
+    ``start_approval`` writes the submittal through a bulk UPDATE and then
+    expires the instance, which is correct - nothing may serve the stale cached
+    values afterwards - but it turns any long-held row into a trap: the next
+    plain attribute access is an implicit lazy load, and in async SQLAlchemy
+    that is ``MissingGreenlet``, not a refresh. It took all four of these tests
+    down on the 2026-09-22 nightly, each on a bare ``submittal_id`` read after
+    the call. An id cannot go stale; re-read the row with ``get_submittal``
+    wherever its fields are actually needed.
+    """
+    row = await svc.create_submittal(
         SubmittalCreate(
             project_id=project_id,
             title="Shop drawing — rebar",
@@ -117,6 +128,7 @@ async def _make_submittal(
         ),
         user_id=str(user_id),
     )
+    return row.id
 
 
 async def _make_route(
@@ -157,22 +169,22 @@ async def test_start_approval_creates_instance_and_submits(session: AsyncSession
     project_id, user_id = await _seed(session)
     svc = SubmittalService(session)
     engine = ApprovalRouteService(session)
-    submittal = await _make_submittal(svc, project_id, user_id)
+    submittal_id = await _make_submittal(svc, project_id, user_id)
     route = await _make_route(engine, project_id, user_id)
 
-    instance = await svc.start_approval(submittal.id, route.id, started_by=str(user_id))
+    instance = await svc.start_approval(submittal_id, route.id, started_by=str(user_id))
 
     assert instance.target_kind == "submittal"
-    assert instance.target_id == submittal.id
+    assert instance.target_id == submittal_id
     assert instance.status == "pending"
 
     # Draft submittal was moved into the review flow + instance id recorded.
-    fresh = await svc.get_submittal(submittal.id)
+    fresh = await svc.get_submittal(submittal_id)
     assert fresh.status == "submitted"
     assert (fresh.metadata_ or {}).get("approval_instance_id") == str(instance.id)
 
     # get_latest_approval returns the same instance.
-    latest = await svc.get_latest_approval(submittal.id)
+    latest = await svc.get_latest_approval(submittal_id)
     assert latest is not None
     assert latest.id == instance.id
 
@@ -184,12 +196,12 @@ async def test_second_workflow_rejected_409(session: AsyncSession) -> None:
     project_id, user_id = await _seed(session)
     svc = SubmittalService(session)
     engine = ApprovalRouteService(session)
-    submittal = await _make_submittal(svc, project_id, user_id)
+    submittal_id = await _make_submittal(svc, project_id, user_id)
     route = await _make_route(engine, project_id, user_id)
 
-    await svc.start_approval(submittal.id, route.id, started_by=str(user_id))
+    await svc.start_approval(submittal_id, route.id, started_by=str(user_id))
     with pytest.raises(HTTPException) as exc:
-        await svc.start_approval(submittal.id, route.id, started_by=str(user_id))
+        await svc.start_approval(submittal_id, route.id, started_by=str(user_id))
     assert exc.value.status_code == 409
 
 
@@ -198,11 +210,11 @@ async def test_approval_decision_drives_fsm_to_approved(session: AsyncSession) -
     project_id, user_id = await _seed(session)
     svc = SubmittalService(session)
     engine = ApprovalRouteService(session)
-    submittal = await _make_submittal(svc, project_id, user_id)
+    submittal_id = await _make_submittal(svc, project_id, user_id)
     route = await _make_route(engine, project_id, user_id, n_steps=1)
     captured = _capture()
 
-    instance = await svc.start_approval(submittal.id, route.id, started_by=str(user_id))
+    instance = await svc.start_approval(submittal_id, route.id, started_by=str(user_id))
     steps = await engine.list_steps(route.id)
 
     # Approve the only step → instance completes, event carries decided_by.
@@ -215,12 +227,12 @@ async def test_approval_decision_drives_fsm_to_approved(session: AsyncSession) -
     completed = [d for n, d in captured if n == "approval_routes.instance.completed"]
     assert completed, "expected a completed event"
     assert completed[0]["target_kind"] == "submittal"
-    assert completed[0]["target_id"] == str(submittal.id)
+    assert completed[0]["target_id"] == str(submittal_id)
     assert completed[0]["decided_by"] == str(user_id)
 
     # The subscriber body drives the submittal FSM.
     result = await svc.apply_approval_decision(
-        submittal.id,
+        submittal_id,
         decision="approved",
         decided_by=str(user_id),
         comment="LGTM",
@@ -230,7 +242,7 @@ async def test_approval_decision_drives_fsm_to_approved(session: AsyncSession) -
 
     # Idempotent: a duplicate event does not error or double-approve.
     again = await svc.apply_approval_decision(
-        submittal.id,
+        submittal_id,
         decision="approved",
         decided_by=str(user_id),
         comment="LGTM",
@@ -243,11 +255,11 @@ async def test_approval_rejection_drives_fsm_to_rejected(session: AsyncSession) 
     project_id, user_id = await _seed(session)
     svc = SubmittalService(session)
     engine = ApprovalRouteService(session)
-    submittal = await _make_submittal(svc, project_id, user_id)
+    submittal_id = await _make_submittal(svc, project_id, user_id)
     route = await _make_route(engine, project_id, user_id, n_steps=2)
     captured = _capture()
 
-    instance = await svc.start_approval(submittal.id, route.id, started_by=str(user_id))
+    instance = await svc.start_approval(submittal_id, route.id, started_by=str(user_id))
     steps = await engine.list_steps(route.id)
 
     # Reject step 2-of-2 source (the first step rejection short-circuits).
@@ -261,7 +273,7 @@ async def test_approval_rejection_drives_fsm_to_rejected(session: AsyncSession) 
     assert rejected and rejected[0]["target_kind"] == "submittal"
 
     result = await svc.apply_approval_decision(
-        submittal.id,
+        submittal_id,
         decision="rejected",
         decided_by=str(user_id),
         comment="missing dims",
@@ -276,10 +288,10 @@ async def test_no_route_keeps_direct_path(session: AsyncSession) -> None:
     """A project with no configured route keeps today's direct approve path."""
     project_id, user_id = await _seed(session)
     svc = SubmittalService(session)
-    submittal = await _make_submittal(svc, project_id, user_id)
+    submittal_id = await _make_submittal(svc, project_id, user_id)
 
     # No instance exists → get_latest_approval is None and direct approve works.
-    assert await svc.get_latest_approval(submittal.id) is None
-    await svc.submit_submittal(submittal.id)
-    approved = await svc.approve_submittal(submittal.id, approver_id=str(user_id))
+    assert await svc.get_latest_approval(submittal_id) is None
+    await svc.submit_submittal(submittal_id)
+    approved = await svc.approve_submittal(submittal_id, approver_id=str(user_id))
     assert approved.status == "approved"

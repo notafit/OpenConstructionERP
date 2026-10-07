@@ -3326,15 +3326,6 @@
   }
  ],
  "sources": {
-  "ne2_shaded": {
-   "attribution": "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors &copy; <a href=\"https://openmaptiles.org/\">OpenMapTiles</a> &copy; <a href=\"https://openfreemap.org/\">OpenFreeMap</a>",
-   "maxzoom": 6,
-   "tileSize": 256,
-   "tiles": [
-    "/api/v1/geo-hub/natural-earth/{z}/{x}/{y}.png"
-   ],
-   "type": "raster"
-  },
   "openmaptiles": {
    "attribution": "&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors &copy; <a href=\"https://openmaptiles.org/\">OpenMapTiles</a> &copy; <a href=\"https://openfreemap.org/\">OpenFreeMap</a>",
    "maxzoom": 14,

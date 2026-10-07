@@ -161,13 +161,13 @@ describe('matchProjectFile', () => {
   });
 
   it('offers the design-option module only what it can turn into a model', () => {
-    /* The old upload input advertised meshes, spreadsheets and PDFs. None of
-     * those becomes a quantified model, so an option could never be priced
-     * from one; offering them promised something the module cannot do. */
+    /* Meshes and spreadsheets never become a quantified model, so offering
+     * them promises something the module cannot do. PDF drawings are valid
+     * as a concept-stage design basis (OC-07) and are accepted. */
     expect(matchProjectFile(doc('Tower.ifc'), DESIGN_OPTION_SOURCE_FORMATS)).not.toBeNull();
     expect(matchProjectFile(doc('Tower.glb'), DESIGN_OPTION_SOURCE_FORMATS)).toBeNull();
     expect(matchProjectFile(doc('Quantities.xlsx'), DESIGN_OPTION_SOURCE_FORMATS)).toBeNull();
-    expect(matchProjectFile(doc('Plan.pdf'), DESIGN_OPTION_SOURCE_FORMATS)).toBeNull();
+    expect(matchProjectFile(doc('Plan.pdf'), DESIGN_OPTION_SOURCE_FORMATS)).not.toBeNull();
   });
 
   it('falls back to mime_type only when the name has no extension', () => {

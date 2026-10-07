@@ -8,6 +8,42 @@ The equivalent document for the other platform is `docs/desktop/MACOS_NOTARIZATI
 
 For where every published release actually stands across all four signature mechanisms, and how to check a download yourself, see `docs/desktop/RELEASE_SIGNATURE_INVENTORY.md`.
 
+## Smart App Control, and why the installer signature is not enough
+
+Windows 11 Smart App Control checks every executable file as the loader maps it, not only the file that was downloaded, and it offers no per-app exception. A file runs when Microsoft's cloud reputation service knows it, or when it carries a valid signature that chains to a CA in the Microsoft Trusted Root Program. Everything else is blocked. Smart App Control starts in an evaluation mode after a clean Windows install and later switches itself on, which is how a tester can run the app once and find it blocked on later starts with nothing changed on our side.
+
+The desktop sidecar is a PyInstaller onefile build that unpacks about 490 `.exe`, `.dll` and `.pyd` files at every start and runs them from `%LOCALAPPDATA%\OpenConstructionERP\extract`. Measured on a 17.x install, 409 of those 492 files carried no signature: every PostgreSQL program (`postgres.exe`, `initdb.exe`, `pg_ctl.exe` and the rest), and most of the native modules of scipy, scikit-learn, pandas, pyarrow and numpy. The launcher, the sidecar and the uninstaller were unsigned too. Signing only the installer, which is all the Key Vault job further down does, leaves every one of them blocked.
+
+So the release workflow signs from the inside out, in three places, all skipped unless the Artifact Signing secrets below are set:
+
+1. In `build-sidecar`, before PyInstaller runs, `scripts/sign_windows_binaries.py` signs every unsigned PE file in the Python environment the sidecar is built from. Files that already carry their publisher's signature (the Python Software Foundation, Microsoft, Intel) keep it. This has to happen before packing, because the onefile archive seals its members and no later pass can reach them.
+2. Right after PyInstaller, the onefile `openconstructionerp-server.exe` itself is signed, and the existing sidecar checks then run the signed file.
+3. In `build-tauri`, the bundled converters are signed, and Tauri receives `bundle.windows.signCommand` through `--config`, so it signs the launcher, its copy of the sidecar, the NSIS plugins, the uninstaller and the installer.
+
+`scripts/setup_windows_signing.py` decides whether any of this runs. With no secrets it writes a notice and changes nothing. With some but not all it fails the run and names the missing ones. It signs only when the run releases a version tag, so a branch build is never signed.
+
+### Artifact Signing secrets
+
+Azure Artifact Signing (formerly Trusted Signing) issues short-lived certificates under a Microsoft root and costs 9.99 USD a month on the Basic tier (5,000 signatures a month, then 0.005 USD each). A release uses one signature per unsigned file it signs: every unsigned PE file in the sidecar's build environment plus the launcher, the sidecar, the converters, the NSIS plugins, the uninstaller and the installer, which is several hundred. The signing steps print the exact count, so read the first signed run before relying on the quota. Public Trust is open to organisations in the EU, and to individual developers only in the US and Canada, so the account has to be opened in the company's name. Identity validation takes from one to twenty business days. Reputation for SmartScreen still builds over time, as with any certificate, but Smart App Control accepts the signature from the first release.
+
+Create these six repository secrets under Settings, Secrets and variables, Actions:
+
+`ARTIFACT_SIGNING_ENDPOINT` is the regional endpoint of the account, for example `https://weu.codesigning.azure.net` for West Europe. It must match the region the account and the certificate profile were created in.
+
+`ARTIFACT_SIGNING_ACCOUNT` is the Artifact Signing account name.
+
+`ARTIFACT_SIGNING_PROFILE` is the certificate profile name (Public Trust).
+
+`ARTIFACT_SIGNING_TENANT_ID`, `ARTIFACT_SIGNING_CLIENT_ID` and `ARTIFACT_SIGNING_CLIENT_SECRET` identify an Entra ID app registration that holds the "Artifact Signing Certificate Profile Signer" role on the profile. The workflow passes them to the signing library as `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`, the names the Azure SDK reads, so the secret never appears on a command line.
+
+The timestamp authority is `http://timestamp.acs.microsoft.com`. Do not remove it: the certificates are valid for three days, and the timestamp is what keeps a signature valid after that.
+
+To check a release, install it on a test machine and run, in PowerShell, `Get-ChildItem "$env:LOCALAPPDATA\OpenConstructionERP\extract" -Recurse -Include *.exe,*.dll,*.pyd | Get-AuthenticodeSignature | Group-Object Status`. Every file should report `Valid`.
+
+The Key Vault path described in the rest of this document signs only the installers after they are published. It is kept for a certificate bought from a CA, but on its own it does not satisfy Smart App Control.
+
+When the Artifact Signing secrets are set, that job does not sign again. It downloads the published installer and runs `signtool verify /pa` on it, so `WINDOWS_SIGNING_REQUIRED` can be set to `true` with either path. Right after PyInstaller, the sidecar step also opens the onefile archive and verifies every PE member inside it, so a signature lost during packing fails the run instead of shipping.
+
 ## What is unsigned today, and how you can tell
 
 Every Windows installer this project has published is unsigned. There is no partial state and no historical exception.
@@ -20,7 +56,7 @@ You can also check a downloaded file directly. Right-click the `.exe`, choose Pr
 
 Windows SmartScreen inspects executables downloaded from the internet. An unsigned installer trips the "Windows protected your PC" dialog, which offers no obvious way forward: the user has to click "More info" and then "Run anyway", and most people do not. Some corporate environments block unsigned installers outright and the user never sees a choice at all.
 
-A signed installer carries a verifiable statement of who published it. With an Extended Validation certificate SmartScreen trusts the publisher immediately. With an Organization Validation certificate the publisher builds reputation over the first weeks of downloads and the warning fades. Either way the file stops being anonymous.
+A signed installer carries a verifiable statement of who published it. SmartScreen still warns on the first downloads, with an Organization Validation and an Extended Validation certificate alike, but it names the publisher, and the warning fades as the certificate builds reputation over the first weeks of downloads. Either way the file stops being anonymous.
 
 Signing does not change what the app does, what it installs, or where its data lives.
 
@@ -30,7 +66,7 @@ Signing does not change what the app does, what it installs, or where its data l
 
 Buy one from a public certificate authority. GlobalSign, DigiCert, Sectigo and SSL.com all issue them. Expect identity verification of the company, which takes days rather than minutes, so start early.
 
-Choose between Organization Validation and Extended Validation. EV costs more and grants SmartScreen reputation from the first signature. OV is cheaper and starts from zero reputation. For a product whose installers are downloaded by strangers, EV is worth the difference.
+Choose between Organization Validation and Extended Validation. For SmartScreen they now behave the same: both start without reputation and earn it through clean downloads over weeks. EV used to grant reputation from the first signature, and Microsoft's page "SmartScreen reputation for Windows app developers" (May 2026) says that no longer holds and that paying for EV only to avoid the warning is not justified. Take OV unless an enterprise buyer asks for EV.
 
 ### Why the certificate cannot simply be a file
 
@@ -100,7 +136,7 @@ One value in the workflow may need changing when the certificate arrives. The ti
 
 After the first release with the secrets in place, open the Desktop Release run for that tag. The job summary should read "Windows code signing: running against Azure Key Vault" followed by a line reporting how many installers were signed and verified. If it reads SKIPPED, the secrets are not being seen.
 
-Then download the published `.exe` and check it on a Windows machine. Right-click, Properties, Digital Signatures tab. The tab now exists, the signer name is the organisation on the certificate, and opening the entry shows a countersignature timestamp. Running the installer should no longer produce the "Windows protected your PC" dialog, immediately with an EV certificate, and after some download volume with an OV one.
+Then download the published `.exe` and check it on a Windows machine. Right-click, Properties, Digital Signatures tab. The tab now exists, the signer name is the organisation on the certificate, and opening the entry shows a countersignature timestamp. The first downloads may still show a SmartScreen prompt, now naming the organisation as publisher. It stops once the certificate has earned reputation through download volume, with an OV and an EV certificate alike.
 
 From a command line, `signtool verify /pa /v installer.exe` prints the chain and reports success. `signtool` ships with the Windows SDK.
 
@@ -119,6 +155,8 @@ AzureSignTool, the tool the workflow calls: https://github.com/vcsjones/AzureSig
 CA/Browser Forum baseline requirements for code signing, the source of the hardware key storage rule: https://cabforum.org/working-groups/code-signing/requirements/
 
 Microsoft, SmartScreen and application reputation: https://learn.microsoft.com/en-us/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/
+
+Microsoft, SmartScreen reputation for Windows app developers, the source for EV no longer bypassing SmartScreen and for Smart App Control checking every executable: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation
 
 Azure Key Vault certificates: https://learn.microsoft.com/en-us/azure/key-vault/certificates/
 

@@ -144,6 +144,8 @@ TEMPLATE = DemoTemplate(
                 ("04.6", "环氧自流平，地下车库 (Epoxy self-levelling floor, basement parking)", "m2", 10000, 95.00, {"gb50500": "011101006"}),
                 ("04.7", "石材踢脚线 80mm (Stone skirting 80 mm)", "m", 5200, 62.00, {"gb50500": "011105002"}),
                 ("04.8", "木地板，品牌店铺公区 (Timber flooring, branded retail common areas)", "m2", 3200, 320.00, {"gb50500": "011103001"}),
+                ("04.9", "地面伸缩缝不锈钢盖板 (Floor expansion joint stainless-steel cover)", "m", 320, 185.00, {"gb50500": "011105003"}),
+                ("04.10", "地下车库交通标线及地坪划线 (Basement parking lane markings and floor lines)", "m2", 1200, 18.00, {"gb50500": "011101007"}),
             ],
         ),
         # -- 05 墙柱面及天棚装饰工程 (Wall and ceiling finishes) -------------
@@ -162,6 +164,8 @@ TEMPLATE = DemoTemplate(
                 ("05.8", "软膜天花，特色区域 (Stretch ceiling, feature areas)", "m2", 1200, 220.00, {"gb50500": "011302001"}),
                 ("05.9", "外墙真石漆翻新 (External texture-stone paint renovation)", "m2", 9500, 65.00, {"gb50500": "011208001"}),
                 ("05.10", "外墙铝板幕墙局部更换 (Partial aluminium curtain-wall replacement)", "m2", 2800, 980.00, {"gb50500": "011209002"}),
+                ("05.11", "防火涂料钢结构 (Intumescent fireproof coating to steelwork)", "m2", 1650, 48.00, {"gb50500": "011207001"}),
+                ("05.12", "无障碍标识及导视系统 (Accessibility signage and wayfinding system)", "项", 1, 280000.00, {"gb50500": "011408001"}),
             ],
         ),
         # -- 06 门窗工程 (Doors and windows) ---------------------------------
@@ -223,6 +227,9 @@ TEMPLATE = DemoTemplate(
                 ("09.5", "气体灭火系统，配电间 (Gas suppression, electrical rooms)", "项", 1, 380000.00, {"gb50500": "030303001"}),
                 ("09.6", "卫生洁具 (Sanitary fittings)", "套", 320, 2200.00, {"gb50500": "030104001"}),
                 ("09.7", "雨水排水管道修复 (Rainwater drainage pipe repair)", "m", 850, 120.00, {"gb50500": "030102002"}),
+                ("09.8", "消防应急广播系统更新 (Fire emergency broadcast system renewal)", "项", 1, 420000.00, {"gb50500": "030302002"}),
+                ("09.9", "屋面雨水虹吸排水系统 (Roof siphonic rainwater drainage system)", "项", 1, 350000.00, {"gb50500": "030102003"}),
+                ("09.10", "消防水池清洗及防腐 (Fire water tank cleaning and anti-corrosion)", "项", 1, 180000.00, {"gb50500": "030302003"}),
             ],
         ),
         # -- 10 电梯工程 (Lifts) --------------------------------------------

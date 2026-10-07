@@ -9,7 +9,7 @@
  * landing pad for the new clients and any future additions.
  */
 
-import { ApiError, apiDelete, apiGet, apiPost } from '@/shared/lib/api';
+import { ApiError, apiDelete, apiGet, apiPost, type Page } from '@/shared/lib/api';
 
 /* ── Removing a purchase order ────────────────────────────────────────── */
 
@@ -268,6 +268,40 @@ export interface RetainageReconciliationReport {
     }
   >;
   po_rows: RetainageReportRow[];
+}
+
+/** Committed quantities per BOQ position through the cost spine (PO -> CostLine -> Position). */
+export interface CommittedByPosition {
+  boq_position_id: string;
+  committed_qty: string;
+  committed_value: string;
+}
+
+
+/**
+ * A page of the rollup, typed as the shared `Page` rather than a local copy of
+ * it. `total` counts the positions the project has commitments against, not
+ * the rows on this page, so a caller comparing the rollup with the bill can
+ * tell whether it has seen all of it, and `isTruncated` answers that the same
+ * way for every register instead of once per call site.
+ */
+export function getCommittedByPosition(
+  projectId: string,
+  options: { offset?: number; limit?: number } = {}
+): Promise<Page<CommittedByPosition>> {
+  const query = new URLSearchParams();
+  if (options.offset !== undefined) query.set('offset', String(options.offset));
+  if (options.limit !== undefined) query.set('limit', String(options.limit));
+  // The `?` is written into the route rather than folded into the suffix, and
+  // that is not a style choice. check_page_envelope_consumers reads the route
+  // out of the string literal and cuts it at the first `?`, so a suffix that
+  // carries its own `?` leaves the literal reading as a path segment and the
+  // endpoint cannot be guarded at all. `/v1/transmittals/?${qs}` is the same
+  // shape for the same reason. An empty query leaves a bare trailing `?`,
+  // which is a valid empty query string and is what makes the route visible.
+  return apiGet<Page<CommittedByPosition>>(
+    `/v1/procurement/project/${projectId}/committed-by-position/?${query.toString()}`,
+  );
 }
 
 export function getRetainageReconciliation(options: {

@@ -35,10 +35,14 @@ from app.dependencies import (
 from app.modules.contacts.models import Contact
 from app.modules.procurement.cost_spine import positions_for_cost_lines
 from app.modules.procurement.models import PurchaseOrder
+from app.modules.procurement.repository import PurchaseOrderRepository
 from app.modules.procurement.schemas import (
+    CommittedByPositionListResponse,
+    CommittedByPositionRow,
     GRCreate,
     GRListResponse,
     GRResponse,
+    InvoiceCheckRequest,
     POCancelRequest,
     POCreate,
     POInvoiceCreatedResponse,
@@ -105,10 +109,21 @@ def _po_to_response(
     po: PurchaseOrder,
     vendor_names: dict[str, str],
     line_positions: dict[str, uuid.UUID],
+    invoiced: dict[uuid.UUID, tuple[Decimal, int]] | None = None,
 ) -> POResponse:
     resp = POResponse.model_validate(po)
+    net, count = (invoiced or {}).get(po.id, (Decimal("0"), 0))
+    resp.invoiced_net = str(net)
+    resp.invoice_count = count
     if po.vendor_contact_id:
         resp.vendor_name = vendor_names.get(po.vendor_contact_id)
+    if not resp.vendor_name:
+        # An order drafted from an award to a bidder that is not in the
+        # directory has no vendor contact, only the company it was awarded to.
+        # Name that company rather than show an order with no vendor at all.
+        supplier = (po.metadata_ or {}).get("supplier_name") if isinstance(po.metadata_, dict) else None
+        if isinstance(supplier, str) and supplier.strip():
+            resp.vendor_name = supplier.strip()
     # Computed retainage values cannot come through ``model_validate`` (they
     # are ORM methods, not attributes), so stamp them here. Strings, in the
     # PO's own currency - never blended.
@@ -136,7 +151,8 @@ async def _po_response(session: AsyncSession, po: PurchaseOrder) -> POResponse:
     missing lookup. Keeping the pair in one place is what stops that.
     """
     vendor_names = await _fetch_vendor_names(session, [po.vendor_contact_id])
-    return _po_to_response(po, vendor_names, await _fetch_line_positions(session, [po]))
+    invoiced = await PurchaseOrderRepository(session).invoiced_net_by_po(po.project_id, [po])
+    return _po_to_response(po, vendor_names, await _fetch_line_positions(session, [po]), invoiced)
 
 
 # ── Purchase Orders (list / create) ─────────────────────────────────────────
@@ -168,8 +184,9 @@ async def list_purchase_orders(
     )
     vendor_names = await _fetch_vendor_names(service.session, (po.vendor_contact_id for po in items))
     line_positions = await _fetch_line_positions(service.session, items)
+    invoiced = await service.po_repo.invoiced_net_by_po(project_id, items)
     return POListResponse(
-        items=[_po_to_response(po, vendor_names, line_positions) for po in items],
+        items=[_po_to_response(po, vendor_names, line_positions, invoiced) for po in items],
         total=total,
         offset=offset,
         limit=limit,
@@ -502,7 +519,9 @@ async def create_invoice_from_po(
     # referential-integrity trigger takes a conflicting ``FOR KEY SHARE`` on the
     # parent row when one is inserted. An ``Invoice`` does NOT: finance is an
     # optional module and its invoice carries no foreign key to a PO, only a
-    # ``metadata_["po_id"]`` stamp written below. So nothing in the database
+    # plain ``purchase_order_id`` (plus the older ``metadata_["po_id"]`` stamp)
+    # written below. Linking an invoice from the finance side takes the same
+    # lock, in ``FinanceService._check_po_link``. So nothing in the database
     # makes this insert wait, and without the lock here a payable invoice can be
     # created against a PO that is being deleted in another transaction.
     #
@@ -607,6 +626,7 @@ async def create_invoice_from_po(
                 project_id=po.project_id,
                 contact_id=po.vendor_contact_id,
                 invoice_direction="payable",
+                purchase_order_id=po_id,
                 invoice_number=invoice_number,
                 invoice_date=po.issue_date or "",
                 due_date=None,
@@ -722,6 +742,35 @@ async def get_po_match_status(
     await verify_project_access(po.project_id, str(user_id), session)
     payload = await service.get_match_status(po_id)
     return POMatchStatusResponse.model_validate(payload)
+
+
+@router.post(
+    "/{po_id}/invoice-check/",
+    dependencies=[Depends(RequirePermission("procurement.read"))],
+)
+async def check_invoice_against_order(
+    po_id: uuid.UUID,
+    data: InvoiceCheckRequest,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    service: ProcurementService = Depends(_get_service),
+) -> dict[str, Any]:
+    """Check a supplier invoice against the order it bills (read-only, warnings only).
+
+    Runs the ``invoice_po_match`` rules: is the invoice's net within what is
+    still open on the order, and, when goods receipts exist, has what is
+    invoiced per order line been received. The invoice form calls this while
+    the invoice is being entered; nothing is saved and nothing is refused.
+    """
+    po = await service.get_po(po_id)
+    await verify_project_access(po.project_id, str(user_id), session)
+    return await service.check_invoice_against_po(
+        po_id,
+        invoice_net=data.amount_subtotal,
+        lines=[line.model_dump() for line in data.line_items],
+        exclude_invoice_id=data.invoice_id,
+        invoice_ref=data.invoice_number,
+    )
 
 
 @router.get(
@@ -904,6 +953,53 @@ async def list_po_retainage_releases(
     )
     return PORetainageReleaseListResponse(
         items=[PORetainageReleaseResponse.model_validate(r) for r in releases],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
+
+
+# ── Committed vs remaining by BOQ position ──────────────────────────────────
+
+
+@router.get(
+    "/project/{project_id}/committed-by-position/",
+    response_model=CommittedByPositionListResponse,
+    dependencies=[Depends(RequirePermission("procurement.read"))],
+)
+async def committed_by_position(
+    project_id: uuid.UUID,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    service: ProcurementService = Depends(_get_service),
+) -> CommittedByPositionListResponse:
+    """Return committed quantities and values per BOQ position.
+
+    Walks all non-cancelled PO items in the project, joins through the cost
+    spine to resolve each item's ``boq_position_id``, and returns one row per
+    position with ``committed_qty`` and ``committed_value``. The caller can
+    compare these against the BOQ estimated quantities to see what still
+    needs to be bought.
+
+    This is a page and not the whole set. One row appears for every bill
+    position the project has raised an order against, so the set grows every
+    time a buyer orders against a position nothing had been ordered against
+    before - it is a register keyed to the bill, not a fixed taxonomy whose
+    length a developer chooses. ``total`` counts the positions with
+    commitments rather than the rows on the page, so a reader working through
+    the bill knows there is more to come.
+
+    Received quantities are not on this rollup. An earlier version of this
+    docstring promised ``received_qty`` and ``received_value``; nothing ever
+    computed them, and no response has ever carried them. Goods receipts are
+    read through the goods-receipt endpoints.
+    """
+    await verify_project_access(project_id, str(user_id), session)
+    rows, total = await service.committed_by_position(project_id, limit=limit, offset=offset)
+    return CommittedByPositionListResponse(
+        items=[CommittedByPositionRow(**row) for row in rows],
         total=total,
         offset=offset,
         limit=limit,

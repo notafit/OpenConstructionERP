@@ -48,6 +48,18 @@ For requirements where DDC currently does **not** emit the equivalent (e.g., per
 - Some IDS validators in the wild are written against IfcOpenShell APIs. Mitigation: our IDS round-trip operates on canonical entities; a thin shim can adapt when needed.
 - Spec code samples need translation. Mitigation: RFC 34 §5 provides the canonical-format equivalent for every spec algorithm.
 
+## Amendment, 2026-09-20: the memory figure
+
+The consequence above says the server can run on a 2 GB VPS. That figure has
+been remeasured and the documented floor is now **3 GB on a dedicated server**;
+`docs/INSTALL_LINUX.md` carries the arithmetic. The line is left as written
+because it records what was believed when this decision was accepted, and an
+ADR that is edited to match today stops being evidence of anything.
+
+Nothing in the decision changes. The point being made was that avoiding
+IfcOpenShell keeps the server small, and it still does. The number attached to
+"small" was simply never measured at the time.
+
 ## Implementation note
 
 Where the spec mentions tools that internally use IfcOpenShell (e.g., `ifctester` for IDS validation), we either:

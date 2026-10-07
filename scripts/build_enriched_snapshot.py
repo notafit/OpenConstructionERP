@@ -365,7 +365,10 @@ def _ensure_target_collection(
 
     existing = {c.name for c in client.get_collections().collections}
     if target in existing:
-        print(f"  [ensure] target collection {target!r} already exists — resume mode", flush=True)
+        print(
+            f"  [ensure] target collection {target!r} already exists — resume mode",
+            flush=True,
+        )
         return
 
     # Extract source vector schema. qdrant_client surfaces named vectors
@@ -527,7 +530,10 @@ def build_enriched_snapshot(
                     "passage_text": passage,
                 }
             )
-            print(f"    {p.id} ({(p.payload or {}).get('rate_code')!r}): {passage}", flush=True)
+            print(
+                f"    {p.id} ({(p.payload or {}).get('rate_code')!r}): {passage}",
+                flush=True,
+            )
         return {
             "mode": "dry-run",
             "source": source,
@@ -540,7 +546,10 @@ def build_enriched_snapshot(
             client.delete_collection(target)
             print(f"  [recreate] dropped existing {target!r}", flush=True)
         except Exception as exc:
-            print(f"  [recreate] delete skipped (collection may not exist): {exc}", flush=True)
+            print(
+                f"  [recreate] delete skipped (collection may not exist): {exc}",
+                flush=True,
+            )
 
     _ensure_target_collection(client, source, target)
 
@@ -569,7 +578,10 @@ def build_enriched_snapshot(
         try:
             dense, sparse = _encode_batch(model, pending_passages)
         except Exception as exc:
-            print(f"  [encode] batch failed ({exc}); skipping {len(pending_passages)}", flush=True)
+            print(
+                f"  [encode] batch failed ({exc}); skipping {len(pending_passages)}",
+                flush=True,
+            )
             encode_failures += len(pending_passages)
             pending_passages.clear()
             pending_payloads.clear()
@@ -608,7 +620,10 @@ def build_enriched_snapshot(
         pending_payloads.clear()
         pending_ids.clear()
 
-    print(f"  [encode] starting scroll on {source!r} (batch={batch_size}, limit={limit})", flush=True)
+    print(
+        f"  [encode] starting scroll on {source!r} (batch={batch_size}, limit={limit})",
+        flush=True,
+    )
     while True:
         try:
             points, offset = client.scroll(

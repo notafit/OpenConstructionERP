@@ -1,6 +1,6 @@
 # OpenConstructionERP documentation
 
-OpenConstructionERP is an open, self-hosted platform for construction estimating and project delivery. It covers the whole job in one place: build a bill of quantities, take off quantities from drawings and models, price the work against national cost bases, turn a BIM model into cost and carbon, run a tender, plan and control the programme, and capture what happens on site. It is modular, so you enable only the parts you need, and 190 modules ship in the box.
+OpenConstructionERP is an open, self-hosted platform for construction estimating and project delivery. It covers the whole job in one place: build a bill of quantities, take off quantities from drawings and models, price the work against national cost bases, turn a BIM model into cost and carbon, run a tender, plan and control the programme, and capture what happens on site. It is modular, so you enable only the parts you need, and 193 modules ship in the box.
 
 This page is the map for the written documentation. Pick the path that matches why you are here, or scroll the sections below.
 
@@ -30,6 +30,10 @@ Price, check, deliver:
 - [Tendering and bid comparison](./user-guide/tendering-and-bids.md) - package the work, invite subcontractors, and compare bids side by side.
 - [Planning and cost control](./user-guide/planning-and-cost-control.md) - 4D schedule, 5D cost model, earned value, forecasts and cash flow.
 - [Field and site operations](./user-guide/field-and-site.md) - daily diary, inspections, safety, logistics and the record that holds up later.
+
+Work with the assistant:
+
+- [The AI assistant](./user-guide/ai-assistant.md) - describe a change in plain words, check the prepared card, apply it, and find every AI change again in the ledger and the audit trail.
 
 ## Cost data
 
@@ -70,6 +74,7 @@ For developers extending or building on OpenConstructionERP.
 - [Desktop install guide](./desktop/INSTALL.md) - set up on a workstation.
 - [Desktop remote server](./desktop/REMOTE_SERVER.md) - point desktop installations at one server your organisation already runs, instead of a separate database per desk.
 - [Email and SMTP setup](./email-setup.md) - configure outbound mail for password resets, tender invitations and notifications, pick the right port, and check whether it is working.
+- [Maps and basemaps](./maps.md) - where the street maps come from, how to self-host them, and how to give the 3D globe raster street tiles of your own.
 - [Backup freshness monitoring](./backup-monitoring.md) - point the staleness check at your database dumps, set the age threshold to match your backup schedule, and route the three exit codes so a backup that quietly stopped is heard.
 
 ## How the platform fits together

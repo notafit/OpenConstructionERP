@@ -5,8 +5,10 @@
 // /benchmarks, rendered by modules/cost-benchmark/BenchmarkModule.tsx).
 //
 // Concept-first, then a step-by-step of the four inputs the user fills.
-// Every key carries its inline English defaultValue; nothing here is added
-// to en.ts or any locale file. Key prefix: guide.benchmarks.*
+// Every key carries its inline English defaultValue; the keys are not in
+// en.ts, the inline defaults are the English source; their translations live
+// in the other locale files, so a changed default needs its translations
+// redone too. Key prefix: guide.benchmarks.*
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

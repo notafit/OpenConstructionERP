@@ -55,9 +55,15 @@ MANIFEST = PartnerPackManifest(
         "ontario_obc",
         "quebec_ccq",
     ],
+    # The documents above are reference text the engine never executes. This
+    # is the list that switches rules on. Canadian bills are coded against
+    # MasterFormat, the same set the canada-ca pack and the CA country row
+    # run, so a Quebec project created under this partner pack is checked the
+    # way any other Canadian project is.
+    validation_rule_sets=["masterformat"],
     default_modules=[],  # empty = show all (Shape A, no module hiding)
     hidden_modules=[],
-    demo_template_ids=["condo-toronto"],
+    demo_template_ids=["office-montreal"],
     branding=PartnerBranding(
         primary_color="#1C9BD7",  # batimatech cyan
         accent_color="#1B3A5B",  # batimatech navy
@@ -77,6 +83,6 @@ MANIFEST = PartnerPackManifest(
             "OBC (Ontario)",
             "CCQ / RBQ (Québec)",
         ],
-        "support_email": "contact@batimatech.ca",
+        "support_email": "info@datadrivenconstruction.io",
     },
 )

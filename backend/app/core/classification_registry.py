@@ -95,6 +95,15 @@ CLASSIFICATION_STANDARD_LABELS: Mapping[str, str] = MappingProxyType(
         "uniformat": "UniFormat",
         "gaeb": "GAEB",
         "tetelrend": "Tételrend",
+        "nlsfb": "NL/SfB",
+        # National codings a country pack writes on every line, which no
+        # country maps to by default. Labelled so a line coded against them
+        # can be named, like ONORM and GAEB above.
+        "bkp": "BKP",
+        "sfb_ccs": "SfB/CCS",
+        "ns3451": "NS 3451",
+        "bsab": "BSAB",
+        "knr": "KNR",
     }
 )
 
@@ -132,6 +141,10 @@ COUNTRY_TO_STANDARD: Mapping[str, str] = MappingProxyType(
         "CZ": "din276",
         "SK": "din276",
         "RO": "din276",
+        # Greece, with the Greek country pack: every line carries its ΝΕΤ
+        # article under its own key and is classified against DIN 276. It
+        # had no entry and fell through to the default with a warning.
+        "GR": "din276",
         "BG": "din276",
         "HR": "din276",
         "SI": "din276",
@@ -214,11 +227,16 @@ COUNTRY_TO_STANDARD: Mapping[str, str] = MappingProxyType(
         # This read din276 until 2026-08, which was the Central European
         # default rather than a statement about Hungary.
         "HU": "tetelrend",
+        # Ukraine. Its national cost rules replaced the shared Soviet-era
+        # norm lineage with the Настанова of наказ Мінрегіону №281 in 2021,
+        # and the Ukrainian country pack files every line under DIN 276 with
+        # the chapter of the summary estimate beside it, the way the Czech
+        # and Polish packs map onto DIN 276. It read gesn until 2026-09.
+        "UA": "din276",
         # GESN family. Mongolia is here because its construction norms
         # descend from the same lineage as the CIS states around it,
         # not because a catalogue declares it.
         "RU": "gesn",
-        "UA": "gesn",
         "BY": "gesn",
         "KZ": "gesn",
         "MN": "gesn",
@@ -308,6 +326,8 @@ REGION_ALIAS_TO_COUNTRY: Mapping[str, str] = MappingProxyType(
         "SOUTHAFRICA": "ZA",
         "AUSTRALIA": "AU",
         "NEWZEALAND": "NZ",
+        "CROATIA": "HR",
+        "IRELAND": "IE",
         # The picker's macro options, anchored the same way the macro
         # names above are: on a member country whose standard the whole
         # option can live with. Where the members agree the anchor is
@@ -340,6 +360,33 @@ REGION_ALIAS_TO_COUNTRY: Mapping[str, str] = MappingProxyType(
         # DIN 276 by fall-through is as good an answer as any other
         # guess. It is the one option that is meant to default, and the
         # gate names it as such.
+    }
+)
+
+# The alias tokens above that name a group of countries rather than one. Each
+# resolves to an anchor country so that a standard can be chosen, but the
+# anchor is a stand-in: an Austrian project filed under DACH is not German.
+# Callers that also hold a country column read it before the anchor.
+MACRO_REGION_TOKENS: frozenset[str] = frozenset(
+    {
+        "DACH",
+        "EU",
+        "BENELUX",
+        "NORDIC",
+        "SCANDINAVIA",
+        "LATAM",
+        "GULF",
+        "GCC",
+        "MIDDLE_EAST",
+        "ASIA_PAC",
+        "NORDICS",
+        "LATINAMERICA",
+        "MIDDLEEAST",
+        "GULFSTATES",
+        "NORTHAFRICA",
+        "EASTAFRICA",
+        "WESTAFRICA",
+        "SOUTHEASTASIA",
     }
 )
 
@@ -464,6 +511,19 @@ def normalise_region(raw: str | None) -> str | None:
             return None
         token = head
     return None
+
+
+def is_macro_region(raw: str | None) -> bool:
+    """Whether a region string names a group of countries rather than one.
+
+    Args:
+        raw: Region as stored on the project.
+
+    Returns:
+        True for ``DACH``, ``LATAM``, ``Middle East`` and the other macro
+        labels in :data:`MACRO_REGION_TOKENS`.
+    """
+    return _canonical_token(raw) in MACRO_REGION_TOKENS
 
 
 def standard_for_country(country: str | None) -> str | None:

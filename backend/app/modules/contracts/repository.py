@@ -8,8 +8,9 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import bindparam, func, select, update
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import func, select, update
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm.util import identity_key
@@ -32,8 +33,14 @@ from app.modules.contracts.models import (
     LDClause,
     ProgressClaim,
     ProgressClaimLine,
+    RetentionRelease,
     RetentionSchedule,
 )
+from app.modules.contracts.periods import claim_order_key, claims_before
+
+#: Claim metadata key frozen when a claim leaves draft: the ids of the claims
+#: it counted as previous. See :meth:`ProgressClaimRepository.prior_claims`.
+PRIOR_CLAIM_IDS_KEY = "prior_claim_ids"
 
 
 class _CRUDBase:
@@ -196,6 +203,31 @@ class RetentionScheduleRepository(_CRUDBase):
         return list(result.scalars().all())
 
 
+class RetentionReleaseRepository(_CRUDBase):
+    model = RetentionRelease
+
+    async def list_for_contract(self, contract_id: uuid.UUID) -> list[RetentionRelease]:
+        """Every release on a contract, void ones included, oldest first."""
+        result = await self.session.execute(
+            select(RetentionRelease)
+            .where(RetentionRelease.contract_id == contract_id)
+            .order_by(RetentionRelease.created_at, RetentionRelease.id)
+        )
+        return list(result.scalars().all())
+
+    async def billed_on_claims(self, claim_ids: list[uuid.UUID]) -> list[RetentionRelease]:
+        """The releases billed on any of ``claim_ids``."""
+        if not claim_ids:
+            return []
+        result = await self.session.execute(
+            select(RetentionRelease).where(
+                RetentionRelease.progress_claim_id.in_(claim_ids),
+                RetentionRelease.status == "billed",
+            )
+        )
+        return list(result.scalars().all())
+
+
 class FeeStructureRepository(_CRUDBase):
     model = FeeStructure
 
@@ -260,6 +292,94 @@ class ProgressClaimRepository(_CRUDBase):
         )
         return list(items), total
 
+    async def ordered_for_contract(self, contract_id: uuid.UUID) -> list[ProgressClaim]:
+        """Every claim on a contract in billing order, rejected ones included.
+
+        Sorted in Python by :func:`~app.modules.contracts.periods.claim_order_key`
+        rather than in SQL: a contract carries a few dozen claims at most, and
+        one key function shared by every caller is worth more than an ORDER BY
+        that would have to spell "undated last" per dialect. Callers that must
+        skip rejected claims do so themselves, because "previous" for the
+        period rules and "prior" for the money both skip them, while a list for
+        display does not.
+        """
+        result = await self.session.execute(select(ProgressClaim).where(ProgressClaim.contract_id == contract_id))
+        return sorted(result.scalars().all(), key=claim_order_key)
+
+    async def open_claims_for_milestones(self, milestone_ids: list[uuid.UUID]) -> dict[uuid.UUID, ProgressClaim]:
+        """The claim billing each instalment, rejected claims left out.
+
+        A rejected claim billed nothing, so the instalment is still owed and a
+        new claim may be raised for it. Where more than one claim names the
+        same instalment, the earliest created one answers.
+        """
+        if not milestone_ids:
+            return {}
+        # The claim and the instalment have to be on the same contract: a
+        # claim's milestone_id is a plain UUID, and one naming another
+        # contract's instalment bills nothing here.
+        stmt = (
+            select(ProgressClaim)
+            .join(
+                ContractMilestone,
+                (ContractMilestone.id == ProgressClaim.milestone_id)
+                & (ContractMilestone.contract_id == ProgressClaim.contract_id),
+            )
+            .where(ProgressClaim.milestone_id.in_(milestone_ids), ProgressClaim.status != "rejected")
+            .order_by(ProgressClaim.created_at)
+        )
+        found: dict[uuid.UUID, ProgressClaim] = {}
+        for claim in (await self.session.execute(stmt)).scalars().all():
+            if claim.milestone_id is not None:
+                found.setdefault(claim.milestone_id, claim)
+        return found
+
+    async def prior_claims(self, contract_id: uuid.UUID, *, before_claim_id: uuid.UUID | None) -> list[ProgressClaim]:
+        """The claims a payment application counts as previously certified.
+
+        Strictly before ``before_claim_id`` in billing order, rejected ones
+        left out: a rejected claim certified nothing. "Every other claim on the
+        contract" is the reading this replaces, and it counted a later claim as
+        previous whenever an earlier one was re-rendered or regenerated.
+        ``None`` (a claim not stored yet) sees every claim on the contract.
+
+        Draft claims are left out too, for a certificate still being built: a
+        draft has not left the contractor, so it certified nothing either, and
+        counting it put work nobody had applied for into "previous
+        certificates". A claim already issued is not restated, though. Its
+        application is drawn again from this method every time it is printed,
+        so when it leaves draft the claims it counted are frozen onto it under
+        :data:`PRIOR_CLAIM_IDS_KEY`, and from then on only those count, less
+        any rejected since. A claim that left draft before the freeze existed
+        keeps the rule it was issued under, drafts counted.
+        """
+        ordered = await self.ordered_for_contract(contract_id)
+        earlier = claims_before(ordered, before_claim_id) if before_claim_id is not None else ordered
+        earlier = [claim for claim in earlier if claim.status != "rejected"]
+        target = next((claim for claim in ordered if claim.id == before_claim_id), None)
+        if target is None or target.status == "draft":
+            return [claim for claim in earlier if claim.status != "draft"]
+        frozen = (target.metadata_ or {}).get(PRIOR_CLAIM_IDS_KEY)
+        if isinstance(frozen, list):
+            counted = {str(claim_id) for claim_id in frozen}
+            return [claim for claim in earlier if str(claim.id) in counted]
+        return earlier
+
+    async def claim_numbers_past_draft(self, contract_id: uuid.UUID) -> list[str]:
+        """The numbers of the claims on a contract that have left draft, sorted.
+
+        Read by the contract delete, which cascades to every claim. A claim
+        billed without a schedule of values (T&M, cost-plus) has no lines, so
+        the billed-line check cannot see it; this asks the claims directly.
+        """
+        result = await self.session.execute(
+            select(ProgressClaim.claim_number).where(
+                ProgressClaim.contract_id == contract_id,
+                ProgressClaim.status != "draft",
+            )
+        )
+        return sorted(number or "" for number in result.scalars().all())
+
     async def next_claim_number(self, contract_id: uuid.UUID) -> str:
         result = await self.session.execute(
             select(func.count()).select_from(ProgressClaim).where(ProgressClaim.contract_id == contract_id)
@@ -321,6 +441,85 @@ class ProgressClaimLineRepository(_CRUDBase):
         await self.session.flush()
         return lines
 
+    async def claims_billing_lines(self, contract_line_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+        """Which of these schedule of values lines a claim has billed on, and which claims.
+
+        Returns each billed line's id mapped to the numbers of the claims whose
+        lines point at it, sorted; a line no claim line references is absent.
+        This is the single definition of "billed" for a schedule line: the
+        service refuses to rewrite or delete a line that appears here, and the
+        line listing reports the same set, so the screen and the server cannot
+        disagree about which lines are locked.
+
+        Every claim status counts, a draft or a rejected one included. The
+        foreign key from the claim line cascades, so deleting the schedule line
+        takes the claim's lines with it whatever state the claim is in.
+        """
+        if not contract_line_ids:
+            return {}
+        stmt = (
+            select(ProgressClaimLine.contract_line_id, ProgressClaim.claim_number)
+            .join(ProgressClaim, ProgressClaim.id == ProgressClaimLine.progress_claim_id)
+            .where(ProgressClaimLine.contract_line_id.in_(set(contract_line_ids)))
+            .distinct()
+        )
+        billed: dict[uuid.UUID, list[str]] = {}
+        for line_id, claim_number in (await self.session.execute(stmt)).all():
+            billed.setdefault(line_id, []).append(claim_number or "")
+        return {line_id: sorted(numbers) for line_id, numbers in billed.items()}
+
+    async def update_fields_many(self, fields_by_id: dict[uuid.UUID, dict[str, Any]]) -> None:
+        """Write the same columns on many claim lines in one statement.
+
+        :meth:`update_fields` for a batch. ``fields_by_id`` maps a line's id
+        to the values to write on it, and every entry names the same columns.
+        One UPDATE goes out with a parameter set per line, where a loop over
+        :meth:`update_fields` made a round trip per line, which on a long
+        schedule of values was most of the time a claim took to work out.
+
+        The values written are copied onto whichever of those lines the
+        session already holds, as :meth:`update_fields` does and for the same
+        reason: in an async session a stale attribute is not reloaded on
+        access, and the certificate reads column I straight off these
+        instances. Plain values only, since a SQL expression would leave the
+        in-memory copy unknown.
+
+        Raises:
+            ValueError: the entries name different columns, or a value is a
+                SQL expression.
+        """
+        if not fields_by_id:
+            return
+        names = sorted(next(iter(fields_by_id.values())))
+        for values in fields_by_id.values():
+            if sorted(values) != names:
+                raise ValueError("update_fields_many needs every line to name the same columns")
+            if any(isinstance(value, ClauseElement) for value in values.values()):
+                raise ValueError("update_fields_many writes plain values, not SQL expressions")
+        # Anything the unit of work still holds for these rows goes out first,
+        # so a later flush cannot write an older value over this one.
+        await self.session.flush()
+        table = self.model.__table__
+        columns = sa_inspect(self.model).columns
+        stmt = (
+            update(table)
+            .where(table.c.id == bindparam("row_id"))
+            .values({columns[name]: bindparam(f"new_{name}") for name in names})
+        )
+        await self.session.execute(
+            stmt,
+            [
+                {"row_id": row_id, **{f"new_{name}": values[name] for name in names}}
+                for row_id, values in fields_by_id.items()
+            ],
+        )
+        for row_id, values in fields_by_id.items():
+            instance = self.session.identity_map.get(identity_key(self.model, row_id))
+            if instance is None:
+                continue
+            for name, value in values.items():
+                set_committed_value(instance, name, value)
+
     async def delete_for_claim(self, claim_id: uuid.UUID) -> int:
         """Delete every claim line belonging to ``claim_id``.
 
@@ -337,53 +536,96 @@ class ProgressClaimLineRepository(_CRUDBase):
         await self.session.flush()
         return int(result.rowcount or 0)
 
+    async def delete_for_claim_lines(self, claim_id: uuid.UUID, contract_line_ids: set[uuid.UUID]) -> int:
+        """Delete this claim's lines on the given SoV lines, and only those.
+
+        Committing a populate preview replaces the rows the person ticked. A
+        line on any other SoV line, typed in by hand or left over from an
+        earlier commit, is not part of that decision and stays.
+        """
+        if not contract_line_ids:
+            return 0
+        stmt = sa_delete(ProgressClaimLine).where(
+            ProgressClaimLine.progress_claim_id == claim_id,
+            ProgressClaimLine.contract_line_id.in_(contract_line_ids),
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return int(result.rowcount or 0)
+
     async def prior_period_value_by_line(
         self,
         contract_id: uuid.UUID,
         *,
-        exclude_claim_id: uuid.UUID | None = None,
+        before_claim_id: uuid.UUID | None,
     ) -> dict[uuid.UUID, Decimal]:
         """Sum of ``period_completed_value`` per contract line across prior claims.
 
-        Used to maintain the running ``cumulative_completed_value`` on each new
-        claim line: the cumulative for a line is every recognised period value
-        billed against it so far (this contract's non-rejected claims) plus the
-        current period. Rejected claims are excluded because they were never
-        recognised as work-in-place; the claim currently being (re)generated is
-        excluded via ``exclude_claim_id`` so a re-run does not double-count its
-        own previous lines. Returns ``{contract_line_id: Decimal}``.
+        This is G703 column D, work completed from previous applications, and
+        the base every running ``cumulative_completed_value`` is built on.
+        "Prior" is :meth:`ProgressClaimRepository.prior_claims`: the claims
+        strictly before ``before_claim_id`` in billing order, rejected and
+        draft ones left out. It used to be every claim except the one being
+        written, which counted a later claim as previous whenever an earlier
+        one was regenerated or re-rendered. ``None`` (a claim not stored yet)
+        counts every claim past draft. Returns ``{contract_line_id: Decimal}``.
         """
+        prior = await ProgressClaimRepository(self.session).prior_claims(contract_id, before_claim_id=before_claim_id)
+        if not prior:
+            return {}
         stmt = (
             select(
                 ProgressClaimLine.contract_line_id,
                 func.coalesce(func.sum(ProgressClaimLine.period_completed_value), 0),
             )
-            .join(
-                ProgressClaim,
-                ProgressClaim.id == ProgressClaimLine.progress_claim_id,
-            )
-            .where(
-                ProgressClaim.contract_id == contract_id,
-                ProgressClaim.status != "rejected",
-            )
+            .where(ProgressClaimLine.progress_claim_id.in_([claim.id for claim in prior]))
             .group_by(ProgressClaimLine.contract_line_id)
         )
-        if exclude_claim_id is not None:
-            stmt = stmt.where(ProgressClaimLine.progress_claim_id != exclude_claim_id)
         result = await self.session.execute(stmt)
         return {row[0]: Decimal(str(row[1] or 0)) for row in result.all()}
 
-    async def lines_with_status_for_contract(
+    async def period_value_by_claim(self, contract_id: uuid.UUID) -> dict[uuid.UUID, Decimal]:
+        """What each claim's own lines bill this period, summed per claim, for every claim on a contract.
+
+        One aggregate rather than every claim line hydrated to add up a
+        handful of numbers. A claim with no lines is absent, which reads as
+        zero. Returns ``{progress_claim_id: Decimal}``.
+        """
+        stmt = (
+            select(
+                ProgressClaimLine.progress_claim_id,
+                func.coalesce(func.sum(ProgressClaimLine.period_completed_value), 0),
+            )
+            .join(ProgressClaim, ProgressClaim.id == ProgressClaimLine.progress_claim_id)
+            .where(ProgressClaim.contract_id == contract_id)
+            .group_by(ProgressClaimLine.progress_claim_id)
+        )
+        result = await self.session.execute(stmt)
+        return {row[0]: Decimal(str(row[1] or 0)) for row in result.all()}
+
+    async def lines_with_claim_for_contract(
         self,
         contract_id: uuid.UUID,
-    ) -> list[tuple[ProgressClaimLine, str]]:
-        """All claim lines for a contract + their parent claim status.
+    ) -> list[tuple[ProgressClaimLine, ProgressClaim]]:
+        """All claim lines for a contract, each paired with its claim.
 
         Single JOIN query - replaces an N+1 (one claim-line query per
         progress claim) in the SoV-status rollup.
+
+        It used to return the claim's status and nothing else, which was all
+        the rollup needed while it only had to separate billed from paid. The
+        rollup now also has to know which claim is the latest in billing
+        order, and billing order is :func:`~app.modules.contracts.periods.claim_order_key`
+        over three of the claim's own columns. Returning the claim hands the
+        caller the whole ordering question instead of another column, and
+        saves tagging derived values onto the line rows on the way out.
+
+        No ORDER BY: the caller sorts by the shared key rather than by
+        whatever this statement happened to return, for the reason given on
+        :meth:`ProgressClaimRepository.ordered_for_contract`.
         """
         stmt = (
-            select(ProgressClaimLine, ProgressClaim.status)
+            select(ProgressClaimLine, ProgressClaim)
             .join(
                 ProgressClaim,
                 ProgressClaim.id == ProgressClaimLine.progress_claim_id,
@@ -511,6 +753,38 @@ class ContractMilestoneRepository(_CRUDBase):
             .where(ContractMilestone.contract_id == contract_id)
             .order_by(ContractMilestone.planned_date, ContractMilestone.code)
         )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_linked(
+        self,
+        *,
+        activity_id: uuid.UUID | None = None,
+        schedule_id: uuid.UUID | None = None,
+        statuses: tuple[str, ...] | None = None,
+        triggers: tuple[str, ...] | None = None,
+        contract_statuses: tuple[str, ...] | None = None,
+    ) -> list[ContractMilestone]:
+        """Instalments that follow one schedule activity, or any activity of one schedule.
+
+        ``contract_statuses`` filters on the contract the instalment belongs
+        to, so a draft or closed contract is never moved by the schedule.
+        """
+        stmt = select(ContractMilestone)
+        if activity_id is not None:
+            stmt = stmt.where(ContractMilestone.activity_id == activity_id)
+        if schedule_id is not None:
+            stmt = stmt.where(ContractMilestone.schedule_id == schedule_id)
+        if activity_id is None and schedule_id is None:
+            return []
+        if statuses is not None:
+            stmt = stmt.where(ContractMilestone.status.in_(statuses))
+        if triggers is not None:
+            stmt = stmt.where(ContractMilestone.trigger.in_(triggers))
+        if contract_statuses is not None:
+            stmt = stmt.join(Contract, Contract.id == ContractMilestone.contract_id).where(
+                Contract.status.in_(contract_statuses)
+            )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 

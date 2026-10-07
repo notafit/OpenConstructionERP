@@ -58,8 +58,12 @@ def _has_index(inspector: sa.engine.reflection.Inspector, table: str, index: str
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
-    is_sqlite = bind.dialect.name == "sqlite"
-    guid_type = sa.String(36) if is_sqlite else sa.dialects.postgresql.UUID(as_uuid=True)
+    # ``String(36)`` on PostgreSQL too. ``GUID`` in ``app.database`` is a
+    # ``TypeDecorator`` over ``String(36)`` with no ``load_dialect_impl``, so
+    # ``create_all`` builds every identity column as ``character varying(36)``
+    # and a native uuid here cannot carry a foreign key to one: PostgreSQL
+    # answers ``DatatypeMismatch`` as soon as the chain is walked, not stamped.
+    guid_type = sa.String(36)
 
     if not _has_table(inspector, _TABLE):
         # Fresh install where create_all has not yet built the table - the

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Arbeidet med dette tiltaket startet den {start}, før søknaden ble sendt inn den {filed} - de fleste programmer gir ingen støtte i det hele tatt når tiltaket først er startet",
+      "unevidenced": "Arbeidet startet tidlig, den {start}, og ifølge saksdokumentene har myndigheten tillatt det, men ingen skriftlig tillatelse er oppgitt",
+      "evidence": "Registrer referansen til den skriftlige tillatelsen til tidlig oppstart, slik at dokumentasjonen står seg ved kontroll",
+      "suggestion": "Sjekk programvilkårene før du bruker mer penger. Er den tidlige oppstarten tillatt skriftlig, registrerer du tillatelsen; er den ikke det, spør myndigheten før søknaden går videre"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Utbetaling {draw} omfatter kostnader fra før {period_start}, dagen tilsagnsperioden starter",
+      "after": "Utbetaling {draw} omfatter kostnader fra etter {period_end}, dagen tilsagnsperioden slutter",
+      "spans": "Utbetaling {draw} går utenfor tilsagnsperioden i begge ender, {period_start} til {period_end}",
+      "suggestion": "Flytt kostnadene utenfor tilsagnsperioden til en egen utbetaling og ta dem opp med myndigheten, i stedet for å la én anmodning omfatte begge deler"
+    },
+    "own_share_is_covered": {
+      "fail": "Programmet krever en egenandel på {rate} prosent, det vil si {required}, men søknaden oppgir {recorded}",
+      "suggestion": "Oppgi hvor resten av egenandelen kommer fra før du sender inn, fordi programmet beregner den av grunnlaget for støtteberettigede kostnader og ikke av prosjektets totalkostnad"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "De {count} søknadene i dette prosjektet gir til sammen en støtteintensitet på {intensity} prosent av de støtteberettigede kostnadene, over taket på {cap} prosent som det strengeste av programmene deres oppgir",
+      "suggestion": "Offentlig støtte kumuleres på tvers av programmer og forvaltningsnivåer. Reduser beløpet i én søknad, eller undersøk om tiltakene kan skilles slik at hvert tiltak bærer sine egne kostnader"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Tilsagnsperioden ble avsluttet den {period_end}, og ingen sluttrapport er påbegynt",
+      "late": "Sluttrapporten hadde frist den {due} og ble sendt inn den {submitted}",
+      "overdue": "Sluttrapporten hadde frist den {due} og er ikke sendt inn",
+      "suggestion": "Send inn det som finnes, i stedet for å vente til alt er komplett. De fleste myndigheter forlenger en frist på forespørsel, men ingen forlenger en frist som allerede er passert"
+    },
+    "errors": {
+      "application_not_found": "Søknaden ble ikke funnet",
+      "programme_code_taken": "Det finnes allerede et program med denne koden i dette landet",
+      "programme_not_found": "Programmet ble ikke funnet",
+      "programme_has_applications": "Dette programmet har søknader og kan ikke slettes. Avslutt det i stedet.",
+      "application_code_taken": "Det finnes allerede en søknad med denne koden i dette prosjektet",
+      "approved_application_not_deletable": "En innvilget søknad kan ikke slettes. Sett statusen til trukket eller avsluttet i stedet.",
+      "approval_needs_period_end": "Et tilsagn må ha en sluttdato for tilsagnsperioden, fordi alle senere frister regnes fra den",
+      "draw_needs_approval": "Det kan bare utbetales midler på en innvilget søknad",
+      "draw_not_found": "Utbetalingen ble ikke funnet",
+      "paid_draw_not_deletable": "En utbetaling som allerede er betalt, kan ikke slettes",
+      "proof_not_found": "Bruksrapporten ble ikke funnet",
+      "obligation_not_found": "Forpliktelsen ble ikke funnet",
+      "eligible_exceeds_amount": "Det støtteberettigede beløpet kan ikke være større enn det samlede beløpet",
+      "allocation_not_found": "Kostnadsfordelingen ble ikke funnet"
+    }
+  }
+}

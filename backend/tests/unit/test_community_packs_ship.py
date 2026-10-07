@@ -31,6 +31,7 @@ discovery module itself, so nothing here can be skipped by a database marker.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import subprocess
 import tomllib
 from functools import lru_cache
@@ -251,6 +252,189 @@ def test_the_desktop_bundle_ships_the_same_packs_as_the_wheel() -> None:
         f"bundle: {sorted(wheel - desktop) or 'none'}. In the desktop bundle and not the wheel: "
         f"{sorted(desktop - wheel) or 'none'}. backend/pyproject.toml is the decision; bring "
         f"_COMMUNITY_PACKS in desktop/pyinstaller.spec back in line with it, or change both."
+    )
+
+
+# ── The third mirror: the Docker build context ──────────────────────────────
+#
+# A pack reaches a user by three routes, not two. The wheel's force-include map
+# and the PyInstaller spec are held against each other above. The third is
+# ``deploy/docker/Dockerfile.unified``, which names every pack in a COPY line of
+# its own, and nothing in this file had ever looked at it.
+#
+# It fails differently from the other two, and harder. A COPY naming a path the
+# build context does not carry aborts ``docker build`` outright, so a pack added
+# to the map and not here does not ship a thinner image, it ships no image at
+# all. That is not hypothetical: v16.2.0 published its PyPI package and its
+# release page and produced no container, for precisely this reason.
+#
+# The directives are parsed rather than searched for, and the parser is the one
+# scripts/check_docker_force_include_context.py already runs in the Repo hygiene
+# lane rather than a second copy of it. A second parser is a second thing to
+# drift, and that one already knows the distinctions that decide the answer.
+#
+# What is new here, and the reason these tests are not that script repeated:
+# the script holds the Dockerfile against the force-include MAP. These hold it
+# against the licence signals in the TREE, and against the other two mirrors. If
+# the map and the Dockerfile ever move together, set equality between them stays
+# green and only the tree can say that a pack is shipped or withheld wrongly.
+
+_DOCKERFILE = _REPO_ROOT / "deploy" / "docker" / "Dockerfile.unified"
+_DOCKER_CONTEXT_GATE = _REPO_ROOT / "scripts" / "check_docker_force_include_context.py"
+
+
+@lru_cache(maxsize=1)
+def _docker_copy_parser():
+    """Load the Dockerfile COPY reader the Repo hygiene lane already uses.
+
+    Imported by path rather than reimplemented. It already makes the three
+    distinctions that decide which paths a build really carries: only the shared
+    ``backend-base`` stage counts, a ``COPY --from=`` reads another stage rather
+    than the build context, and a directive continued over several physical
+    lines is one instruction.
+
+    Raises:
+        AssertionError: If the script has moved, which would otherwise surface
+            as an import error rather than as the missing instrument it is.
+    """
+    assert _DOCKER_CONTEXT_GATE.is_file(), (
+        f"{_DOCKER_CONTEXT_GATE} is gone. The Dockerfile's COPY directives are read with its "
+        f"parser, so the comparisons below have no instrument and would sweep clean over nothing."
+    )
+    spec = importlib.util.spec_from_file_location("_docker_context_gate", _DOCKER_CONTEXT_GATE)
+    assert spec is not None and spec.loader is not None, f"cannot load {_DOCKER_CONTEXT_GATE}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _dockerfile_copied_slugs() -> set[str]:
+    """Pack slugs the Docker build context carries, read from the COPY directives.
+
+    Returns:
+        Every slug copied by the shared base stage.
+
+    Raises:
+        AssertionError: If a copy from the packs tree is not one pack's ``src``.
+            A whole-tree or glob copy is the shape the Dockerfile's own comment
+            forbids, because it bakes the held-back packs into a public image
+            layer permanently, and it would read here as no packs at all.
+    """
+    slugs = set()
+    for path in _docker_copy_parser().copied_context_paths(str(_DOCKERFILE)):
+        parts = Path(path).as_posix().split("/")
+        if parts[0] != "packs":
+            continue
+        assert len(parts) == 3 and parts[2] == "src", (
+            f"{_DOCKERFILE} copies {path!r} out of the packs tree, and this reader understands only "
+            f"'packs/<slug>/src'. Copying the tree or a glob would ship whichever pack lands in it "
+            f"next, and would be counted here as no packs at all. Extend the reader rather than "
+            f"letting the shape go unchecked."
+        )
+        slugs.add(parts[1])
+    return slugs
+
+
+def test_the_docker_reader_sees_the_copy_directives_it_is_about_to_check() -> None:
+    """Guard the instrument before the three comparisons that lean on it.
+
+    Each of them is a set difference, and an empty set agrees with everything. A
+    parser that stopped matching, or a stage that was renamed, would report the
+    Dockerfile perfectly in line with both other mirrors.
+    """
+    slugs = _dockerfile_copied_slugs()
+    print(f"\n{len(slugs)} pack slugs copied into the Docker build context by {_DOCKERFILE.name}")
+    assert len(slugs) >= 10, (
+        f"only {len(slugs)} pack slugs were read out of {_DOCKERFILE}: {sorted(slugs)}. The file "
+        f"names far more than that, so the reader is no longer looking at what it thinks it is."
+    )
+
+
+def test_every_shippable_pack_is_copied_into_the_docker_image() -> None:
+    """The direction that stops the image building at all."""
+    missing = _shippable_slugs() - _dockerfile_copied_slugs()
+    assert not missing, (
+        f"{len(missing)} pack(s) carry no disqualifying signal and are not copied into the Docker "
+        f"build context: {sorted(missing)}. Every one of them is force-included by the wheel, which "
+        f"pip builds inside the image, so this does not ship an image missing those packs - "
+        f"hatchling aborts with 'Forced include not found' and the build produces no image. Add "
+        f"'COPY packs/<slug>/src/ packs/<slug>/src/' to the backend-base stage of "
+        f"deploy/docker/Dockerfile.unified."
+    )
+
+
+def test_every_pack_the_dockerfile_copies_exists_on_disk() -> None:
+    """A COPY naming a path that is not there is a broken build, not a licence error.
+
+    This would also surface as a surplus below, because the shippable set is
+    computed from the tree and a directory that is not in it cannot join. It
+    gets its own assertion because that message would misdiagnose it, sending
+    the reader to look for a DEPRECATED.txt or a partner_url inside a pack that
+    does not exist, and because the consequence differs in kind: a withheld pack
+    ships something it should not, an absent path ships nothing at all.
+
+    Unlike the wheel and the spec, this failure mode is specific to a
+    Dockerfile. COPY has no tolerant glob to fall back on; the daemon refuses
+    the instruction and the build stops there.
+    """
+    absent = sorted(_dockerfile_copied_slugs() - {d.name for d in _pack_dirs()})
+    assert not absent, (
+        f"{len(absent)} slug(s) are copied by deploy/docker/Dockerfile.unified and hold no pack in "
+        f"the tree: {absent}. COPY refuses a source the build context does not carry, so this stops "
+        f"'docker build' on that line and no image is produced. Either the pack was removed and the "
+        f"COPY line outlived it, or the slug is misspelt."
+    )
+
+
+def test_no_withheld_pack_is_copied_into_the_docker_image() -> None:
+    """The other direction, which a public registry makes permanent.
+
+    Restricted to slugs that really hold a pack, so that a line naming nothing
+    is reported by the test above and by this one, each in its own terms.
+
+    Worse here than in the wheel. Deleting a file in a later layer does not
+    remove it from the layer that added it, and these images are published to a
+    public registry, so a pack copied in once stays fetchable from that layer
+    for as long as the tag exists. Nothing fails: the image builds, passes its
+    healthcheck and ships.
+    """
+    surplus = sorted((_dockerfile_copied_slugs() & {d.name for d in _pack_dirs()}) - _shippable_slugs())
+    assert not surplus, (
+        f"{len(surplus)} pack(s) are copied into the Docker build context while carrying a signal "
+        f"that says they should not be: {surplus}. Either the pack is deprecated, or it declares a "
+        f"partner_url and so names an outside rights holder. Remove the COPY line, or change the "
+        f"signal in the pack if the decision has genuinely changed."
+    )
+
+
+def test_the_three_mirrors_of_the_pack_list_agree() -> None:
+    """One decision, three hand-written copies of it, in three languages.
+
+    A hatch force-include map, a Python tuple and a set of COPY directives
+    cannot read each other, so each is maintained by hand and any pair can drift
+    apart. Until this test two of them were compared and the third was not, and
+    a pack added to the map and the spec but not the Dockerfile passed every
+    gate in this file while breaking the container build.
+
+    The pairs are reported separately rather than as one symmetric difference,
+    because which file is behind is the whole of what the reader needs.
+    """
+    wheel = _force_included_slugs()
+    desktop = _desktop_bundled_slugs()
+    docker = _dockerfile_copied_slugs()
+    print(f"\nwheel {len(wheel)}, desktop {len(desktop)}, docker {len(docker)}")
+    assert wheel and desktop and docker, (
+        f"one of the three readers returned nothing at all - wheel {len(wheel)}, desktop "
+        f"{len(desktop)}, docker {len(docker)}. That is an instrument failing rather than a mirror "
+        f"shipping no packs, and it would make the comparison below read as clean."
+    )
+    assert wheel == desktop == docker, (
+        f"the three mirrors of the pack list disagree. In the wheel and not the Docker image: "
+        f"{sorted(wheel - docker) or 'none'}. In the Docker image and not the wheel: "
+        f"{sorted(docker - wheel) or 'none'}. In the wheel and not the desktop bundle: "
+        f"{sorted(wheel - desktop) or 'none'}. In the desktop bundle and not the wheel: "
+        f"{sorted(desktop - wheel) or 'none'}. backend/pyproject.toml is the decision; bring "
+        f"desktop/pyinstaller.spec and deploy/docker/Dockerfile.unified back in line with it."
     )
 
 

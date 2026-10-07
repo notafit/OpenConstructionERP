@@ -65,6 +65,21 @@ import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { apiGet, apiPost, apiPatch, downloadWithAuth, extractErrorMessageFromBody, type Page } from '@/shared/lib/api';
 import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { ContactSearchInput } from '@/shared/ui/ContactSearchInput';
+import { InvoicePurchaseOrderField } from './InvoicePurchaseOrderField';
+import { InvoiceLinesEditor } from './InvoiceLinesEditor';
+import {
+  editorLinesFromInvoice,
+  invoiceTotals as linesTotals,
+  linesToPayload,
+  newEditorLine,
+  vatChoices,
+  type InvoiceEditorLine,
+  type TaxConfigRow,
+} from './invoiceLines';
+import { invalidateFinanceFigures } from './financeQueryKeys';
+import { settleAndMarkPaid } from './markInvoicePaid';
+import { budgetCategoryLabel, wbsLabel, type WbsNode } from './budgetLabels';
+import { ContingencyBudgetNote } from '@/features/risk/ContingencyBudgetNote';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
@@ -77,6 +92,8 @@ import { StatementsTab } from './StatementsTab';
 import { RetentionLedgerTab } from './RetentionLedgerTab';
 import { EInvoiceModal } from './EInvoiceModal';
 import { financeGuide } from './financeGuide';
+import { DEFAULT_FINANCE_TAB, isFinanceTab, type FinanceTab } from './financeTabs';
+import { UnlinkedTwinBanner } from '@/features/subcontractors/UnlinkedTwinBanner';
 import { fmtList, fmtPercent, fmtFixed, fmtNumberForInput } from '@/shared/lib/formatters';
 
 // English fallbacks for the computed `finance.payment_status_*` keys. The default used to be
@@ -95,6 +112,8 @@ interface BudgetLine {
   project_id: string;
   wbs_id: string | null;
   wbs_code?: string;
+  // Server-resolved name of wbs_id (WBS node or bill section), when it is an id.
+  wbs_label?: string | null;
   category: string;
   original_budget: number;
   revised_budget: number;
@@ -123,6 +142,10 @@ interface InvoiceLineItem {
   // InvoiceLineItemResponse). When present the line can deep-link to the
   // 5D cost spine row it posts actuals onto.
   cost_line_id: string | null;
+  // EN 16931 per-line VAT, percent. Null when the line never named one.
+  vat_rate?: string | null;
+  vat_category?: string | null;
+  sort_order?: number;
 }
 
 interface Invoice {
@@ -155,7 +178,11 @@ interface Invoice {
   amount_subtotal?: string | null;
   tax_amount?: string | null;
   amount_total?: string | null;
+  // Retainage held back from payment, Decimal-as-string.
+  retention_amount?: string | null;
   contact_id?: string | null;
+  // The purchase order a payable invoice bills, when one was picked.
+  purchase_order_id?: string | null;
   invoice_date?: string | null;
   currency_code?: string | null;
   notes?: string | null;
@@ -276,7 +303,6 @@ interface EVMData {
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 
-type FinanceTab = 'budgets' | 'invoices' | 'inbox' | 'payments' | 'statements' | 'retention' | 'evm' | 'connectors';
 type InvoiceSubTab = 'payable' | 'receivable';
 
 /** Common currency shortlist for the create/edit selects. NOT a default —
@@ -480,6 +506,16 @@ interface FinanceDashboardData {
   budget_warning_level: string;
   total_payments: number;
   cash_flow_net: number;
+  /** Net of VAT: supplier invoices and approved subcontract payment
+   *  applications. `total_committed` and `total_actual` are net as well. */
+  total_invoiced?: number | string;
+  /** Cash out of the door, VAT included: payments on supplier invoices less
+   *  refunds, plus subcontract payment applications marked paid. */
+  total_paid?: number | string;
+  /** Net of VAT: incurred beyond what was committed (received past an order
+   *  nobody invoiced, settled past a subcontract's value). Committed stops at
+   *  zero, so this is where that excess shows. */
+  total_over_commitment?: number | string;
   /** Base currency the totals are expressed in. For a project-scoped
    *  dashboard the server FX-converts every foreign record into this
    *  currency via Project.fx_rates; empty when no record carries one. */
@@ -519,7 +555,11 @@ export function FinanceSummaryCards({
   const totalBudget = Number(dashboard?.total_budget_original ?? 0);
   const totalRevised = Number(dashboard?.total_budget_revised ?? 0);
   const totalActual = Number(dashboard?.total_actual ?? 0);
-  const totalInvoiced = Number(dashboard?.total_payable ?? 0);
+  const totalCommitted = Number(dashboard?.total_committed ?? 0);
+  const totalInvoiced = Number(dashboard?.total_invoiced ?? 0);
+  const totalPaid = Number(dashboard?.total_paid ?? 0);
+  const totalOverCommitment = Number(dashboard?.total_over_commitment ?? 0);
+  const totalUnpaid = Number(dashboard?.total_payable ?? 0);
   const totalReceivable = Number(dashboard?.total_receivable ?? 0);
   const totalOverdue = Number(dashboard?.total_overdue ?? 0);
   const remaining = (totalRevised || totalBudget) - totalActual;
@@ -551,7 +591,9 @@ export function FinanceSummaryCards({
   if (
     totalBudget === 0 &&
     totalRevised === 0 &&
+    totalCommitted === 0 &&
     totalInvoiced === 0 &&
+    totalUnpaid === 0 &&
     totalReceivable === 0
   ) {
     return (
@@ -590,23 +632,75 @@ export function FinanceSummaryCards({
     );
   }
 
-  const cards = [
+  // Every figure states its basis. Budget, committed, invoiced and remaining
+  // are compared net of VAT, because the budget comes from the bill, which is
+  // net; paid and the two open balances are cash and carry the VAT. A card
+  // with no basis is a count or a status, not an amount against the budget.
+  const basisNet = t('finance.basis_net', { defaultValue: 'Net of VAT' });
+  const basisGross = t('finance.basis_gross', { defaultValue: 'Incl. VAT' });
+
+  const cards: Array<{
+    key: string;
+    label: string;
+    basis?: string;
+    value: number;
+    icon: React.ReactNode;
+    color: string;
+    accent: string;
+  }> = [
     {
+      key: 'budget',
       label: t('finance.summary_total_budget', { defaultValue: 'Total Budget' }),
+      basis: basisNet,
       value: totalBudget,
       icon: <Wallet size={18} />,
       color: 'bg-oe-blue/10 text-oe-blue',
       accent: 'bg-oe-blue',
     },
     {
-      label: t('finance.summary_total_invoiced', { defaultValue: 'Total Invoiced (Payable)' }),
+      // What orders, subcontracts and unordered invoices still promise and
+      // has not been incurred yet. With actual it adds up to the outturn.
+      key: 'committed',
+      label: t('finance.summary_committed', { defaultValue: 'Committed' }),
+      basis: basisNet,
+      value: totalCommitted,
+      icon: <FileText size={18} />,
+      color: 'bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-400',
+      accent: 'bg-violet-500',
+    },
+    {
+      key: 'invoiced',
+      label: t('finance.summary_invoiced', { defaultValue: 'Invoiced' }),
+      basis: basisNet,
       value: totalInvoiced,
       icon: <Receipt size={18} />,
       color: 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-400',
       accent: 'bg-amber-500',
     },
     {
+      key: 'paid',
+      label: t('finance.summary_paid', { defaultValue: 'Paid' }),
+      basis: basisGross,
+      value: totalPaid,
+      icon: <CreditCard size={18} />,
+      color: 'bg-sky-50 text-sky-600 dark:bg-sky-950/40 dark:text-sky-400',
+      accent: 'bg-sky-500',
+    },
+    {
+      // What the old "Total Invoiced (Payable)" card showed: supplier
+      // invoices still to be paid, not everything invoiced.
+      key: 'unpaid',
+      label: t('finance.summary_unpaid_payables', { defaultValue: 'Unpaid supplier invoices' }),
+      basis: basisGross,
+      value: totalUnpaid,
+      icon: <Inbox size={18} />,
+      color: 'bg-orange-50 text-orange-600 dark:bg-orange-950/40 dark:text-orange-400',
+      accent: 'bg-orange-500',
+    },
+    {
+      key: 'receivable',
       label: t('finance.summary_receivable', { defaultValue: 'Receivable' }),
+      basis: basisGross,
       value: totalReceivable,
       icon: <PiggyBank size={18} />,
       color: 'bg-green-50 text-green-600 dark:bg-green-950/40 dark:text-green-400',
@@ -618,7 +712,9 @@ export function FinanceSummaryCards({
       // all along; this screen declared the field and never read it, so the
       // one figure a finance lead opens the page for was the one it did not
       // show. Same key as the reporting tile: one number, one wording.
+      key: 'overdue',
       label: t('reporting.overdue_total', { defaultValue: 'Total Overdue' }),
+      basis: basisGross,
       value: totalOverdue,
       icon: <AlertTriangle size={18} />,
       color:
@@ -628,7 +724,9 @@ export function FinanceSummaryCards({
       accent: totalOverdue > 0 ? 'bg-red-500' : 'bg-green-500',
     },
     {
+      key: 'remaining',
       label: t('finance.summary_remaining', { defaultValue: 'Remaining Budget' }),
+      basis: basisNet,
       value: remaining,
       icon: <DollarSign size={18} />,
       color: remaining >= 0
@@ -637,6 +735,19 @@ export function FinanceSummaryCards({
       accent: remaining >= 0 ? 'bg-green-500' : 'bg-red-500',
     },
   ];
+  // Only when there is some: committed never goes below zero, so money spent
+  // beyond what was committed would otherwise vanish into that zero.
+  if (totalOverCommitment > 0) {
+    cards.splice(2, 0, {
+      key: 'over_commitment',
+      label: t('finance.summary_over_commitment', { defaultValue: 'Beyond commitment' }),
+      basis: basisNet,
+      value: totalOverCommitment,
+      icon: <AlertTriangle size={18} />,
+      color: 'bg-red-50 text-red-600 dark:bg-red-950/40 dark:text-red-400',
+      accent: 'bg-red-500',
+    });
+  }
 
   const barColor =
     warningLevel === 'critical'
@@ -650,7 +761,8 @@ export function FinanceSummaryCards({
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {cards.map((card) => (
           <div
-            key={card.label}
+            key={card.key}
+            data-testid={`finance-card-${card.key}`}
             className="relative overflow-hidden rounded-xl border border-border-light bg-surface-elevated/90 shadow-xs transition-shadow duration-normal ease-oe hover:shadow-sm"
           >
             <div className={`absolute top-0 start-0 end-0 h-1 ${card.accent}`} />
@@ -666,6 +778,9 @@ export function FinanceSummaryCards({
               <div className="text-xl font-bold tabular-nums text-content-primary">
                 <MoneyDisplay amount={card.value} currency={currency} />
               </div>
+              {card.basis && (
+                <div className="mt-0.5 text-2xs text-content-tertiary">{card.basis}</div>
+              )}
             </div>
           </div>
         ))}
@@ -798,24 +913,26 @@ export function FinancePage() {
   const projectName = useProjectContextStore((s) => s.activeProjectName);
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const [activeTab, setActiveTab] = useState<FinanceTab>('budgets');
-
-  // Honour a ?tab= deep link once on mount so the Reporting Finance dashboard
-  // (and any other caller) can drill straight into a specific Finance section.
-  // The param is consumed and cleared with replace so a refresh / share keeps
-  // the user wherever they navigated to next (CONN-74 consumer).
-  const VALID_TABS: readonly FinanceTab[] = ['budgets', 'invoices', 'inbox', 'payments', 'statements', 'retention', 'evm', 'connectors'];
-  useEffect(() => {
-    const requested = searchParams.get('tab');
-    if (requested && VALID_TABS.includes(requested as FinanceTab)) {
-      setActiveTab(requested as FinanceTab);
-      const next = new URLSearchParams(searchParams);
-      next.delete('tab');
-      setSearchParams(next, { replace: true });
-    }
-    // Run once on mount; the param is cleared immediately after it is read.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // The active tab lives in ?tab= (CONN-74 consumer: the Reporting Finance
+  // dashboard, the accommodation billing link and the case playbooks all
+  // drill in with /finance?tab=retention and the like). It used to be read
+  // once on mount and then deleted, because the tab was component state and
+  // a ?tab= left behind would have pulled a refresh or a shared link back to
+  // the section the user had already moved away from. Every switch now
+  // writes the tab back, so the URL never goes stale and there is nothing
+  // left to clear. Keeping it is what lets a menu row stay highlighted and a
+  // reload keep the section. Switches replace rather than push.
+  const rawTab = searchParams.get('tab');
+  const activeTab: FinanceTab = isFinanceTab(rawTab) ? rawTab : DEFAULT_FINANCE_TAB;
+  const setActiveTab = (next: FinanceTab) =>
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set('tab', next);
+        return params;
+      },
+      { replace: true },
+    );
 
   // Module Insights panel. Charts the project's invoices - the register that
   // carries every payable and receivable together with its status and due
@@ -974,6 +1091,11 @@ export function FinancePage() {
           onGoToInvoices={() => setActiveTab('invoices')}
         />
       )}
+
+      {/* A subcontract written both as an agreement and as a contract, not
+          linked, is counted twice in the figures above; say so where the
+          double count shows. */}
+      {projectId && <UnlinkedTwinBanner projectId={projectId} />}
 
       {/* Tab Bar */}
       <TabBar<FinanceTab>
@@ -1383,6 +1505,18 @@ function BudgetsTab({ projectId }: { projectId: string }) {
   const { data: budgetPage, isLoading, isError, error, refetch } = budgetsQuery;
   const budgets = budgetPage?.items;
 
+  // The project's WBS nodes, so a row seeded from a bill shows the node's
+  // code and name instead of its id.
+  const { data: wbsList } = useQuery({
+    queryKey: ['project-wbs', projectId],
+    queryFn: () => apiGet<WbsNode[]>(`/v1/projects/${projectId}/wbs/`),
+    enabled: !!projectId,
+  });
+  const wbsNodes = useMemo(
+    () => new Map((Array.isArray(wbsList) ? wbsList : []).map((node) => [node.id, node])),
+    [wbsList],
+  );
+
   const filtered = useMemo(() => {
     if (!budgets) return [];
     if (!search) return budgets;
@@ -1390,7 +1524,9 @@ function BudgetsTab({ projectId }: { projectId: string }) {
     return budgets.filter(
       (b) =>
         (b.wbs_id ?? '').toLowerCase().includes(q) ||
-        b.category.toLowerCase().includes(q),
+        wbsLabel(b.wbs_id, wbsNodes, b.wbs_label).text.toLowerCase().includes(q) ||
+        b.category.toLowerCase().includes(q) ||
+        budgetCategoryLabel(t, b.category).toLowerCase().includes(q),
     );
   }, [budgets, search]);
 
@@ -1427,9 +1563,9 @@ function BudgetsTab({ projectId }: { projectId: string }) {
               {t('finance.boq_tip_title', { defaultValue: 'Tip:' })}
             </strong>{' '}
             <span className="text-blue-700 dark:text-blue-300">
-              {t('finance.boq_tip_desc', {
+              {t('finance.boq_tip_lock_desc', {
                 defaultValue:
-                  'Lock your BOQ estimate, then use "Create Budget from Estimate" below to generate budget lines on the 5D Cost Model page.',
+                  'Lock the bill of quantities and its budget lines appear here, one per WBS item, net of VAT. You can also add a line by hand.',
               })}
             </span>
             <Button
@@ -1446,9 +1582,8 @@ function BudgetsTab({ projectId }: { projectId: string }) {
         <EmptyState
           icon={<Wallet size={28} strokeWidth={1.5} />}
           title={t('finance.no_budgets', { defaultValue: 'No budget lines yet' })}
-          description={t('finance.no_budgets_desc', {
-            defaultValue:
-              'Generate budget lines from your locked BOQ estimate, or add them manually.',
+          description={t('finance.no_budgets_lock_desc', {
+            defaultValue: 'Lock the bill of quantities to seed budget lines, or add a line manually.',
           })}
           action={
             <div className="flex flex-wrap items-center justify-center gap-2">
@@ -1616,10 +1751,24 @@ function BudgetsTab({ projectId }: { projectId: string }) {
                   key={b.id}
                   className="border-b border-border-light hover:bg-surface-secondary/30 transition-colors"
                 >
-                  <td className="px-4 py-3 font-mono text-xs text-content-primary">
-                    {b.wbs_id ?? b.wbs_code ?? ''}
+                  <td
+                    className="px-4 py-3 text-xs text-content-primary"
+                    title={wbsLabel(b.wbs_id ?? b.wbs_code, wbsNodes, b.wbs_label).title}
+                    data-testid="budget-wbs"
+                  >
+                    {wbsLabel(b.wbs_id ?? b.wbs_code, wbsNodes, b.wbs_label).text}
                   </td>
-                  <td className="px-4 py-3 text-content-secondary">{b.category}</td>
+                  <td className="px-4 py-3 text-content-secondary" data-testid="budget-category">
+                    {budgetCategoryLabel(t, b.category)}
+                    <ContingencyBudgetNote
+                      projectId={projectId}
+                      category={b.category}
+                      metadata={b.metadata}
+                      revised={b.revised_budget}
+                      original={b.original_budget}
+                      currency={rowCurrency}
+                    />
+                  </td>
                   <td className="px-4 py-3 text-right">
                     <MoneyDisplay amount={b.original_budget} currency={rowCurrency} />
                   </td>
@@ -1712,12 +1861,23 @@ function BudgetsTab({ projectId }: { projectId: string }) {
             <Card key={b.id} className="p-4">
               <div className="flex items-start justify-between gap-2 mb-2">
                 <div className="min-w-0">
-                  <span className="text-xs font-mono text-content-tertiary">
-                    {b.wbs_id ?? b.wbs_code ?? ''}
+                  <span
+                    className="text-xs text-content-tertiary"
+                    title={wbsLabel(b.wbs_id ?? b.wbs_code, wbsNodes, b.wbs_label).title}
+                  >
+                    {wbsLabel(b.wbs_id ?? b.wbs_code, wbsNodes, b.wbs_label).text}
                   </span>
                   <h4 className="text-sm font-semibold text-content-primary truncate">
-                    {b.category}
+                    {budgetCategoryLabel(t, b.category)}
                   </h4>
+                  <ContingencyBudgetNote
+                    projectId={projectId}
+                    category={b.category}
+                    metadata={b.metadata}
+                    revised={b.revised_budget}
+                    original={b.original_budget}
+                    currency={rowCurrency}
+                  />
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {rowCurrency && (
@@ -1897,47 +2057,6 @@ function BudgetsTab({ projectId }: { projectId: string }) {
 /* ── Invoices Tab ─────────────────────────────────────────────────────── */
 
 /**
- * The widest gap between a total a person typed and one the server will keep.
- *
- * A cent. Rounding a lump sum to a nicer figure is a real thing to want, and a
- * cent of it is the only part that survives an invoice: subtotal + tax = total
- * is the arithmetic every receiver checks (EN 16931 BR-CO-15), so a total that
- * disagrees by more than rounding is not a preference, it is a document nobody
- * downstream can accept. The server holds the same identity to twice this, so
- * anything this form lets through is something the API will keep.
- */
-const INVOICE_TOTAL_TOLERANCE = 0.01;
-
-/**
- * The invoice form's three money fields, read as numbers.
- *
- * `Number` rather than `parseFloat` on purpose. `parseFloat` stops at the
- * first character it cannot use and hands back what it has, so a grouped or
- * comma-decimal string read as 9 or as 900 instead of failing, which is how
- * issue #466 stayed silent. `Number('9,000.00')` is `NaN`, and a field that
- * cannot be read is reported as unset rather than as a smaller number.
- *
- * A blank subtotal beside a typed total is filled from the total rather than
- * sent as a zero: the server derives the stored total from subtotal + tax, so
- * a zero subtotal stored a zero invoice next to a line item carrying the real
- * figure.
- */
-function readInvoiceAmounts(form: { subtotal: string; tax: string; amount: string }) {
-  const read = (raw: string): number | null => {
-    const text = (raw ?? '').trim();
-    if (text === '') return null;
-    const n = Number(text);
-    return Number.isFinite(n) ? n : null;
-  };
-  const tax = read(form.tax) ?? 0;
-  const typedSubtotal = read(form.subtotal);
-  const typedTotal = read(form.amount);
-  const subtotal = typedSubtotal ?? (typedTotal != null ? typedTotal - tax : 0);
-  const total = typedTotal ?? subtotal + tax;
-  return { subtotal, tax, total, typedSubtotal, typedTotal };
-}
-
-/**
  * The invoice register and the create/edit form behind it.
  *
  * Exported so the money a person types into that form can be driven end to
@@ -1945,7 +2064,7 @@ function readInvoiceAmounts(form: { subtotal: string; tax: string; amount: strin
  * mounting the whole Finance page around it.
  */
 export function InvoicesTab({ projectId }: { projectId: string }) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const { confirm, ...confirmProps } = useConfirm();
@@ -1969,15 +2088,42 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
   });
   const projectCurrency = invDashboard?.currency || '';
 
+  // The VAT rates of the project's country, and the one a new line starts
+  // with. Same key as the project pages, so this is usually a cache hit.
+  const { data: invProject } = useQuery({
+    queryKey: ['project', projectId],
+    queryFn: () => apiGet<{ country_code?: string | null }>(`/v1/projects/${projectId}`),
+    enabled: !!projectId,
+  });
+  const projectCountry = (invProject?.country_code || '').trim().toUpperCase();
+  const { data: countryTaxes } = useQuery({
+    queryKey: ['i18n-tax-configs', projectCountry],
+    queryFn: () =>
+      apiGet<{ items?: TaxConfigRow[] }>(
+        `/v1/i18n_foundation/tax-configs/by-country/${encodeURIComponent(projectCountry)}`,
+      ),
+    enabled: !!projectCountry,
+  });
+  const { options: vatOptions, defaultRate: defaultVat } = useMemo(
+    () => vatChoices(Array.isArray(countryTaxes?.items) ? countryTaxes.items : []),
+    [countryTaxes],
+  );
+
   const [invoiceForm, setInvoiceForm] = useState({
     direction: 'payable' as 'payable' | 'receivable',
     counterparty: '',
     contact_id: '',
     invoice_date: todayStr,
     due_date: '',
-    subtotal: '',
-    tax: '',
-    amount: '',
+    // The number printed on the supplier's invoice (payable) or our own
+    // (receivable). Empty on create means the register generates one.
+    invoice_number: '',
+    // What was billed, line by line, each with its VAT rate. Subtotal, tax
+    // and total are derived from these; there is no typed total to disagree.
+    lines: [newEditorLine(null)] as InvoiceEditorLine[],
+    // Set once a line is edited. An unedited invoice keeps its stored lines
+    // and figures on save instead of having them rewritten from the editor.
+    lines_dirty: false,
     currency: '',
     description: '',
     // BT-10, the Buyer reference / Leitweg-ID. Invoice data by the standard:
@@ -1990,15 +2136,10 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
     // an invoice lets a user advance its status, which is otherwise only
     // reachable via the row Approve / Mark Paid actions (#284).
     status: 'draft',
+    // Optional order this payable invoice bills. Empty means not linked.
+    purchase_order_id: '',
   });
   const [invoiceErrors, setInvoiceErrors] = useState<Record<string, string>>({});
-  // Tracks whether the user has hand-entered the Total (overriding the
-  // subtotal+tax auto-sum). Once set, subtotal/tax edits no longer clobber
-  // the manual total - they only suggest a recomputed value the user can
-  // restore via the "recalculate" affordance. Reset whenever a fresh form is
-  // opened (new invoice / edit / direction reset) so each invoice starts in
-  // auto-compute mode.
-  const [amountEditedManually, setAmountEditedManually] = useState(false);
   const invoiceDateRef = useRef<HTMLInputElement>(null);
   // When set, the invoice modal is in edit mode for this existing invoice.
   const [editingInvoice, setEditingInvoice] = useState<Invoice | null>(null);
@@ -2019,14 +2160,6 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
       wire.invoice_direction === 'receivable' || inv.direction === 'receivable'
         ? 'receivable'
         : 'payable';
-    const subtotal = inv.amount_subtotal != null ? String(inv.amount_subtotal) : '';
-    const tax = inv.tax_amount != null ? String(inv.tax_amount) : '';
-    const total =
-      inv.amount_total != null
-        ? String(inv.amount_total)
-        : inv.amount != null
-          ? String(inv.amount)
-          : '';
     const issueDate = (inv.invoice_date ?? inv.issue_date ?? '').split('T')[0] || '';
     const dueDate = (inv.due_date ?? '').split('T')[0] || '';
     setInvoiceForm({
@@ -2035,9 +2168,13 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
       contact_id: inv.contact_id ?? '',
       invoice_date: issueDate,
       due_date: dueDate,
-      subtotal,
-      tax,
-      amount: total,
+      invoice_number: inv.invoice_number ?? '',
+      lines: editorLinesFromInvoice(
+        inv.line_items,
+        { subtotal: inv.amount_subtotal, tax: inv.tax_amount },
+        defaultVat,
+      ),
+      lines_dirty: false,
       // Never hardcode EUR — fall back to the project's resolved currency so
       // an editor on a BRL/USD/etc. project keeps that currency (task #217).
       currency: inv.currency_code || inv.currency || projectCurrency || '',
@@ -2045,21 +2182,25 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
       buyer_reference: readBuyerReference(inv.metadata),
       // Shown exactly as stored. A person sees the state the machine wrote.
       status: inv.status || 'draft',
+      purchase_order_id: inv.purchase_order_id ?? '',
     });
-    // If the stored total differs from subtotal+tax, the invoice was saved
-    // with a deliberate manual total - preserve that intent so editing the
-    // subtotal/tax doesn't silently overwrite it.
-    const subN = parseFloat(subtotal || '0');
-    const taxN = parseFloat(tax || '0');
-    const totalN = parseFloat(total || '0');
-    setAmountEditedManually(
-      Number.isFinite(totalN) &&
-        total.trim() !== '' &&
-        Math.abs(totalN - (subN + taxN)) > INVOICE_TOTAL_TOLERANCE,
-    );
     setInvoiceErrors({});
     setEditingInvoice(inv);
   };
+
+  useEffect(() => {
+    if (!defaultVat) return;
+    setInvoiceForm((f) =>
+      f.lines.some((l) => !l.vat_touched && l.vat_rate === '')
+        ? {
+            ...f,
+            lines: f.lines.map((l) =>
+              !l.vat_touched && l.vat_rate === '' ? { ...l, vat_rate: defaultVat } : l,
+            ),
+          }
+        : f,
+    );
+  }, [defaultVat]);
 
   const closeInvoiceModal = () => {
     setShowCreate(false);
@@ -2075,26 +2216,14 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
   }, [invoiceModalOpen]);
 
   const canSubmitInvoice =
-    !!invoiceForm.invoice_date && readInvoiceAmounts(invoiceForm).total > 0;
+    !!invoiceForm.invoice_date && linesTotals(invoiceForm.lines).total > 0;
 
   const validateInvoice = (): boolean => {
     const e: Record<string, string> = {};
-    const { tax, total, typedSubtotal, typedTotal } = readInvoiceAmounts(invoiceForm);
     if (!invoiceForm.invoice_date) e.invoice_date = t('validation.required', { defaultValue: 'This field is required' });
-    if (!invoiceForm.subtotal && !invoiceForm.amount) e.subtotal = t('validation.required', { defaultValue: 'This field is required' });
-    else if (total <= 0) e.subtotal = t('validation.positive_number', { defaultValue: 'Must be a positive number' });
-    // A hand-typed total that does not add up is named here rather than
-    // resolved in one direction or the other. Rewriting either figure would
-    // change a number a person typed without telling them, and dropping the
-    // typed total on the floor is what used to happen: the server rebuilt it
-    // from subtotal + tax, so the override never reached the invoice at all.
-    if (
-      typedSubtotal != null &&
-      typedTotal != null &&
-      Math.abs(typedTotal - (typedSubtotal + tax)) > INVOICE_TOTAL_TOLERANCE
-    ) {
-      e.amount = t('finance.total_mismatch', {
-        defaultValue: 'The total must equal the subtotal plus tax',
+    if (!(linesTotals(invoiceForm.lines).total > 0)) {
+      e.lines = t('finance.lines_required', {
+        defaultValue: 'Enter at least one line with a quantity and a unit rate',
       });
     }
     setInvoiceErrors(e);
@@ -2113,30 +2242,18 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
   }, [invoiceModalOpen]);
 
   // The e-invoice engine derives the document from its lines (BR-16 refuses
-  // an invoice without any), and this simple form bills one figure - so that
-  // figure travels as one lump-sum line. The unit token follows the UI
-  // language ('psch' is the German schedule word, 'lsum' the neutral one);
-  // both map to UNECE LS in the export.
-  const singleFormLine = (form: typeof invoiceForm, lineAmount: number) => {
-    if (!(lineAmount > 0)) return [];
-    return [
-      {
-        description:
-          form.description.trim() ||
-          t('finance.invoice_line_default', { defaultValue: 'Contract works for the billing period' }),
-        quantity: '1',
-        unit: i18n.language.toLowerCase().startsWith('de') ? 'psch' : 'lsum',
-        unit_rate: lineAmount.toFixed(2),
-        amount: lineAmount.toFixed(2),
-      },
-    ];
-  };
+  // an invoice without any) and the server requires each line to say what it
+  // is, so a line left without a description takes the invoice's notes.
+  const lineFallbackDescription = (form: typeof invoiceForm) =>
+    form.description.trim() ||
+    t('finance.invoice_line_default', { defaultValue: 'Contract works for the billing period' });
 
   const createInvoiceMut = useMutation({
     mutationFn: (data: typeof invoiceForm) => {
-      const { subtotal: sub, tax, total } = readInvoiceAmounts(data);
+      const { subtotal: sub, tax, total } = linesTotals(data.lines);
       return apiPost('/v1/finance/', {
         project_id: projectId,
+        invoice_number: data.invoice_number.trim() || undefined,
         contact_id: data.contact_id || undefined,
         invoice_direction: data.direction,
         invoice_date: data.invoice_date,
@@ -2154,16 +2271,16 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
         // The line is the subtotal, never the gross: lines are net amounts and
         // the server refuses a set of them that does not add up to the
         // subtotal it is being asked to store.
-        line_items: singleFormLine(data, sub),
+        line_items: linesToPayload(data.lines, lineFallbackDescription(data)),
         metadata: invoiceMetadataWithBuyerReference(null, data.buyer_reference),
+        purchase_order_id:
+          data.direction === 'payable' && data.purchase_order_id ? data.purchase_order_id : undefined,
       });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['finance-invoices', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['finance', 'dashboard', projectId] });
+      void invalidateFinanceFigures(queryClient);
       setShowCreate(false);
-      setInvoiceForm({ direction: 'payable', counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', subtotal: '', tax: '', amount: '', currency: projectCurrency, description: '', buyer_reference: '', status: 'draft' });
-      setAmountEditedManually(false);
+      setInvoiceForm({ direction: 'payable', counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', invoice_number: '', lines: [newEditorLine(defaultVat)], lines_dirty: false, currency: projectCurrency, description: '', buyer_reference: '', status: 'draft', purchase_order_id: '' });
       addToast({ type: 'success', title: t('finance.invoice_created', { defaultValue: 'Invoice created successfully' }) });
     },
     onError: (e: Error) =>
@@ -2179,39 +2296,43 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
   // rejects an illegal jump, and the dropdown only offers legal next states.
   const updateInvoiceMut = useMutation({
     mutationFn: (data: { id: string; form: typeof invoiceForm; prevStatus: string }) => {
-      const { subtotal: sub, tax, total } = readInvoiceAmounts(data.form);
+      // Money travels only when a line was edited. An unedited save keeps the
+      // stored lines and figures as they are: a claim-born or imported
+      // invoice keeps its own breakdown, and an approved one is not refused
+      // for amounts this form merely re-derived.
+      const { subtotal: sub, tax, total } = linesTotals(data.form.lines);
+      const moneyPatch = data.form.lines_dirty
+        ? {
+            amount_subtotal: fmtNumberForInput(sub),
+            tax_amount: fmtNumberForInput(tax),
+            amount_total: fmtNumberForInput(total),
+            line_items: linesToPayload(data.form.lines, lineFallbackDescription(data.form)),
+          }
+        : {};
       // Compared against the stored status directly. The form no longer
       // relabels 'sent', so relabelling here too would make a plain edit of a
       // sent invoice look like a sent -> sent transition, which the backend
       // table does not allow and would reject with a 400.
       const statusChanged = data.form.status !== data.prevStatus;
-      // A claim-born or imported invoice carries a real line breakdown;
-      // replacing it with this form's single figure would destroy it. Only
-      // the simple shape (no lines yet, or the one line this form wrote) is
-      // kept in sync with the edited amounts.
-      const existingLines = editingInvoice?.line_items ?? [];
-      const lineItemsPatch =
-        existingLines.length <= 1 ? { line_items: singleFormLine(data.form, sub) } : {};
       return apiPatch(`/v1/finance/${data.id}`, {
         contact_id: data.form.contact_id || null,
         invoice_direction: data.form.direction,
         invoice_date: data.form.invoice_date,
         due_date: data.form.due_date || null,
-        amount_subtotal: fmtNumberForInput(sub),
-        tax_amount: fmtNumberForInput(tax),
-        amount_total: fmtNumberForInput(total),
         currency_code: data.form.currency || projectCurrency || '',
         notes: data.form.description || null,
         // Merged over the stored object: PATCH replaces metadata wholesale,
         // and only the buyer reference is edited here.
         metadata: invoiceMetadataWithBuyerReference(editingInvoice?.metadata, data.form.buyer_reference),
-        ...lineItemsPatch,
+        ...moneyPatch,
+        // Null unlinks. A receivable invoice never bills a purchase order.
+        purchase_order_id:
+          data.form.direction === 'payable' && data.form.purchase_order_id ? data.form.purchase_order_id : null,
         ...(statusChanged ? { status: data.form.status } : {}),
       });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['finance-invoices', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['finance', 'dashboard', projectId] });
+      void invalidateFinanceFigures(queryClient);
       closeInvoiceModal();
       addToast({ type: 'success', title: t('finance.invoice_updated', { defaultValue: 'Invoice updated successfully' }) });
     },
@@ -2298,9 +2419,7 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
     mutationFn: (invoiceId: string) =>
       apiPatch(`/v1/finance/${invoiceId}`, { status: 'pending' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ['finance-invoices', projectId],
-      });
+      void invalidateFinanceFigures(queryClient);
       addToast({
         type: 'success',
         title: t('finance.invoice_sent_for_approval', {
@@ -2316,9 +2435,7 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
     mutationFn: (invoiceId: string) =>
       apiPost(`/v1/finance/${invoiceId}/approve/`),
     onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ['finance-invoices', projectId],
-      });
+      void invalidateFinanceFigures(queryClient);
       addToast({
         type: 'success',
         title: t('finance.invoice_approved', {
@@ -2330,13 +2447,13 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
       addToast({ type: 'error', title: t('finance.approve_failed', { defaultValue: 'Failed to approve invoice' }), message: e.message }),
   });
 
+  // Records the payment for what is still open, then moves the status. The
+  // status change alone wrote no payment, so payments, cash flow and the
+  // statements stayed at zero for every invoice closed from this button.
   const markPaidMutation = useMutation({
-    mutationFn: (invoiceId: string) =>
-      apiPost(`/v1/finance/${invoiceId}/pay/`),
+    mutationFn: (invoice: Invoice) => settleAndMarkPaid(invoice, new Date().toISOString().slice(0, 10)),
     onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: ['finance-invoices', projectId],
-      });
+      void invalidateFinanceFigures(queryClient);
       addToast({
         type: 'success',
         title: t('finance.invoice_paid', { defaultValue: 'Invoice marked as paid successfully' }),
@@ -2400,9 +2517,8 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
             size="sm"
             icon={<Plus size={14} />}
             onClick={() => {
-              setInvoiceForm({ direction: subTab, counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', subtotal: '', tax: '', amount: '', currency: projectCurrency, description: '', buyer_reference: '', status: 'draft' });
+              setInvoiceForm({ direction: subTab, counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', invoice_number: '', lines: [newEditorLine(defaultVat)], lines_dirty: false, currency: projectCurrency, description: '', buyer_reference: '', status: 'draft', purchase_order_id: '' });
               setInvoiceErrors({});
-              setAmountEditedManually(false);
               setShowCreate(true);
             }}
           >
@@ -2478,9 +2594,8 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
                   ? {
                       label: t('finance.new_invoice', { defaultValue: 'New Invoice' }),
                       onClick: () => {
-                        setInvoiceForm({ direction: subTab, counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', subtotal: '', tax: '', amount: '', currency: projectCurrency, description: '', buyer_reference: '', status: 'draft' });
+                        setInvoiceForm({ direction: subTab, counterparty: '', contact_id: '', invoice_date: todayStr, due_date: '', invoice_number: '', lines: [newEditorLine(defaultVat)], lines_dirty: false, currency: projectCurrency, description: '', buyer_reference: '', status: 'draft', purchase_order_id: '' });
                         setInvoiceErrors({});
-                        setAmountEditedManually(false);
                         setShowCreate(true);
                       },
                     }
@@ -2676,7 +2791,7 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
                                   confirmLabel: t('finance.mark_paid', { defaultValue: 'Mark Paid' }),
                                   variant: 'danger',
                                 });
-                                if (ok) markPaidMutation.mutate(inv.id);
+                                if (ok) markPaidMutation.mutate(inv);
                               }}
                               loading={markPaidMutation.isPending}
                             >
@@ -2806,7 +2921,7 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
                               confirmLabel: t('finance.mark_paid', { defaultValue: 'Mark Paid' }),
                               variant: 'danger',
                             });
-                            if (ok) markPaidMutation.mutate(inv.id);
+                            if (ok) markPaidMutation.mutate(inv);
                           }}
                           loading={markPaidMutation.isPending}
                         >
@@ -2987,11 +3102,49 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
             >
               <ContactSearchInput
                 value={invoiceForm.counterparty}
-                onChange={(id, name) => setInvoiceForm((f) => ({ ...f, counterparty: name, contact_id: id }))}
+                onChange={(id, name) =>
+                  setInvoiceForm((f) => ({
+                    ...f,
+                    counterparty: name,
+                    contact_id: id,
+                    // An order belongs to one supplier; a new supplier drops the link.
+                    purchase_order_id: id === f.contact_id ? f.purchase_order_id : '',
+                  }))
+                }
                 placeholder={
                   invoiceForm.direction === 'payable'
                     ? t('finance.search_vendor', { defaultValue: 'Search vendor...' })
                     : t('finance.search_client', { defaultValue: 'Search client...' })
+                }
+              />
+            </WideModalField>
+            <WideModalField
+              label={
+                invoiceForm.direction === 'payable'
+                  ? t('finance.supplier_invoice_number', { defaultValue: 'Supplier invoice number' })
+                  : t('finance.invoice_number', { defaultValue: 'Invoice #' })
+              }
+              hint={
+                isEditingInvoice
+                  ? undefined
+                  : t('finance.invoice_number_hint', {
+                      defaultValue: 'As printed on the document. Leave empty to have a number generated.',
+                    })
+              }
+            >
+              <input
+                type="text"
+                value={invoiceForm.invoice_number}
+                maxLength={50}
+                // The number is the key payments and exports match on, so it
+                // is set when the invoice is entered and not edited after.
+                disabled={isEditingInvoice}
+                onChange={(e) => setInvoiceForm((f) => ({ ...f, invoice_number: e.target.value }))}
+                className={clsx(inputCls, isEditingInvoice && 'opacity-70')}
+                aria-label={
+                  invoiceForm.direction === 'payable'
+                    ? t('finance.supplier_invoice_number', { defaultValue: 'Supplier invoice number' })
+                    : t('finance.invoice_number', { defaultValue: 'Invoice #' })
                 }
               />
             </WideModalField>
@@ -3040,6 +3193,29 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
                   aria-label={t('finance.einvoice.buyerReferenceLabel', {
                     defaultValue: 'Buyer reference / Leitweg-ID',
                   })}
+                />
+              </WideModalField>
+            )}
+
+            {/* The order this supplier invoice bills. Optional; linking it is
+                what keeps an order and its invoice from being committed
+                twice on the Finance dashboard. */}
+            {invoiceForm.direction === 'payable' && (
+              <WideModalField
+                label={t('finance.po_link_label', { defaultValue: 'Purchase order' })}
+                span={2}
+                hint={t('finance.po_link_hint', {
+                  defaultValue:
+                    'Optional. A linked invoice counts against its order, so the order and the invoice are committed once.',
+                })}
+              >
+                <InvoicePurchaseOrderField
+                  projectId={projectId}
+                  contactId={invoiceForm.contact_id}
+                  value={invoiceForm.purchase_order_id}
+                  onChange={(poId) => setInvoiceForm((f) => ({ ...f, purchase_order_id: poId }))}
+                  amountSubtotal={linesTotals(invoiceForm.lines).subtotal}
+                  invoiceId={editingInvoice?.id}
                 />
               </WideModalField>
             )}
@@ -3120,136 +3296,18 @@ export function InvoicesTab({ projectId }: { projectId: string }) {
                 ))}
               </select>
             </WideModalField>
-            <WideModalField
-              label={t('finance.subtotal', { defaultValue: 'Subtotal' })}
-              required
-              error={invoiceErrors.subtotal}
-            >
-              <div className="relative">
-                <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-xs text-content-tertiary font-medium">
-                  {invoiceForm.currency}
-                </span>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={invoiceForm.subtotal}
-                  onChange={(e) => {
-                    const sub = e.target.value;
-                    const amounts = readInvoiceAmounts({ ...invoiceForm, subtotal: sub });
-                    // Only auto-fill the total while the user hasn't taken it
-                    // over manually; otherwise preserve their entered total.
-                    // Canonical form, because this lands back in a number
-                    // field and a grouped one empties it (#466).
-                    const total = fmtNumberForInput(amounts.subtotal + amounts.tax);
-                    setInvoiceForm((f) => ({
-                      ...f,
-                      subtotal: sub,
-                      ...(amountEditedManually ? {} : { amount: total }),
-                    }));
-                    if (invoiceErrors.subtotal || invoiceErrors.amount) setInvoiceErrors((prev) => { const next = { ...prev }; delete next.subtotal; delete next.amount; return next; });
-                  }}
-                  className={clsx(inputCls, 'pl-12', invoiceErrors.subtotal && 'border-semantic-error focus:ring-red-300 focus:border-semantic-error')}
-                  placeholder="0.00"
-                />
-              </div>
-            </WideModalField>
-            <WideModalField label={t('finance.tax', { defaultValue: 'Tax' })}>
-              <div className="relative">
-                <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-xs text-content-tertiary font-medium">
-                  {invoiceForm.currency}
-                </span>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={invoiceForm.tax}
-                  onChange={(e) => {
-                    const tax = e.target.value;
-                    const amounts = readInvoiceAmounts({ ...invoiceForm, tax });
-                    // Preserve a manually entered total; otherwise keep it in
-                    // sync with subtotal+tax, in the canonical form the field
-                    // itself accepts (#466).
-                    const total = fmtNumberForInput(amounts.subtotal + amounts.tax);
-                    setInvoiceForm((f) => ({
-                      ...f,
-                      tax,
-                      ...(amountEditedManually ? {} : { amount: total }),
-                    }));
-                    if (invoiceErrors.amount) setInvoiceErrors((prev) => { const next = { ...prev }; delete next.amount; return next; });
-                  }}
-                  className={clsx(inputCls, 'pl-12')}
-                  placeholder="0.00"
-                />
-              </div>
-            </WideModalField>
-            <div className="sm:col-span-2 lg:col-span-3 rounded-lg bg-surface-secondary/60 px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-content-primary">
-                    {t('finance.total', { defaultValue: 'Total' })}
-                  </span>
-                  {amountEditedManually && (
-                    <Badge variant="warning" size="sm">
-                      {t('finance.total_manual', { defaultValue: 'Manual override' })}
-                    </Badge>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="pointer-events-none text-xs text-content-tertiary font-medium">
-                    {invoiceForm.currency}
-                  </span>
-                  {/* Editable so a user can round to a nice figure or paste a
-                      pre-calculated total; once touched it stops being
-                      overwritten by subtotal/tax edits (item: manual total). */}
-                  <input
-                    type="number"
-                    step="0.01"
-                    aria-label={t('finance.total', { defaultValue: 'Total' })}
-                    value={(() => {
-                      if (amountEditedManually) return invoiceForm.amount;
-                      const { subtotal, tax } = readInvoiceAmounts(invoiceForm);
-                      return fmtNumberForInput(subtotal + tax);
-                    })()}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setAmountEditedManually(true);
-                      setInvoiceForm((f) => ({ ...f, amount: v }));
-                      if (invoiceErrors.amount) setInvoiceErrors((prev) => { const next = { ...prev }; delete next.amount; return next; });
-                    }}
-                    className={clsx(
-                      'h-9 w-36 rounded-lg border bg-surface-primary px-3 text-right text-base font-bold tabular-nums text-content-primary focus:outline-none focus:ring-2',
-                      invoiceErrors.amount
-                        ? 'border-semantic-error focus:ring-red-300 focus:border-semantic-error'
-                        : 'border-border focus:ring-oe-blue/30 focus:border-oe-blue',
-                    )}
-                    placeholder="0.00"
-                  />
-                </div>
-              </div>
-              {invoiceErrors.amount && (
-                <div className="mt-2 flex items-center justify-end">
-                  <span className="text-xs font-medium text-semantic-error">
-                    {invoiceErrors.amount}
-                  </span>
-                </div>
-              )}
-              {amountEditedManually && (
-                <div className="mt-2 flex items-center justify-end">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const { subtotal, tax } = readInvoiceAmounts(invoiceForm);
-                      setAmountEditedManually(false);
-                      setInvoiceForm((f) => ({ ...f, amount: fmtNumberForInput(subtotal + tax) }));
-                      setInvoiceErrors((prev) => { const next = { ...prev }; delete next.amount; return next; });
-                    }}
-                    className="text-xs font-medium text-oe-blue hover:underline"
-                  >
-                    {t('finance.total_recalculate', {
-                      defaultValue: 'Recalculate from subtotal + tax',
-                    })}
-                  </button>
-                </div>
-              )}
+            <div className="sm:col-span-2 lg:col-span-3">
+              <InvoiceLinesEditor
+                lines={invoiceForm.lines}
+                onChange={(lines) => {
+                  setInvoiceForm((f) => ({ ...f, lines, lines_dirty: true }));
+                  if (invoiceErrors.lines) setInvoiceErrors((prev) => { const next = { ...prev }; delete next.lines; return next; });
+                }}
+                currency={invoiceForm.currency || projectCurrency || undefined}
+                vatOptions={vatOptions}
+                defaultVat={defaultVat}
+                error={invoiceErrors.lines}
+              />
             </div>
           </WideModalSection>
 

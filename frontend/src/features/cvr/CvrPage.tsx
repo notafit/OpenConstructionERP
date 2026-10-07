@@ -41,7 +41,8 @@ import {
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
-import { apiGet, getErrorMessage } from '@/shared/lib/api';
+import { getErrorMessage } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { formatCurrency, toNum } from '@/shared/lib/money';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -64,6 +65,7 @@ import {
   createPaymentApplication,
   updatePaymentApplication,
   deletePaymentApplication,
+  fetchProgressClaimOptions,
   type CvrReport,
   type CvrLine,
   type CvrSummary,
@@ -74,6 +76,7 @@ import {
 } from './api';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildCvrInsights } from './cvrInsights';
+import { payappDraftFromClaim, progressClaimLabel } from './payappFromClaim';
 import { fmtList, fmtPercent } from '@/shared/lib/formatters';
 import { toDecimalPayloadString } from '@/shared/lib/parseDecimal';
 
@@ -441,7 +444,7 @@ export function CvrPage() {
 
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1207,8 +1210,31 @@ function PaymentApplicationsSection({
   const [number, setNumber] = useState('');
   const [gross, setGross] = useState('');
   const [retention, setRetention] = useState('');
+  const [claimId, setClaimId] = useState('');
 
   const [deleteTarget, setDeleteTarget] = useState<PaymentApplication | null>(null);
+
+  const { data: claimOptions = [] } = useQuery({
+    queryKey: ['cvr-progress-claims', projectId],
+    queryFn: () => fetchProgressClaimOptions(projectId),
+    enabled: !!projectId,
+  });
+  const selectedClaim = claimOptions.find((c) => c.id === claimId);
+  const claimLabelById = useMemo(
+    () => new Map(claimOptions.map((c) => [c.id, progressClaimLabel(c)])),
+    [claimOptions],
+  );
+
+  const pickClaim = (id: string) => {
+    setClaimId(id);
+    const claim = claimOptions.find((c) => c.id === id);
+    if (!claim) return;
+    const draft = payappDraftFromClaim(claim, period);
+    setPeriod(draft.period);
+    setNumber(draft.number);
+    setGross(draft.gross);
+    setRetention(draft.retention);
+  };
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -1218,9 +1244,12 @@ function PaymentApplicationsSection({
         application_number: number || undefined,
         gross_value: toDecimalPayloadString(gross),
         retention: toDecimalPayloadString(retention),
-        currency: defaultCurrency || undefined,
+        // A claim in another currency keeps its own; the backend fills it.
+        currency: selectedClaim ? selectedClaim.currency || undefined : defaultCurrency || undefined,
+        progress_claim_id: claimId || undefined,
       }),
     onSuccess: () => {
+      setClaimId('');
       setNumber('');
       setGross('');
       setRetention('');
@@ -1283,7 +1312,17 @@ function PaymentApplicationsSection({
             <tbody>
               {applications.map((app) => (
                 <tr key={app.id} className="border-b border-border-light/60">
-                  <td className="py-2 pr-3 font-medium text-content-primary">{app.application_number || '-'}</td>
+                  <td className="py-2 pr-3 font-medium text-content-primary">
+                    {app.application_number || '-'}
+                    {app.progress_claim_id && claimLabelById.has(app.progress_claim_id) && (
+                      <div className="text-2xs font-normal text-content-tertiary">
+                        {t('cvr.payapp_from_claim', {
+                          defaultValue: 'From claim {{claim}}',
+                          claim: claimLabelById.get(app.progress_claim_id) ?? '',
+                        })}
+                      </div>
+                    )}
+                  </td>
                   <td className="py-2 pr-3 text-content-secondary">{app.period}</td>
                   <td className="py-2 pr-3 text-right tabular-nums text-content-secondary">{formatCurrency(app.gross_value, app.currency)}</td>
                   <td className="py-2 pr-3 text-right tabular-nums text-content-tertiary">{formatCurrency(app.retention, app.currency)}</td>
@@ -1324,7 +1363,20 @@ function PaymentApplicationsSection({
         </div>
       )}
 
-      <div className="grid grid-cols-2 items-end gap-2 rounded-lg border border-dashed border-border-light p-3 sm:grid-cols-5">
+      <div className="grid grid-cols-2 items-end gap-2 rounded-lg border border-dashed border-border-light p-3 sm:grid-cols-6">
+        <select
+          className={INPUT_CLS}
+          value={claimId}
+          onChange={(e) => pickClaim(e.target.value)}
+          aria-label={t('cvr.payapp_claim_picker', { defaultValue: 'Raise from progress claim' })}
+        >
+          <option value="">{t('cvr.payapp_no_claim', { defaultValue: 'No progress claim' })}</option>
+          {claimOptions.map((c) => (
+            <option key={c.id} value={c.id}>
+              {progressClaimLabel(c)}
+            </option>
+          ))}
+        </select>
         <input className={INPUT_CLS} placeholder={t('cvr.col_application', { defaultValue: 'IPA-001' })} value={number} onChange={(e) => setNumber(e.target.value)} />
         <input className={INPUT_CLS} placeholder={t('cvr.period', { defaultValue: 'Period (YYYY-MM)' })} value={period} onChange={(e) => setPeriod(e.target.value)} />
         <input className={INPUT_CLS} inputMode="decimal" placeholder={t('cvr.col_gross', { defaultValue: 'Gross' })} value={gross} onChange={(e) => setGross(e.target.value)} />

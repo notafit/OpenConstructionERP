@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "dubai_municipality",
+  "name": "Dubai Municipality Building Code and Regulations",
+  "standard": "Dubai Municipality Building Code / DM Green Building Regulations",
+  "jurisdiction": "AE",
+  "description": "Validates project documentation against Dubai Municipality (DM) building regulations, Al Sa'fat Green Building Rating System, and DM technical guidelines. Checks that the building permit (Rakhsa) process is referenced, that Al Sa'fat rating requirements (Bronze/Silver/Gold/Platinum) are addressed for applicable building types, that DM structural and MEP guidelines are followed, and that DM-specific requirements for deep foundations, high-rise buildings and mixed-use developments are documented.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "dm.building_permit_rakhsa_referenced",
+    "dm.building_classification_set",
+    "dm.al_safat_rating_if_applicable",
+    "dm.al_safat_bronze_minimum_requirements",
+    "dm.structural_guidelines_referenced",
+    "dm.deep_foundation_guidelines_if_applicable",
+    "dm.high_rise_requirements_if_applicable",
+    "dm.mep_guidelines_referenced",
+    "dm.parking_requirements_documented",
+    "dm.accessibility_requirements_documented",
+    "dm.noc_from_dm_referenced",
+    "dm.completion_certificate_provisions"
+  ],
+  "regulator": "Dubai Municipality (DM)",
+  "publication_year": 2023
+}

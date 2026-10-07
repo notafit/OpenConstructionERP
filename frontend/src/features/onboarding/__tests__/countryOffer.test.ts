@@ -32,26 +32,19 @@ function pack(slug: string, country: string, partnerName: string): InstalledPart
 }
 
 /**
- * The seventeen packs backend/pyproject.toml force-includes into the
- * community wheel, NOT the twenty a checkout of this repository serves.
+ * The twenty-eight packs backend/pyproject.toml force-includes into the
+ * community wheel, NOT the thirty a checkout of this repository serves.
  *
- * Twenty and not twenty-one, which is the number of directories under packs/.
+ * Thirty and not thirty-one, which is the number of directories under packs/.
  * aus-nzs carries DEPRECATED.txt under src/ and has no manifest.py at all, so
  * the loader never registers it and it is absent from a checkout as much as
- * from a release. Counting directories and counting servable packs give
- * different answers, and two readers reached seventeen by different routes
- * before that was written down here.
+ * from a release.
  *
- * The three missing ones are the whole point of this fixture. batimatech-ca
- * and bimhessen-de are excluded under partnership agreements and
- * doker-formwork for a third-party logo, so Germany and Canada reach the
- * curated-preset branch on every real install while resolving to a real pack
- * in the tree the tests run from. Feeding this list is the only way the
- * preset branch is ever executed.
+ * The two missing ones are batimatech-ca (partnership) and doker-formwork
+ * (third-party logo). bimhessen-de is also checkout-only (partnership), so
+ * Canada reaches the curated-preset branch on every real install.
  *
- * Keep this list equal to the force-include block. It stood at fifteen while
- * the wheel shipped seventeen, and both packs it had lost, hungary-hu and
- * russia-gesn, serve markets the case catalogue carries.
+ * Keep this list equal to the force-include block.
  */
 const WHEEL_PACKS: InstalledPartnerPack[] = [
   pack('aus', 'AU', 'Australia Construction Pack'),
@@ -71,6 +64,16 @@ const WHEEL_PACKS: InstalledPartnerPack[] = [
   pack('saudi-vision2030', 'SA', 'Saudi Vision 2030 Pack'),
   pack('south-africa', 'ZA', 'South Africa Construction Pack'),
   pack('uk-jct', 'GB', 'UK Construction Pack'),
+  pack('france-fr', 'FR', 'France Construction Pack'),
+  pack('germany-de', 'DE', 'Germany Construction Pack'),
+  pack('italy-it', 'IT', 'Italy Construction Pack'),
+  pack('japan-jp', 'JP', 'Japan Construction Pack'),
+  pack('korea-kr', 'KR', 'South Korea Construction Pack'),
+  pack('netherlands-nl', 'NL', 'Netherlands Construction Pack'),
+  pack('poland-pl', 'PL', 'Poland Construction Pack'),
+  pack('spain-es', 'ES', 'Spain Construction Pack'),
+  pack('turkey-tr', 'TR', 'Turkey Construction Pack'),
+  pack('uae-ae', 'AE', 'UAE Construction Pack'),
   pack('us-california', 'US', 'California Construction Pack'),
   pack('us-costdata', 'US', 'US Construction Pack'),
   pack('us-texas', 'US', 'Texas Construction Pack'),
@@ -88,39 +91,33 @@ describe('resolveCountryOffer, on the packs the wheel ships', () => {
     expect(offer).toEqual({ kind: 'pack', pack: expect.objectContaining({ slug: 'brazil-sinapi' }) });
   });
 
-  it('offers a curated preset in Germany and Canada, where no pack ever ships', () => {
-    // The branch this whole fixture exists for. In a checkout both countries
-    // resolve to a real pack, so a test using the developer's own pack list
-    // would report this working while shipping it unexercised.
-    for (const [country, presetId] of [
-      ['de', 'de'],
-      ['ca', 'ca'],
-    ] as const) {
-      const offer = resolveCountryOffer(country, WHEEL_PACKS);
-      expect(offer).toEqual({ kind: 'preset', preset: expect.objectContaining({ id: presetId }) });
-    }
+  it('offers the pack for Germany now that germany-de ships, and a preset for Canada', () => {
+    // Germany now ships germany-de in the wheel; Canada still has no wheel pack.
+    expect(resolveCountryOffer('de', WHEEL_PACKS)).toEqual({
+      kind: 'pack',
+      pack: expect.objectContaining({ slug: 'germany-de' }),
+    });
+    expect(resolveCountryOffer('ca', WHEEL_PACKS)).toEqual({
+      kind: 'preset',
+      preset: expect.objectContaining({ id: 'ca' }),
+    });
   });
 
-  it('offers the pack instead once the pack is actually present', () => {
-    // Same two countries, checkout pack list. Proves the preset branch is
-    // chosen because the pack is absent, not because of anything about DE
-    // and CA themselves.
+  it('offers the partner pack once it is present alongside the country pack', () => {
+    // With batimatech-ca added, Canada resolves to the partner pack.
+    // Germany already has germany-de in the wheel; bimhessen-de is the
+    // partner variant and the resolver prefers the first match by slug.
     const all = [...WHEEL_PACKS, ...CHECKOUT_ONLY];
-    expect(resolveCountryOffer('de', all)).toEqual({
-      kind: 'pack',
-      pack: expect.objectContaining({ slug: 'bimhessen-de' }),
-    });
     expect(resolveCountryOffer('ca', all)).toEqual({
       kind: 'pack',
       pack: expect.objectContaining({ slug: 'batimatech-ca' }),
     });
   });
 
-  it('offers a preset for a market that has cases and has never had a pack', () => {
-    // Spain: ten case studies, no pack in the repository at all.
+  it('offers the pack for Spain now that it ships', () => {
     expect(resolveCountryOffer('es', WHEEL_PACKS)).toEqual({
-      kind: 'preset',
-      preset: expect.objectContaining({ id: 'es' }),
+      kind: 'pack',
+      pack: expect.objectContaining({ slug: 'spain-es' }),
     });
   });
 

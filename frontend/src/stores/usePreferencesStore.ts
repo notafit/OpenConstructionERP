@@ -55,28 +55,37 @@ export type NumberLocale =
   | 'ja-JP'
   | 'zh-CN'
   | 'es-MX'
-  | 'en-IN';
+  | 'en-IN'
+  | 'de-CH';
 
 interface Preferences {
   currency: string;
   measurementSystem: MeasurementSystem;
   dateFormat: DateFormat;
   numberLocale: NumberLocale;
-  vatRate: number;
-  defaultRegion: string;
   defaultCurrency: string;
-  defaultStandard: string;
 }
+
+/**
+ * Keys this store used to carry and no longer does.
+ *
+ * `vatRate: 19`, `defaultRegion: 'DACH'` and `defaultStandard: 'din276'` were
+ * written for every account and read by nothing: VAT comes from the project's
+ * country through the tax table and the bill's own tax line, the region and
+ * standard from the project. What they did do was make every user's saved
+ * preferences say German VAT and a DACH region, so a Croatian contractor
+ * looking at their settings saw 19 % where their country charges 25 %. A value
+ * that looks like a default and is not one is dropped on the next read rather
+ * than left in the blob.
+ */
+const RETIRED_KEYS = ['vatRate', 'defaultRegion', 'defaultStandard'] as const;
 
 const DEFAULTS: Preferences = {
   currency: 'EUR',
   measurementSystem: 'metric',
   dateFormat: 'auto',
   numberLocale: 'auto',
-  vatRate: 19,
-  defaultRegion: 'DACH',
   defaultCurrency: 'EUR',
-  defaultStandard: 'din276',
 };
 
 /**
@@ -103,6 +112,7 @@ function readPreferences(): Preferences {
     if (!raw) return DEFAULTS;
     const { _v: version, ...stored } = JSON.parse(raw) as Partial<Preferences> & { _v?: number };
     const prefs: Preferences = { ...DEFAULTS, ...stored };
+    for (const key of RETIRED_KEYS) delete (prefs as unknown as Record<string, unknown>)[key];
     if ((version ?? 1) < SCHEMA_VERSION && prefs.numberLocale === LEGACY_NUMBER_LOCALE) {
       prefs.numberLocale = 'auto';
     }
@@ -234,6 +244,13 @@ const NUMBER_FORMAT_TO_LOCALE: Record<string, NumberLocale> = {
   '1.234,56': 'de-DE',
   '1,234.56': 'en-US',
   '1 234,56': 'fr-FR',
+  // Swiss grouping, in the ASCII spelling CLDR prints today and the
+  // typographic one older releases printed. Both are written by `i18n_data.py`
+  // patterns or by hand, and both mean the same apostrophe grouping.
+  "1'234.56": 'de-CH',
+  '1’234.56': 'de-CH',
+  // Lakh and crore, the pattern `i18n_data.py` files India under.
+  '12,34,567.89': 'en-IN',
 };
 
 /**
@@ -257,8 +274,25 @@ const SEEDED_ACCOUNT_LOCALE: NumberLocale | undefined =
  * currency while lakh and crore grouping was unreachable by any choice.
  */
 export const NUMBER_LOCALES: readonly NumberLocale[] = [
-  'auto', 'de-DE', 'en-US', 'en-GB', 'fr-FR', 'ru-RU', 'ar-SA', 'ja-JP', 'zh-CN', 'es-MX', 'en-IN',
+  'auto', 'de-DE', 'en-US', 'en-GB', 'fr-FR', 'ru-RU', 'ar-SA', 'ja-JP', 'zh-CN', 'es-MX', 'en-IN', 'de-CH',
 ];
+
+/**
+ * Countries whose documents group numbers in a way the UI language does not.
+ *
+ * Switzerland is the second entry after India. A German-speaking Swiss reader
+ * runs the German UI, which resolves to `de` and writes `1.234.567,89`; a Swiss
+ * bill is written `1'234'567.89`. Measured on ICU 78.3 (CLDR 48): `de-CH`,
+ * `fr-CH` and `it-CH` all print that same apostrophe grouping, so mapping the
+ * country to `de-CH` is right for French- and Italian-speaking Swiss
+ * workspaces too, even though the tag names German. They differ only in the
+ * decimal mark: `fr-CH` writes a comma, and a French-speaking workspace gets
+ * the point `de-CH` and `it-CH` write.
+ */
+const COUNTRY_NUMBER_LOCALE: ReadonlyMap<string, NumberLocale> = new Map<string, NumberLocale>([
+  ['in', 'en-IN'],
+  ['ch', 'de-CH'],
+]);
 
 /**
  * The number locale a country's documents are grouped in, or `null`.
@@ -266,27 +300,29 @@ export const NUMBER_LOCALES: readonly NumberLocale[] = [
  * A country earns an entry here only when its tag actually changes the
  * grouping. India does: `en-IN` writes `47,65,79,722.78` where `en-US` writes
  * `476,579,722.78`, and that lakh/crore grouping is what every estimator,
- * contractor and auditor in that market reads. Germany and the United States
- * do not, because the UI language already resolves to their own tags, and
- * answering for them here would put a second opinion on top of a reader whose
+ * contractor and auditor in that market reads. Switzerland does too: its
+ * apostrophe grouping is not what the German, French or Italian UI resolves
+ * to (see `COUNTRY_NUMBER_LOCALE`). Germany and the United States do not,
+ * because the UI language already resolves to their own tags, and answering
+ * for them here would put a second opinion on top of a reader whose
  * separators were already right.
  *
- * Measured before it was written, and the measurement is why the table has one
- * row. Pakistan, Bangladesh, Sri Lanka and Nepal use the same lakh system in
+ * Measured before it was written, and the measurement is why the table is this
+ * short. Pakistan, Bangladesh, Sri Lanka and Nepal use the same lakh system in
  * life, but `en-PK`, `en-BD`, `en-LK` and `en-NP` all resolve to plain `en` and
  * group by threes, so there is no tag to map them onto and an entry would be a
  * promise the engine cannot keep. Their answer is a different piece of work,
  * not another line here.
  *
- * The return type is `NumberLocale`, so a tag that is not one of the values
- * the store understands cannot be added to this table without the compiler
+ * The table's value type is `NumberLocale`, so a tag that is not one of the
+ * values the store understands cannot be added to it without the compiler
  * saying so.
  *
  * @param country ISO 3166-1 alpha-2, any case; `null` when nothing says.
  */
 export function numberLocaleForCountry(country: string | null | undefined): NumberLocale | null {
   const cc = (country || '').trim().toLowerCase();
-  return cc === 'in' ? 'en-IN' : null;
+  return COUNTRY_NUMBER_LOCALE.get(cc) ?? null;
 }
 
 /**

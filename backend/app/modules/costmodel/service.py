@@ -627,7 +627,7 @@ class CostModelService:
         Returns:
             BudgetSummary with per-category breakdown.
         """
-        rows = await self.budget_repo.aggregate_by_category(project_id)
+        rows = await self.budget_repo.aggregate_by_category(project_id, include_unbudgeted_commitments=True)
 
         categories: list[BudgetCategoryRow] = []
         for row in rows:
@@ -660,8 +660,9 @@ class CostModelService:
         the whole thing up to the project. All money is Decimal-exact; the
         commitment ratio is undefined (null) when a budget is zero or absent.
 
-        ``committed`` is the ``committed_amount`` column - the value already
-        committed to contracts (subcontracts, purchase orders, awarded values).
+        ``committed`` is the value already committed to contracts: issued
+        purchase orders and non-draft contracts linked to the group's cost
+        lines, or the manual ``committed_amount`` on lines without such links.
 
         Args:
             project_id: Target project.
@@ -669,7 +670,7 @@ class CostModelService:
         Returns:
             A ContractExposureResponse with per-group rows and the project rollup.
         """
-        rows = await self.budget_repo.aggregate_by_category(project_id)
+        rows = await self.budget_repo.aggregate_by_category(project_id, include_unbudgeted_commitments=True)
         exposure = compute_contract_exposure((row["category"], row["planned"], row["committed"]) for row in rows)
 
         # Mirror the sibling money surfaces (dashboard / EVM): carry the project
@@ -779,6 +780,25 @@ class CostModelService:
         project_id_str = str(line.project_id)
 
         fields = data.model_dump(exclude_unset=True)
+
+        # A line whose cost line carries issued purchase orders or signed
+        # contracts takes its committed from them, so a typed value would be
+        # stored and then silently ignored by every total. Refuse it instead;
+        # echoing back the value the API reported for the line is allowed so a
+        # client that round-trips the whole row keeps working.
+        if fields.get("committed_amount") is not None:
+            effective, _unbudgeted, from_documents = await self.budget_repo.effective_committed(line.project_id)
+            if line_id in from_documents:
+                cent = Decimal("0.01")
+                if Decimal(str(fields["committed_amount"])).quantize(cent) != effective[line_id].quantize(cent):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            "Committed on this budget line comes from the purchase orders and contracts "
+                            "linked to its cost line and cannot be edited by hand. Change those documents instead."
+                        ),
+                    )
+                fields.pop("committed_amount")
 
         # Convert float values to strings for storage
         for key in ("planned_amount", "committed_amount", "actual_amount", "forecast_amount"):
@@ -2754,7 +2774,7 @@ class CostSpineService:
 
         else:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "Invalid target_type. Expected one of: boq_position, budget_line, po_item, contract_line, rfq."
                 ),
@@ -3643,9 +3663,9 @@ async def _on_labour_reversed(event: object) -> None:
 # router, so binding here keeps the wiring inside an allowed file. Guard
 # against double-registration on repeated imports (test reload, etc.).
 if _on_labour_logged not in event_bus._handlers.get("fieldreports.labour.logged", []):
-    event_bus.subscribe("fieldreports.labour.logged", _on_labour_logged)
+    event_bus.subscribe_once("fieldreports.labour.logged", _on_labour_logged)
 if _on_labour_reversed not in event_bus._handlers.get("fieldreports.labour.reversed", []):
-    event_bus.subscribe("fieldreports.labour.reversed", _on_labour_reversed)
+    event_bus.subscribe_once("fieldreports.labour.reversed", _on_labour_reversed)
 
 
 # ── Cost-overrun alerts (Gap D - actual breaches planned + threshold) ─────────
@@ -3808,4 +3828,4 @@ async def _on_budget_line_changed(event: object) -> None:
 # subscriber above). Guard against double-registration on repeated imports.
 for _overrun_event in ("costmodel.budget_line.updated", "costmodel.budget_line.actual_posted"):
     if _on_budget_line_changed not in event_bus._handlers.get(_overrun_event, []):
-        event_bus.subscribe(_overrun_event, _on_budget_line_changed)
+        event_bus.subscribe_once(_overrun_event, _on_budget_line_changed)

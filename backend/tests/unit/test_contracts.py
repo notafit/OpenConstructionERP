@@ -310,7 +310,7 @@ def test_generate_tm_claim_raises_nte_cap_exceeded() -> None:
         )
 
 
-def test_generate_tm_claim_with_fee_and_prior_paid() -> None:
+def test_generate_tm_claim_with_fee_and_prior_billed() -> None:
     c = _contract(
         contract_type="tm",
         retention_percent=Decimal("5"),
@@ -322,13 +322,34 @@ def test_generate_tm_claim_with_fee_and_prior_paid() -> None:
         time_entries_total=Decimal("4000"),
         material_entries_total=Decimal("1000"),
         fee_structure=fee,
-        prior_paid=Decimal("1000"),
+        prior_billed=Decimal("1000"),
     )
-    # base = 5000, fee = 500, gross = 5500, retention = 275, prior = 1000, net = 4225
+    # base = 5000, fee = 500, gross = 5500, retention = 275, net = 5225.
+    # The entries are this period's, so what earlier claims billed or were
+    # paid is not taken off again; this used to assert 4225.
     assert result["fee"] == Decimal("500.0000")
     assert result["gross"] == Decimal("5500")
     assert result["retention"] == Decimal("275.0000")
-    assert result["net"] == Decimal("4225.0000")
+    assert result["net"] == Decimal("5225.0000")
+
+
+def test_the_tm_cap_counts_what_was_billed_not_what_was_paid() -> None:
+    c = _contract(contract_type="tm", retention_percent=Decimal("0"), terms={"tm_nte_cap": "10000"})
+    # 9000 billed before and not yet paid: 1500 more crosses the cap.
+    with pytest.raises(NTECapExceededError):
+        generate_tm_claim(
+            c,
+            time_entries_total=Decimal("1500"),
+            material_entries_total=Decimal("0"),
+            fee_structure=None,
+            prior_billed=Decimal("9000"),
+        )
+
+
+def test_a_cost_plus_claim_is_not_charged_for_earlier_payments() -> None:
+    c = _contract(contract_type="cost_plus", retention_percent=Decimal("5"))
+    result = generate_cost_plus_claim(c, None, Decimal("10000"), Decimal("7000"))
+    assert result["net"] == Decimal("9500.0000")
 
 
 # ── generate_unit_price_claim ───────────────────────────────────────────
@@ -468,6 +489,11 @@ def test_claim_transitions_pipeline() -> None:
     assert "certified" in allowed_claim_transitions("approved")
     assert "paid" in allowed_claim_transitions("certified")
     assert allowed_claim_transitions("paid") == frozenset()
+    # Rejection reopens a claim for editing, and certification is the point
+    # the invoice is raised, so a certified claim has nowhere back to go: the
+    # money is undone with a credit note, not with a status change.
+    assert "rejected" in allowed_claim_transitions("approved")
+    assert "rejected" not in allowed_claim_transitions("certified")
 
 
 def test_claim_transition_invalid_raises() -> None:
@@ -738,15 +764,20 @@ def test_compute_sov_status_aggregates_by_line() -> None:
     line_a = SimpleNamespace(id=uuid.uuid4(), quantity=Decimal("100"), unit_rate=Decimal("10"))
     line_b = SimpleNamespace(id=uuid.uuid4(), quantity=Decimal("50"), unit_rate=Decimal("20"))
     # 30 units billed on A in a paid claim, 10 units billed on B in submitted (earned not paid)
-    cl_a_paid = SimpleNamespace(
-        contract_line_id=line_a.id,
-        period_completed_value=Decimal("300"),
-        _claim_status="paid",
+    # Each line arrives paired with its claim; the status is read from there.
+    cl_a_paid = (
+        SimpleNamespace(
+            contract_line_id=line_a.id,
+            period_completed_value=Decimal("300"),
+        ),
+        SimpleNamespace(id=uuid.uuid4(), status="paid", claim_number="PC-0001"),
     )
-    cl_b_submitted = SimpleNamespace(
-        contract_line_id=line_b.id,
-        period_completed_value=Decimal("200"),
-        _claim_status="submitted",
+    cl_b_submitted = (
+        SimpleNamespace(
+            contract_line_id=line_b.id,
+            period_completed_value=Decimal("200"),
+        ),
+        SimpleNamespace(id=uuid.uuid4(), status="submitted", claim_number="PC-0002"),
     )
     result = compute_sov_status(
         [line_a, line_b],
@@ -907,6 +938,11 @@ async def test_transition_claim_certified_emits_event_and_stamps_certifier() -> 
         net_due=Decimal("9500"),
         status="approved",
         metadata_={},
+        # Certification freezes G702 lines 4 and 5 onto the claim when they
+        # are not there yet; a claim that already carries them, which is
+        # every claim generated against a schedule of values, is left alone.
+        completed_stored_to_date=Decimal("10000"),
+        retention_held_to_date=Decimal("500"),
     )
     mock_publish = MagicMock()
     with patch.object(contracts_service.event_bus, "publish_detached", mock_publish):

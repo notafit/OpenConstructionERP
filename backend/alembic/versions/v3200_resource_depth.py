@@ -10,9 +10,14 @@ Adds the resource-depth tables and two demand columns:
 * ``oe_resources_assignment.units`` / ``.unit_kind`` - the native-units demand
   lane (crew=3, excavator=1), additive on the existing assignment table.
 
-FKs into the existing resources tables reuse the dialect-aware ``guid_type``
-(PostgreSQL UUID, else String(36)) that those tables were created with, so the
-constraints type-match on Postgres. Every step is guarded so re-applying on a DB
+FKs into the existing resources tables reuse ``String(36)``, which is what
+those tables were created with on every dialect: ``GUID`` in ``app.database``
+is a ``TypeDecorator`` over ``String(36)`` with no ``load_dialect_impl``, so
+``create_all`` renders each identity column as ``character varying(36)`` on
+PostgreSQL as well. This paragraph used to say the type was dialect-aware and
+native uuid on PostgreSQL, and the constraints did not type-match at all - a
+uuid child pointing at a varchar parent is refused with ``DatatypeMismatch``
+the moment the chain is walked rather than stamped. Every step is guarded so re-applying on a DB
 where ``Base.metadata.create_all`` already built the schema is a no-op; the
 downgrade fully reverses the upgrade.
 
@@ -78,8 +83,12 @@ def _timestamps() -> tuple[sa.Column, sa.Column]:
 
 def upgrade() -> None:
     bind = op.get_bind()
-    is_sqlite = bind.dialect.name == "sqlite"
-    guid_type = sa.String(36) if is_sqlite else sa.dialects.postgresql.UUID(as_uuid=True)
+    # ``String(36)`` on PostgreSQL too. ``GUID`` in ``app.database`` is a
+    # ``TypeDecorator`` over ``String(36)`` with no ``load_dialect_impl``, so
+    # ``create_all`` builds every identity column as ``character varying(36)``
+    # and a native uuid here cannot carry a foreign key to one: PostgreSQL
+    # answers ``DatatypeMismatch`` as soon as the chain is walked, not stamped.
+    guid_type = sa.String(36)
 
     if not _has_table(bind, _RATE):
         op.create_table(

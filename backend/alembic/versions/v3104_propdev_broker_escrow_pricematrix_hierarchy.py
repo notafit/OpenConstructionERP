@@ -93,7 +93,15 @@ def upgrade() -> None:  # noqa: C901 — sequential CREATE TABLEs, easier flat.
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     is_sqlite = bind.dialect.name == "sqlite"
-    guid = sa.String(36) if is_sqlite else sa.dialects.postgresql.UUID(as_uuid=True)
+    # ``String(36)`` on every dialect, PostgreSQL included. ``GUID`` in
+    # ``app.database`` is a ``TypeDecorator`` whose ``impl`` is ``String(36)``
+    # and which has no ``load_dialect_impl``, so ``Base.metadata.create_all``
+    # builds every identity column as ``character varying(36)`` here too. The
+    # native uuid this used to declare made ``development_id`` a ``uuid``
+    # pointing at a ``character varying(36)`` parent, and PostgreSQL refuses
+    # that foreign key with ``DatatypeMismatch`` the moment the chain is walked
+    # rather than stamped.
+    guid = sa.String(36)
 
     # ── Phase ───────────────────────────────────────────────────────────
     if not _has_table(inspector, "oe_property_dev_phase"):

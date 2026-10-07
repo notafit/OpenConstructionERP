@@ -51,6 +51,8 @@ import { MiniGeometryPreview } from '@/shared/ui/MiniGeometryPreview';
 import { fetchBIMElementsByIds, fetchBIMElementProperties } from '@/features/bim/api';
 import type { BIMElementData } from '@/shared/ui/BIMViewer/ElementManager';
 import { fmtList, fmtFixed } from '@/shared/lib/formatters';
+import { reuseNumberFormat } from '@/shared/lib/money';
+import { parseDecimalInput } from '@/shared/lib/parseDecimal';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 import { localizedUnitCode } from '@/shared/lib/unitLabels';
 import type { DisplayQuantityApi } from '@/shared/hooks/useDisplayQuantity';
@@ -121,10 +123,12 @@ function getValidationTooltip(
   switch (status) {
     case 'passed':
       return t('boq.validation_passed', { defaultValue: 'Validation passed - position is complete' });
+    // Not boq.validation_warnings/_errors: those are the counted toolbar
+    // summary, and without a count they printed a literal "{{count}}" here.
     case 'warnings':
-      return t('boq.validation_warnings', { defaultValue: 'Validation warnings - review recommended' });
+      return t('boq.validation_tooltip_warnings', { defaultValue: 'Validation warnings, review recommended' });
     case 'errors':
-      return t('boq.validation_errors', { defaultValue: 'Validation errors - action required' });
+      return t('boq.validation_tooltip_errors', { defaultValue: 'Validation errors, action required' });
     case 'pending':
       return t('boq.validation_pending', { defaultValue: 'Validation pending - not yet checked' });
     default:
@@ -200,6 +204,7 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
   }, [nameDraft, description, ctx, data]);
 
   if (!data?._isSection || !ctx) return null;
+  const readOnly = Boolean(ctx.readOnly);
 
   const isCollapsed = ctx.collapsedSections?.has(data.id) ?? false;
   const childCount: number = data._childCount ?? 0;
@@ -231,8 +236,9 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
         dragOver ? 'bg-oe-blue-subtle border-t-2 border-oe-blue' : ''
       }`}
       style={depth > 0 ? { paddingLeft: 8 + depth * 22 } : undefined}
-      draggable
+      draggable={!readOnly}
       onDragStart={(e) => {
+        if (readOnly) return;
         e.dataTransfer.setData('text/x-section-id', data.id);
         e.dataTransfer.effectAllowed = 'move';
       }}
@@ -248,7 +254,7 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
         e.preventDefault();
         setDragOver(false);
         const fromId = e.dataTransfer.getData('text/x-section-id');
-        if (fromId && fromId !== data.id) {
+        if (fromId && fromId !== data.id && !readOnly) {
           ctx.onReorderSections?.(fromId, data.id);
         }
       }}
@@ -258,12 +264,14 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
           contrast the token was chosen for, so the class would have read as
           fixed while the grip stayed invisible. The step on hover is colour
           now, not opacity. */}
-      <span
-        data-testid="section-drag-grip"
-        className="cursor-grab shrink-0 text-content-secondary group-hover/section:text-content-primary transition-colors"
-      >
-        <GripVertical size={14} />
-      </span>
+      {!readOnly && (
+        <span
+          data-testid="section-drag-grip"
+          className="cursor-grab shrink-0 text-content-secondary group-hover/section:text-content-primary transition-colors"
+        >
+          <GripVertical size={14} />
+        </span>
+      )}
 
       <button
         onClick={(e) => {
@@ -323,9 +331,9 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
           onClick={(e) => e.stopPropagation()}
           onDoubleClick={(e) => {
             e.stopPropagation();
-            startRename();
+            if (!readOnly) startRename();
           }}
-          title={t('boq.rename_section_hint', {
+          title={readOnly ? undefined : t('boq.rename_section_hint', {
             defaultValue: 'Double-click to rename',
           })}
           className="text-xs font-bold text-content-primary uppercase tracking-wide
@@ -340,15 +348,16 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
       <span className="shrink-0 inline-flex items-center h-4 px-1.5 rounded-full
                        bg-surface-tertiary text-[10px] font-medium text-content-tertiary
                        tabular-nums">
-        {childCount} {childCount === 1
-          ? t('boq.item', { defaultValue: 'item' })
-          : t('boq.items', { defaultValue: 'items' })
-        }
+        {t('boq.item_count', {
+          count: childCount,
+          defaultValue_one: '{{count}} item',
+          defaultValue_other: '{{count}} items',
+        })}
       </span>
 
       <div className="flex-1" />
 
-      {!renaming && (
+      {!renaming && !readOnly && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -367,7 +376,7 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
         </button>
       )}
 
-      {ctx.onAddSubSection && (
+      {ctx.onAddSubSection && !readOnly && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -392,6 +401,7 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
           section id, so the new partida lands in this section — never in the
           last one. Rendered as the primary section action; "Sub" sits beside
           it for the rarer nested-section case. */}
+      {!readOnly && (
       <button
         onClick={(e) => {
           e.stopPropagation();
@@ -408,8 +418,9 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
         <Plus size={11} />
         {t('boq.add_position', { defaultValue: 'Add Position' })}
       </button>
+      )}
 
-      {(ctx as FullGridContext | undefined)?.onDeleteSection && (
+      {(ctx as FullGridContext | undefined)?.onDeleteSection && !readOnly && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -418,18 +429,47 @@ export function SectionFullWidthRenderer(params: ICellRendererParams) {
             // ag-grid cell renderers (which mount/unmount unpredictably).
             (ctx as FullGridContext).onDeleteSection!(data.id);
           }}
-          className="shrink-0 h-5 flex items-center gap-0.5 px-1.5 rounded
-                     text-[10px] font-medium
+          // Always drawn, dimmed at rest: a control that only hover reveals
+          // does not exist on a touch screen, and a section once added could
+          // not be removed there. Full strength on hover and keyboard focus.
+          className="shrink-0 h-6 w-6 flex items-center justify-center rounded
                      text-content-tertiary hover:text-red-600
                      bg-transparent hover:bg-red-50 dark:hover:bg-red-950/30
-                     opacity-0 group-hover/section:opacity-100
+                     opacity-50 group-hover/section:opacity-100 focus-visible:opacity-100
+                     focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/60
                      transition-all"
           title={t('boq.delete_section', { defaultValue: 'Delete section with all positions' })}
           aria-label={t('boq.delete_section', { defaultValue: 'Delete section with all positions' })}
         >
-          <Trash2 size={10} />
+          <Trash2 size={12} />
         </button>
       )}
+
+      {/* The same actions button the position rows carry, opening the section
+          context menu (add position, sub-section, collapse, delete) for
+          anyone who does not know about right-click, or has none. */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          ctx.onShowContextMenu?.(e, 'section', data);
+        }}
+        className="shrink-0 flex h-6 w-6 items-center justify-center rounded
+                   text-content-tertiary hover:text-content-primary
+                   hover:bg-surface-tertiary
+                   focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue
+                   transition-all"
+        title={t('boq.section_actions', { defaultValue: 'Section actions' })}
+        // Named per section: a screen reader lists every row's button, and
+        // twenty identical "Section actions" say nothing about which is which.
+        aria-label={t('boq.section_actions_named', {
+          defaultValue: 'Actions for section {{name}}',
+          name: description || ordinal,
+        })}
+        aria-haspopup="menu"
+      >
+        <MoreHorizontal size={14} />
+      </button>
 
       {/* Issue #157 (skolodi) — FX-missing warning at the section level.
           Bubbled up by BOQGrid's collectFxWarnings: when any descendant
@@ -607,6 +647,8 @@ export interface VariationLineTraceBadge {
 }
 
 export type FullGridContext = ActionsContext & ResourceGridContext & SectionGroupContext & {
+  /** The bill is locked: renderers show values and offer no write. */
+  readOnly?: boolean;
   /**
    * Issue #435 - present only when the bill belongs to a variation request.
    * Keyed by position id; a line missing from the map is untraced and paints
@@ -639,6 +681,9 @@ export type FullGridContext = ActionsContext & ResourceGridContext & SectionGrou
   onUpdatePosition?: (id: string, data: Record<string, unknown>, oldData: Record<string, unknown>) => void;
   /** Highlight linked BIM elements in the 3D viewer (triggered from ordinal badge). */
   onHighlightBIMElements?: (elementIds: string[]) => void;
+  /** Open the project's BIM model to pick elements for a position that has
+   *  no model links yet. Absent on a locked bill. */
+  onLinkFromModel?: (positionId: string) => void;
   /** Delete a section with all its child positions. */
   onDeleteSection?: (sectionId: string) => void;
   /** Reorder sections via drag-and-drop. */
@@ -1239,10 +1284,11 @@ export function DescriptionCellRenderer(params: ICellRendererParams) {
 
   const fmt = (n: number) => {
     try {
-      return new Intl.NumberFormat(getNumberLocale(), {
+      // Shared instance keyed on the locale, see reuseNumberFormat in money.ts.
+      return reuseNumberFormat(`cell.fixed2|${getNumberLocale()}`, () => new Intl.NumberFormat(getNumberLocale(), {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
-      }).format(n);
+      })).format(n);
     } catch {
       return String(n);
     }
@@ -1615,7 +1661,7 @@ export function BimLinkCellRenderer(params: ICellRendererParams) {
                 setShowPdfPopover(false);
                 navigate(pdfDeepLink);
               }}
-              onApplyQuantity={ctx?.onUpdatePosition}
+              onApplyQuantity={ctx?.readOnly ? undefined : ctx?.onUpdatePosition}
               displayQuantity={ctx?.displayQuantity}
             />
           </>,
@@ -1643,7 +1689,7 @@ export function BimLinkCellRenderer(params: ICellRendererParams) {
                 setShowDwgPopover(false);
                 navigate(dwgDeepLink);
               }}
-              onApplyQuantity={ctx?.onUpdatePosition}
+              onApplyQuantity={ctx?.readOnly ? undefined : ctx?.onUpdatePosition}
               displayQuantity={ctx?.displayQuantity}
             />
           </>,
@@ -1664,7 +1710,7 @@ export function BimLinkCellRenderer(params: ICellRendererParams) {
               style={popoverStyle!}
               onClose={() => setShowPreview(false)}
               positionData={data}
-              onUpdatePosition={ctx?.onUpdatePosition}
+              onUpdatePosition={ctx?.readOnly ? undefined : ctx?.onUpdatePosition}
             />
           </>,
           document.body,
@@ -2663,6 +2709,21 @@ function PdfDwgSourcePopover(props: PdfDwgSourcePopoverProps) {
 
 /* ── Inline Number Input ──────────────────────────────────────────── */
 
+/**
+ * Read what was typed into a resource row's quantity or rate: a formula
+ * (`=2*PI()*3`, `12.5 x 4`) is evaluated, anything else goes through the
+ * shared decimal grammar, so `1.234,56` and `1 234,56` are 1234.56 rather than
+ * the 1.234 and 1 that a first-comma replace produced. NaN when unreadable.
+ */
+export function parseInlineNumber(text: string): number {
+  const trimmed = text.trim();
+  if (isFormula(trimmed)) {
+    const evaluated = evaluateFormula(trimmed);
+    return evaluated !== null ? evaluated : NaN;
+  }
+  return parseDecimalInput(trimmed) ?? NaN;
+}
+
 function InlineNumberInput({
   value,
   onCommit,
@@ -2687,18 +2748,11 @@ function InlineNumberInput({
 
   // Resource-row qty/rate use this input. Like the position quantity cell,
   // we want Excel-style formulas: typing "=2*PI()*3" or "12.5 x 4" commits
-  // the evaluated number. isFormula gates the formula path so plain "12.5"
-  // still goes through the simple parseFloat path with no behaviour change.
+  // the evaluated number. isFormula gates the formula path so a plain number
+  // goes through the locale-aware decimal parser (see parseInlineNumber).
   const commit = useCallback(() => {
     setEditing(false);
-    const trimmed = text.trim();
-    let parsed: number;
-    if (isFormula(trimmed)) {
-      const evaluated = evaluateFormula(trimmed);
-      parsed = evaluated !== null ? evaluated : NaN;
-    } else {
-      parsed = parseFloat(trimmed.replace(',', '.'));
-    }
+    const parsed = parseInlineNumber(text);
     if (!isNaN(parsed) && parsed !== value) {
       onCommit(parsed);
     }
@@ -3661,7 +3715,8 @@ function PopoverFxRateRow({
 
   const commit = (force: boolean) => {
     if (readOnly) return;
-    const n = parseFloat(draft.replace(',', '.'));
+    // Shared decimal grammar: a first-comma replace read `1.234,56` as 1.234.
+    const n = parseDecimalInput(draft) ?? NaN;
     if (!Number.isFinite(n) || n <= 0) {
       reset();
       dirtyRef.current = false;
@@ -4945,6 +5000,9 @@ function VariantHeaderResourceRow({
 
 /* ── Resource Full-Width Renderer ──────────────────────────────────── */
 
+/** ``inert`` as React 18 passes it through: a string, not a boolean. */
+const INERT = { inert: '' } as Record<string, string>;
+
 export function ResourceFullWidthRenderer(params: ICellRendererParams) {
   const { data, context, api } = params;
   const ctx = context as FullGridContext | undefined;
@@ -4976,14 +5034,16 @@ export function ResourceFullWidthRenderer(params: ICellRendererParams) {
 
   // Resource sub-row
   if (data?._isResource) {
-    return <EditableResourceRow data={data} ctx={ctx} slots={slots} leftPad={leftPad} />;
+    const row = <EditableResourceRow data={data} ctx={ctx} slots={slots} leftPad={leftPad} />;
+    return ctx.readOnly ? <div className="h-full w-full" {...INERT}>{row}</div> : row;
   }
 
   // Synthetic "abstract variant" header — surfaces the position-level
   // CWICR variant catalog as a visible row inside the resource panel.
   // V badge prominent + click anywhere reopens the position-level picker.
   if (data?._isVariantHeader) {
-    return <VariantHeaderResourceRow data={data} ctx={ctx} slots={slots} leftPad={leftPad} />;
+    const row = <VariantHeaderResourceRow data={data} ctx={ctx} slots={slots} leftPad={leftPad} />;
+    return ctx.readOnly ? <div className="h-full w-full" {...INERT}>{row}</div> : row;
   }
 
   // "Add resource" row — column-driven layout so the action buttons sit
@@ -4991,6 +5051,8 @@ export function ResourceFullWidthRenderer(params: ICellRendererParams) {
   // total slot, and any custom regional-preset columns get empty
   // width-matched placeholders that preserve grid alignment.
   if (data?._isAddResource) {
+    // Adding a resource is a write, and a locked bill takes none.
+    if (ctx.readOnly) return <div className="h-full w-full" aria-hidden="true" />;
     const renderTotalSlot = (width: number) => {
       if (typeof data._positionResourceTotal !== 'number' || data._positionResourceTotal <= 0) {
         return (
@@ -5132,11 +5194,13 @@ export function QuantityCellRenderer(params: ICellRendererParams) {
         maxFrac = 4;
       }
       // Always use a dedicated formatter with the computed maxFrac
-      // (ctx.fmt is fixed at 2 decimals and would hide small values)
-      const f = new Intl.NumberFormat(ctx?.locale ?? getNumberLocale(), {
+      // (ctx.fmt is fixed at 2 decimals and would hide small values).
+      // Shared instance: this runs for every visible quantity cell on every
+      // refresh, and building a formatter costs far more than using one.
+      const f = reuseNumberFormat(`cell.quantity|${ctx?.locale ?? getNumberLocale()}|${maxFrac}`, () => new Intl.NumberFormat(ctx?.locale ?? getNumberLocale(), {
         minimumFractionDigits: 2,
         maximumFractionDigits: maxFrac,
-      });
+      }));
       formatted = f.format(num);
     }
   }
@@ -5292,11 +5356,11 @@ export function UnitRateCellRenderer(params: ICellRendererParams) {
       // instead would agree with it today and drift the moment the grid changes
       // how it supplies the locale, which is the shape of the defect this cell
       // was part of: the rate asked the UI language while the total asked the
-      // project, and one table printed two.
-      return new Intl.NumberFormat(ctx?.locale ?? getNumberLocale(), {
+      // project, and one table printed two. Shared instance, see money.ts.
+      return reuseNumberFormat(`cell.fixed2|${ctx?.locale ?? getNumberLocale()}`, () => new Intl.NumberFormat(ctx?.locale ?? getNumberLocale(), {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
-      }).format(isNaN(displayRate) ? 0 : displayRate);
+      })).format(isNaN(displayRate) ? 0 : displayRate);
     } catch {
       return String(value ?? '');
     }
@@ -5366,6 +5430,39 @@ export function UnitRateCellRenderer(params: ICellRendererParams) {
     },
     [ctx, data, meta, numericVal, stats],
   );
+
+  // An imported deduction line has no price on purpose: the bill's deductions
+  // markup line takes its amount off. Show its own signed rate with a badge so
+  // the zero does not read as a missing price.
+  if (meta.deduction === true) {
+    const money = (raw: unknown) => {
+      const n = parseFloat(String(raw ?? ''));
+      if (isNaN(n)) return '';
+      return reuseNumberFormat(`cell.fixed2|${ctx?.locale ?? getNumberLocale()}`, () => new Intl.NumberFormat(ctx?.locale ?? getNumberLocale(), {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })).format(n);
+    };
+    return (
+      <span
+        className="flex items-center justify-end gap-1 w-full h-full text-xs tabular-nums leading-[32px] text-content-tertiary"
+        title={t('boq.deduction_rate_tooltip', {
+          defaultValue:
+            'A deduction of {{amount}}. The line adds nothing itself: its amount is taken off by the deductions line among the bill markups.',
+          amount: money(meta.deduction_amount),
+        })}
+        data-testid={`boq-deduction-rate-${data.id}`}
+      >
+        <span
+          className="shrink-0 inline-flex items-center h-4 px-1 rounded text-[9px] font-semibold
+                     bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300"
+        >
+          {t('boq.deduction_badge', { defaultValue: 'Deduction' })}
+        </span>
+        <span>{money(meta.deduction_unit_rate)}</span>
+      </span>
+    );
+  }
 
   // No variant cache → render the formatted number, prefixed with a
   // compact currency badge when the position is priced in a non-base
@@ -5443,13 +5540,16 @@ export function UnitRateCellRenderer(params: ICellRendererParams) {
         <button
           ref={anchorRef}
           type="button"
+          // A locked bill keeps the pill as a label: picking a variant rewrites the rate.
+          disabled={Boolean(ctx?.readOnly)}
           onClick={(e) => {
             e.stopPropagation();
+            if (ctx?.readOnly) return;
             setPickerOpen((open) => !open);
           }}
           onMouseDown={(e) => e.stopPropagation()}
           className={`shrink-0 inline-flex items-center gap-0.5 h-5 px-1.5 rounded text-[10px] font-semibold
-                      transition-colors cursor-pointer ${
+                      transition-colors cursor-pointer disabled:cursor-default ${
                         variant
                           ? 'bg-oe-blue/15 text-oe-blue hover:bg-oe-blue/25'
                           : 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60'
@@ -5484,7 +5584,7 @@ export function UnitRateCellRenderer(params: ICellRendererParams) {
         </span>
       )}
       <span className={isResourceDriven ? 'text-content-tertiary' : ''}>{formatted}</span>
-      {pickerOpen && hasVariants && (
+      {pickerOpen && hasVariants && !ctx?.readOnly && (
         <VariantPicker
           variants={variants!}
           stats={stats!}
@@ -5510,7 +5610,7 @@ export function UnitCellRenderer(params: ICellRendererParams) {
   // Bug 9: render the raw unit code (e.g. "m2") with NO casing transform — must match
   // the agSelectCellEditor dropdown which lists lowercase values.
   if (!data || data._isSection || data._isFooter) {
-    return <span className="text-center text-2xs font-mono">{value ?? ''}</span>;
+    return <span className="text-center text-xs font-mono">{value ?? ''}</span>;
   }
 
   const ctx = context as FullGridContext | undefined;
@@ -5532,7 +5632,7 @@ export function UnitCellRenderer(params: ICellRendererParams) {
 
   // No source indicator needed
   if (!bimSource && !pdfSource && !dwgSource) {
-    return <span className="text-center text-2xs font-mono w-full block">{displayUnit}</span>;
+    return <span className="text-center text-xs font-mono w-full block">{displayUnit}</span>;
   }
 
   if (pdfSource) {
@@ -5541,7 +5641,7 @@ export function UnitCellRenderer(params: ICellRendererParams) {
     const shortLabel = (parts[parts.length - 1] ?? pdfSource).trim();
     return (
       <div className="flex flex-col items-center justify-center h-full w-full gap-0">
-        <span className="text-2xs font-mono leading-tight">{displayUnit}</span>
+        <span className="text-xs font-mono leading-tight">{displayUnit}</span>
         <span
           className="text-[7px] leading-none font-medium text-rose-600 dark:text-rose-400 truncate max-w-full"
           title={pdfSource}
@@ -5558,7 +5658,7 @@ export function UnitCellRenderer(params: ICellRendererParams) {
     const shortLabel = (parts[parts.length - 1] ?? dwgSource).trim();
     return (
       <div className="flex flex-col items-center justify-center h-full w-full gap-0">
-        <span className="text-2xs font-mono leading-tight">{displayUnit}</span>
+        <span className="text-xs font-mono leading-tight">{displayUnit}</span>
         <span
           className="text-[7px] leading-none font-medium text-amber-600 dark:text-amber-400 truncate max-w-full"
           title={dwgSource}
@@ -5576,7 +5676,7 @@ export function UnitCellRenderer(params: ICellRendererParams) {
 
   return (
     <div className="flex flex-col items-center justify-center h-full w-full gap-0">
-      <span className="text-2xs font-mono leading-tight">{displayUnit}</span>
+      <span className="text-xs font-mono leading-tight">{displayUnit}</span>
       <span
         className="text-[7px] leading-none font-medium text-emerald-600 dark:text-emerald-400 truncate max-w-full"
         title={bimSource}
@@ -5620,7 +5720,33 @@ export function BimQtyPickerCellRenderer(params: ICellRendererParams) {
     setShowPicker(true);
   }, []);
 
-  if (!hasBimLink) return null;
+  // A locked bill takes no writes: no picker and no linking.
+  if (ctx?.readOnly) return null;
+
+  // No links yet: offer to pick elements in the project's model for this
+  // position, the way in that used to exist only from the BIM side. Faint
+  // at rest because it sits on every unlinked row.
+  if (!hasBimLink) {
+    const onLinkFromModel = ctx?.onLinkFromModel;
+    if (!onLinkFromModel || !ctx?.bimModelId || cadElementIds.length > 0) return null;
+    const label = t('boq.link_from_model', { defaultValue: 'Pick elements in the 3D model' });
+    return (
+      <div className="flex items-center justify-center h-full w-full">
+        <button
+          type="button"
+          onClick={() => onLinkFromModel(data.id)}
+          data-testid="boq-link-from-model"
+          className="h-6 w-6 flex items-center justify-center rounded
+                     text-content-quaternary opacity-60 hover:opacity-100 hover:text-oe-blue hover:bg-oe-blue/10
+                     transition-colors cursor-pointer"
+          title={label}
+          aria-label={label}
+        >
+          <Cuboid size={13} />
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center justify-center h-full w-full">

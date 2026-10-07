@@ -1,19 +1,15 @@
 # DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 # Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-"""CCDC is recognised as a standard and reports that it has no periods yet.
+"""CCDC is recognised as a standard and carries its own sourced periods.
 
 Two shipped Canadian demo packs declare CCDC 2 (2020) as their contract form.
-The normaliser did not recognise it, so it became UNKNOWN, and an unknown
-standard falls through to the standard-neutral fallback windows. The result was
-not a visible gap: a Canadian variation was given a 28 calendar-day claim
-deadline and a countdown, sourced from nothing.
+The normaliser maps every CCDC variant to the CCDC family, which has real
+notice periods derived from the contract text (GC 6.1, 6.3, 6.5, 6.6).
 
-Recognising the form on its own would replace a fabricated number with a
-silently missing one. So CCDC is recognised *and* registered as held: no
-periods are invented, and the clock says so instead of counting.
-
-This mirrors the convention the payment-clock registry already uses for a
-country deliberately carried without a value.
+Claims and EOT are 10 working days (BUSINESS basis), while quotation (14),
+assessment (15) and response (15) are calendar days.  This is the first
+standard in the table that mixes day bases, and the working-day entries
+differ materially from the standard-neutral fallback of 28 calendar days.
 """
 
 from __future__ import annotations
@@ -28,7 +24,6 @@ from app.modules.change_intelligence.time_bar import (
     NOTICE_CLAIM,
     NOTICE_EOT,
     NOTICE_PERIODS,
-    NOTICE_PERIODS_HELD,
     NOTICE_QUOTATION,
     NOTICE_RESPONSE,
     STANDARD_CCDC,
@@ -76,23 +71,33 @@ def test_recognising_ccdc_does_not_disturb_the_other_standards() -> None:
     assert normalize_standard("") == STANDARD_UNKNOWN
 
 
-# ── 2. It reports no period rather than computing a fictitious one ───────
+# ── 2. CCDC periods are sourced from the contract, not from the generic fallback
+
+
+CCDC_EXPECTED: dict[str, int] = {
+    NOTICE_CLAIM: 10,
+    NOTICE_EOT: 10,
+    NOTICE_QUOTATION: 14,
+    NOTICE_ASSESSMENT: 15,
+    NOTICE_RESPONSE: 15,
+}
 
 
 @pytest.mark.parametrize("notice_type", ALL_NOTICE_TYPES)
-def test_a_held_standard_reports_no_period_instead_of_the_generic_one(notice_type: str) -> None:
-    """This is the assertion the whole change exists for.
+def test_ccdc_returns_its_own_period_not_the_generic_fallback(notice_type: str) -> None:
+    """Each CCDC period comes from GC 6.x, not from the standard-neutral table."""
+    actual = period_for(STANDARD_CCDC, notice_type)
+    assert actual == CCDC_EXPECTED[notice_type]
+    assert actual != GENERIC_PERIODS[notice_type], (
+        f"{notice_type}: CCDC period equals the generic fallback ({actual}); "
+        "the test cannot distinguish a sourced value from a fallback"
+    )
 
-    Before the change this returned the generic window - 28, 28, 28, 21, 14 -
-    for a standard nobody had entered a single period for.
-    """
-    assert period_for(STANDARD_CCDC, notice_type) is None
 
-
-def test_no_ccdc_period_was_invented() -> None:
-    """The registry must stay empty for CCDC until a period is sourced."""
-    assert STANDARD_CCDC not in NOTICE_PERIODS
-    assert STANDARD_CCDC in NOTICE_PERIODS_HELD
+def test_ccdc_is_registered_with_real_periods() -> None:
+    """CCDC is in NOTICE_PERIODS with all five notice types populated."""
+    assert STANDARD_CCDC in NOTICE_PERIODS
+    assert set(NOTICE_PERIODS[STANDARD_CCDC]) == set(ALL_NOTICE_TYPES)
 
 
 def test_a_genuinely_unknown_standard_still_gets_the_generic_fallback() -> None:
@@ -114,7 +119,7 @@ def test_every_registered_period_still_states_its_basis() -> None:
     assert period_bases_are_complete() == []
 
 
-# ── 3. The refusal is visible, and it does not disarm the risk flag ──────
+# ── 3. The CCDC clock carries real periods, not a generic countdown ──────
 
 
 def _ccdc_clock(*, proof_on_file: bool) -> object:
@@ -140,31 +145,26 @@ def _ccdc_clock(*, proof_on_file: bool) -> object:
     )
 
 
-def test_a_ccdc_clock_is_returned_and_says_unknown_rather_than_vanishing() -> None:
-    """The honest path has to stay on screen to be honest.
-
-    A refusal that dropped the clock from the register would trade a wrong
-    answer for no answer, which is the failure this change is avoiding.
-    """
+def test_a_ccdc_clock_carries_the_sourced_period() -> None:
+    """The clock is returned with the real CCDC claim period, not None."""
     clock = _ccdc_clock(proof_on_file=False)
     assert clock.standard == STANDARD_CCDC
-    assert clock.period_days is None
-    assert clock.deadline is None
-    assert clock.days_remaining is None
-    assert clock.status == STATUS_UNKNOWN
+    assert clock.period_days == 10
+    assert clock.deadline is not None
+    assert clock.status != STATUS_UNKNOWN
 
 
-def test_a_held_period_still_flags_the_entitlement_as_at_risk() -> None:
-    """Not knowing the window is not evidence the notice is safe."""
+def test_a_ccdc_clock_without_proof_flags_at_risk() -> None:
+    """A notice without proof on file is still at risk regardless of the source."""
     assert _ccdc_clock(proof_on_file=False).entitlement_at_risk is True
 
 
-def test_a_ccdc_clock_no_longer_shows_a_countdown_from_nowhere() -> None:
-    """Names the exact wrong behaviour, so a regression is unambiguous.
+def test_a_ccdc_clock_does_not_use_the_generic_28_day_period() -> None:
+    """The old defect gave CCDC the generic 28 calendar-day fallback.
 
-    On the tree before this change the same input produced period_days=28, a
-    deadline of 2026-08-29 and status "due_soon" - a live countdown to a legal
-    deadline that no contract text supports.
+    CCDC claims are 10 working days (GC 6.6), materially different from 28
+    calendar days. A clock that still shows 28 calendar days is sourcing from
+    the wrong table.
     """
     clock = _ccdc_clock(proof_on_file=True)
     assert clock.period_days != 28

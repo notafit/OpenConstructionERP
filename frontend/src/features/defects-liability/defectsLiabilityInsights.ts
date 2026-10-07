@@ -16,6 +16,7 @@
  */
 import { useTranslation } from 'react-i18next';
 import type { InsightDataset, InsightDef } from '@/features/insights';
+import { parseDateUTC } from '@/shared/lib/dates';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -105,7 +106,7 @@ interface Row {
 function toRow(d: DefectLite, t: Translate): Row {
   const open = OPEN_STATUSES.includes(d.status) ? 1 : 0;
   const done = DONE_STATUSES.includes(d.status);
-  const dueRaw = d.due_date ? new Date(d.due_date).getTime() : NaN;
+  const dueRaw = d.due_date ? parseDateUTC(d.due_date).getTime() : NaN;
   const overdue = open === 1 && !Number.isNaN(dueRaw) && dueRaw < Date.now() ? 1 : 0;
 
   let daysToRectify: number | string = '';

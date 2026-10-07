@@ -14,8 +14,11 @@ it returns.
 Two derivations happen here:
 
 * :func:`derive_trades` reads which work sections (trades) are present, absent or
-  flagged in the estimate. A trade is keyed on the DIN 276 main cost group
-  (an open classification standard already used across the platform); a position
+  flagged in the estimate. The trade taxonomy uses DIN 276 main cost groups as
+  its canonical key, but the engine resolves codes from every classification
+  standard the platform supports (MasterFormat, NRM, UNTEC, GB50500 etc.) so a
+  US project classified under MasterFormat or a UK project classified under NRM
+  produces the same coverage picture as a German project under DIN 276. A position
   with no classification is matched on its description keywords as a fallback so
   a BOQ imported without cost codes still yields useful coverage.
 * :func:`draft_basis` turns that coverage into the three qualification lists. A
@@ -244,6 +247,172 @@ def normalize_din276_main_group(raw: object) -> str:
     return ""
 
 
+# ── Cross-standard normalisation to trade groups ──────────────────────────
+#
+# The trade taxonomy above is keyed on DIN 276 main groups (100-800), but
+# estimates arrive classified under many standards. A US project uses
+# MasterFormat divisions, a UK project uses NRM work sections, and so on.
+# Rather than asking each caller to pre-convert, the derivation engine maps
+# every supported standard to the same trade-group codes so the coverage
+# picture works regardless of which classification the project chose.
+#
+# The mappings are coarse by design: the derivation only needs to know which
+# of the eight trade buckets a position belongs to, not the full depth of the
+# standard. A MasterFormat division 03 (Concrete) lands in the same bucket
+# as a DIN 276 group 300 (Building construction works).
+
+# CSI MasterFormat division (first 2 digits) -> DIN 276 main group.
+_MASTERFORMAT_DIV_TO_GROUP: dict[str, str] = {
+    # Divisions 01-14: general and structural -> 300 (building construction)
+    "02": "200",  # Existing Conditions / site prep
+    "03": "300",  # Concrete
+    "04": "300",  # Masonry
+    "05": "300",  # Metals
+    "06": "300",  # Wood, Plastics, Composites
+    "07": "300",  # Thermal and Moisture Protection
+    "08": "300",  # Openings (doors, windows)
+    "09": "300",  # Finishes
+    "10": "300",  # Specialties
+    "11": "600",  # Equipment
+    "12": "600",  # Furnishings
+    "13": "300",  # Special Construction
+    "14": "400",  # Conveying Equipment (elevators)
+    # Divisions 21-28: facility services -> 400 (technical systems)
+    "21": "400",  # Fire Suppression
+    "22": "400",  # Plumbing
+    "23": "400",  # HVAC
+    "25": "400",  # Integrated Automation
+    "26": "400",  # Electrical
+    "27": "400",  # Communications
+    "28": "400",  # Electronic Safety and Security
+    # Divisions 31-35: site and infrastructure -> 200 (site preparation)
+    "31": "200",  # Earthwork
+    "32": "500",  # Exterior Improvements (landscaping)
+    "33": "200",  # Utilities
+    "34": "200",  # Transportation
+    "35": "200",  # Waterway and Marine Construction
+    # Divisions 40-49: process equipment (industrial)
+    "40": "400",  # Process Integration
+    "41": "400",  # Material Processing / Handling Equipment
+    "42": "400",  # Process Heating / Cooling / Drying
+    "43": "400",  # Process Gas / Liquid Handling
+    "44": "400",  # Pollution / Waste Control Equipment
+    "46": "400",  # Water / Wastewater Equipment
+    "48": "400",  # Electrical Power Generation
+}
+
+
+def normalize_masterformat_group(raw: object) -> str:
+    """Return the trade group from a MasterFormat code's division number.
+
+    MasterFormat codes look like ``"03 30 00"`` or ``"03-30-00"`` or ``"033000"``.
+    The first two digits are the division. Returns ``""`` when the input does
+    not start with a recognisable two-digit division.
+    """
+    code = str(raw or "").strip().replace("-", " ")
+    if not code:
+        return ""
+    # Extract first two digit characters, skipping any leading spaces.
+    digits = ""
+    for ch in code:
+        if ch.isdigit():
+            digits += ch
+            if len(digits) == 2:
+                break
+        elif digits:
+            # Non-digit after some digits (e.g. space in "03 30 00")
+            break
+    if len(digits) < 2:
+        return ""
+    return _MASTERFORMAT_DIV_TO_GROUP.get(digits, "")
+
+
+# NRM 1 work section (first digit of the code) -> DIN 276 main group.
+# NRM codes look like "1.1", "2.5.1", "5.8" etc. The first digit is the
+# work section number.
+_NRM_SECTION_TO_GROUP: dict[str, str] = {
+    "0": "200",  # 0: Facilitating works, site prep
+    "1": "300",  # 1: Substructure
+    "2": "300",  # 2: Superstructure
+    "3": "300",  # 3: Internal finishes
+    "4": "300",  # 4: Fittings, furnishings, equipment (building-related)
+    "5": "400",  # 5: Services (M&E)
+    "6": "300",  # 6: Prefabricated buildings and building units
+    "7": "500",  # 7: Work to existing buildings
+    "8": "500",  # 8: External works
+}
+
+
+def normalize_nrm_group(raw: object) -> str:
+    """Return the trade group from an NRM work section code.
+
+    NRM codes look like ``"2.5.1"`` or ``"5.8"``. The first digit is the
+    work section that drives the trade mapping. Returns ``""`` when the input
+    is not a usable NRM code.
+    """
+    code = str(raw or "").strip()
+    if not code:
+        return ""
+    first = code[0]
+    if first.isdigit():
+        return _NRM_SECTION_TO_GROUP.get(first, "")
+    return ""
+
+
+# The classification standards whose codes the engine can resolve to a trade
+# group. Each entry is (json-key, normaliser). Tried in order; the first
+# that returns a non-empty group wins. DIN 276 is first because it is the
+# canonical taxonomy the trade table is keyed on.
+_CLASSIFICATION_RESOLVERS: tuple[tuple[str, object], ...] = (
+    ("din276", normalize_din276_main_group),
+    ("masterformat", normalize_masterformat_group),
+    ("nrm", normalize_nrm_group),
+    # Numeric-code standards (ÖNORM, UNTEC, GB50500, Birim Fiyat, Tételrend,
+    # NL/SfB, SINAPI, KBIM) share the DIN 276 hundred-group scheme or are
+    # close enough that the first-digit-to-hundred mapping works. The
+    # canonical-format converters already emit 3-digit codes in this family,
+    # so we reuse the DIN 276 normaliser.
+    ("onorm", normalize_din276_main_group),
+    ("untec", normalize_din276_main_group),
+    ("gb50500", normalize_din276_main_group),
+    ("voci", normalize_din276_main_group),
+    ("birimfiyat", normalize_din276_main_group),
+    ("tetelrend", normalize_din276_main_group),
+    ("nlsfb", normalize_din276_main_group),
+    ("sinapi", normalize_din276_main_group),
+    ("gesn", normalize_din276_main_group),
+    ("sekisan", normalize_din276_main_group),
+    ("kbim", normalize_din276_main_group),
+    ("uniclass", normalize_din276_main_group),
+    ("omniclass", normalize_din276_main_group),
+    ("uniformat", normalize_din276_main_group),
+    ("gaeb", normalize_din276_main_group),
+    ("bc3", normalize_din276_main_group),
+)
+
+
+def resolve_trade_group(classification: dict) -> str:
+    """Return the trade-group code from a classification dict, trying every standard.
+
+    Args:
+        classification: The position's ``classification`` JSONB, e.g.
+            ``{"din276": "330", "masterformat": "03 30 00"}``.
+
+    Returns:
+        A trade-group code (e.g. ``"300"``) from the first standard that
+        resolves, or ``""`` when none does.
+    """
+    if not classification or not isinstance(classification, dict):
+        return ""
+    for key, normaliser in _CLASSIFICATION_RESOLVERS:
+        raw = classification.get(key, "")
+        if raw:
+            group = normaliser(raw)
+            if group:
+                return group
+    return ""
+
+
 def _fold(text: object) -> str:
     """Lower-case a description for case-insensitive keyword matching."""
     return str(text or "").strip().lower()
@@ -294,9 +463,12 @@ def derive_trades(positions: list[dict]) -> TradeCoverage:
 
     Args:
         positions: Flat list of position dicts. Each may carry
-            ``classification`` (``{"din276": "330"}``), ``description``,
-            ``quantity``, ``unit_rate`` and ``total``. All keys are optional and
-            defended - a sparse dict is handled, not assumed.
+            ``classification`` (e.g. ``{"din276": "330"}``,
+            ``{"masterformat": "03 30 00"}``, or ``{"nrm": "2.5"}``),
+            ``description``, ``quantity``, ``unit_rate`` and ``total``. All
+            keys are optional and defended - a sparse dict is handled, not
+            assumed. The classification may hold codes from any supported
+            standard; the first one that resolves to a trade group wins.
 
     Returns:
         A :class:`TradeCoverage` with present trades (ordered by descending
@@ -308,9 +480,10 @@ def derive_trades(positions: list[dict]) -> TradeCoverage:
 
     for pos in positions:
         classification = pos.get("classification") or {}
-        din_raw = classification.get("din276", "") if isinstance(classification, dict) else ""
+        if not isinstance(classification, dict):
+            classification = {}
         description = pos.get("description", "")
-        main_group = normalize_din276_main_group(din_raw)
+        main_group = resolve_trade_group(classification)
 
         trade: Trade | None
         if main_group and main_group in _TRADE_BY_CODE:
@@ -377,6 +550,7 @@ SOURCE_FAMILIES: dict[str, str] = {
     "gaeb_import": "imported",
     "excel_import": "imported",
     "bc3_import": "imported",
+    "xpwe_import": "imported",
     "smart_import": "imported",
     "smart_import_ai": "imported",
     # Lines generated from a reference cost database, assembly or price match.
@@ -842,10 +1016,15 @@ class Qualification:
     basis: str = ""  # why the line was drafted: "present" | "absent" | "flag" | "standard"
     source: str = "auto"  # "auto" (drafted) | "manual" (user-added)
     enabled: bool = True
+    # OC-14: optional link to a review task. When an open assumption is
+    # linked to a task, the task carries the assignee, deadline and evidence.
+    # Closing the task does not auto-remove the assumption — a person must
+    # confirm the evidence before the assumption is retired.
+    linked_task_id: str | None = None
 
     def to_dict(self) -> dict:
         """Serialise to the JSON shape stored on the model / returned to the UI."""
-        return {
+        d = {
             "id": self.id,
             "category": self.category,
             "text": self.text,
@@ -855,6 +1034,9 @@ class Qualification:
             "source": self.source,
             "enabled": self.enabled,
         }
+        if self.linked_task_id:
+            d["linked_task_id"] = self.linked_task_id
+        return d
 
 
 @dataclass
@@ -868,6 +1050,7 @@ class BasisDraft:
 
 # Standard estimate qualifications, drafted on every basis so the document reads
 # like a real one. Described by function only - never a brand or product.
+# Keys are stable identifiers; English is the fallback for untranslated locales.
 _STANDARD_EXCLUSIONS: tuple[tuple[str, str], ...] = (
     ("vat", "Value added tax and any other sales taxes, unless separately stated."),
     ("permits", "Statutory permits, authority fees and connection charges."),
@@ -897,6 +1080,358 @@ _STANDARD_ASSUMPTIONS: tuple[tuple[str, str], ...] = (
         "Rates reflect competitive market conditions at the stated base date.",
     ),
 )
+
+# ── OC-05: locale-aware condition text ──────────────────────────────────────
+#
+# Standard exclusions, assumptions and dynamic condition phrases translated
+# into the project's language.  The backend generates the text once at draft
+# time and stores it, so switching the UI language later never rewrites an
+# agreed condition.  Translations cover the major construction markets; an
+# unsupported locale falls back to English.
+
+_EXCLUSION_TEXTS: dict[str, dict[str, str]] = {
+    "de": {
+        "vat": "Umsatzsteuer und sonstige Verkehrssteuern, sofern nicht gesondert ausgewiesen.",
+        "permits": "Behördliche Genehmigungen, Gebühren und Anschlusskosten.",
+        "land-finance": "Grundstückserwerb, Rechtskosten und Finanzierungskosten.",
+        "escalation": "Preisgleitung und Inflation über den angegebenen Basisstichtag hinaus.",
+        "by-others": "Leistungen Dritter oder Leistungen aus gesonderten Verträgen.",
+        "ground": "Außergewöhnliche Baugrundverhältnisse, Kontamination, Wasserhaltung und Felsaushub, sofern nicht angegeben.",
+        "loose-ffe": "Lose Möbel, Einrichtungsgegenstände und betriebliche Ausstattung, sofern nicht aufgeführt.",
+        "prof-fees": "Planungs-, Beratungs- und Überwachungshonorare, sofern nicht aufgeführt.",
+    },
+    "fr": {
+        "vat": "Taxe sur la valeur ajoutée et autres taxes sur les ventes, sauf mention contraire.",
+        "permits": "Autorisations administratives, redevances et frais de raccordement.",
+        "land-finance": "Acquisition foncière, frais juridiques et charges de financement.",
+        "escalation": "Révision de prix et inflation au-delà de la date de référence indiquée.",
+        "by-others": "Travaux décrits comme étant à la charge d'autrui ou relevant d'un marché séparé.",
+        "ground": "Conditions de sol anormales, pollution, rabattement de nappe et excavation de rocher, sauf mention contraire.",
+        "loose-ffe": "Mobilier, agencements et équipements d'exploitation non fixés, sauf mention contraire.",
+        "prof-fees": "Honoraires de conception, de conseil et de supervision, sauf mention contraire.",
+    },
+    "es": {
+        "vat": "Impuesto sobre el valor añadido y otros impuestos sobre ventas, salvo indicación en contrario.",
+        "permits": "Permisos, tasas administrativas y derechos de conexión.",
+        "land-finance": "Adquisición de terrenos, costes legales y cargas financieras.",
+        "escalation": "Revisión de precios e inflación más allá de la fecha base indicada.",
+        "by-others": "Cualquier trabajo descrito como a cargo de terceros o de un contrato independiente.",
+        "ground": "Condiciones anormales del terreno, contaminación, agotamiento de aguas y excavación en roca, salvo indicación en contrario.",
+        "loose-ffe": "Mobiliario suelto, accesorios y equipamiento operativo, salvo indicación en contrario.",
+        "prof-fees": "Honorarios profesionales, de diseño y de supervisión, salvo indicación en contrario.",
+    },
+    "it": {
+        "vat": "Imposta sul valore aggiunto e altre imposte sulle vendite, salvo diversa indicazione.",
+        "permits": "Autorizzazioni, diritti e oneri di allacciamento.",
+        "land-finance": "Acquisizione del terreno, spese legali e oneri finanziari.",
+        "escalation": "Revisione prezzi e inflazione oltre la data di riferimento indicata.",
+        "by-others": "Lavori descritti come a carico di terzi o oggetto di contratto separato.",
+        "ground": "Condizioni anomale del terreno, contaminazione, abbassamento della falda e scavo in roccia, salvo diversa indicazione.",
+        "loose-ffe": "Arredi mobili, accessori e attrezzature operative, salvo diversa indicazione.",
+        "prof-fees": "Compensi professionali, di progettazione e di direzione lavori, salvo diversa indicazione.",
+    },
+    "pt": {
+        "vat": "Imposto sobre o valor acrescentado e demais impostos sobre vendas, salvo indicação em contrário.",
+        "permits": "Licenças, taxas administrativas e encargos de ligação.",
+        "land-finance": "Aquisição de terreno, custos jurídicos e encargos financeiros.",
+        "escalation": "Revisão de preços e inflação para além da data de referência indicada.",
+        "by-others": "Trabalhos descritos como da responsabilidade de terceiros ou de contrato separado.",
+        "ground": "Condições anómalas do terreno, contaminação, rebaixamento do nível freático e escavação em rocha, salvo indicação em contrário.",
+        "loose-ffe": "Mobiliário solto, acessórios e equipamento operacional, salvo indicação em contrário.",
+        "prof-fees": "Honorários profissionais, de projecto e de fiscalização, salvo indicação em contrário.",
+    },
+    "nl": {
+        "vat": "Belasting over de toegevoegde waarde en andere omzetbelastingen, tenzij afzonderlijk vermeld.",
+        "permits": "Wettelijke vergunningen, leges en aansluitkosten.",
+        "land-finance": "Grondverwerving, juridische kosten en financieringslasten.",
+        "escalation": "Prijsindexering en inflatie na de opgegeven basisdatum.",
+        "by-others": "Werkzaamheden die beschreven zijn als door derden of onder een apart contract.",
+        "ground": "Afwijkende grondcondities, verontreinigingen, bemaling en rotswinning, tenzij vermeld.",
+        "loose-ffe": "Los meubilair, inrichting en bedrijfsapparatuur, tenzij gespecificeerd.",
+        "prof-fees": "Ontwerp-, advies- en toezichthonoraria, tenzij gespecificeerd.",
+    },
+    "ru": {
+        "vat": "Налог на добавленную стоимость и прочие налоги с продаж, если не указано отдельно.",
+        "permits": "Государственные разрешения, пошлины и плата за присоединение.",
+        "land-finance": "Приобретение земельного участка, юридические расходы и затраты на финансирование.",
+        "escalation": "Удорожание и инфляция за пределами указанной базисной даты.",
+        "by-others": "Работы, выполняемые третьими лицами или по отдельному договору.",
+        "ground": "Особые грунтовые условия, загрязнение, водопонижение и разработка скальных пород, если не указано иное.",
+        "loose-ffe": "Мебель, предметы обстановки и эксплуатационное оборудование, если не включены в перечень.",
+        "prof-fees": "Профессиональные гонорары, проектирование и авторский надзор, если не включены в перечень.",
+    },
+    "zh": {
+        "vat": "增值税及其他销售税，除非另行列明。",
+        "permits": "法定许可证、行政规费和接驳费。",
+        "land-finance": "土地取得费、法律费用和融资费用。",
+        "escalation": "超出基准日期的价格调整和通货膨胀。",
+        "by-others": "由他方承担或属于单独合同范围的工作。",
+        "ground": "异常地质条件、污染、降水和岩石开挖，除非另行说明。",
+        "loose-ffe": "活动家具、器具和运营设备，除非已列项。",
+        "prof-fees": "设计、咨询和监理费，除非已列项。",
+    },
+    "ar": {
+        "vat": "ضريبة القيمة المضافة وأي ضرائب مبيعات أخرى، ما لم يُذكر خلاف ذلك.",
+        "permits": "التصاريح القانونية والرسوم الحكومية ورسوم التوصيل.",
+        "land-finance": "تكاليف شراء الأرض والتكاليف القانونية ورسوم التمويل.",
+        "escalation": "تصاعد الأسعار والتضخم بعد تاريخ الأساس المحدد.",
+        "by-others": "أي أعمال موصوفة بأنها من قبل الغير أو بموجب عقد منفصل.",
+        "ground": "ظروف التربة غير الطبيعية والتلوث ونزح المياه وحفر الصخور، ما لم يُذكر خلاف ذلك.",
+        "loose-ffe": "الأثاث المتحرك والتجهيزات والمعدات التشغيلية، ما لم تكن مدرجة.",
+        "prof-fees": "أتعاب التصميم والاستشارات والإشراف المهني، ما لم تكن مدرجة.",
+    },
+    "ja": {
+        "vat": "付加価値税およびその他の売上税（別途記載のない限り）。",
+        "permits": "法定許認可、行政手数料および接続負担金。",
+        "land-finance": "用地取得費、法務費用および資金調達費用。",
+        "escalation": "記載基準日を超える価格変動およびインフレーション。",
+        "by-others": "他者施工または別途契約とされる工事。",
+        "ground": "異常地盤条件、汚染、排水および岩盤掘削（記載のない限り）。",
+        "loose-ffe": "什器備品および運用設備（明記のない限り）。",
+        "prof-fees": "設計、コンサルティングおよび監理報酬（明記のない限り）。",
+    },
+    "ko": {
+        "vat": "부가가치세 및 기타 판매세, 별도 명시되지 않는 한.",
+        "permits": "법정 허가, 관련 수수료 및 접속 부담금.",
+        "land-finance": "토지 취득비, 법률 비용 및 금융 비용.",
+        "escalation": "기재된 기준일 이후의 물가 상승 및 인플레이션.",
+        "by-others": "타인 시공 또는 별도 계약으로 기술된 공사.",
+        "ground": "이상 지반 조건, 오염, 배수 및 암반 굴착, 별도 명시되지 않는 한.",
+        "loose-ffe": "비고정 가구, 부속품 및 운영 장비, 별도 항목화되지 않는 한.",
+        "prof-fees": "설계, 감리 및 전문 용역비, 별도 항목화되지 않는 한.",
+    },
+    "tr": {
+        "vat": "Katma değer vergisi ve diğer satış vergileri, ayrıca belirtilmedikçe.",
+        "permits": "Yasal izinler, resmi harçlar ve bağlantı ücretleri.",
+        "land-finance": "Arsa edinimi, hukuki masraflar ve finansman giderleri.",
+        "escalation": "Belirtilen baz tarihini aşan fiyat artışı ve enflasyon.",
+        "by-others": "Başkaları tarafından veya ayrı bir sözleşme kapsamında yapılacağı belirtilen işler.",
+        "ground": "Anormal zemin koşulları, kirlilik, su tahliyesi ve kaya kazısı, aksi belirtilmedikçe.",
+        "loose-ffe": "Serbest mobilya, aksesuar ve işletme ekipmanı, ayrıca belirtilmedikçe.",
+        "prof-fees": "Tasarım, danışmanlık ve denetim ücretleri, ayrıca belirtilmedikçe.",
+    },
+    "pl": {
+        "vat": "Podatek od towarów i usług oraz inne podatki obrotowe, o ile nie wyszczególniono osobno.",
+        "permits": "Pozwolenia urzędowe, opłaty administracyjne i koszty przyłączy.",
+        "land-finance": "Nabycie gruntu, koszty prawne i koszty finansowania.",
+        "escalation": "Waloryzacja cen i inflacja wykraczające poza wskazaną datę bazową.",
+        "by-others": "Prace określone jako wykonywane przez inne podmioty lub objęte odrębną umową.",
+        "ground": "Nietypowe warunki gruntowe, zanieczyszczenia, odwodnienie i roboty w skale, o ile nie wskazano inaczej.",
+        "loose-ffe": "Meble wolnostojące, wyposażenie i sprzęt eksploatacyjny, o ile nie wyszczególniono.",
+        "prof-fees": "Honoraria projektowe, doradcze i nadzoru, o ile nie wyszczególniono.",
+    },
+}
+
+_ASSUMPTION_TEXTS: dict[str, dict[str, str]] = {
+    "de": {
+        "quantities": "Die Mengen wurden auf Grundlage der zum Zeitpunkt der Kalkulation verfügbaren Unterlagen ermittelt und sind bei der Ausführungsplanung zu bestätigen.",
+        "workmanship": "Es werden normale Arbeitszeiten, üblicher Zugang und uneingeschränkte Baustellenbedingungen vorausgesetzt.",
+        "market": "Die Einheitspreise spiegeln wettbewerbsfähige Marktbedingungen zum angegebenen Basisstichtag wider.",
+    },
+    "fr": {
+        "quantities": "Les quantités sont mesurées d'après les informations disponibles au moment de l'estimation et sont à confirmer lors de la conception détaillée.",
+        "workmanship": "Des horaires de travail normaux, un accès standard et des conditions de chantier sans restriction sont présumés.",
+        "market": "Les prix unitaires reflètent les conditions concurrentielles du marché à la date de référence indiquée.",
+    },
+    "es": {
+        "quantities": "Las mediciones se basan en la información disponible en el momento de la estimación y quedan sujetas a confirmación en el diseño de detalle.",
+        "workmanship": "Se presumen jornadas laborales normales, acceso estándar y condiciones de obra sin restricciones.",
+        "market": "Los precios unitarios reflejan condiciones de mercado competitivas a la fecha base indicada.",
+    },
+    "it": {
+        "quantities": "Le quantità sono ricavate dalla documentazione disponibile al momento della stima e sono soggette a conferma in fase di progettazione esecutiva.",
+        "workmanship": "Si presumono orari di lavoro ordinari, accesso standard e condizioni di cantiere prive di restrizioni.",
+        "market": "I prezzi unitari riflettono condizioni di mercato concorrenziali alla data di riferimento indicata.",
+    },
+    "pt": {
+        "quantities": "As quantidades foram medidas com base nas informações disponíveis no momento da estimativa e estão sujeitas a confirmação no projecto de execução.",
+        "workmanship": "Presumem-se horários de trabalho normais, acesso corrente e condições de estaleiro sem restrições.",
+        "market": "Os preços unitários refletem condições de mercado concorrenciais na data de referência indicada.",
+    },
+    "nl": {
+        "quantities": "Hoeveelheden zijn opgemeten op basis van de beschikbare informatie op het moment van raming en dienen bij het uitvoeringsontwerp te worden bevestigd.",
+        "workmanship": "Er wordt uitgegaan van normale werktijden, gebruikelijke toegang en onbeperkte bouwplaatscondities.",
+        "market": "De eenheidsprijzen weerspiegelen marktconforme condities op de opgegeven basisdatum.",
+    },
+    "ru": {
+        "quantities": "Объёмы определены на основании информации, доступной на момент составления сметы, и подлежат подтверждению на стадии рабочей документации.",
+        "workmanship": "Предполагаются нормальный режим работы, стандартный доступ и беспрепятственные условия на площадке.",
+        "market": "Расценки отражают конкурентные рыночные условия на указанную базисную дату.",
+    },
+    "zh": {
+        "quantities": "工程量依据估算时可用的资料计算，须在施工图设计阶段确认。",
+        "workmanship": "假定正常工作时间、标准进场条件和无限制的施工环境。",
+        "market": "单价反映基准日期的竞争性市场行情。",
+    },
+    "ar": {
+        "quantities": "تم قياس الكميات بناءً على المعلومات المتاحة وقت إعداد التقدير وهي خاضعة للتأكيد خلال التصميم التفصيلي.",
+        "workmanship": "يُفترض ساعات عمل عادية ووصول قياسي وظروف موقع غير مقيّدة.",
+        "market": "تعكس الأسعار ظروف سوق تنافسية في تاريخ الأساس المحدد.",
+    },
+    "ja": {
+        "quantities": "数量は見積時点で利用可能な情報に基づき計測されており、実施設計で確認が必要です。",
+        "workmanship": "通常の作業時間、標準的なアクセス、制約のない現場条件を前提とします。",
+        "market": "単価は記載基準日時点の競争的市場条件を反映しています。",
+    },
+    "ko": {
+        "quantities": "수량은 산정 시점에 이용 가능한 정보를 기반으로 측정되었으며, 실시설계 단계에서 확인이 필요합니다.",
+        "workmanship": "정상 근무 시간, 표준 접근 및 제한 없는 현장 조건을 전제로 합니다.",
+        "market": "단가는 기재된 기준일의 경쟁적 시장 조건을 반영합니다.",
+    },
+    "tr": {
+        "quantities": "Miktarlar tahmin anında mevcut bilgilere göre ölçülmüştür ve detay tasarımda teyit edilmelidir.",
+        "workmanship": "Normal çalışma saatleri, standart erişim ve kısıtlamasız şantiye koşulları varsayılmaktadır.",
+        "market": "Birim fiyatlar belirtilen baz tarihteki rekabetçi piyasa koşullarını yansıtmaktadır.",
+    },
+    "pl": {
+        "quantities": "Ilości zostały ustalone na podstawie informacji dostępnych w momencie kosztorysowania i wymagają potwierdzenia na etapie projektu wykonawczego.",
+        "workmanship": "Zakłada się normalne godziny pracy, standardowy dostęp i nieograniczone warunki na placu budowy.",
+        "market": "Ceny jednostkowe odzwierciedlają konkurencyjne warunki rynkowe na wskazaną datę bazową.",
+    },
+}
+
+# Dynamic phrases that wrap around trade labels and count variables.
+_DYNAMIC_PHRASES: dict[str, dict[str, str]] = {
+    "en": {
+        "included": "{label} is included ({count} {items}).",
+        "excluded": "{label} is not included in this estimate.",
+        "item_one": "item",
+        "item_other": "items",
+        "amounts_in": "All amounts are expressed in {currency}.",
+        "base_date": "Rates are based on a base date of {date}.",
+    },
+    "de": {
+        "included": "{label} ist enthalten ({count} {items}).",
+        "excluded": "{label} ist in dieser Kalkulation nicht enthalten.",
+        "item_one": "Position",
+        "item_other": "Positionen",
+        "amounts_in": "Alle Beträge sind in {currency} angegeben.",
+        "base_date": "Die Preise beziehen sich auf den Basisstichtag {date}.",
+    },
+    "fr": {
+        "included": "{label} est inclus ({count} {items}).",
+        "excluded": "{label} n'est pas inclus dans cette estimation.",
+        "item_one": "poste",
+        "item_other": "postes",
+        "amounts_in": "Tous les montants sont exprimés en {currency}.",
+        "base_date": "Les prix sont établis sur la base de la date de référence {date}.",
+    },
+    "es": {
+        "included": "{label} está incluido ({count} {items}).",
+        "excluded": "{label} no está incluido en esta estimación.",
+        "item_one": "partida",
+        "item_other": "partidas",
+        "amounts_in": "Todos los importes se expresan en {currency}.",
+        "base_date": "Los precios se basan en la fecha base {date}.",
+    },
+    "it": {
+        "included": "{label} è incluso ({count} {items}).",
+        "excluded": "{label} non è incluso in questa stima.",
+        "item_one": "voce",
+        "item_other": "voci",
+        "amounts_in": "Tutti gli importi sono espressi in {currency}.",
+        "base_date": "I prezzi si riferiscono alla data di riferimento {date}.",
+    },
+    "pt": {
+        "included": "{label} está incluído ({count} {items}).",
+        "excluded": "{label} não está incluído nesta estimativa.",
+        "item_one": "item",
+        "item_other": "itens",
+        "amounts_in": "Todos os valores são expressos em {currency}.",
+        "base_date": "Os preços referem-se à data de referência {date}.",
+    },
+    "nl": {
+        "included": "{label} is opgenomen ({count} {items}).",
+        "excluded": "{label} is niet opgenomen in deze raming.",
+        "item_one": "post",
+        "item_other": "posten",
+        "amounts_in": "Alle bedragen zijn uitgedrukt in {currency}.",
+        "base_date": "De prijzen zijn gebaseerd op de basisdatum {date}.",
+    },
+    "ru": {
+        "included": "{label} включено ({count} {items}).",
+        "excluded": "{label} не включено в данную смету.",
+        "item_one": "позиция",
+        "item_other": "позиций",
+        "amounts_in": "Все суммы выражены в {currency}.",
+        "base_date": "Расценки основаны на базисной дате {date}.",
+    },
+    "zh": {
+        "included": "{label}已包含（{count}{items}）。",
+        "excluded": "{label}不包含在本次估算中。",
+        "item_one": "项",
+        "item_other": "项",
+        "amounts_in": "所有金额以{currency}表示。",
+        "base_date": "价格基于基准日期{date}。",
+    },
+    "ar": {
+        "included": "{label} مشمول ({count} {items}).",
+        "excluded": "{label} غير مشمول في هذا التقدير.",
+        "item_one": "بند",
+        "item_other": "بنود",
+        "amounts_in": "جميع المبالغ معبّر عنها بعملة {currency}.",
+        "base_date": "الأسعار مبنية على تاريخ الأساس {date}.",
+    },
+    "ja": {
+        "included": "{label}を含む（{count}{items}）。",
+        "excluded": "{label}は本見積に含まれていません。",
+        "item_one": "件",
+        "item_other": "件",
+        "amounts_in": "全ての金額は{currency}建てです。",
+        "base_date": "単価は基準日{date}に基づきます。",
+    },
+    "ko": {
+        "included": "{label} 포함 ({count}{items}).",
+        "excluded": "{label}은(는) 본 산정에 포함되지 않습니다.",
+        "item_one": "건",
+        "item_other": "건",
+        "amounts_in": "모든 금액은 {currency}로 표시됩니다.",
+        "base_date": "단가는 기준일 {date}에 근거합니다.",
+    },
+    "tr": {
+        "included": "{label} dahildir ({count} {items}).",
+        "excluded": "{label} bu tahmine dahil değildir.",
+        "item_one": "kalem",
+        "item_other": "kalem",
+        "amounts_in": "Tüm tutarlar {currency} cinsinden ifade edilmiştir.",
+        "base_date": "Fiyatlar {date} baz tarihine dayanmaktadır.",
+    },
+    "pl": {
+        "included": "{label} — uwzględniono ({count} {items}).",
+        "excluded": "{label} nie jest uwzględnione w niniejszym kosztorysie.",
+        "item_one": "pozycja",
+        "item_other": "pozycji",
+        "amounts_in": "Wszystkie kwoty wyrażono w {currency}.",
+        "base_date": "Ceny oparto na dacie bazowej {date}.",
+    },
+}
+
+
+def _resolve_lang(locale: str | None) -> str:
+    """Extract the two-letter language code from a locale string.
+
+    Handles ``"de"``, ``"de-DE"``, ``"de_DE"`` and ``None`` (→ ``"en"``).
+    """
+    if not locale:
+        return "en"
+    tag = locale.strip().replace("_", "-").split("-")[0].lower()
+    return tag if tag else "en"
+
+
+def _exc_text(lang: str, key: str, fallback: str) -> str:
+    """Return a translated standard exclusion, falling back to English."""
+    return _EXCLUSION_TEXTS.get(lang, {}).get(key, fallback)
+
+
+def _asm_text(lang: str, key: str, fallback: str) -> str:
+    """Return a translated standard assumption, falling back to English."""
+    return _ASSUMPTION_TEXTS.get(lang, {}).get(key, fallback)
+
+
+def _phrase(lang: str, key: str) -> str:
+    """Return a dynamic phrase template, falling back to English."""
+    phrases = _DYNAMIC_PHRASES.get(lang, _DYNAMIC_PHRASES["en"])
+    return phrases.get(key, _DYNAMIC_PHRASES["en"][key])
 
 
 # ── Sibling estimating-module assumptions ───────────────────────────────────
@@ -1217,6 +1752,7 @@ def draft_basis(
     pricing_base_date: str | None = None,
     provenance: ProvenanceSummary | None = None,
     markups: MarkupPicture | None = None,
+    locale: str | None = None,
 ) -> BasisDraft:
     """Draft the inclusions, exclusions and assumptions from trade coverage.
 
@@ -1244,6 +1780,7 @@ def draft_basis(
         A :class:`BasisDraft` of deterministic, editable qualification lines.
     """
     draft = BasisDraft()
+    lang = _resolve_lang(locale)
     picture = markups or MarkupPicture()
     # A standard exclusion the bill itself disproves is dropped rather than
     # drafted and left for the estimator to notice.
@@ -1256,12 +1793,12 @@ def draft_basis(
     # Inclusions - one per present trade, richest first.
     for trade in coverage.present:
         count = trade.position_count
-        item_word = "item" if count == 1 else "items"
+        item_word = _phrase(lang, "item_one") if count == 1 else _phrase(lang, "item_other")
         draft.inclusions.append(
             Qualification(
                 id=f"inc-trade-{trade.code}",
                 category="inclusion",
-                text=f"{trade.label} is included ({count} {item_word}).",
+                text=_phrase(lang, "included").format(label=trade.label, count=count, items=item_word),
                 trade_code=trade.code,
                 trade_label=trade.label,
                 basis="present",
@@ -1269,15 +1806,21 @@ def draft_basis(
         )
 
     # Exclusions - expected trades that are absent, then the standard set.
+    # OC-02: when the BOQ is empty, every trade reads as absent, but that is a
+    # gap ("not yet estimated"), not a confirmed scope boundary.  We draft the
+    # lines unchecked so the reviewer sees what is missing without mistaking
+    # machine-detected gaps for agreed exclusions.
+    empty_boq = coverage.total_positions == 0
     for trade in coverage.absent_core:
         draft.exclusions.append(
             Qualification(
                 id=f"exc-trade-{trade.code}",
                 category="exclusion",
-                text=f"{trade.label} is not included in this estimate.",
+                text=_phrase(lang, "excluded").format(label=trade.label),
                 trade_code=trade.code,
                 trade_label=trade.label,
                 basis="absent",
+                enabled=not empty_boq,
             )
         )
     for key, text in _STANDARD_EXCLUSIONS:
@@ -1287,8 +1830,9 @@ def draft_basis(
             Qualification(
                 id=f"exc-{key}",
                 category="exclusion",
-                text=text,
+                text=_exc_text(lang, key, text),
                 basis="standard",
+                enabled=not empty_boq,
             )
         )
 
@@ -1373,7 +1917,7 @@ def draft_basis(
             Qualification(
                 id="asm-base-date",
                 category="assumption",
-                text=f"Rates are based on a base date of {base_date}.",
+                text=_phrase(lang, "base_date").format(date=base_date),
                 basis="standard",
             )
         )
@@ -1382,7 +1926,7 @@ def draft_basis(
             Qualification(
                 id="asm-currency",
                 category="assumption",
-                text=f"All amounts are expressed in {currency.strip()}.",
+                text=_phrase(lang, "amounts_in").format(currency=currency.strip()),
                 basis="standard",
             )
         )
@@ -1391,7 +1935,7 @@ def draft_basis(
             Qualification(
                 id=f"asm-{key}",
                 category="assumption",
-                text=text,
+                text=_asm_text(lang, key, text),
                 basis="standard",
             )
         )

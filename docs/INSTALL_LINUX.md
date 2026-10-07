@@ -20,6 +20,66 @@ openconstructionerp
 
 Open http://localhost:8080. Done. The legacy `openestimate` command still works as an alias of `openconstructionerp`.
 
+That start binds to `127.0.0.1`, so the page opens on the server itself and nowhere else. To reach it from another machine, start it as `openconstructionerp serve --host 0.0.0.0 --port 8080` and open the firewall for that port.
+
+---
+
+## What the machine needs
+
+Give it **3 GB of memory on a dedicated server**. That is a floor rather than
+a recommendation, and the difference matters: below it the machine runs
+perfectly well until the first country cost pack import, and then stops, in
+the way described a few paragraphs down.
+
+Here is the arithmetic, measured rather than estimated. The application with
+every module loaded sits at roughly 800 MB before it serves a request.
+PostgreSQL beside it wants another 200 to 400 MB. The operating system takes
+its own share. That is most of one and a half gigabytes at idle, and idle is
+not where the trouble is.
+
+The peak is not the application, it is the one off import of a country cost
+pack. A pack expands from a compressed file into hundreds of thousands of
+database rows, and that import was measured at roughly 1.2 GB on top of
+everything else from 17.7.0 onward, against roughly 4 GB before it. On 17.6.0
+and earlier the load cannot finish on a small machine at all, so if a pack is
+what you came for, check `openconstructionerp --version` first.
+
+Add the idle figure to the import peak and two gigabytes does not fit. Three
+does, with enough margin that the kernel is never choosing between your
+database and your application. Dedicated is part of the figure: on a shared or
+burstable instance the memory is only nominally yours, and the moment that
+matters is the one moment you cannot retry cheaply.
+
+Most cloud images ship with no swap file, Hetzner among them, which leaves no
+cushion whatsoever. The moment the kernel runs short it picks the largest
+process and sends it SIGKILL. Python cannot catch SIGKILL, so there is no
+traceback, no error in the log and nothing in the browser except a connection
+that stopped answering. The import runs inside the API process, so the whole
+server goes with it rather than one failed request.
+
+Two gigabytes of swap is usually enough and costs nothing but disk:
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+free -m                      # Swap: should now show about 2048
+```
+
+To find out whether this is what happened to a server that has already died,
+ask the kernel rather than the application log:
+
+```bash
+dmesg | grep -i "killed process"
+journalctl -k --since "2 hours ago" | grep -i "out of memory"
+```
+
+If an import was interrupted, start it again. Work items are keyed by code and
+region and an existing one is left untouched, so a second run cannot duplicate
+what the first one already wrote.
+
 ---
 
 ## 1. The PEP 668 trap (Ubuntu 23.04+)
@@ -267,6 +327,8 @@ ls -l /usr/bin/IfcExporter        # should exist and be > 1 KB
 | `ModuleNotFoundError` after install | Wrong venv active | Re-run `source ~/openconstructionerp-venv/bin/activate` |
 | `Address already in use` | Port 8080 taken | `ss -tlnp \| grep 8080`, then `openconstructionerp serve --port 9090` (section 5) |
 | `openconstructionerp: command not found` after pipx | Path not refreshed | `pipx ensurepath` then open a new shell |
+| The server stops answering while a country cost pack loads, nothing in the log | The kernel out of memory killer, not the application | Add swap and run 17.7.0 or newer (see "What the machine needs"), confirm with `dmesg \| grep -i "killed process"` |
+| Opens with `curl` on the server, unreachable from any other machine | The default bind is `127.0.0.1` | Start it as `openconstructionerp serve --host 0.0.0.0 --port 8080` (section 6) |
 | BIM converter install "signal timed out", stuck on placeholder geometry | A slow link aborted an older build's blocking download | Fixed in 8.8.0+: the install now runs in the background, resumes, and unpacks without root or dpkg. Retry **Settings -> BIM Converters -> Install**; only if it still fails, install from the terminal (section 7) |
 
 If you still cannot install, run `openconstructionerp doctor` (or `python -m openconstructionerp doctor`) and open an issue with the full output: https://github.com/datadrivenconstruction/OpenConstructionERP/issues

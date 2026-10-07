@@ -8,8 +8,8 @@ running concurrently.
 
 Coverage:
 
-1.  Auth gates — 401 without a user, 403 when the caller isn't the
-    project owner / admin.
+1.  Auth gates — 401 without a user, 404 when the caller cannot read the
+    project (owner, member or admin can), the same answer as a missing one.
 2.  Empty project — every field returns False, no exceptions.
 3.  Populated modules — inserting a row into a single module's table
     flips that module's bool to True and leaves the rest False.
@@ -245,17 +245,67 @@ async def test_module_presence_requires_authentication(
 
 @pytest.mark.tenant_isolation
 @pytest.mark.asyncio
-async def test_module_presence_403_for_non_owner(
+async def test_module_presence_404_for_a_stranger(
     client: AsyncClient,
     project_owned_by,
 ) -> None:
-    """Authenticated stranger (non-admin) → 403, not 200."""
+    """Authenticated stranger (non-admin) → 404, the same answer as a missing project."""
     _owner_id, project_id = await project_owned_by()
     stranger_id = uuid.uuid4()
     _set_acting_user(stranger_id, role="estimator")
 
     resp = await client.get(f"/api/v1/projects/{project_id}/module-presence")
-    assert resp.status_code == 403, resp.text
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.tenant_isolation
+@pytest.mark.asyncio
+async def test_project_reads_open_for_a_viewer_member(
+    client: AsyncClient,
+    project_owned_by,
+    temp_engine_and_factory,
+) -> None:
+    """A viewer on the project team reads the profile, modules and presence.
+
+    These three are reads the project page makes as it opens. They used the
+    owner check, so every member who was not the owner got 403 on a project
+    that otherwise opened for them. Membership is what grants read access
+    everywhere else in the module, and a stranger still gets 404.
+    """
+    from app.modules.teams.models import Team, TeamMembership
+    from app.modules.users.models import User
+
+    _owner_id, project_id = await project_owned_by()
+    _engine, factory = temp_engine_and_factory
+    member_id = uuid.uuid4()
+    async with factory() as session:
+        session.add(
+            User(
+                id=member_id,
+                email=f"member-{uuid.uuid4().hex[:6]}@presence.io",
+                hashed_password="x" * 60,
+                full_name="Presence Member",
+                role="viewer",
+                locale="en",
+                is_active=True,
+                metadata_={},
+            )
+        )
+        team = Team(id=uuid.uuid4(), project_id=project_id, name="Default", metadata_={})
+        session.add(team)
+        await session.flush()
+        session.add(TeamMembership(id=uuid.uuid4(), team_id=team.id, user_id=member_id, role="member"))
+        await session.commit()
+
+    _set_acting_user(member_id, role="viewer")
+    for path in ("module-presence", "profile", "modules"):
+        resp = await client.get(f"/api/v1/projects/{project_id}/{path}")
+        assert resp.status_code == 200, (path, resp.text)
+
+    _set_acting_user(uuid.uuid4(), role="viewer")
+    for path in ("module-presence", "profile", "modules"):
+        resp = await client.get(f"/api/v1/projects/{project_id}/{path}")
+        assert resp.status_code == 404, (path, resp.text)
 
 
 @pytest.mark.asyncio
@@ -283,42 +333,51 @@ async def test_module_presence_empty_tables_do_not_500(
 
 
 @pytest.mark.asyncio
-async def test_module_presence_probes_run_concurrently(
+async def test_module_presence_probes_run_one_at_a_time(
     client: AsyncClient,
     project_owned_by,
 ) -> None:
-    """asyncio.gather must wrap the probe coroutines.
+    """The probes must never overlap: they share one AsyncSession.
 
-    Patches ``asyncio.gather`` inside the module_presence namespace
-    and asserts it was invoked exactly once with N coroutine args
-    (one per registered probe). If a future refactor accidentally
-    serialises probes with an ``await`` loop, this fails loudly.
+    This asserted the opposite until 2026-09-22 - that ``asyncio.gather``
+    wrapped the probe coroutines - and reached for ``mp.asyncio.gather`` to
+    prove it. The module dropped the concurrency, and the ``asyncio`` import
+    with it, on purpose: an AsyncSession is not safe for concurrent
+    operations, and on PostgreSQL one failing probe aborts the shared
+    transaction and drags every later probe into a false negative, dimming
+    half the sidebar. So the guard points the other way now. Counting probe
+    calls alone would not catch a regression - a gathered run makes the same
+    number of calls - so the assertion is on overlap.
     """
     from app.modules.projects import module_presence as mp
 
     user_id, project_id = await project_owned_by()
     _set_acting_user(user_id)
     # The cache is per-process and survives test boundaries; clear
-    # it so the patched gather is guaranteed to be reached.
+    # it so the probes are guaranteed to be reached.
     mp.invalidate_presence_cache()
 
-    call_args: list[tuple] = []
-    # Capture the real gather BEFORE patching so the replacement
-    # doesn't recurse into itself via ``mp.asyncio.gather``.
-    real_gather = mp.asyncio.gather
+    real_probe = mp._run_one_probe
+    in_flight = 0
+    peak = 0
+    calls = 0
 
-    async def _capturing_gather(*args, **kwargs):  # type: ignore[no-untyped-def]
-        call_args.append(args)
-        return await real_gather(*args, **kwargs)
+    async def _counting_probe(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal in_flight, peak, calls
+        in_flight += 1
+        peak = max(peak, in_flight)
+        calls += 1
+        try:
+            return await real_probe(*args, **kwargs)
+        finally:
+            in_flight -= 1
 
-    with patch.object(mp.asyncio, "gather", _capturing_gather):
+    with patch.object(mp, "_run_one_probe", _counting_probe):
         resp = await client.get(f"/api/v1/projects/{project_id}/module-presence")
     assert resp.status_code == 200, resp.text
 
-    assert len(call_args) == 1, "gather should be called exactly once per request"
-    assert len(call_args[0]) == len(mp.PRESENCE_PROBES), (
-        f"gather got {len(call_args[0])} args; expected {len(mp.PRESENCE_PROBES)}"
-    )
+    assert calls == len(mp.PRESENCE_PROBES), f"ran {calls} probes; expected {len(mp.PRESENCE_PROBES)}"
+    assert peak == 1, f"{peak} probes were in flight at once, and they share one session"
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@
 The from-excel and from-pdf session-creation handlers used to read the whole
 request body into RAM with ``await file.read()`` and had no spreadsheet-bomb
 guard or PDF page cap, so a single oversized upload could OOM-kill the
-single-worker container on the 2 GB target box (a decompression-bomb .xlsx and
+single-worker container on the 3 GB target box (a decompression-bomb .xlsx and
 a page-dense PDF are the same class that took down the takeoff container).
 
 These tests pin the front-door guards added to the router, without touching the

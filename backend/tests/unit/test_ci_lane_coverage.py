@@ -101,11 +101,13 @@ REQUIRED_STATUS_CHECKS: frozenset[str] = frozenset()
 # as advisory, and it offered that as the reason the PostgreSQL lane names unit
 # files one at a time. Remeasured 2026-08-29: the unrelated reason was the Node
 # heap ceiling on the frontend type check and build, fixed on 2026-06-05 and
-# 2026-06-06 by d33d9bebf and 9b2007ba7. Both steps run at
-# --max-old-space-size=9216 today (ci.yml:480, :488) and both are green, so a
-# red Backend CI now is a real failure that has to be read rather than
-# discounted. Leaving the old sentence in place would have handed the next
-# reader a retired reason to go on ignoring the lane.
+# 2026-06-06 by d33d9bebf and 9b2007ba7. The type program outgrew that 9216
+# ceiling again at e03fcee77, and on 2026-09-21 it went to 12288 in
+# frontend/package.json and the ci.yml Type check and Build steps, with the
+# architecture manifest taken out of the type program. Either way a red
+# Backend CI is a real failure that has to be read rather than discounted.
+# Leaving the old sentence in place would have handed the next reader a
+# retired reason to go on ignoring the lane.
 #
 # A second cause of that silence was fixed on the day this was remeasured.
 # ci.yml cancelled in progress unconditionally, and this repository pushes

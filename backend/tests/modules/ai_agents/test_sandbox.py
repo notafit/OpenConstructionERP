@@ -5,6 +5,10 @@
 Seeds the sample agent runs and checks that they are scored (so the accuracy
 scoreboard renders populated), idempotent, per-user scoped, and clearly marked
 so they can be identified and removed.
+
+The scoring tests run as the hosted demo, because that is the only deployment
+where seeding happens at all and the only one where sample runs count toward
+accuracy. The opposite case has its own test at the bottom of the file.
 """
 
 from __future__ import annotations
@@ -26,6 +30,24 @@ from app.modules.ai_agents.sandbox import (
 )
 from app.modules.users.models import User
 from tests._pg import transactional_session
+
+
+@pytest.fixture(autouse=True)
+def demo_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put these tests on a demo box, the only deployment that seeds samples.
+
+    The seeding endpoint is gated on ``OE_DEMO_MODE`` and the scoreboard leaves
+    sample runs out of the aggregate unless the same flag is set, so "seeded
+    samples on a box that is not the demo" is a state the product cannot reach.
+    Asserting the scoreboard against it pins behaviour no user can observe, and
+    it also empties the scoreboard for every user at once, which is enough to
+    make a scoping assertion pass without scoping working.
+
+    The exclusion itself is not left unguarded:
+    :func:`test_samples_stay_out_of_the_scoreboard_off_the_demo_box` drops the
+    flag and asserts the opposite outcome over the same rows.
+    """
+    monkeypatch.setenv("OE_DEMO_MODE", "1")
 
 
 @pytest_asyncio.fixture
@@ -130,3 +152,26 @@ async def test_sample_runs_are_marked_for_cleanup(session: AsyncSession) -> None
         # Two independent markers so the rows are unambiguously sample data.
         assert run.trigger_source == SAMPLE_TRIGGER_SOURCE
         assert run.trust.get(SAMPLE_FLAG_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_samples_stay_out_of_the_scoreboard_off_the_demo_box(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Illustrative sample runs never count toward accuracy off the demo box.
+
+    This is the other direction of :func:`demo_box`, and the pair is the point.
+    The same nine rows score three agents with the flag set and score nothing
+    without it, so a scoreboard that counted every row would fail here and one
+    that counted none would fail in the seeding tests. Neither test can pass by
+    agreeing with a predicate that is simply always true.
+    """
+    uid = await _user(session)
+    await seed_sandbox_runs(session, user_id=uid)
+
+    # The rows exist either way. Only the aggregate is gated.
+    assert len(await _runs_for(session, uid)) == len(SAMPLE_RUNS)
+    assert len(await build_scoreboard(session, user_id=uid)) == 3
+
+    monkeypatch.delenv("OE_DEMO_MODE", raising=False)
+    assert await build_scoreboard(session, user_id=uid) == []

@@ -10,39 +10,43 @@
  * Implementation notes:
  *
  * - **Where the answer comes from.** The server asks PyPI, falls back to the
- *   GitHub release, compares versions itself and caches the result for four
- *   hours. This used to be a browser call straight to api.github.com, which
+ *   GitHub release, compares versions itself and caches the result for a
+ *   day. This used to be a browser call straight to api.github.com, which
  *   costs the anonymous rate limit — 60 requests an hour per IP, shared by
  *   everyone in an office — and cannot be answered at all on an air-gapped
  *   install, where it failed once an hour per tab and logged every attempt.
  *   The server also knows things the browser cannot see: which version is
  *   really installed, and whether this build can upgrade itself.
  *
- * - **Caching.** The query holds the answer for the same four hours the
- *   server caches it, so mounting the widget again costs nothing and a
- *   long-lived tab still notices a release that lands while it is open.
+ * - **Caching.** The query holds the answer for the same day the server
+ *   caches it and asks again once that day is over, so mounting the widget
+ *   again costs nothing and a desktop window left open for a week still
+ *   hears about a release within a day of it landing.
  *
  * - **Failure.** Anything other than a well-formed answer — offline, a proxy
  *   answering with its own page, a slow endpoint, an error — renders nothing
  *   at all. The notice can never be the reason a screen fails.
  *
- * - **Dismiss.** Per-version dismiss state is stored in sessionStorage; once
- *   the user closes the card for v0.8.0 they will not see it again until
- *   v0.8.1 (or higher) appears.
+ * - **Dismiss.** The dismissed version is kept in localStorage; once the
+ *   user closes the card for v0.8.0 no update notice shows again, in the
+ *   sidebar or as the one-line notice on Settings and About, until a version
+ *   newer than v0.8.0 is offered. See {@link isUpdateDismissed}.
  */
 
 import { useState, useEffect, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { useQuery } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Sparkles, X, ExternalLink, Copy, Check,
   Plus, Wrench, Palette, Loader2, Download, RotateCcw,
 } from 'lucide-react';
-import { apiGet, apiPost, ApiError } from '@/shared/lib/api';
+import { apiGet, apiPost, ApiError, getAuthToken } from '@/shared/lib/api';
 import { copyToClipboard } from '@/shared/lib/browser';
 import { isTauri, openExternalUrl, openInNewTab } from '@/shared/lib/desktop';
 import { getIntlLocale } from '@/shared/lib/formatters';
+import { compareVersions, parseVersion } from '@/shared/lib/version';
 
 /* ── One-click upgrade — starts `pip install --upgrade` server-side ───
  *
@@ -103,10 +107,82 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const VERSION_CHECK_URL = '/api/system/version-check';
 /** Matches the server's own cache window, so holding the answer here costs
  *  the server nothing and asking again inside it would gain nothing. */
-const VERSION_CHECK_TTL_MS = 4 * 60 * 60 * 1000;
-// Dismiss now lives in sessionStorage — every fresh app open shows the
-// banner again, but the user can hide it for the current tab/session.
-const DISMISS_KEY = 'oe_update_dismissed_version_session';
+export const VERSION_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+// OC-16: dismiss state persists across sessions via localStorage so the
+// banner does not reappear on every page load. The guard is version-scoped:
+// dismissing v17.4.1 does not suppress a later v17.5.0 notification.
+const DISMISS_KEY = 'oe_update_dismissed_version';
+/** Fired on this window when a notice is dismissed, so every mounted notice
+ *  (the sidebar card and the line on Settings or About) hides together. The
+ *  `storage` event covers other tabs but never fires in the tab that wrote. */
+const DISMISS_EVENT = 'oe:update-dismissed';
+
+/**
+ * Whether a dismissal covers the version on offer.
+ *
+ * It does when the dismissed version is the offered one or newer, compared as
+ * numbers rather than as text: the text is whatever the key holds, and the
+ * card itself prints "v18.0.0", so a person who copies it writes the "v". A
+ * string equality let exactly that dismissal through. A key naming an older
+ * release (17.8.3 against 18.0.0) does not cover the newer one, which is the
+ * point of keying the dismissal by version. A key that names no version at
+ * all covers nothing.
+ *
+ * This is not a second answer to "is there an update": the server decides
+ * `update_available`. It answers a question the server cannot see, namely
+ * what this browser was told to stop showing.
+ */
+export function isUpdateDismissed(dismissed: string | null | undefined, offered: string): boolean {
+  const d = parseVersion(dismissed);
+  const o = parseVersion(offered);
+  if (!d || !o) return false;
+  return compareVersions(d, o) >= 0;
+}
+
+function readDismissedVersion(): string | null {
+  try {
+    return localStorage.getItem(DISMISS_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The dismissed version and a way to dismiss one, shared by every notice.
+ *
+ * Read at mount, so a notice mounting on another route with the answer
+ * already cached stays down, and kept in step afterwards through the dismiss
+ * event (this tab) and the `storage` event (other tabs).
+ */
+function useUpdateDismissal(): [string | null, (version: string) => void] {
+  const [dismissed, setDismissed] = useState<string | null>(readDismissedVersion);
+
+  useEffect(() => {
+    const reread = () => setDismissed(readDismissedVersion());
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === DISMISS_KEY) reread();
+    };
+    window.addEventListener(DISMISS_EVENT, reread);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener(DISMISS_EVENT, reread);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
+  const dismiss = useCallback((version: string) => {
+    setDismissed(version);
+    try {
+      localStorage.setItem(DISMISS_KEY, version);
+    } catch {
+      /* storage unavailable: the notice simply reappears on the next mount */
+    }
+    window.dispatchEvent(new Event(DISMISS_EVENT));
+  }, []);
+
+  return [dismissed, dismiss];
+}
+
 /** The endpoint truncates the release body at this many characters, so notes
  *  arriving at exactly this length are a cut, not a short release. */
 const NOTES_CAP = 500;
@@ -148,7 +224,15 @@ export interface VersionCheck {
    *  notes: only a GitHub release naming `latest_version` is quoted. */
   assets: ReleaseAsset[];
   self_upgrade_supported: boolean;
+  /** Whether this signed-in caller may press "Apply update". Off unless the
+   *  server sets ALLOW_RUNTIME_UPGRADE=true, and never for a demo account. */
+  runtime_upgrade_allowed: boolean;
+  /** Why not, when it is not allowed: 'disabled' or 'demo_account'. */
+  runtime_upgrade_blocked: 'disabled' | 'demo_account' | null;
   upgrade_command: string;
+  /** True when the user or an administrator turned update checks off, in
+   *  which case the server asked nobody and answers with its own version. */
+  check_disabled?: boolean;
 }
 
 /** One published installer: what it is called, where it is, how big it is. */
@@ -262,9 +346,15 @@ function pickInstaller(assets: ReleaseAsset[], platform: InstallerPlatform): Rel
  * whose shape moved - all of them are the same thing to a reader, which is
  * nothing to show.
  */
-async function fetchVersionCheck(): Promise<VersionCheck | null> {
+async function fetchVersionCheck(force = false): Promise<VersionCheck | null> {
   try {
-    const r = await fetch(VERSION_CHECK_URL, { headers: { Accept: 'application/json' } });
+    // The endpoint answers signed-in callers only, and this notice lives
+    // inside the signed-in shell, so the session's token goes with it.
+    const token = getAuthToken();
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    // `force` skips the server's four-hour cache; only a pressed button sends it.
+    const r = await fetch(force ? `${VERSION_CHECK_URL}?force=true` : VERSION_CHECK_URL, { headers });
     if (!r.ok) return null;
     const data: unknown = await r.json();
     if (!data || typeof data !== 'object') return null;
@@ -286,7 +376,16 @@ async function fetchVersionCheck(): Promise<VersionCheck | null> {
       // instruction reaches a pip install too, while a pip command reaches a
       // frozen build as advice it cannot carry out.
       self_upgrade_supported: body.self_upgrade_supported === true,
+      // Not offered unless the server says so, for the same reason.
+      runtime_upgrade_allowed: body.runtime_upgrade_allowed === true,
+      runtime_upgrade_blocked:
+        body.runtime_upgrade_blocked === 'demo_account'
+          ? 'demo_account'
+          : body.runtime_upgrade_blocked === 'disabled'
+            ? 'disabled'
+            : null,
       upgrade_command: typeof body.upgrade_command === 'string' ? body.upgrade_command : '',
+      check_disabled: body.check_disabled === true,
     };
   } catch {
     return null;
@@ -440,14 +539,18 @@ function notesExcerpt(notes: string, limit = 320): string {
 export function useUpdateCheck(): VersionCheck | null {
   const { data } = useQuery<VersionCheck | null>({
     queryKey: ['system-version-check'],
-    queryFn: fetchVersionCheck,
+    // Wrapped: react-query passes its context as the first argument, which
+    // would otherwise land in `force`.
+    queryFn: () => fetchVersionCheck(),
     enabled: !UPDATE_CHECK_DISABLED,
     staleTime: VERSION_CHECK_TTL_MS,
-    // No interval. A tab left open for days will not hear about a release
-    // until it is reloaded, and that is the trade this widget should make: a
-    // timer asks again forever, including on the install that can never be
-    // answered, which is the shape of the storm this change removed. A
-    // release is worth knowing about within the session that follows it.
+    // Once a day, also in a window left open for days, which is how the
+    // desktop app is used. The storm the old browser-side call produced was
+    // one request an hour per tab straight to GitHub; this is one request a
+    // day to our own server, which answers from its own day-long cache, and
+    // an install that can never be answered pays one failed call a day.
+    refetchInterval: VERSION_CHECK_TTL_MS,
+    refetchIntervalInBackground: true,
     refetchOnWindowFocus: false,
     retry: false,
   });
@@ -455,48 +558,190 @@ export function useUpdateCheck(): VersionCheck | null {
   return data && data.update_available ? data : null;
 }
 
-interface UpdateNotificationProps {
-  /** When true, the dismiss state is ignored — used on the About / Settings pages
-   *  where the user explicitly navigated to "see what's new". */
-  forceShow?: boolean;
-  /** Hide the dismiss button — pairs naturally with `forceShow`. */
-  hideDismiss?: boolean;
+/**
+ * The update the reader has not dismissed, or null.
+ *
+ * What every notice renders from: the server's answer when it offers an
+ * update, minus a dismissal that covers the offered version.
+ */
+export function useUndismissedUpdate(): {
+  release: VersionCheck | null;
+  dismiss: () => void;
+} {
+  const release = useUpdateCheck();
+  const [dismissedVersion, dismissVersion] = useUpdateDismissal();
+  const dismiss = useCallback(() => {
+    if (release) dismissVersion(release.latest_version);
+  }, [release, dismissVersion]);
+  const shown = release && !isUpdateDismissed(dismissedVersion, release.latest_version) ? release : null;
+  return { release: shown, dismiss };
 }
 
-export function UpdateNotification({ forceShow = false, hideDismiss = false }: UpdateNotificationProps = {}) {
-  const { t } = useTranslation();
-  const release = useUpdateCheck();
-  // The version a dismissal was about, not the fact that one happened. Read
-  // from storage at mount rather than when the answer arrives, so a card
-  // dismissed in this session stays down when the widget mounts again on
-  // another route with the answer already cached.
-  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() => {
-    try {
-      return sessionStorage.getItem(DISMISS_KEY);
-    } catch {
-      return null;
-    }
-  });
-  const [showFullModal, setShowFullModal] = useState(false);
+type ManualCheckState = 'idle' | 'checking' | 'current' | 'available' | 'failed' | 'disabled';
 
-  const handleDismiss = useCallback(() => {
-    if (!release) return;
-    setDismissedVersion(release.latest_version);
-    try {
-      sessionStorage.setItem(DISMISS_KEY, release.latest_version);
-    } catch {
-      /* storage unavailable — the card simply reappears next mount */
+/**
+ * About's "Check for updates" button.
+ *
+ * Asks the server with `force`, so the answer is today's and not the cached
+ * one, and writes it into the same query the notices read, so a newer version
+ * found here also appears as the one-line notice above it. Says which of the
+ * four answers it got, because "nothing happened" after a click reads as a
+ * broken button: up to date, a newer version, could not ask, or turned off.
+ */
+export function CheckForUpdatesButton({ className = '' }: { className?: string }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [state, setState] = useState<ManualCheckState>('idle');
+  const [found, setFound] = useState('');
+
+  const check = useCallback(async () => {
+    setState('checking');
+    const data = await fetchVersionCheck(true);
+    queryClient.setQueryData(['system-version-check'], data);
+    if (!data) {
+      setState('failed');
+    } else if (data.check_disabled) {
+      setState('disabled');
+    } else if (data.update_available) {
+      setFound(data.latest_version);
+      setState('available');
+    } else {
+      setState('current');
     }
-  }, [release]);
+  }, [queryClient]);
+
+  if (UPDATE_CHECK_DISABLED) return null;
+
+  const message =
+    state === 'checking'
+      ? t('about.check_updates_checking', { defaultValue: 'Checking...' })
+      : state === 'current'
+        ? t('about.check_updates_current', { defaultValue: 'You have the latest version.' })
+        : state === 'available'
+          ? t('about.check_updates_available', {
+              defaultValue: 'Version {{version}} is available.',
+              version: found,
+            })
+          : state === 'failed'
+            ? t('about.check_updates_failed', {
+                defaultValue: 'Could not check for updates right now. Try again later.',
+              })
+            : state === 'disabled'
+              ? t('about.check_updates_disabled', {
+                  defaultValue: 'Update checks are turned off on this computer.',
+                })
+              : t('about.check_updates_hint', {
+                  defaultValue: 'Asks PyPI and GitHub which version is the latest. Nothing about you is sent.',
+                });
+
+  return (
+    <div className={`flex flex-wrap items-center gap-3 text-sm ${className}`}>
+      <button
+        type="button"
+        onClick={() => void check()}
+        disabled={state === 'checking'}
+        className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-content-primary hover:bg-surface-secondary disabled:opacity-60"
+      >
+        {state === 'checking' ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />}
+        {t('about.check_updates', { defaultValue: 'Check for updates' })}
+      </button>
+      <span className="text-xs text-content-tertiary" role="status" aria-live="polite">
+        {message}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The update notice for the collapsed, icon-only sidebar.
+ *
+ * The sidebar card is too wide for the icon strip, and hiding it there meant
+ * a reader who keeps the sidebar collapsed never heard about a release. This
+ * is the same notice as one icon with a dot: it follows the same dismissal,
+ * names the version in its tooltip, and opens About, where the one-line notice
+ * and the Check for updates button live.
+ */
+export function UpdateBadge() {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const { release } = useUndismissedUpdate();
+  if (!release) return null;
+
+  const label = t('about.check_updates_available', {
+    defaultValue: 'Version {{version}} is available.',
+    version: release.latest_version,
+  });
+
+  return (
+    <button
+      type="button"
+      onClick={() => navigate('/about')}
+      title={label}
+      aria-label={label}
+      className="relative mx-auto mb-2 mt-3 flex h-8 w-8 items-center justify-center rounded-lg text-sky-600 hover:bg-sky-500/10 dark:text-sky-300"
+    >
+      <Sparkles size={16} strokeWidth={2.25} />
+      <span
+        className="absolute right-1 top-1 h-2 w-2 rounded-full bg-sky-500 ring-2 ring-surface-primary"
+        aria-hidden="true"
+      />
+    </button>
+  );
+}
+
+/**
+ * The one-line update notice for Settings and About.
+ *
+ * Those pages used to render the full sidebar card with its dismiss button
+ * removed and the dismissal ignored, so a reader who had closed the notice
+ * met it again, undismissable, on the two pages they open most to check a
+ * setting. The line says the same thing in one row, links to the release, and
+ * follows the same dismissal as the sidebar card.
+ */
+export function UpdateInlineNotice({ className = '' }: { className?: string }) {
+  const { t } = useTranslation();
+  const { release } = useUndismissedUpdate();
+  if (!release) return null;
+  return (
+    <div
+      className={`flex items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-4 py-2.5 text-sm dark:border-sky-800 dark:bg-sky-950 ${className}`}
+    >
+      <Sparkles size={14} className="shrink-0 text-sky-500" />
+      <span className="text-content-secondary">
+        {release.current_version
+          ? t('settings.update_available_inline', {
+              defaultValue: 'Update available: v{{current}} → v{{latest}}',
+              current: release.current_version,
+              latest: release.latest_version,
+            })
+          : `v${release.latest_version}`}
+      </span>
+      {release.release_url && (
+        <a
+          href={release.release_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ml-auto text-xs font-medium text-oe-blue hover:underline"
+        >
+          {t('common.details', { defaultValue: 'Details' })}
+        </a>
+      )}
+    </div>
+  );
+}
+
+export function UpdateNotification() {
+  const { t } = useTranslation();
+  const { release, dismiss: handleDismiss } = useUndismissedUpdate();
+  const [showFullModal, setShowFullModal] = useState(false);
 
   const grouped = useMemo<GroupedHighlights | null>(
     () => (release ? groupHighlights(release.release_notes) : null),
     [release],
   );
 
+  // Scoped to the version dismissed: a newer release speaks up on its own.
   if (!release) return null;
-  // Scoped to the version dismissed: the next release speaks up on its own.
-  if (dismissedVersion === release.latest_version && !forceShow) return null;
 
   const relativeDate = release.published_at
     ? new Date(release.published_at).toLocaleDateString(getIntlLocale())
@@ -571,15 +816,13 @@ export function UpdateNotification({ forceShow = false, hideDismiss = false }: U
             </div>
           </div>
         </button>
-        {!hideDismiss && (
-          <button
-            onClick={handleDismiss}
-            aria-label={t('common.dismiss', { defaultValue: 'Dismiss' })}
-            className="absolute top-1.5 right-1.5 flex h-5 w-5 items-center justify-center rounded text-sky-500/70 hover:text-blue-700 hover:bg-sky-500/20 dark:hover:bg-sky-400/20 transition-colors"
-          >
-            <X size={11} />
-          </button>
-        )}
+        <button
+          onClick={handleDismiss}
+          aria-label={t('common.dismiss', { defaultValue: 'Dismiss' })}
+          className="absolute top-1.5 right-1.5 flex h-5 w-5 items-center justify-center rounded text-sky-500/70 hover:text-blue-700 hover:bg-sky-500/20 dark:hover:bg-sky-400/20 transition-colors"
+        >
+          <X size={11} />
+        </button>
       </div>
 
       {showFullModal && (
@@ -667,10 +910,10 @@ function UpdateFullModal({
    *  spinner; ``done`` shows the post-pip result + restart hint; ``error``
    *  shows the captured stderr so the user can copy it into a bug report.
    *
-   *  Backed by ``POST /api/system/upgrade`` which gates on
-   *  ``ALLOW_RUNTIME_UPGRADE`` — managed installs (VPS, SaaS) keep the
-   *  copy-paste path while localhost / Windows installer users get the
-   *  one-click button working out of the box. */
+   *  Backed by ``POST /api/system/upgrade``, which is off unless the server
+   *  sets ``ALLOW_RUNTIME_UPGRADE=true`` and is always refused to a demo
+   *  account. The server says which through ``runtime_upgrade_allowed``, so
+   *  the button is only offered where pressing it can work. */
   const [upgradeStatus, setUpgradeStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [upgradeResult, setUpgradeResult] = useState<UpgradeJob | null>(null);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
@@ -937,8 +1180,9 @@ function UpdateFullModal({
           )}
 
           {/* One-click upgrade — server-side ``pip install --upgrade`` in the
-              same venv as the running uvicorn. The 403 fallback below shows
-              when ALLOW_RUNTIME_UPGRADE is off (managed installs).
+              same venv as the running uvicorn. Offered only when the server
+              reports runtime_upgrade_allowed; the section above explains a
+              refusal instead.
 
               Shown only where the server says this build can upgrade itself.
               It used to be shown everywhere, deliberately, because the 409 a
@@ -947,7 +1191,29 @@ function UpdateFullModal({
               That reasoning held while the instruction lived in the refusal;
               it is now printed up front by the installer card below, so the
               reader gets it without pressing a button that cannot work. */}
-          {release.self_upgrade_supported && (
+          {/* Pip can run here, but this caller may not start it from the
+              browser: say why and how to switch it on, and leave the command
+              card below to do the rest. */}
+          {release.self_upgrade_supported && !release.runtime_upgrade_allowed && (
+            <section data-testid="update-runtime-blocked">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-content-tertiary mb-3">
+                {t('update.apply_now', { defaultValue: 'Apply update' })}
+              </h3>
+              <p className="rounded-xl border border-border bg-surface-primary px-3 py-3 text-2xs leading-relaxed text-content-secondary">
+                {release.runtime_upgrade_blocked === 'demo_account'
+                  ? t('update.runtime_blocked_demo', {
+                      defaultValue:
+                        'Demo accounts cannot update the installation. Sign in with your own administrator account, or run the command below on the server.',
+                    })
+                  : t('update.runtime_blocked_disabled', {
+                      defaultValue:
+                        'Updating from the browser is switched off on this server. To switch it on, set ALLOW_RUNTIME_UPGRADE=true in the server environment and restart it, or run the command below on the server.',
+                    })}
+              </p>
+            </section>
+          )}
+
+          {release.self_upgrade_supported && release.runtime_upgrade_allowed && (
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wider text-content-tertiary mb-3">
               {t('update.apply_now', { defaultValue: 'Apply update' })}
@@ -970,6 +1236,7 @@ function UpdateFullModal({
                     </div>
                   </div>
                   <button
+                    data-testid="update-apply-now"
                     onClick={handleApplyUpgrade}
                     className="shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-br from-sky-500 to-blue-600 hover:from-sky-600 hover:to-blue-700 px-3 py-2 text-sm font-semibold text-white shadow-sm shadow-blue-500/30 transition-all"
                   >

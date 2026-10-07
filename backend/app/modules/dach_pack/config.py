@@ -270,6 +270,255 @@ PACK_CONFIG: dict[str, Any] = {
             "description": "Final invoice per § 16 VOB/B",
         },
     ],
+    # ── Progress billing ─────────────────────────────────────────────────────
+    # Read through ``app.core.regional_packs.resolve_progress_billing``. Keyed
+    # per country on purpose: this pack also claims AT and CH, and a German
+    # figure must never answer for them (Austria once got Germany's VAT that
+    # way). Only DE is written; AT and CH resolve to None until someone sources
+    # them. Every number sits under a dict that carries ``statute_reference``
+    # or ``source`` plus ``effective_date`` (``None`` = commencement not
+    # established). VOB/B applies by agreement; VOB/A binds public awarding
+    # authorities, so its ceilings are guidance for everyone else.
+    "progress_billing": {
+        "DE": {
+            "retention_policy": {
+                "tiers": [{"from_percent_complete": "0", "rate": "10"}],
+                "rate_is_maximum": True,
+                "tier_mode": "prospective",
+                "stored_materials_rate": None,
+                "statute_reference": "§ 17 Abs. 6 Nr. 1 Satz 1 VOB/B",
+                "effective_date": None,
+                "note": (
+                    "Where the parties agreed that the security is kept back from payments, the client may cut "
+                    "each payment by at most 10 percent until the agreed security sum is reached. Delivered and "
+                    "specially made materials count as work in the payment (§ 16 Abs. 1 Nr. 1 VOB/B), so they "
+                    "are retained at the same rate and no separate stored-materials rate is set. VOB/B caps "
+                    "nothing itself: the cut stops at the agreed security sum, which each contract states, so "
+                    "the cap is left to the contract."
+                ),
+                "cap": None,
+                "public_client_cap": {
+                    "percent_of_contract_sum": "5",
+                    "statute_reference": "§ 9c Abs. 2 Satz 1 VOB/A",
+                    "effective_date": None,
+                    "note": (
+                        "For a public awarding authority the performance security should not exceed 5 percent of "
+                        "the contract sum. It binds public clients only; a private contract agrees its own figure."
+                    ),
+                },
+                "public_client_waiver": {
+                    "below_contract_sum_net_eur": "250000",
+                    "statute_reference": "§ 9c Abs. 1 Satz 2 VOB/A",
+                    "effective_date": None,
+                    "note": (
+                        "A public awarding authority waives the performance security, and as a rule the "
+                        "defects security, where the contract sum is below 250,000 euros net of VAT."
+                    ),
+                },
+                "escrow": {
+                    "required": True,
+                    "deposit_within_working_days": "18",
+                    "public_client_own_custody_account": True,
+                    "deferred_deposit_for_small_or_short_contracts": True,
+                    "statute_reference": "§ 17 Abs. 6 Nr. 1 Satz 3, Nr. 2 and Nr. 4 VOB/B",
+                    "effective_date": None,
+                    "note": (
+                        "The client tells the contractor each amount kept back and pays it into a blocked "
+                        "account (Sperrkonto) within 18 working days of that notice. For small or short "
+                        "contracts it may pay in only at final payment; public clients may keep it on their own "
+                        "custody account without interest."
+                    ),
+                },
+            },
+            "release_events": {
+                "events": [
+                    {
+                        "event": "substantial_completion",
+                        "release_percent_of_held": "100",
+                        "required_documents": ["acceptance_protocol"],
+                        "requires_defects_security": True,
+                        "statute_reference": "§ 12 VOB/B, formal acceptance record § 12 Abs. 4 Nr. 1; § 17 Abs. 8 Nr. 1 VOB/B",
+                        "effective_date": None,
+                        "note": (
+                            "Acceptance (Abnahme) releases the unused performance security at the agreed time, "
+                            "at the latest once the work is accepted and the security for defect claims is "
+                            "provided. The client may keep back a matching part for contract claims the defects "
+                            "security does not cover. The protocol is the written record of a formal acceptance."
+                        ),
+                        "starts_security": {
+                            "kind": "defects_liability",
+                            "percent_of_final_account": None,
+                            "source": "contractual",
+                            "effective_date": None,
+                            "public_client_ceiling": {
+                                "percent_of_final_account": "3",
+                                "statute_reference": "§ 9c Abs. 2 Satz 2 VOB/A",
+                                "effective_date": None,
+                                "note": (
+                                    "For a public awarding authority the security for defect claims should not "
+                                    "exceed 3 percent of the final account sum; a private contract agrees its own."
+                                ),
+                            },
+                        },
+                    },
+                    {
+                        "event": "defects_period_end",
+                        "release_percent_of_held": "100",
+                        "period_years": "2",
+                        "period_starts_at": "substantial_completion",
+                        "required_documents": [],
+                        "statute_reference": "§ 17 Abs. 8 Nr. 2 VOB/B",
+                        "effective_date": None,
+                        "note": (
+                            "The unused security for defect claims is returned two years after acceptance unless "
+                            "another date was agreed. The client may keep back a matching part for defect claims "
+                            "it has raised and that are still open."
+                        ),
+                    },
+                    {
+                        "event": "security_substituted",
+                        "release_percent_of_held": "100",
+                        "requires_security_type": "retention_bond",
+                        "required_documents": [],
+                        "statute_reference": "§ 17 Abs. 3 VOB/B",
+                        "effective_date": None,
+                        "note": "The contractor chooses the kind of security and may replace one with another.",
+                    },
+                ],
+            },
+            "stored_materials": {
+                "billable": True,
+                "requirements_by_location_kind": {
+                    "on_site": {
+                        "any_of": [["title_transferred"], ["security"]],
+                        "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 3 VOB/B; § 632a Abs. 1 Satz 6 BGB",
+                        "effective_date": None,
+                    },
+                    "off_site": {
+                        "any_of": [["title_transferred"], ["security"]],
+                        "eligible_items": "specially_fabricated_components",
+                        "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 3 VOB/B; § 632a Abs. 1 Satz 6 BGB",
+                        "effective_date": None,
+                    },
+                    "bonded_warehouse": {
+                        "any_of": [["title_transferred"], ["security"]],
+                        "eligible_items": "specially_fabricated_components",
+                        "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 3 VOB/B; § 632a Abs. 1 Satz 6 BGB",
+                        "effective_date": None,
+                    },
+                    "supplier_premises": {
+                        "any_of": [["title_transferred"], ["security"]],
+                        "eligible_items": "specially_fabricated_components",
+                        "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 3 VOB/B; § 632a Abs. 1 Satz 6 BGB",
+                        "effective_date": None,
+                    },
+                },
+                "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 3 VOB/B; § 632a Abs. 1 Satz 6 BGB",
+                "effective_date": None,
+                "bgb_effective_date": "2018-01-01",
+                "note": (
+                    "Materials delivered to site, and components made specially for the work and held ready, "
+                    "count as work in an interim payment if the client, at its choice, has been given ownership "
+                    "of them or equivalent security. Away from the site only the specially made components "
+                    "qualify. The BGB wording applies to contracts concluded from 1 January 2018."
+                ),
+            },
+            "sub_payment_requirements": {
+                # Summary the subcontractor rollup reads; ``requirements`` below
+                # is the detail, and a test holds the two to the same names.
+                # No lien waiver: neither VOB/B nor the BGB asks for one with a
+                # payment, so the flag stays False rather than borrowing the US rule.
+                "certificate_types": [
+                    "construction_tax_exemption",
+                    "social_security_clearance",
+                    "employers_liability_clearance",
+                ],
+                "lien_waiver_required": False,
+                "statute_reference": "§ 48 Abs. 2 and § 48b EStG; § 28e Abs. 3a to 3f SGB IV; § 150 Abs. 3 SGB VII",
+                "effective_date": None,
+                "requirements": [
+                    {
+                        "code": "construction_tax_exemption",
+                        "evidence": "certificate",
+                        "cert_type": "construction_tax_exemption",
+                        "valid_at": "payment_date",
+                        "effect_if_missing": "tax_withholding",
+                        "withholding_scheme": "DE_BAUABZUGSTEUER",
+                        "statute_reference": "§ 48 Abs. 2 Satz 1 EStG; § 48b Abs. 1 EStG",
+                        "effective_date": "2002-01-01",
+                        "note": (
+                            "Without an exemption certificate (Freistellungsbescheinigung) that is valid when "
+                            "the payment is made, the client must withhold the construction withholding tax; "
+                            "the rate and the small-amount limit live in the tax withholding scheme."
+                        ),
+                    },
+                    {
+                        "code": "social_security_clearance",
+                        "evidence": "certificate",
+                        "cert_type": "social_security_clearance",
+                        "valid_at": "period_end",
+                        "coverage": "contract_duration_without_gaps",
+                        "alternative": "prequalification",
+                        "effect_if_missing": "contractor_liability",
+                        "applies_from_total_construction_value_eur": "275000",
+                        "statute_reference": "§ 28e Abs. 3a, 3b, 3d and 3f SGB IV; § 14 AEntG",
+                        "effective_date": None,
+                        "note": (
+                            "A main contractor is liable like a guarantor for its subcontractor's social security "
+                            "contributions once the construction work commissioned for the building reaches "
+                            "275,000 euros. Prequalification or clearance certificates from the collecting "
+                            "agencies covering the whole contract period without a gap discharge it. The "
+                            "posted-workers act adds the same liability for contributions to the joint "
+                            "institutions of the collective agreement, such as the construction industry fund "
+                            "(SOKA-BAU), which issues its own clearance."
+                        ),
+                    },
+                    {
+                        "code": "employers_liability_clearance",
+                        "evidence": "certificate",
+                        "cert_type": "employers_liability_clearance",
+                        "valid_at": "period_end",
+                        "coverage": "contract_duration_without_gaps",
+                        "effect_if_missing": "contractor_liability",
+                        "statute_reference": "§ 150 Abs. 3 SGB VII with § 28e Abs. 3a to 3f SGB IV",
+                        "effective_date": None,
+                        "note": (
+                            "The same liability covers the statutory accident insurance contributions; the "
+                            "subcontractor proves payment with a qualified clearance certificate from its "
+                            "accident insurance carrier (Berufsgenossenschaft)."
+                        ),
+                    },
+                ],
+            },
+            "billing_cycle": {
+                "frequency": "monthly",
+                "period_end": "month_end",
+                "source": "industry_practice",
+                "effective_date": None,
+                "note": (
+                    "VOB/B names no interval; monthly is the usual agreed rhythm, and three to four weeks is "
+                    "what commentary treats as reasonable where nothing was agreed."
+                ),
+                "interval_rule": {
+                    "text": "in möglichst kurzen Zeitabständen oder zu den vereinbarten Zeitpunkten",
+                    "statute_reference": "§ 16 Abs. 1 Nr. 1 Satz 1 VOB/B",
+                    "effective_date": None,
+                },
+                "payment_clock_regimes": {
+                    "vob_b_interim": "de_vob_b_abschlag",
+                    "vob_b_final": "de_vob_b_schluss",
+                    "bgb_interim": "de_bgb_632a",
+                },
+            },
+            "change_line_code_format": {
+                "format": "N{source_code}",
+                "placeholders": ["source_code"],
+                "source": "platform_convention",
+                "effective_date": None,
+                "note": "Additional-work items (Nachtragspositionen) are listed apart from the original bill of quantities.",
+            },
+        },
+    },
     # ── Units (metric defaults) ──────────────────────────────────────────────
     "default_units": {
         "length": "m",

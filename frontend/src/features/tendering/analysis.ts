@@ -43,6 +43,10 @@ export interface BidTotalLike {
   currency: string;
   deviation_pct: number;
   status: string;
+  /** Lines the bidder actually priced (0 = unknown / legacy). */
+  matched_lines?: number;
+  /** Total reference lines in the package (0 = unknown / legacy). */
+  total_lines?: number;
 }
 
 export type RecommendationConfidence = 'high' | 'medium' | 'low';
@@ -98,5 +102,47 @@ export function recommend(
   if (gapRatio < 0.02) {
     return { winner, runnerUp, confidence: 'medium', reasonKey: 'narrow_gap', gapAmount, belowMedianPct: Math.round(belowMedianPct * 10) / 10 };
   }
+  // OC-24: an incomplete bid (e.g. 44 of 50 items) should not get "high"
+  // confidence. When coverage data is available and below 95%, cap at medium.
+  const matched = winner.matched_lines ?? 0;
+  const total = winner.total_lines ?? 0;
+  if (total > 0 && matched > 0 && matched / total < 0.95) {
+    return { winner, runnerUp, confidence: 'medium', reasonKey: 'clear_winner', gapAmount, belowMedianPct: Math.round(belowMedianPct * 10) / 10 };
+  }
   return { winner, runnerUp, confidence: 'high', reasonKey: 'clear_winner', gapAmount, belowMedianPct: Math.round(belowMedianPct * 10) / 10 };
+}
+
+
+/** One bidder's cell on a comparison line, as the comparison endpoint sends it. */
+export interface BidCellLike {
+  unit_rate: number | null;
+  /** False when the bidder gave no price for the line. Absent on old answers. */
+  priced?: boolean;
+}
+
+/**
+ * The bidder's unit price on a line, or ``null`` when they gave none.
+ *
+ * The endpoint sends no figure for an unpriced line (``unit_rate: null``,
+ * ``priced: false``). Reading it as 0 would show a missing price exactly like
+ * a real zero and rank it the cheapest on the line.
+ */
+export function cellRate(cell: BidCellLike): number | null {
+  if (cell.priced === false || cell.unit_rate === null || cell.unit_rate === undefined) return null;
+  return Number(cell.unit_rate);
+}
+
+/** The prices on a line that can be compared: the unpriced cells left out. */
+export function pricedRates(cells: readonly BidCellLike[]): number[] {
+  return cells.map(cellRate).filter((r): r is number => r !== null);
+}
+
+/**
+ * How many of the package's lines a bid left unpriced, 0 when the comparison
+ * carries no coverage (an answer older than ``matched_lines``).
+ */
+export function unpricedLineCount(bid: Pick<BidTotalLike, 'matched_lines' | 'total_lines'>): number {
+  const total = bid.total_lines ?? 0;
+  if (total <= 0 || bid.matched_lines === undefined) return 0;
+  return Math.max(0, total - bid.matched_lines);
 }

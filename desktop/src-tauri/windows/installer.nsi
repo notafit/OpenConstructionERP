@@ -521,12 +521,34 @@ Function PageLeaveReinstall
         Abort
       ${EndIf}
 
+      ; OpenConstructionERP fork. When the old uninstaller fails for any reason
+      ; other than user cancellation (codes 1 / 1602 above), continue with the
+      ; install instead of aborting. The install writes over every file in
+      ; $INSTDIR, NSIS_HOOK_PREINSTALL stops running processes, and the new
+      ; uninstaller replaces the broken one. Aborting here leaves the user
+      ; stuck: the old uninstaller is broken, the new installer refuses to
+      ; proceed, and the only way forward is manual removal via Windows Settings.
+      ;
+      ; On an UPGRADE ($R0 = 1) this is completely silent. Code -1 in the field
+      ; has been traced to old hooks (pre-v15.9) whose PowerShell fails under
+      ; antivirus or group policy on specific machines, and showing a scary
+      ; "Unable to uninstall!" dialog on every upgrade when the fix is always
+      ; "click Yes and continue" is worse than the error it reports. The new
+      ; installer's NSIS_HOOK_PREINSTALL stops every process the old uninstaller
+      ; missed, and every file is overwritten. On same-version reinstalls or
+      ; downgrades the dialog is kept so the user can decide.
+      ${If} $R0 = 1
+        ; Upgrading: silently continue. Log it for diagnostics but do not
+        ; block the user with a dialog they can only answer one way.
+        DetailPrint "Note: the previous version's uninstaller exited with code $0. Continuing with the upgrade."
+        Goto reinst_done
+      ${EndIf}
+
       ${If} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
         StrCpy $R5 "$R5$\nIt left $INSTDIR\${MAINBINARYNAME}.exe behind."
       ${EndIf}
 
-      ; Other errors? say what happened and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)$\n$\n$R5$\n$\nOpen Windows Settings, go to Apps, remove ${PRODUCTNAME} there, then run this installer again."
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "$(unableToUninstall)$\n$\n$R5$\n$\nThe installer can continue and overwrite the existing files. Continue?" /SD IDYES IDYES reinst_done
       Abort
     ${EndIf}
   reinst_done:
@@ -929,9 +951,11 @@ Section Uninstall
 
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
 
-  ; Delete the app directory and its content from disk
-  ; Copy main executable
-  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+  ; Delete the app directory and its content from disk.
+  ; /REBOOTOK: if the executable is still locked (antivirus, indexer), Windows
+  ; schedules it for deletion on the next reboot instead of silently failing.
+  ; Without it the file stays behind and the directory cannot be removed.
+  Delete /REBOOTOK "$INSTDIR\${MAINBINARYNAME}.exe"
 
   ; Delete resources
   {{#each resources}}
@@ -960,7 +984,7 @@ Section Uninstall
 
 
   ; Delete uninstaller
-  Delete "$INSTDIR\uninstall.exe"
+  Delete /REBOOTOK "$INSTDIR\uninstall.exe"
 
   {{#each resources_ancestors}}
   RMDir /REBOOTOK "$INSTDIR\\{{this}}"

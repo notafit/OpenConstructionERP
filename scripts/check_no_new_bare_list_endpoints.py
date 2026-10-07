@@ -102,6 +102,12 @@ CANNOT_TRUNCATE: frozenset[str] = frozenset(
         # nothing could reach, while advertising a truncation this endpoint
         # must never have.
         "rebar_schedule/router.py::cutting_summary",
+        # A fixed registry of EN 16931 country profiles the build supports.
+        # The list is compiled from profiles.py, gains an entry when a developer
+        # adds a new country profile, and is never user-expandable. The route
+        # returns the whole PROFILES dict, so there is no query, no LIMIT and no
+        # state in which it answers with part of the set.
+        "einvoice/router.py::list_profiles",
     }
 )
 

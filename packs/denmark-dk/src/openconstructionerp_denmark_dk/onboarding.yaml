@@ -1,0 +1,50 @@
+# Denmark Construction Pack — first-login onboarding wizard.
+# Streamed by /api/v1/partner-pack/onboarding-script and rendered by
+# the OnboardingWizard React component in place of the default steps.
+
+version: 2
+pack: denmark-dk
+locale: da
+title: "Velkommen til OpenConstructionERP — Danmark"
+title_en: "Welcome to OpenConstructionERP — Denmark Edition"
+subtitle: "Fire trin til at indstille dit arbejdsomraade til dansk kalkulationspraksis (V&S, SfB/CCS, AB 18). Four quick steps to align your workspace with Danish estimating practice."
+
+steps:
+  - id: company_profile
+    title: "Virksomhedsprofil / Company profile"
+    body: "Indtast virksomhedens oplysninger. De vises i rapporter, tilbud og udbudsdokumenter. Enter your company details so reports, tenders and invoices are correctly attributed."
+    fields:
+      - { key: company_name, label: "Virksomhedsnavn / Company name", type: text, required: true }
+      - { key: cvr_number, label: "CVR-nummer / CVR number", type: text, required: false, placeholder: "XXXXXXXX", help: "Dit CVR-nummer registreret hos Erhvervsstyrelsen. Your CVR number registered with the Danish Business Authority." }
+      - { key: legal_form, label: "Selskabsform / Legal form", type: select, options: ["Aktieselskab (A/S)", "Anpartsselskab (ApS)", "Interessentskab (I/S)", "Enkeltmandsvirksomhed", "Kommanditselskab (K/S)", "Anden / Other"], default: "Anpartsselskab (ApS)", required: true }
+      - { key: moms_registered, label: "Momsregistreret / VAT registered", type: checkbox, default: true, help: "Bekraeft at virksomheden er momsregistreret hos Skattestyrelsen. Confirm the company is VAT registered with the Danish Tax Agency." }
+
+  - id: standards_classification
+    title: "Standarder og klassifikation / Standards and classification"
+    body: "Vaelg hvilke danske standarder der skal gaelde for dine projekter. BOQ-validering tilpasses derefter. Confirm which Danish standards apply to your projects. BOQ validation will align accordingly."
+    fields:
+      - { key: classification_standard, label: "Klassifikationssystem / Classification system", type: radio, options: ["SfB (Standard)", "CCS Cuneco Classification System (nyere / newer)"], default: "SfB (Standard)", required: true }
+      - { key: vs_edition, label: "V&S-udgave / V&S edition", type: radio, options: ["V&S aktuel udgave / V&S current edition", "Aeldre udgave / Older edition"], default: "V&S aktuel udgave / V&S current edition", required: true }
+      - { key: contract_form, label: "Standardaftale / Standard contract form", type: select, options: ["AB 18 — Hovedentreprise (general contracting)", "ABT 18 — Totalentreprise (design-build)", "ABR 18 — Raadgivning (consultancy)"], default: "AB 18 — Hovedentreprise (general contracting)", required: true }
+
+  - id: tax_procurement
+    title: "Skat og udbud / Tax and procurement"
+    body: "Momssats og udbudsprofil. Standardsatsen er 25% moms. Confirm your tax rate and procurement profile. The default is 25% moms."
+    fields:
+      - { key: default_moms_rate, label: "Momssats / VAT rate", type: radio, options: ["25% (standardsats / standard rate)", "0% (momsfri / VAT exempt)"], default: "25% (standardsats / standard rate)", required: true }
+      - { key: procurement_type, label: "Overvejende bygherre / Predominant client type", type: radio, options: ["Offentligt udbud (udbudsloven) / Public procurement", "Privat bygherre / Private client", "Blandet / Mixed"], default: "Blandet / Mixed", required: true }
+      - { key: cwicr_regions, label: "CWICR-omkostningsregioner / CWICR cost regions", type: multiselect, options: ["Copenhagen (DKK)"], default: ["Copenhagen (DKK)"], required: true }
+
+  - id: review
+    title: "Gennemgaa og afslut / Review and finish"
+    body: "Vi opretter dit arbejdsomraade med V&S, SfB/CCS og dine valgte indstillinger. Alt kan aendres senere under Indstillinger. We will create your workspace with V&S, SfB/CCS and your chosen settings. Everything can be changed later in Settings."
+    action:
+      label: "Opret mit arbejdsomraade / Create my workspace"
+      apply:
+        - set_default_currency: DKK
+        - set_tax_template: dk_moms_25
+        - enable_rule_packs:
+            - vs_specification
+            - sfb_ccs_classification
+            - ab18_contract
+        - preload_cwicr_regions_from: cwicr_regions

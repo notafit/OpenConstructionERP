@@ -99,7 +99,60 @@ from app.modules.i18n_foundation.tax_window_supersede import (
 #: * ``EARLIEST_SUPERSEDED_FROM`` does not move. It is derived from
 #:   ``windows[1:]``, the superseding windows only, and 2026-01-01 is later
 #:   than Israel's 2025-01-01.
-EXPECTED_POPULATION = {("CA", "HST_NS"), ("IL", "VAT"), ("RU", "NDS")}
+#:
+#: ``IE/VAT`` was added on 2026-10-04, and it is the first line here whose
+#: change lies wholly in the past. What was looked at before updating it:
+#:
+#: * Ireland cut the standard rate from 23 % to 21 % for 1 September 2020 to
+#:   28 February 2021, by an amendment to section 46 of the VAT Consolidation
+#:   Act 2010, and 23 % came back on 1 March 2021. Source read for that:
+#:   Chartered Accountants Ireland, TaxSource, "VAT Matters", September 2020
+#:   (read 2026-10-04). The seed shipped one open 23 % window from 2012-01-01,
+#:   so a supply in that half year was priced two points high.
+#: * What the repair will therefore do to installs in the field: close the
+#:   open 23 % row at 2020-08-31 and insert the 21 % window and the 23 % one
+#:   that follows it. Unlike Nova Scotia, Israel and Russia, the answer moves
+#:   on past dates only - 1 September 2020 to 28 February 2021 now resolves
+#:   at 21 - and today's answer stays 23. That is the intended reading: a
+#:   document dated in that half year is charged the rate of its own date.
+#: * The flag stays still. All three Irish windows ship ``is_default`` true,
+#:   the Israeli way, and they must, because VAT_RED, VAT_RED_9 and VAT_ZERO
+#:   are open-ended beside every one of them.
+#: * ``EARLIEST_SUPERSEDED_FROM`` moves from 2025-01-01 to 2020-09-01, the
+#:   start of the 21 % window.
+#:
+#: ``CH/VAT``, ``CH/VAT_REDUCED`` and ``CH/VAT_SPECIAL`` were added on
+#: 2026-10-04, and the repair does nothing to any of them. What was looked at:
+#:
+#: * Switzerland charged 7.7, 2.5 and 3.7 % from 2018-01-01 to 2023-12-31 and
+#:   8.1, 2.6 and 3.8 % from 2024-01-01 (ESTV, "Erhoehung der MWST-Steuersaetze
+#:   2024", read 2026-10-04). The seed carried only the 2024 rates, so a Swiss
+#:   date before 2024 had no rate at all. The new rows are closed windows
+#:   placed BEFORE the windows every install already holds.
+#: * What this repair will therefore do in the field: nothing. Its predicate
+#:   looks for an open row matching a window the file has closed, and the only
+#:   open Swiss rows are the 2024 ones, which the file still leaves open.
+#: * That is NOT an honest refusal on its own, and an earlier version of this
+#:   note said it was. The bill does not refuse a date the seed cannot answer:
+#:   ``apply_default_markups`` lets the region's line stand, and Switzerland's
+#:   region is DACH, so a 2023 Swiss bill on an old install was charged
+#:   Germany's 19. The windows reach old installs through
+#:   ``tax_history_backfill`` instead, the additive repair for a past window
+#:   in front of a line the install already holds, pinned in
+#:   ``tests/pg/test_tax_history_backfill.py``. A date before 2018 has no
+#:   Swiss rate anywhere; such a bill still takes the DACH line, and now marks
+#:   it with ``vat_rate_unresolved_on`` and a warning.
+#: * ``EARLIEST_SUPERSEDED_FROM`` does not move: the Swiss replacement windows
+#:   start on 2024-01-01, after Ireland's 2020-09-01.
+EXPECTED_POPULATION = {
+    ("CA", "HST_NS"),
+    ("IL", "VAT"),
+    ("RU", "NDS"),
+    ("IE", "VAT"),
+    ("CH", "VAT"),
+    ("CH", "VAT_REDUCED"),
+    ("CH", "VAT_SPECIAL"),
+}
 
 
 def test_the_repair_will_touch_exactly_these_rate_lines() -> None:

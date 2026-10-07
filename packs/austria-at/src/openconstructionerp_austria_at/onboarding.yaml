@@ -1,0 +1,45 @@
+# Austria Construction Pack - first-login onboarding wizard.
+# Streamed by /api/v1/partner-pack/onboarding-script and rendered by
+# the OnboardingWizard React component in place of the default steps.
+#
+# Sprachregister: Sie-Form (formal business German), with English parallel.
+
+version: 2
+pack: austria-at
+locale: de
+title: "Willkommen bei OpenConstructionERP - Oesterreich"
+title_en: "Welcome to OpenConstructionERP - Austria Edition"
+subtitle: "Drei Schritte, um Ihren Arbeitsbereich auf oesterreichische Kalkulationspraxis auszurichten (OENORM B 2061, B 1801, A 2063). Three quick steps to align your workspace with Austrian estimating practice."
+
+steps:
+  - id: company_profile
+    title: "Unternehmensprofil / Company profile"
+    body: "Bitte hinterlegen Sie die Stammdaten Ihres Unternehmens. Sie erscheinen in Berichten, Angeboten und Vergabeunterlagen. Enter your company details so reports, tenders and invoices are correctly attributed."
+    fields:
+      - { key: company_name, label: "Firmenname / Company name", type: text, required: true }
+      - { key: uid_nr, label: "UID-Nummer (Umsatzsteuer-Identifikationsnummer) / VAT ID", type: text, required: false, placeholder: "ATU12345678", help: "Ihre Umsatzsteuer-Identifikationsnummer gemaess UStG. Your Austrian VAT identification number." }
+      - { key: legal_form, label: "Rechtsform / Legal form", type: select, options: ["GmbH (Gesellschaft mit beschraenkter Haftung)", "AG (Aktiengesellschaft)", "OG (Offene Gesellschaft)", "KG (Kommanditgesellschaft)", "GmbH & Co KG", "Einzelunternehmen", "GesbR (Gesellschaft buergerlichen Rechts)", "Sonstige / Other"], default: "GmbH (Gesellschaft mit beschraenkter Haftung)", required: true }
+      - { key: firmenbuch_nr, label: "Firmenbuchnummer / Commercial register number", type: text, required: false }
+      - { key: head_office_bundesland, label: "Bundesland des Hauptsitzes / Head-office federal state", type: select, options: ["Wien", "Niederoesterreich", "Oberoesterreich", "Salzburg", "Tirol", "Vorarlberg", "Kaernten", "Steiermark", "Burgenland"], required: true }
+
+  - id: standards_classification
+    title: "Normen und Klassifikation / Standards and classification"
+    body: "Legen Sie fest, welche oesterreichischen Normen fuer Ihre Projekte gelten. Die Validierung des Leistungsverzeichnisses wird darauf ausgerichtet. Confirm which Austrian standards apply to your projects."
+    fields:
+      - { key: oenorm_pricing, label: "Preisermittlung / Pricing standard", type: radio, options: ["OENORM B 2061 (Preisermittlung fuer Bauleistungen, aktuell)", "OENORM B 2060 (aeltere Ausgabe / older edition)"], default: "OENORM B 2061 (Preisermittlung fuer Bauleistungen, aktuell)", required: true }
+      - { key: oenorm_exchange, label: "Datenaustausch / Data exchange", type: radio, options: ["OENORM A 2063 (elektronischer Datenaustausch LV)", "Manuell / Manual"], default: "OENORM A 2063 (elektronischer Datenaustausch LV)", required: true }
+      - { key: oenorm_contract, label: "Vertragsgrundlage / Contract basis", type: radio, options: ["OENORM B 2110 (Allgemeine Vertragsbestimmungen, privat)", "OENORM B 2118 (Allgemeine Vertragsbestimmungen, BVergG)", "Werkvertrag ABGB (civil code)"], default: "OENORM B 2110 (Allgemeine Vertragsbestimmungen, privat)", required: true }
+      - { key: enable_bverg_compliance, label: "BVergG-Compliance aktivieren / Enable Federal Procurement Act compliance", type: checkbox, default: true, help: "Fuer oeffentliche Auftraggeber: Vergabeverfahren gemaess Bundesvergabegesetz 2018. Required for public-sector procurement." }
+
+  - id: review
+    title: "Ueberpruefen und Abschliessen / Review and finish"
+    body: "Wir richten Ihren Arbeitsbereich mit OENORM B 2061, B 1801, A 2063 und den gewaehlten Einstellungen ein. Alles kann spaeter unter Einstellungen geaendert werden. We will create your workspace with OENORM B 2061, B 1801, A 2063 and your chosen settings."
+    action:
+      label: "Arbeitsbereich anlegen / Create my workspace"
+      apply:
+        - set_default_currency: EUR
+        - set_tax_template: at_ust_20
+        - enable_rule_packs:
+            - oenorm_b2061
+            - oenorm_b1801
+            - oenorm_a2063

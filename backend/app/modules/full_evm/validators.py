@@ -74,6 +74,12 @@ from app.core.validation.engine import (
     ValidationRule,
     rule_registry,
 )
+
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, so two findings on one screen cannot disagree
+# about what an amount looks like. Importing it registers nothing.
+from app.core.validation.rules import _fmt_money
 from app.modules.full_evm.metrics import EAC_METHODS
 
 logger = logging.getLogger(__name__)
@@ -153,6 +159,18 @@ def _payload(data: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _currency(payload: dict[str, Any]) -> str:
+    """The currency this payload states, or empty when it states none.
+
+    A baseline payload carries the currency its budget is denominated in. A
+    measurement payload does not, and none is invented for it: an amount here
+    is then grouped and written without a code, which is honest, where a
+    guessed code would read as authoritative and be wrong whenever the project
+    is not in it.
+    """
+    return str(payload.get("currency") or "").strip()
+
+
 def _result(
     rule: ValidationRule,
     *,
@@ -196,6 +214,7 @@ class BaselineBacPositive(ValidationRule):
         if payload.get("kind") != "baseline":
             return []
         bac = _dec(payload.get("bac"))
+        currency = _currency(payload)
         if bac is None:
             return [
                 _result(
@@ -210,7 +229,7 @@ class BaselineBacPositive(ValidationRule):
                 _result(
                     self,
                     passed=False,
-                    message=f"Budget At Completion is {bac}; it must be greater than zero.",
+                    message=f"Budget At Completion is {_fmt_money(bac, currency)}; it must be greater than zero.",
                     details={"bac": str(bac)},
                     suggestion=(
                         "With a zero budget every index (CPI, SPI, percent complete) is undefined "
@@ -218,7 +237,7 @@ class BaselineBacPositive(ValidationRule):
                     ),
                 )
             ]
-        return [_result(self, passed=True, message=f"Budget At Completion is {bac}.")]
+        return [_result(self, passed=True, message=f"Budget At Completion is {_fmt_money(bac, currency)}.")]
 
 
 class BaselinePeriodsOrdered(ValidationRule):
@@ -305,6 +324,7 @@ class BaselinePvMonotonic(ValidationRule):
         if not periods:
             return []
 
+        currency = _currency(payload)
         results: list[RuleResult] = []
         previous: Decimal | None = None
         for index, period in enumerate(periods):
@@ -326,7 +346,8 @@ class BaselinePvMonotonic(ValidationRule):
                         self,
                         passed=False,
                         message=(
-                            f"Cumulative planned value drops from {previous} to {value} at period {ref}. "
+                            f"Cumulative planned value drops from {_fmt_money(previous, currency)} to "
+                            f"{_fmt_money(value, currency)} at period {ref}. "
                             "A cumulative total cannot go down."
                         ),
                         element_ref=ref,
@@ -364,6 +385,7 @@ class BaselinePvMatchesBac(ValidationRule):
         if not periods or bac is None:
             return []
 
+        currency = _currency(payload)
         final = _dec(periods[-1].get("planned_value"))
         if final is None:
             return [
@@ -380,7 +402,8 @@ class BaselinePvMatchesBac(ValidationRule):
                     self,
                     passed=False,
                     message=(
-                        f"The curve ends at {final} but the budget is {bac}, a gap of {gap}. "
+                        f"The curve ends at {_fmt_money(final, currency)} but the budget is "
+                        f"{_fmt_money(bac, currency)}, a gap of {_fmt_money(gap, currency)}. "
                         "Every schedule performance index is measured against this curve."
                     ),
                     details={"final_planned_value": str(final), "bac": str(bac), "gap": str(gap)},
@@ -390,7 +413,9 @@ class BaselinePvMatchesBac(ValidationRule):
                     ),
                 )
             ]
-        return [_result(self, passed=True, message=f"The curve ends at {final}, matching the budget.")]
+        return [
+            _result(self, passed=True, message=f"The curve ends at {_fmt_money(final, currency)}, matching the budget.")
+        ]
 
 
 class BaselineQuantityMonotonic(ValidationRule):
@@ -472,6 +497,7 @@ class MeasureNonNegative(ValidationRule):
         if payload.get("kind") != "measure":
             return []
 
+        currency = _currency(payload)
         results: list[RuleResult] = []
         for key, label in self._FIELDS:
             value = _dec(payload.get(key))
@@ -489,7 +515,10 @@ class MeasureNonNegative(ValidationRule):
                     _result(
                         self,
                         passed=False,
-                        message=f"{label} ({key.upper()}) is {value}; a cumulative total cannot be negative.",
+                        message=(
+                            f"{label} ({key.upper()}) is {_fmt_money(value, currency)}; "
+                            "a cumulative total cannot be negative."
+                        ),
                         element_ref=key,
                         details={key: str(value)},
                         suggestion="Post a correcting entry upstream rather than a negative cumulative total.",
@@ -517,6 +546,7 @@ class MeasureEvWithinBac(ValidationRule):
             return []
         ev = _dec(payload.get("ev"))
         bac = _dec(payload.get("bac"))
+        currency = _currency(payload)
         if ev is None or bac is None or bac <= 0:
             return []
         if ev > bac + _tolerance(bac):
@@ -525,7 +555,8 @@ class MeasureEvWithinBac(ValidationRule):
                     self,
                     passed=False,
                     message=(
-                        f"Earned Value {ev} exceeds the Budget At Completion {bac}. "
+                        f"Earned Value {_fmt_money(ev, currency)} exceeds the Budget At Completion "
+                        f"{_fmt_money(bac, currency)}. "
                         "More value cannot be earned than the scope is worth."
                     ),
                     details={"ev": str(ev), "bac": str(bac)},
@@ -535,7 +566,13 @@ class MeasureEvWithinBac(ValidationRule):
                     ),
                 )
             ]
-        return [_result(self, passed=True, message=f"Earned Value {ev} is within the budget {bac}.")]
+        return [
+            _result(
+                self,
+                passed=True,
+                message=f"Earned Value {_fmt_money(ev, currency)} is within the budget {_fmt_money(bac, currency)}.",
+            )
+        ]
 
 
 class MeasurePvFollowsBaseline(ValidationRule):
@@ -555,6 +592,7 @@ class MeasurePvFollowsBaseline(ValidationRule):
             return []
         pv = _dec(payload.get("pv"))
         curve_pv = _dec(payload.get("baseline_pv"))
+        currency = _currency(payload)
         if pv is None or curve_pv is None:
             return []
         gap = pv - curve_pv
@@ -564,8 +602,8 @@ class MeasurePvFollowsBaseline(ValidationRule):
                     self,
                     passed=False,
                     message=(
-                        f"Planned Value {pv} differs from the baseline curve value {curve_pv} "
-                        f"at this data date by {gap}."
+                        f"Planned Value {_fmt_money(pv, currency)} differs from the baseline curve value "
+                        f"{_fmt_money(curve_pv, currency)} at this data date by {_fmt_money(gap, currency)}."
                     ),
                     details={"pv": str(pv), "baseline_pv": str(curve_pv), "gap": str(gap)},
                     suggestion=(
@@ -707,7 +745,8 @@ class MeasureTcpiAchievable(ValidationRule):
                         self,
                         passed=False,
                         message=(
-                            f"The budget {bac} is fully consumed while {bac - ev} of value remains to be earned. "
+                            f"The budget {_fmt_money(bac, _currency(payload))} is fully consumed while "
+                            f"{_fmt_money(bac - ev, _currency(payload))} of value remains to be earned. "
                             "No cost efficiency can recover the original budget."
                         ),
                         details={"bac": str(bac), "ev": str(ev), "ac": str(ac)},

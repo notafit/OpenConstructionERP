@@ -53,7 +53,21 @@ from reportlab.platypus import (
 )
 
 from app.core.money import minor_units, money_quantum
-from app.core.pdf_fonts import BODY_FONT, BOLD_FONT, pdf_style_for_text, register_pdf_fonts
+from app.core.pdf_branding import (
+    DEFAULT_BRAND,
+    branded_cover_brand,
+    branded_doc_metadata,
+    branded_header_logo,
+    branded_letterhead,
+)
+from app.core.pdf_fonts import (
+    BODY_FONT,
+    BOLD_FONT,
+    pdf_fit_line,
+    pdf_room_beside,
+    pdf_style_for_text,
+    register_pdf_fonts,
+)
 
 # Register the bundled Unicode (DejaVu) faces with reportlab. Idempotent and
 # safe at import time because reportlab is imported at module level here.
@@ -206,19 +220,46 @@ def _build_styles() -> dict[str, ParagraphStyle]:
 
 
 def _footer(canvas: Any, doc: Any) -> None:
-    canvas.saveState()
-    canvas.setFont(BODY_FONT, 7)
-    canvas.setFillColor(colors.HexColor("#999999"))
     generated = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
-    canvas.drawString(MARGIN_LEFT, 12 * mm, f"OpenConstructionERP  |  Generated: {generated}")
-    canvas.drawRightString(PAGE_WIDTH - MARGIN_RIGHT, 12 * mm, f"Page {doc.page}")
+    page_text = f"Page {doc.page}"
+    # The brand is the firm's own name: it may be Chinese, and a legal name may
+    # be long enough to reach the page number, so the line is fitted into the
+    # room beside it. The page number is ours and stays where it is.
+    footer_left, face, size = pdf_fit_line(
+        branded_cover_brand(),
+        pdf_room_beside(PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, page_text),
+        suffix=f"  |  Generated: {generated}",
+        base=BODY_FONT,
+    )
+    canvas.saveState()
+    canvas.setFont(face, size)
+    canvas.setFillColor(colors.HexColor("#999999"))
+    canvas.drawString(MARGIN_LEFT, 12 * mm, footer_left)
+    if (face, size) != (BODY_FONT, 7.0):
+        canvas.setFont(BODY_FONT, 7)
+    canvas.drawRightString(PAGE_WIDTH - MARGIN_RIGHT, 12 * mm, page_text)
     canvas.setStrokeColor(colors.HexColor("#e5e5ea"))
     canvas.setLineWidth(0.5)
     canvas.line(MARGIN_LEFT, 15 * mm, PAGE_WIDTH - MARGIN_RIGHT, 15 * mm)
     canvas.restoreState()
 
 
-def _document(buffer: io.BytesIO, title: str) -> BaseDocTemplate:
+def _page_furniture(letterhead_on_first_page: bool) -> Any:
+    """``onPage`` callback: the footer, and the workspace logo top right.
+
+    The logo is left off a first page that opens with the letterhead, which
+    already carries it.
+    """
+
+    def _draw(canvas: Any, doc: Any) -> None:
+        _footer(canvas, doc)
+        if not (letterhead_on_first_page and doc.page == 1):
+            branded_header_logo(canvas, doc)
+
+    return _draw
+
+
+def _document(buffer: io.BytesIO, title: str, *, letterhead_on_first_page: bool = False) -> BaseDocTemplate:
     frame = Frame(
         MARGIN_LEFT,
         MARGIN_BOTTOM + 4 * mm,
@@ -226,7 +267,17 @@ def _document(buffer: io.BytesIO, title: str) -> BaseDocTemplate:
         PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM - 4 * mm,
         id="main",
     )
-    template = PageTemplate(id="main", frames=[frame], onPage=_footer)
+    template = PageTemplate(id="main", frames=[frame], onPage=_page_furniture(letterhead_on_first_page))
+    meta = branded_doc_metadata()
+    if meta["author"] == DEFAULT_BRAND:
+        # An unbranded workspace keeps the properties these letters always had.
+        meta = {
+            "author": "OpenConstructionERP",
+            "subject": "Tender decision · DDC-CWICR-OE",
+            "creator": "OpenConstructionERP · DataDrivenConstruction",
+            "producer": "OpenConstructionERP / reportlab · datadrivenconstruction.io",
+            "keywords": "DDC-CWICR-OE-2026,OpenConstructionERP,Tendering,DataDrivenConstruction",
+        }
     doc = BaseDocTemplate(
         buffer,
         pagesize=A4,
@@ -235,20 +286,44 @@ def _document(buffer: io.BytesIO, title: str) -> BaseDocTemplate:
         topMargin=MARGIN_TOP,
         bottomMargin=MARGIN_BOTTOM,
         title=title,
-        author="OpenConstructionERP",
-        subject="Tender decision · DDC-CWICR-OE",
-        creator="OpenConstructionERP · DataDrivenConstruction",
-        producer="OpenConstructionERP / reportlab · datadrivenconstruction.io",
-        keywords="DDC-CWICR-OE-2026,OpenConstructionERP,Tendering,DataDrivenConstruction",
+        **meta,
     )
     doc.addPageTemplates([template])
     return doc
 
 
-def _header_block(styles: dict[str, ParagraphStyle], doc_label: str, ref: str) -> list[Any]:
-    """Brand on the left, document label + reference + date on the right."""
+def _letterhead() -> Any | None:
+    """The firm's letterhead, or ``None``.
+
+    The letter's own tables are the full width between the margins and are
+    centred over the frame's 6pt padding, so the letterhead is built to that
+    width and centred the same way. At the frame width it sat 6pt inside the
+    rule under the reference block, which reads as a misprint.
+    """
+    letterhead = branded_letterhead(USABLE_WIDTH)
+    if letterhead is not None:
+        letterhead.hAlign = "CENTER"
+    return letterhead
+
+
+def _header_block(
+    styles: dict[str, ParagraphStyle],
+    doc_label: str,
+    ref: str,
+    *,
+    letterhead: Any | None = None,
+) -> list[Any]:
+    """Brand on the left, document label + reference + date on the right.
+
+    With a letterhead, the letterhead heads the page and already names the
+    firm, so the brand cell is left empty rather than printing it twice.
+    """
     today = datetime.now(tz=UTC).strftime("%d.%m.%Y")
-    left = Paragraph("OpenConstructionERP", styles["brand"])
+    if letterhead is None:
+        brand = branded_cover_brand()
+        left: Any = Paragraph(html.escape(brand), pdf_style_for_text(styles["brand"], brand))
+    else:
+        left = ""
     right = Paragraph(
         f"<b>{html.escape(doc_label)}</b><br/>Ref: {html.escape(ref)}<br/>Date: {today}",
         # The package reference is user data and is Chinese on a Chinese job.
@@ -285,6 +360,21 @@ def _info_table(styles: dict[str, ParagraphStyle], rows: list[tuple[str, str]]) 
     return table
 
 
+def _addressee_rows(label: str, company_name: str, contact_email: str) -> list[tuple[str, str]]:
+    """Who the letter is addressed to: the firm, and its contact when there is one.
+
+    The bidder's contact address used to be printed under "Yours faithfully"
+    and the signer's name, where it reads as the sender's address: a reader
+    replying to the letter was pointed at the bidder's own inbox. It belongs to
+    the addressee, and a letter to a bidder may legitimately carry it there, so
+    it moves rather than goes.
+    """
+    rows = [(label, company_name)]
+    if contact_email:
+        rows.append(("Contact:", contact_email))
+    return rows
+
+
 def generate_award_letter_pdf(
     *,
     package_name: str,
@@ -305,18 +395,21 @@ def generate_award_letter_pdf(
     """
     buffer = io.BytesIO()
     styles = _build_styles()
-    doc = _document(buffer, f"Letter of Award - {package_name}")
+    letterhead = _letterhead()
+    doc = _document(buffer, f"Letter of Award - {package_name}", letterhead_on_first_page=letterhead is not None)
 
     amount_dec = _to_decimal(awarded_amount)
     flow: list[Any] = []
-    flow.extend(_header_block(styles, "LETTER OF AWARD", package_ref))
+    if letterhead is not None:
+        flow.append(letterhead)
+    flow.extend(_header_block(styles, "LETTER OF AWARD", package_ref, letterhead=letterhead))
     flow.append(Paragraph("Notification of Contract Award", styles["doc_title"]))
 
     flow.append(
         _info_table(
             styles,
-            [
-                ("Awarded to:", company_name),
+            _addressee_rows("Awarded to:", company_name, contact_email)
+            + [
                 ("Project:", project_name or "-"),
                 ("Tender package:", package_name),
                 ("Award date:", _fmt_date(awarded_at)),
@@ -380,8 +473,6 @@ def generate_award_letter_pdf(
     flow.append(Paragraph("Yours faithfully,", styles["signoff"]))
     signer = awarded_by_name or project_name or "The Project Team"
     flow.append(_safe_para(signer, styles["value"]))
-    if contact_email:
-        flow.append(_safe_para(contact_email, styles["label"]))
 
     doc.build(flow)
     pdf_bytes = buffer.getvalue()
@@ -411,14 +502,17 @@ def generate_rejection_letter_pdf(
     """
     buffer = io.BytesIO()
     styles = _build_styles()
-    doc = _document(buffer, f"Notice of Outcome - {package_name}")
+    letterhead = _letterhead()
+    doc = _document(buffer, f"Notice of Outcome - {package_name}", letterhead_on_first_page=letterhead is not None)
 
     flow: list[Any] = []
-    flow.extend(_header_block(styles, "NOTICE OF TENDER OUTCOME", package_ref))
+    if letterhead is not None:
+        flow.append(letterhead)
+    flow.extend(_header_block(styles, "NOTICE OF TENDER OUTCOME", package_ref, letterhead=letterhead))
     flow.append(Paragraph("Notification of Unsuccessful Bid", styles["doc_title"]))
 
     info_rows = [
-        ("Bidder:", company_name),
+        *_addressee_rows("Bidder:", company_name, contact_email),
         ("Project:", project_name or "-"),
         ("Tender package:", package_name),
         ("Date:", _fmt_date(rejected_at)),
@@ -464,8 +558,6 @@ def generate_rejection_letter_pdf(
     flow.append(Paragraph("Yours faithfully,", styles["signoff"]))
     signer = signed_by_name or project_name or "The Project Team"
     flow.append(_safe_para(signer, styles["value"]))
-    if contact_email:
-        flow.append(_safe_para(contact_email, styles["label"]))
 
     doc.build(flow)
     pdf_bytes = buffer.getvalue()
@@ -579,10 +671,13 @@ def generate_award_record_pdf(*, record: dict[str, Any], package_ref: str) -> by
     buffer = io.BytesIO()
     styles = _build_styles()
     package_name = str(record.get("package_name") or "")
-    doc = _document(buffer, f"Vergabevermerk - {package_name}")
+    letterhead = _letterhead()
+    doc = _document(buffer, f"Vergabevermerk - {package_name}", letterhead_on_first_page=letterhead is not None)
 
     flow: list[Any] = []
-    flow.extend(_header_block(styles, "VERGABEVERMERK", package_ref))
+    if letterhead is not None:
+        flow.append(letterhead)
+    flow.extend(_header_block(styles, "VERGABEVERMERK", package_ref, letterhead=letterhead))
     flow.append(Paragraph("Award record of the procurement procedure", styles["doc_title"]))
 
     gaps = [g for g in (record.get("gaps") or []) if isinstance(g, dict)]

@@ -3,7 +3,7 @@
 
 ``_extract_ocr_text`` renders each PDF page to a pixmap before OCR. ``get_pixmap``
 has no size ceiling, so a large-format sheet (an A0 drawing at 150 DPI is ~35 MP)
-or a maliciously oversized page could allocate hundreds of MB and OOM a 2 GB
+or a maliciously oversized page could allocate hundreds of MB and OOM a 3 GB
 worker. These tests pin the pure render-scale clamp that bounds every page render
 to ``MAX_OCR_PIXELS`` and confirm normal pages are rendered unchanged. Pure
 functions - no fitz, no tesseract, no database.

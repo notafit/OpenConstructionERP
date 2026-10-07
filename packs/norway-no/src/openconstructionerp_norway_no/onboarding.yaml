@@ -1,0 +1,50 @@
+# Norway Construction Pack — first-login onboarding wizard.
+# Streamed by /api/v1/partner-pack/onboarding-script and rendered by
+# the OnboardingWizard React component in place of the default steps.
+
+version: 2
+pack: norway-no
+locale: "no"  # quoted: a bare no is the boolean false in YAML 1.1
+title: "Velkommen til OpenConstructionERP — Norge"
+title_en: "Welcome to OpenConstructionERP — Norway Edition"
+subtitle: "Fire steg for aa sette opp arbeidsomraadet ditt for norsk kalkulasjonspraksis (NS 3420, NS 3451, NS 8405). Four quick steps to align your workspace with Norwegian estimating practice."
+
+steps:
+  - id: company_profile
+    title: "Bedriftsprofil / Company profile"
+    body: "Oppgi bedriftens opplysninger. De vises i rapporter, tilbud og anbudsdokumenter. Enter your company details so reports, tenders and invoices are correctly attributed."
+    fields:
+      - { key: company_name, label: "Bedriftsnavn / Company name", type: text, required: true }
+      - { key: org_number, label: "Organisasjonsnummer / Organisation number", type: text, required: false, placeholder: "XXX XXX XXX", help: "Organisasjonsnummer registrert i Broennoeysundregistrene. Your organisation number registered with the Broennoysund Register Centre." }
+      - { key: legal_form, label: "Selskapsform / Legal form", type: select, options: ["Aksjeselskap (AS)", "Allmennaksjeselskap (ASA)", "Enkeltpersonforetak (ENK)", "Ansvarlig selskap (ANS/DA)", "Norskregistrert utenlandsk foretak (NUF)", "Annen / Other"], default: "Aksjeselskap (AS)", required: true }
+      - { key: mva_registered, label: "MVA-registrert / VAT registered", type: checkbox, default: true, help: "Bekrefter at bedriften er registrert i Merverdiavgiftsregisteret. Confirm the company is registered in the VAT Register." }
+
+  - id: standards_classification
+    title: "Standarder og klassifikasjon / Standards and classification"
+    body: "Velg hvilke norske standarder som skal gjelde for prosjektene dine. BOQ-validering tilpasses deretter. Confirm which Norwegian standards apply to your projects. BOQ validation will align accordingly."
+    fields:
+      - { key: classification_standard, label: "Klassifikasjonssystem / Classification system", type: radio, options: ["NS 3451 Bygningsdelstabell (Standard)", "NS 3457 Bygningsdelstabell utvidet (Extended)"], default: "NS 3451 Bygningsdelstabell (Standard)", required: true }
+      - { key: ns3420_edition, label: "NS 3420-utgave / NS 3420 edition", type: radio, options: ["NS 3420:2019 (gjeldende / current)", "NS 3420:2013"], default: "NS 3420:2019 (gjeldende / current)", required: true }
+      - { key: contract_form, label: "Standardkontrakt / Standard contract form", type: select, options: ["NS 8405 — Utfoerelsesentreprise (general contracting)", "NS 8407 — Totalentreprise (design-build)", "NS 8406 — Forenklet norsk bygge- og anleggskontrakt (simplified)"], default: "NS 8405 — Utfoerelsesentreprise (general contracting)", required: true }
+
+  - id: tax_procurement
+    title: "Skatt og anskaffelse / Tax and procurement"
+    body: "MVA-sats og anskaffelsesprofil. Standardsatsen er 25% MVA. Confirm your tax rate and procurement profile. The default is 25% MVA."
+    fields:
+      - { key: default_mva_rate, label: "MVA-sats / VAT rate", type: radio, options: ["25% (alminnelig sats / standard rate)", "15% (redusert sats for naeringmidler / reduced rate for food)", "0% (fritatt / exempt)"], default: "25% (alminnelig sats / standard rate)", required: true }
+      - { key: procurement_type, label: "Overveiende oppdragsgiver / Predominant client type", type: radio, options: ["Offentlig anskaffelse (anskaffelsesloven) / Public procurement", "Privat byggherre / Private client", "Blandet / Mixed"], default: "Blandet / Mixed", required: true }
+      - { key: cwicr_regions, label: "CWICR-kostnadsregioner / CWICR cost regions", type: multiselect, options: ["Oslo (NOK)"], default: ["Oslo (NOK)"], required: true }
+
+  - id: review
+    title: "Gjennomgaa og fullfoor / Review and finish"
+    body: "Vi oppretter arbeidsomraadet ditt med NS 3420, NS 3451 og dine valgte innstillinger. Alt kan endres senere under Innstillinger. We will create your workspace with NS 3420, NS 3451 and your chosen settings. Everything can be changed later in Settings."
+    action:
+      label: "Opprett mitt arbeidsomraade / Create my workspace"
+      apply:
+        - set_default_currency: NOK
+        - set_tax_template: no_mva_25
+        - enable_rule_packs:
+            - ns3420_specification
+            - ns3451_classification
+            - ns8405_contract
+        - preload_cwicr_regions_from: cwicr_regions

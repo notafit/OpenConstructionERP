@@ -205,13 +205,14 @@ def test_a_named_existing_standard_lands_on_the_date_it_always_did() -> None:
     assert clock.day_basis == CALENDAR
 
 
-def test_every_period_configured_today_is_a_calendar_day_period() -> None:
-    """The census behind the default, stated rather than assumed.
+def test_the_only_working_day_periods_are_ccdc_claim_and_eot() -> None:
+    """CCDC is the first standard with working-day periods, and the only one.
 
-    Every standard currently in the table counts in calendar days, which is why
-    a bare integer has been right so far. If this ever fails, a working-day
-    standard has been configured and the failure is the point: whoever added it
-    should confirm the basis was a decision and not an oversight.
+    CCDC 2-2020 counts claims (GC 6.6) and EOT (GC 6.5) in working days, while
+    its quotation, assessment and response windows are calendar days. Every
+    other standard counts in calendar days throughout. This pins exactly which
+    entries use a business-day basis so that a new working-day period is a
+    deliberate addition, not an oversight.
     """
     non_calendar = {
         f"{standard}.{notice_type}": basis
@@ -222,7 +223,10 @@ def test_every_period_configured_today_is_a_calendar_day_period() -> None:
     non_calendar.update(
         {f"GENERIC.{notice_type}": basis for notice_type, basis in GENERIC_PERIOD_BASES.items() if basis != CALENDAR}
     )
-    assert non_calendar == {}
+    assert non_calendar == {
+        "CCDC.claim_notice": BUSINESS,
+        "CCDC.eot_notice": BUSINESS,
+    }
 
 
 # --- The gate that stops the defect coming back -----------------------------

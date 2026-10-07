@@ -1,0 +1,23 @@
+{
+  "rule_pack_id": "oenorm_a2063",
+  "name": "OENORM A 2063 — Datenaustausch von Leistungsbeschreibungen",
+  "standard": "OENORM A 2063",
+  "jurisdiction": "AT",
+  "regulator": "Austrian Standards International (ASI)",
+  "applies_to": [
+    "boq",
+    "tender",
+    "validation"
+  ],
+  "description": "Reference document for the bill of quantities exchanged under OENORM A 2063, the Austrian XML format for passing Leistungsverzeichnis positions between client, consultant and contractor. It occupies the same niche as GAEB DA XML in Germany and is the expected format for electronic submissions in Austrian public procurement. The standard governs which stage of the exchange a file represents (Ausschreibung, Angebot, Auftrag), the Leistungsgruppe and Untergruppe hierarchy its ordinals encode, and the requirement that descriptions, units and quantities survive the round trip instead of arriving empty. Of that, what the pack actually checks is the part the engine implements: the shape of a position ordinal, that a position carries a substantive description and a unit, and that ordinals are not repeated. The stage declaration and the hierarchy itself are not checked.",
+  "note": "The two rules enabled here from the 'onorm' set were written under a different designation: the position-format rule carries the title 'OENORM B 2063', not A 2063. What was checked before enabling them is the behaviour, not the title. The position rule accepts an ordinal of the form group.subgroup.position, and the description rule requires a substantive position text; both are properties of the Austrian LV structure this document is about. Whether B 2063 and A 2063 name the same instrument is not asserted here and is one of the points for the reviewer named below to settle.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by an Austrian Baukalkulator or Ziviltechniker before they are relied on for a public submission. No edition year or part number is pinned here; both must be confirmed against Austrian Standards International.",
+  "severity_overrides": {},
+  "enables_rule_ids": [
+    "onorm.position_format",
+    "onorm.description_length",
+    "boq_quality.no_duplicate_ordinals",
+    "boq_quality.empty_unit",
+    "boq_quality.position_has_description"
+  ]
+}

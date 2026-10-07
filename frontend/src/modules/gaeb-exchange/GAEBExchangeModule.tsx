@@ -19,6 +19,7 @@ import {
 import { Button, Badge, DismissibleInfo } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { apiGet, getAuthToken, triggerDownload } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fmtNumber, fmtFixed } from '@/shared/lib/formatters';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -27,6 +28,7 @@ import {
   parseGAEBXML,
   parseGAEBProjectName,
   detectGAEBPhase,
+  isGAEBSitePhase,
   importGAEBToBOQ,
   truncateFinding,
   decodeXmlBuffer,
@@ -197,7 +199,7 @@ export default function GAEBExchangeModule() {
   // --- Shared queries ---
   const { data: projects = [], isSuccess: projectsLoaded } = useQuery<Project[]>({
     queryKey: ['projects-list'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
   });
 
   // Import: project selection for target BOQ. A deep link wins over the
@@ -269,9 +271,23 @@ export default function GAEBExchangeModule() {
         // umlauts in legacy DACH GAEB exports.
         const buffer = await file.arrayBuffer();
         const xmlString = decodeXmlBuffer(buffer);
+        const phase = detectGAEBPhase(xmlString);
+        if (isGAEBSitePhase(phase)) {
+          // A measurement or an invoice read as a bill would add its lines
+          // as new positions. They are read against an existing bill instead.
+          setGaebPhase(phase);
+          setParseError(
+            t('gaeb.site_phase_not_a_bill', {
+              phase,
+              defaultValue:
+                'This is a GAEB {{phase}} file, not a bill of quantities. Open the bill it belongs to and use "GAEB X31 / X89" in its toolbar to read it.',
+            }),
+          );
+          return;
+        }
         const positions = parseGAEBXML(xmlString);
         setGaebProjectName(parseGAEBProjectName(xmlString));
-        setGaebPhase(detectGAEBPhase(xmlString));
+        setGaebPhase(phase);
 
         if (positions.length === 0) {
           setParseError(t('gaeb.parse_error', { defaultValue: 'No positions found in the GAEB XML file. Ensure the file is valid GAEB DA XML 3.3 (X81, X83 or X84).' }));

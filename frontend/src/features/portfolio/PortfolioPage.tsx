@@ -47,6 +47,7 @@ import {
   AlertTriangle,
   GitBranch,
   ArrowRight,
+  FileText,
 } from 'lucide-react';
 
 import { Button, Card, Badge, EmptyState, RecoveryCard, SkeletonTable, CollapsibleSection } from '@/shared/ui';
@@ -55,6 +56,7 @@ import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { getErrorMessage } from '@/shared/lib/api';
 import { scheduleApi, type Schedule, type Activity } from '@/features/schedule/api';
+import { projectsApi } from '@/features/projects/api';
 import {
   portfolioCpmApi,
   type PortfolioTreeNode,
@@ -292,6 +294,17 @@ function TreePanel({
   const [nodeType, setNodeType] = useState<PortfolioNodeType>('programme');
   const [parentId, setParentId] = useState<string>('');
 
+  const { data: allProjects = [] } = useQuery({
+    queryKey: ['projects'],
+    queryFn: projectsApi.list,
+    staleTime: 120_000,
+  });
+  const projectNameById = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of allProjects) m[p.id] = p.name;
+    return m;
+  }, [allProjects]);
+
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['portfolio', 'tree'] });
 
   const createMut = useMutation({
@@ -370,10 +383,26 @@ function TreePanel({
                       <span className="ml-1.5 text-2xs text-content-tertiary">{node.code}</span>
                     ) : null}
                   </span>
-                  <Badge variant="neutral" size="sm">
-                    {node.project_ids.length}
-                  </Badge>
+                  {node.project_ids.length > 0 && (
+                    <Badge variant="neutral" size="sm">
+                      {node.project_ids.length}
+                    </Badge>
+                  )}
                 </button>
+                {node.project_ids.length > 0 && (
+                  <ul className="space-y-px">
+                    {node.project_ids.map((pid) => (
+                      <li
+                        key={pid}
+                        style={{ paddingLeft: `${8 + (depth + 1) * 16}px` }}
+                        className="flex items-center gap-2 py-1 text-xs text-content-secondary"
+                      >
+                        <FileText size={12} className="shrink-0 text-content-tertiary" />
+                        <span className="min-w-0 truncate">{projectNameById[pid] || pid.slice(0, 8)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 {active && (
                   <AttachProjectRow nodeId={node.id} onError={onError} onAttached={refresh} />
                 )}
@@ -667,13 +696,13 @@ function CpmActivityTable({ rows }: { rows: PortfolioCpmActivity[] }) {
           {rows.map((r) => (
             <tr key={`${r.schedule_id}:${r.activity_id}`} className="border-t border-border-light">
               <td className="px-3 py-2">
-                <span className="font-mono text-2xs text-content-tertiary" title={r.schedule_id}>
-                  {shortId(r.schedule_id)}
+                <span className="text-xs text-content-primary" title={r.schedule_id}>
+                  {r.schedule_name || shortId(r.schedule_id)}
                 </span>
               </td>
               <td className="px-3 py-2">
-                <span className="font-mono text-2xs text-content-tertiary" title={r.activity_id}>
-                  {shortId(r.activity_id)}
+                <span className="text-xs text-content-primary" title={r.activity_id}>
+                  {r.activity_name || shortId(r.activity_id)}
                 </span>
               </td>
               <td className="px-3 py-2 text-right font-mono tabular-nums">{r.es}</td>

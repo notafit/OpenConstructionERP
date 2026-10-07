@@ -355,6 +355,9 @@ BUNDLE_MAP: dict[str, str] = {
     "residential-seoul": "residential_ifc",
     "residential-shenzhen": "residential_ifc",
     "residential-warsaw": "residential_ifc",
+    "renovation-guangzhou": "commercial_rvt",
+    "villa-suzhou": "residential_ifc",
+    "office-milan": "commercial_rvt",
     # Heidelberg and Karlsruhe are Heilbronn's siblings, but they take the
     # shared RVT bundle rather than ``retail_heilbronn``. That bundle is not a
     # retail flavour of the generic set: it dispatches to
@@ -371,6 +374,44 @@ BUNDLE_MAP: dict[str, str] = {
     "school-stpetersburg": "commercial_rvt",
     "solar-bess-epc": "commercial_rvt",
     "tower-abudhabi": "commercial_rvt",
+    "office-toronto": "commercial_rvt",
+    "residential-vancouver": "residential_ifc",
+    "office-zurich": "commercial_rvt",
+    "residential-lausanne": "residential_ifc",
+    "office-vienna": "commercial_rvt",
+    "residential-salzburg": "residential_ifc",
+    # Tier 2 packs: Singapore, Ireland, Belgium, Czechia, Portugal,
+    # Indonesia, Nigeria.
+    "office-singapore": "commercial_rvt",
+    "residential-singapore": "residential_ifc",
+    "office-dublin": "commercial_rvt",
+    "residential-cork": "residential_ifc",
+    "office-brussels": "commercial_rvt",
+    "residential-antwerp": "residential_ifc",
+    "office-prague": "commercial_rvt",
+    "residential-brno": "residential_ifc",
+    "residential-zagreb": "residential_ifc",
+    "office-split": "commercial_rvt",
+    "office-lisbon": "commercial_rvt",
+    "residential-porto": "residential_ifc",
+    "commercial-jakarta": "commercial_rvt",
+    "residential-surabaya": "residential_ifc",
+    "commercial-lagos": "commercial_rvt",
+    "residential-abuja": "residential_ifc",
+    # Nordic packs: Sweden, Norway, Denmark.
+    "office-stockholm": "commercial_rvt",
+    "residential-gothenburg": "residential_ifc",
+    "office-oslo": "commercial_rvt",
+    "residential-bergen": "residential_ifc",
+    "office-copenhagen": "commercial_rvt",
+    "residential-aarhus": "residential_ifc",
+    # Romania, Greece, Ukraine.
+    "residential-cluj": "residential_ifc",
+    "office-bucharest": "commercial_rvt",
+    "residential-athens": "residential_ifc",
+    "school-thessaloniki": "commercial_rvt",
+    "residential-lviv": "residential_ifc",
+    "school-kyiv": "commercial_rvt",
 }
 
 # demo_ids that own a dedicated seed path and must never be attached here.

@@ -1,15 +1,20 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, RotateCcw, GitBranch, Diamond, Minus, Users } from 'lucide-react';
+import { Plus, RotateCcw, GitBranch, Diamond, Minus, Users, Trash2, ChevronRight, ChevronDown } from 'lucide-react';
 import { Button, Badge, Card } from '@/shared/ui';
 import { useToastStore } from '@/stores/useToastStore';
 import { listCalendars } from '@/features/schedule-advanced/api';
 import { listAssignmentsForActivity, listResources } from '@/features/resources/api';
+import { AssigneePicker, type AssigneeValue } from '@/features/contacts/AssigneePicker';
 import { scheduleApi, type Activity } from './api';
+import { orderAsTree } from './activityTree';
+import { ActivityDeleteDialog, activityDeleteTarget, type ActivityDeleteTarget } from './ActivityDeleteDialog';
+import { scheduleErrorMessage } from './errors';
 import { fmtList } from '@/shared/lib/formatters';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 
 const TYPES = ['task', 'milestone', 'summary'] as const;
 
@@ -61,6 +66,10 @@ export function ActivityGrid({
   criticalActivityIds,
   onEditDependencies,
   onAddActivity,
+  sectionIds,
+  allActivities,
+  collapsedIds,
+  onToggleCollapse,
 }: {
   scheduleId: string;
   projectId: string;
@@ -68,13 +77,88 @@ export function ActivityGrid({
   criticalActivityIds?: Set<string>;
   onEditDependencies: (activityId: string) => void;
   onAddActivity: () => void;
+  /**
+   * Rows that have children anywhere in the schedule. Pass it whenever
+   * ``activities`` has collapsed rows removed: a collapsed section has no
+   * visible child, so the list alone cannot tell that it can be expanded.
+   */
+  sectionIds?: ReadonlySet<string>;
+  /**
+   * Every activity of the schedule, for the section picker. ``activities``
+   * may be filtered or have collapsed rows removed, and a section hidden
+   * that way is still a place a row can be moved to.
+   */
+  allActivities?: Activity[];
+  collapsedIds?: Set<string>;
+  onToggleCollapse?: (id: string) => void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
 
+  const [deleteTarget, setDeleteTarget] = useState<ActivityDeleteTarget | null>(null);
+  const canDelete = useHasPermission('schedule.delete');
+
   const invalidateGantt = () =>
     queryClient.invalidateQueries({ queryKey: ['gantt', scheduleId] });
+
+  // Compute tree depth for indentation
+  const depthMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    const parentOf: Record<string, string> = {};
+    for (const a of activities) { if (a.parent_id) parentOf[a.id] = a.parent_id; }
+    const getDepth = (id: string): number => {
+      if (id in map) return map[id] ?? 0;
+      const pid = parentOf[id];
+      const d = pid ? getDepth(pid) + 1 : 0;
+      map[id] = d;
+      return d;
+    };
+    for (const a of activities) getDepth(a.id);
+    return map;
+  }, [activities]);
+  // Sections a row can be moved into, in outline order, and each row's own
+  // subtree, which it cannot be moved into.
+  const outline = allActivities ?? activities;
+  const sectionOptions = useMemo(
+    () => orderAsTree(outline).filter((a) => a.activity_type === 'summary'),
+    [outline],
+  );
+  const childrenOf = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const a of outline) {
+      if (!a.parent_id) continue;
+      const list = map.get(a.parent_id);
+      if (list) list.push(a.id);
+      else map.set(a.parent_id, [a.id]);
+    }
+    return map;
+  }, [outline]);
+  const subtreeOf = (id: string): Set<string> => {
+    const seen = new Set<string>([id]);
+    const stack = [id];
+    while (stack.length) {
+      for (const c of childrenOf.get(stack.pop() as string) ?? []) {
+        if (!seen.has(c)) {
+          seen.add(c);
+          stack.push(c);
+        }
+      }
+    }
+    return seen;
+  };
+  const nameById = useMemo(() => {
+    const m = new Map<string, Activity>();
+    for (const a of outline) m.set(a.id, a);
+    return m;
+  }, [outline]);
+
+  const hasChildren = useMemo(() => {
+    if (sectionIds) return sectionIds;
+    const set = new Set<string>();
+    for (const a of activities) { if (a.parent_id) set.add(a.parent_id); }
+    return set;
+  }, [activities, sectionIds]);
 
   // #348: the project's named work calendars, for the per-row calendar picker.
   // Keyed by projectId so the picker and the WorkCalendarManager share a cache.
@@ -83,6 +167,7 @@ export function ActivityGrid({
     queryFn: () => listCalendars(projectId),
     enabled: !!projectId,
   });
+
 
   // Who is booked on each activity, fanned out through ``useQueries``.
   //
@@ -207,6 +292,29 @@ export function ActivityGrid({
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: ({ id, cascade }: { id: string; cascade: boolean }) => scheduleApi.deleteActivity(id, cascade),
+    onSuccess: () => {
+      setDeleteTarget(null);
+      invalidateGantt();
+      addToast({
+        type: 'success',
+        title: t('schedule.activity_deleted', { defaultValue: 'Activity deleted' }),
+      });
+    },
+    onError: (error: Error) =>
+      addToast({
+        type: 'error',
+        title: t('toasts.error', { defaultValue: 'Error' }),
+        message: scheduleErrorMessage(error, t),
+      }),
+  });
+  // A row is deleted only after a confirmation; a section asks whether its
+  // activities go with it or stay and move up one level.
+  const handleDelete = (activity: Activity) => {
+    setDeleteTarget(activityDeleteTarget(activity, allActivities ?? activities));
+  };
+
   const busy =
     updateMutation.isPending || rescheduleMutation.isPending || setCalendarMutation.isPending;
   // Only an operation that moves rows (a full reschedule, or a calendar change
@@ -265,13 +373,16 @@ export function ActivityGrid({
       { key: 'wbs', label: t('schedule.wbs_code', { defaultValue: 'WBS' }), align: 'left' as const },
       { key: 'name', label: t('schedule.activity_name', { defaultValue: 'Activity' }), align: 'left' as const },
       { key: 'type', label: t('schedule.activity_type', { defaultValue: 'Type' }), align: 'left' as const },
+      { key: 'section', label: t('schedule.parent_section', { defaultValue: 'Parent section' }), align: 'left' as const },
       { key: 'start', label: t('schedule.start_date', { defaultValue: 'Start' }), align: 'left' as const },
       { key: 'end', label: t('schedule.end_date', { defaultValue: 'End' }), align: 'left' as const },
       { key: 'duration', label: t('schedule.duration', { defaultValue: 'Duration' }), align: 'right' as const },
       { key: 'progress', label: t('schedule.progress', { defaultValue: 'Progress' }), align: 'right' as const },
       { key: 'calendar', label: t('schedule.calendar.column', { defaultValue: 'Calendar' }), align: 'left' as const },
       { key: 'resources', label: t('schedule.assigned_resources', { defaultValue: 'Resources' }), align: 'left' as const },
+      { key: 'assignee', label: t('schedule.assignee', { defaultValue: 'Assignee' }), align: 'left' as const },
       { key: 'deps', label: t('schedule.predecessors', { defaultValue: 'Predecessors' }), align: 'left' as const },
+      { key: 'actions', label: '', align: 'right' as const },
     ],
     [t],
   );
@@ -375,7 +486,25 @@ export function ActivityGrid({
                       {a.wbs_code || '-'}
                     </td>
                     <td className="px-2 py-1.5 align-middle">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5" style={{ paddingLeft: `${(depthMap[a.id] ?? 0) * 16}px` }}>
+                        {isSummary && (hasChildren.has(a.id) || collapsedIds?.has(a.id)) && onToggleCollapse ? (
+                          <button
+                            type="button"
+                            data-testid={`grid-toggle-${a.id}`}
+                            onClick={() => onToggleCollapse(a.id)}
+                            aria-expanded={!collapsedIds?.has(a.id)}
+                            aria-label={
+                              collapsedIds?.has(a.id)
+                                ? t('schedule.expand_section', { defaultValue: 'Expand section' })
+                                : t('schedule.collapse_section', { defaultValue: 'Collapse section' })
+                            }
+                            className="shrink-0 rounded p-0.5 text-content-tertiary hover:bg-surface-secondary"
+                          >
+                            {collapsedIds?.has(a.id) ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+                          </button>
+                        ) : isSummary ? (
+                          <Minus size={11} className="shrink-0 text-content-tertiary" />
+                        ) : null}
                         {isCritical && (
                           <span className="shrink-0 rounded bg-semantic-error px-1 py-0.5 text-[9px] font-bold leading-none text-white">
                             CP
@@ -384,7 +513,6 @@ export function ActivityGrid({
                         {isMilestone && (
                           <Diamond size={11} className="shrink-0 text-oe-blue" fill="currentColor" />
                         )}
-                        {isSummary && <Minus size={11} className="shrink-0 text-content-tertiary" />}
                         <input
                           key={`name-${a.id}-${a.name}`}
                           data-testid={`grid-name-${a.id}`}
@@ -415,6 +543,35 @@ export function ActivityGrid({
                           </option>
                         ))}
                       </select>
+                    </td>
+                    <td className="px-2 py-1.5 align-middle">
+                      {(() => {
+                        const own = subtreeOf(a.id);
+                        const choices = sectionOptions.filter((s) => !own.has(s.id));
+                        const current = a.parent_id ? nameById.get(a.parent_id) : undefined;
+                        // A parent that is not a summary (imported data) still has
+                        // to show as the value, or the cell would read top level.
+                        if (current && !choices.some((s) => s.id === current.id)) choices.unshift(current);
+                        return (
+                          <select
+                            data-testid={`grid-section-${a.id}`}
+                            aria-label={t('schedule.parent_section', { defaultValue: 'Parent section' })}
+                            className={CELL_INPUT_CLS}
+                            value={a.parent_id ?? ''}
+                            disabled={cellsDisabled}
+                            onChange={(e) =>
+                              updateMutation.mutate({ id: a.id, body: { parent_id: e.target.value || null } })
+                            }
+                          >
+                            <option value="">{t('schedule.no_parent', { defaultValue: 'Top level (no parent)' })}</option>
+                            {choices.map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {s.wbs_code ? `${s.wbs_code} ${s.name}` : s.name}
+                              </option>
+                            ))}
+                          </select>
+                        );
+                      })()}
                     </td>
                     <td className="px-2 py-1.5 align-middle">
                       <input
@@ -490,6 +647,15 @@ export function ActivityGrid({
                         </span>
                       )}
                     </td>
+                    <td className="min-w-[180px] px-2 py-1.5 align-middle">
+                      <GridAssigneeCell
+                        activity={a}
+                        disabled={cellsDisabled}
+                        onCommit={(assigneeId) =>
+                          updateMutation.mutate({ id: a.id, body: { assignee_id: assigneeId } })
+                        }
+                      />
+                    </td>
                     <td className="px-2 py-1.5 align-middle">
                       <button
                         type="button"
@@ -504,6 +670,20 @@ export function ActivityGrid({
                           : t('schedule.add_predecessor', { defaultValue: 'Add predecessor' })}
                       </button>
                     </td>
+                    <td className="px-2 py-1.5 text-right align-middle">
+                      {canDelete && (
+                        <button
+                          type="button"
+                          data-testid={`grid-delete-${a.id}`}
+                          onClick={() => handleDelete(a)}
+                          disabled={deleteMutation.isPending}
+                          title={t('schedule.delete_activity', { defaultValue: 'Delete activity' })}
+                          className="inline-flex items-center rounded-md p-1 text-content-tertiary transition-colors hover:bg-semantic-error/10 hover:text-semantic-error"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })
@@ -511,6 +691,63 @@ export function ActivityGrid({
           </tbody>
         </table>
       </div>
+      <ActivityDeleteDialog
+        target={deleteTarget}
+        loading={deleteMutation.isPending}
+        onCancel={() => setDeleteTarget(null)}
+        onDelete={(cascade) => deleteTarget && deleteMutation.mutate({ id: deleteTarget.id, cascade })}
+      />
     </Card>
+  );
+}
+
+/**
+ * The assignee cell: a contact picked from the caller's contacts, searchable
+ * past the first page.
+ *
+ * The name shown for a stored assignee comes from the server
+ * (``assignee_name``), not from the viewer's own contact list, which holds
+ * only that viewer's contacts and only the first page of them: a colleague's
+ * pick used to fall out of that list and read as unassigned. Typing only
+ * filters; nothing is saved until a contact is picked or the cell is cleared.
+ */
+function GridAssigneeCell({
+  activity,
+  disabled,
+  onCommit,
+}: {
+  activity: Activity;
+  disabled: boolean;
+  onCommit: (assigneeId: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const stored = activity.assignee_id ?? '';
+  const storedName =
+    activity.assignee_name ||
+    (stored ? t('schedule.assignee_unknown_contact', { defaultValue: 'Contact not in your list' }) : '');
+  const [draft, setDraft] = useState<AssigneeValue | null>(null);
+  // The saved value has come back (or changed elsewhere): show it.
+  useEffect(() => setDraft(null), [stored, storedName]);
+  const value = draft ?? { name: storedName, userId: '', contactId: stored };
+
+  return (
+    <AssigneePicker
+      value={value}
+      includeUsers={false}
+      testIdPrefix={`grid-assignee-${activity.id}`}
+      ariaLabel={t('schedule.assignee', { defaultValue: 'Assignee' })}
+      placeholder={t('schedule.no_assignee', { defaultValue: 'Unassigned' })}
+      noMatchesText={t('schedule.assignee_no_matches', { defaultValue: 'No matching contacts.' })}
+      inputClassName={CELL_INPUT_CLS}
+      disabled={disabled}
+      onChange={(next) => {
+        setDraft(next);
+        if (next.contactId) {
+          if (next.contactId !== stored) onCommit(next.contactId);
+        } else if (!next.name && stored) {
+          onCommit(null);
+        }
+      }}
+    />
   );
 }

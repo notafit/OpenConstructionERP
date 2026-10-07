@@ -111,7 +111,7 @@ def _refuse(exc: service.ClearanceError) -> HTTPException:
     if exc.findings:
         detail["findings"] = [f.model_dump() for f in _to_findings(exc.findings)]
     return HTTPException(
-        status_code=status.HTTP_409_CONFLICT if exc.conflict else status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_409_CONFLICT if exc.conflict else status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=detail,
     )
 
@@ -199,7 +199,7 @@ async def create_registration(
     entry = get_country_regime(payload.country)
     if entry is None:  # pragma: no cover - the schema already rejects this
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"No e-invoicing regime is registered for country {payload.country!r}.",
         )
     profile = EInvoiceProfile(
@@ -252,9 +252,26 @@ async def replace_registration(
     entry = get_country_regime(payload.country)
     if entry is None:  # pragma: no cover - the schema already rejects this
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"No e-invoicing regime is registered for country {payload.country!r}.",
         )
+    # The identity documents were filed under is the same record remove_registration
+    # refuses to delete; rewriting it in place would erase it just the same.
+    identity_changed = (
+        payload.company_key != profile.company_key
+        or payload.country != profile.country
+        or payload.tax_registration_id != profile.tax_registration_id
+    )
+    if identity_changed:
+        filed = await repository.count_documents_for_profile(session, profile_id)
+        if filed:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"{filed} document(s) were filed under this registration, so its company, country and "
+                    "tax number are the record of who sent them. Deactivate it and register the new identity."
+                ),
+            )
     profile.company_key = payload.company_key
     profile.country = payload.country
     profile.regime = entry.regime

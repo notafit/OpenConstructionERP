@@ -126,7 +126,11 @@ class _StubSession:
             for k, v in values.items():
                 setattr(self.positions[pk], k, v)
         self.executed.append(stmt)
-        return SimpleNamespace(rowcount=1)
+        # ``apply_winner`` first reads ``BOQ.is_locked``; None reads as a bill
+        # that is not locked, so the award writes its rates back. It then lists
+        # the bill's lines to count the ones the winner left unpriced; an empty
+        # list counts none.
+        return SimpleNamespace(rowcount=1, scalar_one_or_none=lambda: None, all=lambda: [])
 
 
 def _make_service(session: _StubSession | None = None) -> TenderingService:
@@ -304,10 +308,19 @@ def _seed_package_with_boq(
     return pkg, boq_id
 
 
-def _seed_position(session: _StubSession, *, currency: str = "EUR") -> uuid.UUID:
+def _seed_position(session: _StubSession, boq_id: uuid.UUID, *, currency: str = "EUR") -> uuid.UUID:
+    """Seed a BOQ position that belongs to *boq_id*.
+
+    The BOQ id is not decoration. ``apply_winner`` skips any position whose
+    ``boq_id`` is not the package's, so a bid cannot overwrite rates in a BOQ
+    it was never invited to - and a stub without the attribute raises
+    AttributeError inside that guard instead, which is how this helper took
+    two tests down on the 2026-09-22 nightly.
+    """
     pos_id = uuid.uuid4()
     session.positions[pos_id] = SimpleNamespace(
         id=pos_id,
+        boq_id=boq_id,
         quantity="10",
         unit_rate="100",
         total="1000",
@@ -340,8 +353,8 @@ async def test_apply_winner_same_currency_succeeds(
     svc = _make_service(session)
     _patch_project_currency(monkeypatch, currency="EUR")
 
-    pkg, _ = _seed_package_with_boq(svc)
-    pos_id = _seed_position(session)
+    pkg, boq_id = _seed_package_with_boq(svc)
+    pos_id = _seed_position(session, boq_id)
 
     bid = await svc.create_bid(
         pkg.id,
@@ -383,8 +396,8 @@ async def test_apply_winner_different_currency_raises_400(
     svc = _make_service(session)
     _patch_project_currency(monkeypatch, currency="EUR")
 
-    pkg, _ = _seed_package_with_boq(svc)
-    pos_id = _seed_position(session)
+    pkg, boq_id = _seed_package_with_boq(svc)
+    pos_id = _seed_position(session, boq_id)
 
     bid = await svc.create_bid(
         pkg.id,
@@ -436,8 +449,8 @@ async def test_apply_winner_line_level_currency_override_detected(
     svc = _make_service(session)
     _patch_project_currency(monkeypatch, currency="EUR")
 
-    pkg, _ = _seed_package_with_boq(svc)
-    pos_id = _seed_position(session)
+    pkg, boq_id = _seed_package_with_boq(svc)
+    pos_id = _seed_position(session, boq_id)
 
     # Build the bid by hand so we can attach a per-line currency that
     # the BidLineItem pydantic schema doesn't model.
@@ -519,8 +532,8 @@ async def test_apply_winner_unknown_project_currency_does_not_block(
     svc = _make_service(session)
     _patch_project_currency(monkeypatch, currency="")
 
-    pkg, _ = _seed_package_with_boq(svc)
-    pos_id = _seed_position(session)
+    pkg, boq_id = _seed_package_with_boq(svc)
+    pos_id = _seed_position(session, boq_id)
 
     bid = await svc.create_bid(
         pkg.id,

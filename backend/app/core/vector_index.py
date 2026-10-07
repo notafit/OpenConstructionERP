@@ -54,6 +54,7 @@ from app.core.vector import (
     encode_texts_async,
     vector_count_collection,
     vector_delete_collection,
+    vector_get_collection_record,
     vector_index_collection,
     vector_search_collection,
 )
@@ -356,6 +357,37 @@ def _safe_text(text: str | None) -> str:
     return cleaned
 
 
+def _clip_and_look_up(collection_name: str, row_id: str, raw_text: str) -> tuple[str, dict[str, Any] | None]:
+    """The blocking half of :func:`index_one`, run in a worker thread.
+
+    Clips the text (which needs the embedder's tokenizer, so it can wait for a
+    model load in another thread) and fetches what the store already holds for
+    the row. Returns ``("", None)`` when there is nothing to embed, and a
+    ``None`` record when the row is not stored or the store cannot say.
+    """
+    text = _safe_text(raw_text)
+    if not text:
+        return "", None
+    try:
+        return text, vector_get_collection_record(collection_name, row_id)
+    except Exception as exc:  # noqa: BLE001 - "cannot say" means "index it"
+        logger.debug("vector_index: lookup failed for %s/%s: %s", collection_name, row_id, exc)
+        return text, None
+
+
+def _stored_record_is_current(stored: dict[str, Any], item: dict[str, Any]) -> bool:
+    """True when ``stored`` already holds everything ``item`` would write, bar the vector.
+
+    The vector is a function of ``text`` and the model, so equal text means an
+    equal vector under the same model. A model change is handled by the full
+    reindex (``reindex_collection``), which never takes this shortcut.
+    """
+    for key in ("text", "tenant_id", "project_id", "module"):
+        if str(stored.get(key) or "") != str(item.get(key) or ""):
+            return False
+    return _decode_payload(stored.get("payload")) == _decode_payload(item.get("payload"))
+
+
 # ── Public write API ─────────────────────────────────────────────────────
 
 
@@ -368,19 +400,45 @@ async def index_one(
 ) -> bool:
     """Embed and upsert a single row into ``adapter.collection_name``.
 
-    Returns ``True`` if the row was indexed, ``False`` otherwise.  Never
-    raises - every failure is logged and swallowed so the caller (typically
-    an event-bus subscriber) can stay one-line.
+    Returns ``True`` if the store holds the row's current text and payload
+    afterwards, ``False`` otherwise. ``True`` does not mean a write happened:
+    when the store already holds exactly the record this row would produce
+    (same text, payload, project, tenant and module), nothing is embedded or
+    written. That is what a price edit on a BOQ position looks like here, since
+    neither the embedded text nor the payload carries a price. Any difference,
+    a row the store does not have, or a store that cannot answer, all index.
+
+    Nothing blocking runs on the event loop. Clipping the text asks for the
+    embedder, which waits on the model-load lock for as long as another thread
+    is loading the model (a 3 s hold measured as a 2.98 s loop freeze), and the
+    LanceDB lookup, delete and add are synchronous disk I/O. Both go to worker
+    threads; encoding already did.
+
+    Never raises - every failure is logged and swallowed so the caller
+    (typically an event-bus subscriber) can stay one-line.
     """
     try:
         row_id = _coerce_id(getattr(row, "id", None))
         if not row_id:
             return False
-        text = _safe_text(adapter.to_text(row))
+        # The adapter reads ORM attributes, so it stays on the loop; only
+        # plain values cross into the worker thread.
+        text, stored = await asyncio.to_thread(_clip_and_look_up, adapter.collection_name, row_id, adapter.to_text(row))
         if not text:
             # Nothing to embed - make sure any stale entry is removed.
             await delete_one(adapter, row_id)
             return False
+        payload = adapter.to_payload(row) or {}
+        record = {
+            "id": row_id,
+            "text": text,
+            "tenant_id": tenant_id or "",
+            "project_id": project_id or _coerce_id(adapter.project_id_of(row)) or "",
+            "module": adapter.module_name,
+            "payload": json.dumps(payload, ensure_ascii=False, default=str),
+        }
+        if stored is not None and _stored_record_is_current(stored, record):
+            return True
         try:
             vectors = await encode_texts_async([text])
         except Exception as exc:
@@ -392,18 +450,9 @@ async def index_one(
             return False
         if not vectors:
             return False
-        payload = adapter.to_payload(row) or {}
-        item = {
-            "id": row_id,
-            "vector": vectors[0],
-            "text": text,
-            "tenant_id": tenant_id or "",
-            "project_id": project_id or _coerce_id(adapter.project_id_of(row)) or "",
-            "module": adapter.module_name,
-            "payload": json.dumps(payload, ensure_ascii=False, default=str),
-        }
+        item = {"id": row_id, "vector": vectors[0], **{k: v for k, v in record.items() if k != "id"}}
         try:
-            vector_index_collection(adapter.collection_name, [item])
+            await asyncio.to_thread(vector_index_collection, adapter.collection_name, [item])
         except Exception as exc:
             logger.debug(
                 "vector_index.index_one: store failed for %s: %s",
@@ -415,6 +464,11 @@ async def index_one(
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("index_one(%s) failed: %s", adapter.collection_name, exc)
         return False
+
+
+def _clip_all(raw_texts: list[str | None]) -> list[str]:
+    """The blocking half of :func:`index_many`, run in a worker thread."""
+    return [_safe_text(text) for text in raw_texts]
 
 
 async def index_many(
@@ -430,6 +484,11 @@ async def index_many(
     Returns the number of rows successfully indexed.  Designed for backfill
     / reindex flows where you want to embed thousands of rows in one shot
     without exhausting GPU memory.
+
+    As in :func:`index_one`, nothing blocking runs on the event loop: the
+    clipping (which can wait on a model load in another thread) and the store
+    write go to worker threads. A BOQ imported row by row is indexed through
+    here, a batch at a time, while the process keeps serving requests.
     """
     if not rows:
         return 0
@@ -437,13 +496,14 @@ async def index_many(
     indexed = 0
     for start in range(0, len(rows), batch_size):
         chunk = rows[start : start + batch_size]
+        # The adapter reads ORM attributes, so it stays on the loop; only
+        # plain strings cross into the worker thread.
+        candidates = [row for row in chunk if _coerce_id(getattr(row, "id", None))]
+        raw_texts = [adapter.to_text(row) for row in candidates]
+        clipped = await asyncio.to_thread(_clip_all, raw_texts)
         texts: list[str] = []
         good_rows: list[Any] = []
-        for row in chunk:
-            row_id = _coerce_id(getattr(row, "id", None))
-            if not row_id:
-                continue
-            text = _safe_text(adapter.to_text(row))
+        for row, text in zip(candidates, clipped, strict=True):
             if not text:
                 continue
             texts.append(text)
@@ -473,7 +533,7 @@ async def index_many(
                 }
             )
         try:
-            n = vector_index_collection(adapter.collection_name, items)
+            n = await asyncio.to_thread(vector_index_collection, adapter.collection_name, items)
             indexed += n
         except Exception as exc:
             logger.debug("index_many: store failed: %s", exc)
@@ -483,11 +543,14 @@ async def index_many(
 
 
 async def delete_one(adapter: EmbeddingAdapter, row_id: str) -> bool:
-    """Remove a single row from the adapter's collection.  Idempotent."""
+    """Remove a single row from the adapter's collection.  Idempotent.
+
+    The delete is synchronous store I/O, so it runs in a worker thread.
+    """
     if not row_id:
         return False
     try:
-        vector_delete_collection(adapter.collection_name, [_coerce_id(row_id)])
+        await asyncio.to_thread(vector_delete_collection, adapter.collection_name, [_coerce_id(row_id)])
         return True
     except Exception as exc:
         logger.debug("delete_one(%s, %s) failed: %s", adapter.collection_name, row_id, exc)
@@ -495,12 +558,12 @@ async def delete_one(adapter: EmbeddingAdapter, row_id: str) -> bool:
 
 
 async def delete_many(adapter: EmbeddingAdapter, row_ids: list[str]) -> int:
-    """Remove multiple rows from the adapter's collection."""
+    """Remove multiple rows from the adapter's collection, off the event loop."""
     cleaned = [_coerce_id(r) for r in row_ids if r]
     if not cleaned:
         return 0
     try:
-        return vector_delete_collection(adapter.collection_name, cleaned)
+        return await asyncio.to_thread(vector_delete_collection, adapter.collection_name, cleaned)
     except Exception as exc:
         logger.debug("delete_many(%s) failed: %s", adapter.collection_name, exc)
         return 0
@@ -747,11 +810,23 @@ async def reindex_collection(
     project_id: str | None = None,
     purge_first: bool = False,
 ) -> dict[str, Any]:
-    """Backfill a collection from the ground up.
+    """Backfill a collection from the rows it is given.
 
-    If ``purge_first`` is True the entire collection is wiped before the
-    new rows are indexed - useful when the embedding model changes and a
-    full reindex is needed.
+    If ``purge_first`` is True the ids of ``rows`` are dropped from the
+    collection before those same rows are re-indexed - useful when the
+    embedding model changes and a full reindex is needed.  The delete is
+    BY ID on both backends (``PointIdsList`` on qdrant, ``id IN (...)``
+    on lancedb), not a wipe: a row of the collection that is not in
+    ``rows`` is left where it is.
+
+    That is what makes this function safe to call once per page of a
+    paged reindex, which is how every reindex route in the platform now
+    calls it (see ``app.core.vector_routes.reindex_statement_in_pages``).
+    Purging per page and purging once over the union of the pages leave
+    the same rows in the store.  Were the purge a wipe instead, paging a
+    reindex through here would destroy every page but the last, and it
+    would do it silently - so if this behaviour is ever changed, the
+    callers that page have to change with it.
 
     Serialised by a per-collection ``asyncio.Lock`` so two concurrent
     reindex requests against the SAME collection (e.g. startup

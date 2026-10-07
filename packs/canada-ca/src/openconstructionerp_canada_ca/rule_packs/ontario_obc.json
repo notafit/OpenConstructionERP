@@ -1,0 +1,20 @@
+{
+  "rule_pack_id": "ontario_obc",
+  "name": "Ontario Building Code (O. Reg. 332/12)",
+  "name_fr-CA": "Code du bâtiment de l'Ontario (Règl. de l'Ont. 332/12)",
+  "standard": "OBC 2012 + amendments (O. Reg. 332/12)",
+  "jurisdiction": "CA-ON",
+  "regulator": "Ministry of Municipal Affairs and Housing (Ontario)",
+  "publication_year": 2024,
+  "applies_to": [
+    "projects",
+    "validation"
+  ],
+  "description": "Reference document for Ontario-specific compliance on top of NBC 2020. What the regime requires a project to show: the project building permit is referenced, the Building Code Identification Number (BCIN) of the qualified designer is on file, WSIB Clearance Certificate is current for every contractor, prompt-payment per Construction Act (O.Reg. 304/18) is configured, and the Tarion enrolment is recorded for new-home builders. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la conformité particulière à l'Ontario en complément du CNB 2020. Ce que le régime exige du projet : le permis de construire est référencé, le numéro BCIN (Building Code Identification Number) du concepteur qualifié est consigné, le certificat de décharge WSIB est valide pour chaque entrepreneur, le paiement rapide selon la Loi sur la construction (Règl. 304/18) est configuré, et l'inscription Tarion est enregistrée pour les constructeurs de maisons neuves. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {
+    "ontario_obc.wsib_clearance_required": "ERROR"
+  },
+  "why_no_rules": "This document ships as reference and enables no engine rules. The provincial code is applied by the authority having jurisdiction against a submitted design, and nothing in a bill of quantities answers it. Naming a rule would promise a check that no registered rule performs.",
+  "enables_rule_ids": []
+}

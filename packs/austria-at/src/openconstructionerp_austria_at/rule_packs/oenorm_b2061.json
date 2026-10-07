@@ -1,0 +1,21 @@
+{
+  "rule_pack_id": "oenorm_b2061",
+  "name": "OENORM B 2061 — Preisermittlung fuer Bauleistungen",
+  "standard": "OENORM B 2061",
+  "jurisdiction": "AT",
+  "regulator": "Austrian Standards International (ASI)",
+  "applies_to": [
+    "boq",
+    "estimate",
+    "tender",
+    "validation"
+  ],
+  "description": "Reference document for OENORM B 2061, which asks that a tender price is built up rather than presented as a single opaque figure. The standard separates the direct costs of the individual items (Einzelkosten der Teilleistungen) from site overheads (Baustellengemeinkosten), business overheads (Geschaeftsgemeinkosten), risk and profit, and carries that build-up on the K-Blaetter (Kalkulationsformblaetter). This structure is specific to Austria and differs from both the German and the Swiss approach, so the standard asks that each component is stated, that the K-Blatt accompanying the offer is present, and that what it shows reconciles with the priced bill. That build-up is not implemented as a rule here. What the pack checks is the priced bill underneath it: that positions carry a unit rate, that totals reconcile, and that currency is consistent.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by an Austrian Baukalkulator or Ziviltechniker before they are relied on for a public submission. No edition year is pinned here; the edition in force must be confirmed against Austrian Standards International.",
+  "severity_overrides": {},
+  "enables_rule_ids": [
+    "boq_quality.position_has_unit_rate",
+    "boq_quality.total_mismatch",
+    "boq_quality.currency_consistency"
+  ]
+}

@@ -140,6 +140,24 @@ export function parseDecimalInput(raw: string): number | null {
 }
 
 /**
+ * Drop currency signs from a typed amount, so `12,50 €`, `€12,50` and
+ * `$ 1,234.56` read as the number they carry.
+ *
+ * For money fields only: a sign beside an amount never changes its value, and
+ * people type it (on a Croatian or German keyboard the euro sign is AltGr+E),
+ * while a quantity has no business accepting one. Letters are left alone, so
+ * `12 EUR` is still refused rather than guessed at.
+ */
+export function stripCurrencySigns(raw: string): string {
+  return raw.replace(/\p{Sc}/gu, '').trim();
+}
+
+/** {@link parseDecimalInput} for a money field: currency signs are ignored. */
+export function parseMoneyInput(raw: string): number | null {
+  return parseDecimalInput(stripCurrencySigns(raw));
+}
+
+/**
  * Normalise a typed decimal for a JSON field the API parses as a `Decimal`.
  *
  * Money crosses the wire as a STRING (`DecimalMoney` on the backend) so that

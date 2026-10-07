@@ -71,6 +71,12 @@ from app.core.validation.engine import (
     rule_registry,
     validation_engine,
 )
+
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, so two findings on one screen cannot disagree
+# about what an amount looks like. Importing it registers nothing.
+from app.core.validation.rules import _fmt_money
 from app.modules.tax_withholding.service import ZERO, compute_taxable_base, quantise, to_decimal
 
 logger = logging.getLogger(__name__)
@@ -96,6 +102,16 @@ def _dec(value: Any) -> Decimal:
 
 def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _currency(record: dict[str, Any]) -> str:
+    """The currency this record states, never a default.
+
+    Blank stays blank: the renderer then groups the digits and writes no code.
+    A guessed code reads as authoritative and is worse than none, because a
+    reader who trusts it reconciles the wrong ledger.
+    """
+    return _text(record.get("currency_code"))
 
 
 def _as_date(value: Any) -> date | None:
@@ -191,6 +207,7 @@ class TaxableBaseIsCorrect(ValidationRule):
             vat_excluded=vat_excluded,
         )
         actual = quantise(_dec(record.get("taxable_base")))
+        currency = _currency(record)
         details = {
             "gross_amount": str(gross),
             "qualifying_materials": str(materials),
@@ -214,9 +231,10 @@ class TaxableBaseIsCorrect(ValidationRule):
                     self,
                     False,
                     (
-                        f"The base still includes {materials} of materials. This scheme deducts on "
-                        f"labour, so the base should be {expected} and not {actual}, and this payment "
-                        f"over-withholds by {over} {_text(record.get('currency_code'))}."
+                        f"The base still includes {_fmt_money(materials, currency)} of materials. This scheme "
+                        f"deducts on labour, so the base should be {_fmt_money(expected, currency)} and not "
+                        f"{_fmt_money(actual, currency)}, and this payment over-withholds by "
+                        f"{_fmt_money(over, currency)}."
                     ),
                     suggestion=(
                         "Record the materials the party supplied in 'qualifying materials' and take "
@@ -230,8 +248,9 @@ class TaxableBaseIsCorrect(ValidationRule):
                 self,
                 False,
                 (
-                    f"The base is recorded as {actual} but the scheme computes {expected} from a gross "
-                    f"of {gross}. A deduction is only defensible if the base it was taken on is."
+                    f"The base is recorded as {_fmt_money(actual, currency)} but the scheme computes "
+                    f"{_fmt_money(expected, currency)} from a gross of {_fmt_money(gross, currency)}. "
+                    "A deduction is only defensible if the base it was taken on is."
                 ),
                 suggestion="Recompute the base from the gross, the qualifying materials and the VAT.",
                 details=details,
@@ -253,13 +272,17 @@ class WithheldWithinBase(ValidationRule):
         record = _record(context)
         base = _dec(record.get("taxable_base"))
         withheld = _dec(record.get("tax_withheld"))
+        currency = _currency(record)
         details = {"taxable_base": str(base), "tax_withheld": str(withheld)}
         if withheld < ZERO:
             return [
                 _result(
                     self,
                     False,
-                    f"The amount withheld is negative ({withheld}). A withholding is money kept back, never paid out.",
+                    (
+                        f"The amount withheld is negative ({_fmt_money(withheld, currency)}). "
+                        "A withholding is money kept back, never paid out."
+                    ),
                     suggestion="Record a refund of an over-withholding as its own corrective entry, not as a negative deduction.",
                     details=details,
                 )
@@ -270,7 +293,8 @@ class WithheldWithinBase(ValidationRule):
                     self,
                     False,
                     (
-                        f"{withheld} is withheld from a base of {base}. Withholding more than the base "
+                        f"{_fmt_money(withheld, currency)} is withheld from a base of "
+                        f"{_fmt_money(base, currency)}. Withholding more than the base "
                         "leaves the party paid less than the contract allows and the return unfilable."
                     ),
                     suggestion="Check the rate and the base; at 100 percent the two figures are equal, never more.",
@@ -491,6 +515,7 @@ class ReverseChargeInvoiceIsWellFormed(ValidationRule):
         wording = _text(record.get("invoice_wording"))
         vat = _dec(record.get("vat_amount"))
         reference = _text(record.get("invoice_reference"))
+        currency = _currency(record)
         details = {
             "buyer_accounts_for_vat": buyer_accounts,
             "has_wording": bool(wording),
@@ -541,8 +566,9 @@ class ReverseChargeInvoiceIsWellFormed(ValidationRule):
                     self,
                     False,
                     (
-                        f"Invoice {reference} is reverse charged and still shows {vat} of VAT. The buyer "
-                        "accounts for that VAT themselves, so charging it here collects it twice."
+                        f"Invoice {reference} is reverse charged and still shows {_fmt_money(vat, currency)} "
+                        "of VAT. The buyer accounts for that VAT themselves, so charging it here collects "
+                        "it twice."
                     ),
                     suggestion="Show the net amount only and leave the VAT line at zero on a reverse-charge invoice.",
                     details=details,

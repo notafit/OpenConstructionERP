@@ -69,25 +69,110 @@ def _load_schema(dp_code: str) -> etree.XMLSchema:
     return etree.XMLSchema(root)
 
 
-def test_profile_schemas_differ_only_in_the_exchange_phase() -> None:
-    """The two profile files must not drift apart.
+#: What only the priced phase may carry. X83, the call for bids
+#: (Angebotsaufforderung), goes out without prices, so a position has no unit
+#: price, item total or bidder comment, and there are no surcharge positions
+#: and no totals. X84, the priced bid (Angebotsabgabe), carries all of them.
+_PRICED_ONLY_ELEMENTS = frozenset({"UP", "IT", "BidComm", "MarkupItem", "Totals"})
+_PRICED_ONLY_TYPES = frozenset({"UnitPrice", "Money", "Percent", "SurchargePosition", "Totals"})
 
-    They describe the same element model for two exchange phases, so the X84
-    file is the X83 file with the phase swapped. Anything else that differs
-    is an edit someone made to one and forgot in the other.
+#: The shared types whose content model is where the prices go, and so the
+#: only shared declarations allowed to differ between the two files.
+_PHASE_SHAPED_TYPES = frozenset({"Position", "PositionList", "Category", "BillInfo"})
+
+_XS = "{http://www.w3.org/2001/XMLSchema}"
+
+
+def _profile_drift(x83_text: str, x84_text: str) -> list[str]:
+    """Every way the X83 profile differs from X84 other than by leaving prices out.
+
+    Comments are dropped first, because they are allowed to say which phase
+    they describe. Declarations are keyed by kind and name, and the X83 side
+    is compared with its namespace moved to DA84, the one difference every
+    declaration carries. A phase-shaped type is compared by the elements and
+    attributes it declares, since the priced side wraps its items in a choice
+    the unpriced side has no need for.
+    """
+    parser = etree.XMLParser(remove_comments=True, load_dtd=False, no_network=True)
+
+    def _declarations(text: str) -> dict[tuple[str, str], etree._Element]:
+        root = etree.fromstring(text.encode("utf-8"), parser)
+        return {(child.tag, child.get("name")): child for child in root if child.get("name")}
+
+    def _canonical(node: etree._Element, *, from_x83: bool) -> bytes:
+        out = etree.tostring(node, method="c14n")
+        return out.replace(b"DA83/3.3", b"DA84/3.3") if from_x83 else out
+
+    def _members(node: etree._Element, *, priced_out: bool) -> list[tuple[str, ...]]:
+        elements = [
+            ("element", e.get("name") or "", e.get("type") or "")
+            for e in node.iter(f"{_XS}element")
+            if not (priced_out and e.get("name") in _PRICED_ONLY_ELEMENTS)
+        ]
+        attributes = [
+            ("attribute", a.get("name") or "", a.get("type") or "", a.get("use") or "")
+            for a in node.iter(f"{_XS}attribute")
+        ]
+        return sorted(elements + attributes)
+
+    x83, x84 = _declarations(x83_text), _declarations(x84_text)
+    problems: list[str] = []
+    only_in_x84 = {name for _tag, name in x84.keys() - x83.keys()}
+    if only_in_x84 != _PRICED_ONLY_TYPES:
+        problems.append(f"declared only in X84: {sorted(only_in_x84)}, expected {sorted(_PRICED_ONLY_TYPES)}")
+    problems.extend(f"declared only in X83: {name}" for _tag, name in sorted(x83.keys() - x84.keys()))
+    for key in sorted(x83.keys() & x84.keys()):
+        name = key[1]
+        if name in _PHASE_SHAPED_TYPES:
+            if _members(x83[key], priced_out=False) != _members(x84[key], priced_out=True):
+                problems.append(f"{name}: X83 is not X84 with the priced elements taken out")
+        elif _canonical(x83[key], from_x83=True) != _canonical(x84[key], from_x83=False):
+            problems.append(f"{name}: differs between the two files")
+    return problems
+
+
+def test_profile_schemas_differ_only_where_the_phases_do() -> None:
+    """X83 is X84 with the prices left out, and differs in nothing else.
+
+    The two files describe one element model for two exchange phases. They
+    used to be identical but for the phase, and this test compared them as
+    text. Then bfde6a9b0 made X83 strictly unpriced, which is right for a call
+    for bids, and a text comparison could only fail from then on. So the
+    difference the phases are meant to have is now stated in the names above,
+    and everything outside it must still match: an edit to a shared type in
+    one file and not the other is the drift this test is here to catch.
     """
     x83 = (_PROFILE_DIR / _PROFILE_XSD["83"]).read_text(encoding="utf-8")
     x84 = (_PROFILE_DIR / _PROFILE_XSD["84"]).read_text(encoding="utf-8")
-    swapped = (
-        x83.replace("DA83/3.3", "DA84/3.3")
-        .replace("phase X83", "phase X84")
-        .replace(
-            "(Angebotsaufforderung, the unpriced call for bids)",
-            "(Angebotsabgabe, the priced bid submission)",
-        )
-        .replace("3.3 X83.", "3.3 X84.")
-    )
-    assert swapped == x84, "the X83 and X84 profile schemas have drifted apart"
+    assert _profile_drift(x83, x84) == []
+
+
+@pytest.mark.parametrize(
+    ("in_file", "old", "new"),
+    [
+        # A shared type edited in one file only.
+        ("84", '<xs:totalDigits value="11"/>', '<xs:totalDigits value="12"/>'),
+        # A price put back into the call for bids.
+        (
+            "83",
+            '<xs:element name="QU" type="UnitOfMeasure" minOccurs="0"/>',
+            '<xs:element name="QU" type="UnitOfMeasure" minOccurs="0"/><xs:element name="UP" type="UnitPrice"/>',
+        ),
+        # An unpriced declaration added to one file only.
+        (
+            "84",
+            "</xs:schema>",
+            '<xs:simpleType name="Stray"><xs:restriction base="xs:string"/></xs:simpleType></xs:schema>',
+        ),
+    ],
+    ids=["shared-type-edited", "price-in-x83", "stray-declaration"],
+)
+def test_the_profile_drift_check_can_fail(in_file: str, old: str, new: str) -> None:
+    """Each case plants one drift, so a check that had stopped looking would show."""
+    texts = {code: (_PROFILE_DIR / name).read_text(encoding="utf-8") for code, name in _PROFILE_XSD.items()}
+    assert texts[in_file].count(old) == 1, f"the planted edit no longer has a unique anchor: {old}"
+    texts[in_file] = texts[in_file].replace(old, new)
+    assert _profile_drift(texts["83"], texts["84"]) != []
 
 
 @pytest.mark.parametrize("dp_code", ["83", "84"])

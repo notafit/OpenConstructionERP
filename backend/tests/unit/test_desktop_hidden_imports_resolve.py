@@ -57,7 +57,7 @@ Every f-string under ``backend/app`` shaped like ``app.modules.{...}.<layer>``
 is parsed out, including the ones whose layer name sits behind a module-level
 constant, and the spec has to declare every one of those layers that some
 module actually carries a file for. Frequency on disk deliberately plays no
-part: ``repairs.py`` exists in two modules against 189 manifests, so any rule
+part: ``repairs.py`` exists in three modules against 193 manifests, so any rule
 keyed on how common a filename is would rank the layer that most needs naming
 with the one-off helpers.
 
@@ -97,7 +97,7 @@ _MODULES_PREFIX = "app.modules."
 # file passes green the day the discovery loop moves out of the spec or an
 # upstream rename empties the capture: zero unresolvable names out of twelve
 # examined reads identically to zero out of twelve hundred. The tree carries
-# 191 module packages and roughly 980 layer files, so anything under this means
+# 195 module packages and roughly 1100 layer files, so anything under this means
 # the instrument stopped seeing the population, not that the population shrank.
 _MIN_APP_HIDDEN_IMPORTS = 900
 
@@ -112,7 +112,7 @@ _MIN_APP_HIDDEN_IMPORTS = 900
 #     pipeline_nodes, repairs, router, schema, validators). ``module_loader``
 #     alone accounts for 7 of them, so anything under 6 means a whole discovery
 #     site stopped being read.
-#   * module packages - 192 today. The same floor the census helpers rest on.
+#   * module packages - 195 today. The same floor the census helpers rest on.
 _MIN_SCANNED_SOURCES = 800
 _MIN_DYNAMIC_LAYERS = 6
 _MIN_MODULE_PACKAGES = 150

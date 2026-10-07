@@ -64,17 +64,48 @@ def test_the_pack_is_a_country_pack_in_forint(manifest) -> None:
     assert manifest.default_methodology == "hungary"
 
 
-def test_the_pack_does_not_promise_a_hungarian_interface(manifest) -> None:
-    """The deliberate limit, asserted so it cannot be undone by accident.
+def _offered_languages() -> set[str]:
+    """The language codes the interface offers, read from its own list."""
+    source = (REPO_ROOT / "frontend" / "src" / "app" / "i18n.ts").read_text(encoding="utf-8")
+    offered = set(re.findall(r"\{\s*code:\s*'([A-Za-z-]+)'", source))
+    assert len(offered) > 20, "the language list in i18n.ts was not found"
+    return offered
 
-    ``normalizePackLocale`` answers a locale the application does not ship with
-    English. A pack declaring ``hu`` would therefore promise a Hungarian
-    interface and deliver an English one with no signal that it had, and a
-    Hungarian file listed under ``additional_locales`` would be merged over the
-    English bundle, turning the English UI Hungarian for everyone on the
-    installation. Both stay out until a Hungarian bundle exists.
+
+def test_the_pack_switches_the_interface_to_hungarian(manifest) -> None:
+    """Installing the Hungarian pack sets a Hungarian interface.
+
+    ``normalizePackLocale`` answers a locale the application does not ship
+    with English, so the value is only worth declaring while Hungarian is
+    both shipped and offered; the two halves are checked separately because
+    a language can have a file before it is offered. That ``hu`` answers
+    with itself is asserted where the function lives, in
+    ``frontend/src/app/__tests__/normalizePackLocale.test.ts``.
     """
-    assert manifest.default_locale == "en"
+    assert manifest.default_locale == "hu"
+    assert (REPO_ROOT / "frontend" / "src" / "app" / "locales" / "hu.ts").is_file()
+    assert "hu" in _offered_languages()
+
+
+def test_the_apply_plan_the_dialog_reads_carries_the_hungarian_locale(manifest) -> None:
+    """The install dialog switches to ``plan.default_locale`` of the pack preview."""
+    from app.core.partner_pack.apply import _plan
+
+    assert _plan(manifest)["default_locale"] == "hu"
+
+
+def test_the_full_install_hands_the_hungarian_locale_to_the_interface(manifest, monkeypatch) -> None:
+    """The locale step of the one-click full install reports the same locale."""
+    from app.core.partner_pack import discovery, full_install
+
+    monkeypatch.setattr(discovery, "get_pack_by_slug", lambda slug: manifest if slug == "hungary-hu" else None)
+    step = full_install._step_locale("hungary-hu")
+    assert step.status == "ok"
+    assert step.detail == {"locale": "hu"}
+
+
+def test_the_pack_merges_no_locale_file_over_the_shipped_one(manifest) -> None:
+    """A file under ``additional_locales`` would override the shipped bundle for everyone."""
     assert manifest.additional_locales == {}
 
 

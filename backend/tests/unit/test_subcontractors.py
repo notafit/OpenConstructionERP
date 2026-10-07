@@ -354,6 +354,16 @@ class _Repo:
     async def list_for_agreement(self, ag_id: uuid.UUID, **_kwargs: Any) -> list[Any]:
         return [r for r in self.rows.values() if getattr(r, "agreement_id", None) == ag_id]
 
+    async def list_for_application(self, payment_application_id: uuid.UUID) -> list[Any]:
+        # Finance approval reads the pay application's lines to settle each
+        # approved amount, so the payment-line double answers it like the repo.
+        return [r for r in self.rows.values() if getattr(r, "payment_application_id", None) == payment_application_id]
+
+    async def list_for_payment_application(self, payment_application_id: uuid.UUID) -> list[Any]:
+        # The retention accrual of one pay application, which finance approval
+        # moves to the approved gross.
+        return [r for r in self.rows.values() if getattr(r, "payment_application_id", None) == payment_application_id]
+
     async def next_application_number(self, _ag_id: uuid.UUID) -> str:
         self._counter += 1
         return f"PA-{self._counter:04d}"
@@ -365,6 +375,25 @@ class _Repo:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _no_finance_ledger():
+    """Keep the payables ledger out of these in-memory workflow tests.
+
+    Approving and paying a payment application raises and settles a payable
+    through the finance module, which needs a real session. The money it
+    books is covered on PostgreSQL by
+    ``tests/pg/test_a_subcontract_is_billed_and_committed_once.py``; here only
+    the pay application's own workflow is under test, and signing an
+    agreement does not ask finance to bring the budget along.
+    """
+    with (
+        patch("app.modules.subcontractors.finance_bridge.raise_payable_for_pay_app", AsyncMock()),
+        patch("app.modules.subcontractors.finance_bridge.settle_payable", AsyncMock()),
+        patch("app.modules.finance.service.FinanceService.sync_project_budget", AsyncMock(), create=True),
+    ):
+        yield
+
+
 def _make_service() -> Any:
     from app.modules.subcontractors.service import SubcontractorService
 
@@ -374,6 +403,8 @@ def _make_service() -> Any:
         execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
         add=lambda _o: None,
         flush=AsyncMock(),
+        # No project row behind the stub, so an agreement has no country defaults.
+        get=AsyncMock(return_value=None),
     )
     svc.subs = _Repo()
     svc.contacts = _Repo()
@@ -514,6 +545,80 @@ async def test_payment_application_workflow_happy_path() -> None:
         paid = await svc.mark_paid(pa.id)
         assert paid.status == "paid"
         assert paid.paid_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_line_approved_below_its_claim_is_what_is_paid_and_what_retention_holds() -> None:
+    # Finance approves 1500 of a 2000 claim at 5% retention. The claimed
+    # header stays 2000 / 100 / 1900, which the waiver gate reads; what is
+    # paid is 1500 less 75 retention, the retention accrued follows it, and
+    # the paid event that webhooks forward to outside books carries 1425.
+    from app.modules.subcontractors.schemas import (
+        AgreementCreate,
+        AgreementUpdate,
+        ApprovedLineAmount,
+        CertificateCreate,
+        PaymentApplicationCreate,
+        PaymentApplicationLineCreate,
+        SubcontractorCreate,
+    )
+
+    svc = _make_service()
+    with patch("app.modules.subcontractors.service.event_bus.publish_detached") as publish:
+        sub = await svc.create_subcontractor(SubcontractorCreate(legal_name="Acme"))
+        for cert_type in ("insurance", "license"):
+            await svc.record_certificate(
+                CertificateCreate(
+                    subcontractor_id=sub.id,
+                    cert_type=cert_type,
+                    valid_until=date.today() + timedelta(days=180),
+                ),
+            )
+        agreement = await svc.create_agreement(
+            AgreementCreate(
+                subcontractor_id=sub.id,
+                project_id=uuid.uuid4(),
+                title="Concrete subcontract",
+                total_value=Decimal("100000"),
+                currency="EUR",
+                retention_percent=Decimal("5"),
+            ),
+        )
+        await svc.update_agreement(agreement.id, AgreementUpdate(status="active"))
+        pa = await svc.submit_payment_application(
+            PaymentApplicationCreate(
+                agreement_id=agreement.id,
+                gross_amount=Decimal("2000"),
+                currency="EUR",
+                lines=[PaymentApplicationLineCreate(work_package_id=uuid.uuid4(), claimed_amount=Decimal("2000"))],
+            ),
+            user_id="u1",
+        )
+        [line] = await svc.payment_lines.list_for_application(pa.id)
+        await svc.approve_payment_application_foreman(pa.id, user_id="foreman-1")
+        approved = await svc.approve_payment_application_finance(
+            pa.id,
+            user_id="finance-1",
+            lines=[ApprovedLineAmount(line_id=line.id, approved_amount=Decimal("1500"))],
+        )
+
+        assert (approved.gross_amount, approved.retention_amount, approved.net_amount) == (
+            Decimal("2000"),
+            Decimal("100"),
+            Decimal("1900"),
+        )
+        assert (
+            approved.approved_gross_amount,
+            approved.approved_retention_amount,
+            approved.approved_net_amount,
+        ) == (Decimal("1500"), Decimal("75"), Decimal("1425"))
+        assert await svc.retention_balance(agreement.id) == Decimal("75")
+
+        await svc.mark_paid(pa.id)
+
+    [paid_event] = [c.args[1] for c in publish.call_args_list if c.args[0] == "subcontractors.payment_application.paid"]
+    assert paid_event["net_amount"] == "1425.00"
+    assert paid_event["claimed_net_amount"] == "1900.00"
 
 
 @pytest.mark.asyncio

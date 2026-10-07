@@ -101,7 +101,7 @@ def register_submittal_approval_subscribers() -> None:
     """Idempotently wire the submittal approval-decision subscribers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("approval_routes.instance.completed", _on_approval_completed)
-    event_bus.subscribe("approval_routes.instance.rejected", _on_approval_rejected)
+    event_bus.subscribe_once("approval_routes.instance.completed", _on_approval_completed)
+    event_bus.subscribe_once("approval_routes.instance.rejected", _on_approval_rejected)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("Submittals: subscribed to approval-routes terminal decision events")

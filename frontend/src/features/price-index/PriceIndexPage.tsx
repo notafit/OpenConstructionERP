@@ -34,7 +34,8 @@ import {
 import { Button, Badge, Card, CardHeader, EmptyState, ErrorState, Input, PageHeader } from '@/shared/ui';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
-import { apiGet, getErrorMessage } from '@/shared/lib/api';
+import { getErrorMessage } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { parseDecimalInput, toDecimalPayloadString } from '@/shared/lib/parseDecimal';
 import type { Project } from '@/features/projects/api';
 import {
@@ -74,6 +75,7 @@ const QK = {
 
 export function PriceIndexPage() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
 
   return (
     <div className="space-y-5">
@@ -83,6 +85,12 @@ export function PriceIndexPage() {
           defaultValue:
             'Bring an old rate library or a foreign benchmark to current-period money and your region using cost index series and regional factors.',
         })}
+        actions={
+          <Button variant="secondary" size="sm" onClick={() => navigate('/price-index/resource-index')}>
+            <Calculator className="mr-1 h-4 w-4" aria-hidden />
+            {t('price_index.ri.open', { defaultValue: 'Resource-index estimate (Russia)' })}
+          </Button>
+        }
       />
       <PriceIndexContent />
     </div>
@@ -735,7 +743,7 @@ function EscalatePanel({ seriesList }: { seriesList: CostIndexSeries[] }) {
   // already working on.
   const projectsQ = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
     enabled: projectMode,
   });

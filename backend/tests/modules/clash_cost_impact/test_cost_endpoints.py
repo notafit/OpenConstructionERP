@@ -96,7 +96,11 @@ async def admin_user_id(auth_pair: tuple[str, dict[str, str]]) -> str:
 async def project_id(client: AsyncClient, auth: dict[str, str]) -> str:
     resp = await client.post(
         "/api/v1/projects/",
-        json={"name": "Clash Cost Test Project", "description": "endpoints"},
+        # Name the currency. There is no DB-level EUR default any more, and the
+        # endpoints report ``project.currency or ""`` rather than guessing, so a
+        # project created without one answers with an empty currency and the
+        # assertions below would be testing the guess, not the project.
+        json={"name": "Clash Cost Test Project", "description": "endpoints", "currency": "EUR"},
         headers=auth,
     )
     assert resp.status_code in (200, 201), resp.text

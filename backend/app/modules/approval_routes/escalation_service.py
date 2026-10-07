@@ -14,7 +14,8 @@ route and step:
 * ``chain`` - the named approvers of the route's *later* steps, in order. A
   stuck step is escalated upward to the next authority on the route; role-only
   steps (no concrete ``approver_user_id``) contribute no addressable target and
-  are skipped.
+  are skipped, and so is anyone already entitled to decide the current step,
+  who would otherwise be "escalated" to a step they can act on today.
 * ``sla_hours`` - the current step's own SLA budget.
 * ``escalate_after_hours`` - a grace window derived as
   :data:`ESCALATE_GRACE_FACTOR` times the SLA, so the chain is only walked once
@@ -37,6 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.approval_routes import sla_engine
+from app.modules.approval_routes.delegation_engine import DelegationView
 from app.modules.approval_routes.escalation import (
     EscalationPolicy,
     EscalationState,
@@ -45,6 +47,11 @@ from app.modules.approval_routes.escalation import (
     hours_overdue,
 )
 from app.modules.approval_routes.models import Instance, Route, Step, StepState
+from app.modules.approval_routes.service import (
+    ApprovalRouteService,
+    delegation_views_from_rows,
+    step_holder,
+)
 from app.modules.notifications.models import Notification
 
 #: Grace multiple on the SLA before the chain is walked. At the default of 2 a
@@ -151,23 +158,51 @@ async def _prior_escalation_targets(
     return tuple(targets)
 
 
-def _escalation_chain(steps: list[Step], current_ordinal: int) -> tuple[str, ...]:
+def _escalation_chain(steps: list[Step], current_ordinal: int, *, excluded: frozenset[str]) -> tuple[str, ...]:
     """Named approvers of the route's later steps, in order.
 
     Only steps after the current one with a concrete ``approver_user_id``
     contribute - a role-only step has no addressable user to escalate to. This
     is the authority ladder the stuck step is walked up.
+
+    ``excluded`` drops everyone already entitled to decide the current step, so
+    an out-of-office delegate who also sits higher up the route is not
+    "escalated" to a step they can act on today. The pure engine skips a single
+    holder by equality, while entitlement can name several people (a named
+    approver and their delegate), which is why the set is applied here.
+
+    Args:
+        steps: The route's steps, any order.
+        current_ordinal: The ordinal the instance is sitting on.
+        excluded: Stringified ids that may not be escalation targets.
+
+    Returns:
+        The addressable authority ladder above the current step.
     """
     return tuple(
         str(step.approver_user_id)
         for step in steps
-        if step.ordinal > current_ordinal and step.approver_user_id is not None
+        if step.ordinal > current_ordinal
+        and step.approver_user_id is not None
+        and str(step.approver_user_id) not in excluded
     )
 
 
-def _current_holder(instance: Instance, current_step: Step) -> str:
-    """Whoever holds the current step now (assignee override, then approver)."""
-    holder = instance.current_assignee_user_id or current_step.approver_user_id or instance.started_by
+def _current_holder(
+    instance: Instance,
+    current_step: Step,
+    delegations: list[DelegationView],
+    *,
+    now: datetime,
+    project_id: uuid.UUID | None,
+) -> str:
+    """Whoever is expected to act on the current step now.
+
+    Defers to :func:`service.step_holder`, the rule the SLA monitor nudges by,
+    so the holder this view reports and the person a breach reminder reaches
+    cannot disagree. Empty string when nothing names one.
+    """
+    holder = step_holder(instance, current_step, delegations, now=now, project_id=project_id)
     return str(holder) if holder is not None else ""
 
 
@@ -183,7 +218,9 @@ async def evaluate_escalation(
     Builds the policy (chain from the route's later approvers, the current
     step's SLA, the derived grace window) and the live state (how long the step
     has been held, who holds it, who has already been escalated to) and runs the
-    pure engine. A non-pending instance, a missing current step or a step with
+    pure engine. Anyone entitled to decide the current step is kept out of the
+    chain: escalating to someone who can already act on the step is not an
+    escalation. A non-pending instance, a missing current step or a step with
     no SLA returns an idle view (``has_sla`` False). Read-only.
     """
     now = now or datetime.now(UTC)
@@ -200,8 +237,21 @@ async def evaluate_escalation(
     baseline = sla_engine.current_step_baseline(instance.started_at, prior)
     hours_since = max(0.0, (now - baseline).total_seconds() / 3600.0)
 
-    chain = _escalation_chain(steps, instance.current_step_ordinal)
-    holder = _current_holder(instance, current)
+    # Both questions are answered by the approval service, so this reader
+    # cannot drift from the 403 gate or from the breach reminder: who may
+    # decide the step (entitlement, which may name nobody on a role step) and
+    # who is expected to act on it (the holder, which always names someone it
+    # can).
+    svc = ApprovalRouteService(session)
+    entitled = await svc.entitled_deciders(instance, current, now=now)
+    delegations = delegation_views_from_rows(await svc.repo.list_active_delegations())
+
+    chain = _escalation_chain(
+        steps,
+        instance.current_step_ordinal,
+        excluded=frozenset(str(uid) for uid in entitled or ()),
+    )
+    holder = _current_holder(instance, current, delegations, now=now, project_id=route.project_id)
     already = await _prior_escalation_targets(session, instance.id, instance.current_step_ordinal)
 
     policy = EscalationPolicy(

@@ -1,5 +1,0 @@
-{
-  "about.cap.costmodel_desc": "Track budgets over time with Earned Value Management (SPI, CPI), S-curve visualization, cash flow projections, cost snapshots, and what-if scenario modeling for informed decision-making.",
-  "match_elements.new_excel.hint": "Upload an .xlsx with at least a \\\"Description\\\" column (or its localised equivalent — Beschreibung, Описание, Descripción, 描述, etc.). Optional columns: Qty, Unit, Code, Category. Decimal-comma quantities are recognised.",
-  "requirements.import_text_desc": "Paste requirement specifications. Each line should follow the format: entity | attribute | constraint_type | value | unit | category | priority"
-}

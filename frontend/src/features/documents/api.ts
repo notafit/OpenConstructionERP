@@ -6,7 +6,7 @@
  * All photo endpoints are prefixed with /v1/documents/photos/.
  */
 
-import { apiGet, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
+import { apiGet, apiPatch, apiPost, apiDelete, type Page } from '@/shared/lib/api';
 import { useAuthStore } from '@/stores/useAuthStore';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
@@ -327,6 +327,64 @@ export async function uploadDocument(
 
 export async function deleteDocument(id: string): Promise<void> {
   return apiDelete(`/v1/documents/${id}`);
+}
+
+/** How badly a module's hold on a document survives the document.
+ *
+ *  `strands`  the referring column is NOT NULL, so the row cannot record
+ *             that the document went away and is left pointing at nothing.
+ *  `unlinks`  the row survives and loses its attachment.
+ *  `retains`  the row is meant to outlive the document (append-only audit,
+ *             or a copy the module already keeps for itself). */
+export type DocumentReferenceImpact = 'strands' | 'unlinks' | 'retains';
+
+export interface DocumentReferenceItem {
+  key: string;
+  module: string;
+  model: string;
+  impact: DocumentReferenceImpact;
+  count: number;
+}
+
+export interface DocumentReferences {
+  document_id: string;
+  total: number;
+  strands: number;
+  unlinks: number;
+  retains: number;
+  references: DocumentReferenceItem[];
+}
+
+/** What still points at a document, for the delete confirmation.
+ *
+ *  Advisory only: the delete endpoint neither consults this nor is blocked by
+ *  it. Several of these links are documented as deliberately severable, so
+ *  the decision stays with the person confirming - the point is that they
+ *  make it knowing. */
+export async function fetchDocumentReferences(id: string): Promise<DocumentReferences> {
+  return apiGet<DocumentReferences>(`/v1/documents/${id}/references`);
+}
+
+/** What still points at any document of a selection, for a bulk delete.
+ *
+ *  `total`/`strands`/`unlinks`/`retains` and `references` are summed over the
+ *  selection; `documents` holds the per-document answers for the documents
+ *  something points at, heaviest first. `checked` is how many of the asked-for
+ *  ids the caller may open and were looked at - ids outside it are neither
+ *  counted nor named. */
+export interface DocumentBatchReferences {
+  checked: number;
+  referenced_documents: number;
+  total: number;
+  strands: number;
+  unlinks: number;
+  retains: number;
+  references: DocumentReferenceItem[];
+  documents: DocumentReferences[];
+}
+
+export async function fetchBatchDocumentReferences(ids: string[]): Promise<DocumentBatchReferences> {
+  return apiPost<DocumentBatchReferences, { ids: string[] }>('/v1/documents/batch/references/', { ids });
 }
 
 /** Download a stored document's bytes as a Blob (auth-aware).

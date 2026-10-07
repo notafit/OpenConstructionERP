@@ -1,0 +1,71 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "pay_application": {
+    "sub_unapproved_included": {
+      "fail": "Subcontractor pay application {pay_app} is included in this claim while it is {status}, so the amount billed to the owner has not been approved for payment",
+      "suggestion": "Approve the pay application, or exclude it from this claim until it is approved",
+      "statuses": {
+        "submitted": "submitted and not yet reviewed",
+        "rejected": "rejected"
+      }
+    },
+    "sub_waiver_missing": {
+      "fail_amount": "Subcontractor pay application {pay_app} nets {net}, but the lien waivers on file for it cover only {covered}",
+      "fail_through_date": "The lien waiver for subcontractor pay application {pay_app} runs through {through_date}, which is before the pay application's period end of {period_end}",
+      "suggestion": "Collect a lien waiver covering the full net amount through the end of the period, or exclude the pay application from this claim"
+    },
+    "sub_prior_unconditional_missing": {
+      "fail": "Subcontractor pay application {pay_app} was paid on an earlier claim, but no unconditional lien waiver on file runs through its period end of {period_end}",
+      "suggestion": "Collect the unconditional lien waiver for the payment already made and record the date it runs through"
+    },
+    "sub_line_unmapped": {
+      "fail_none": "A line of subcontractor pay application {pay_app} for work package {package}, approved at {amount}, is not linked to any line of this contract's schedule of values",
+      "fail_foreign_line": "A line of subcontractor pay application {pay_app} for work package {package}, approved at {amount}, is linked to a line of a different contract",
+      "fail_parent_line": "A line of subcontractor pay application {pay_app} for work package {package}, approved at {amount}, is linked to a grouping line, which is not billed directly",
+      "suggestion": "Link the work package, or this pay application line, to a billable line of this contract's schedule of values"
+    },
+    "sub_exceeds_gc_line": {
+      "fail": "Subcontract amounts approved to date on line {line} total {approved}, above its scheduled value of {scheduled}",
+      "suggestion": "Check the subcontract approvals on this line, or add a change order that raises its scheduled value"
+    },
+    "sub_certificate_lapsed": {
+      "fail_missing": "{subcontractor} has no {document} on file as of {as_of}, the end of this claim's period",
+      "fail_expired": "{subcontractor}'s {document} was no longer valid on {as_of}, the end of this claim's period",
+      "fail_revoked": "{subcontractor}'s {document} was revoked and was not valid on {as_of}, the end of this claim's period",
+      "suggestion": "Obtain a current certificate from the subcontractor, or exclude their pay applications from this claim",
+      "documents": {
+        "insurance": "insurance certificate",
+        "license": "license",
+        "iso": "ISO certificate",
+        "safety": "safety certificate",
+        "bond": "bond",
+        "wsl_clearance": "workers safety clearance letter",
+        "wsib_clearance": "WSIB clearance certificate",
+        "wcb_clearance": "WCB clearance letter",
+        "attestation_revenu_quebec": "Revenu Quebec attestation",
+        "construction_tax_exemption": "construction tax exemption certificate",
+        "social_security_clearance": "social security clearance certificate",
+        "employers_liability_clearance": "employers' liability clearance certificate"
+      }
+    },
+    "sub_certificate_payment_date": {
+      "fail_missing": "{subcontractor} was paid on {paid_on} for pay application {pay_app} with no {document} on file. {withholding}",
+      "fail_expired": "{subcontractor} was paid on {paid_on} for pay application {pay_app}, but their {document} had run out on {lapsed_on}. {withholding}",
+      "fail_revoked": "{subcontractor} was paid on {paid_on} for pay application {pay_app}, but their {document} had been revoked. {withholding}",
+      "fail_undated": "Pay application {pay_app} of {subcontractor} is marked paid but carries no payment date, so whether the {document} covered the payment cannot be checked. {withholding}",
+      "fail_pending": "Pay application {pay_app} of {subcontractor} is not paid yet. The {document} counts on the day it is paid, not at the end of the period, and the one on file is valid until {valid_until}. {withholding}",
+      "fail_pending_open": "Pay application {pay_app} of {subcontractor} is not paid yet. The {document} counts on the day it is paid, not at the end of the period; the one on file has no end date. {withholding}",
+      "fail_pending_invalid": "Pay application {pay_app} of {subcontractor} is not paid yet, and there is no valid {document} on file that a payment after the period end could fall within. {withholding}",
+      "suggestion": "Check that the certificate is valid on the day you pay, and get a current one from the subcontractor if it is not. The tax is not deducted here: where a payment falls outside a valid certificate, making and reporting the deduction is up to you.",
+      "withholding": {
+        "gross_limit": "Without it, {rate}% of the payment, VAT included, has to be withheld and paid to the tax office, unless everything paid to this subcontractor in the calendar year stays within {limit} ({reference}).",
+        "gross": "Without it, {rate}% of the payment, VAT included, has to be withheld and paid to the tax office ({reference}).",
+        "net_limit": "Without it, {rate}% of the payment, VAT excluded, has to be withheld and paid to the tax office, unless everything paid to this subcontractor in the calendar year stays within {limit} ({reference}).",
+        "net": "Without it, {rate}% of the payment, VAT excluded, has to be withheld and paid to the tax office ({reference}).",
+        "unknown": "Without it, the payment may be subject to tax withholding."
+      }
+    }
+  }
+}

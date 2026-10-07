@@ -113,6 +113,8 @@ def test_the_cache_notices_a_second_save(tmp_path) -> None:
         ("base_font_size", True),
         ("margin_mm", None),
         ("show_page_numbers", "yes"),
+        ("show_letterhead", "no"),
+        ("show_letterhead", 0),
     ],
 )
 def test_one_bad_value_costs_only_that_value(field: str, value: object) -> None:
@@ -180,6 +182,24 @@ def test_saving_the_platform_look_removes_the_file(tmp_path) -> None:
     write_appearance(dict(DEFAULT_APPEARANCE), tmp_path)
     assert not appearance_path(tmp_path).exists()
     assert read_appearance(tmp_path) == DEFAULT_APPEARANCE
+
+
+def test_turning_the_letterhead_off_is_stored_and_on_is_the_default(tmp_path) -> None:
+    """Off is a customisation and must be written; on is the default and must not.
+
+    On by default is what keeps an upgrade invisible: with no company profile
+    there is no letterhead to draw, so the flag changes nothing until a firm
+    fills the profile in. A file that also predates the flag reads as on.
+    """
+    write_appearance({"show_letterhead": False}, tmp_path)
+    assert appearance_path(tmp_path).exists()
+    assert read_appearance(tmp_path)["show_letterhead"] is False
+
+    write_appearance({"show_letterhead": True}, tmp_path)
+    assert not appearance_path(tmp_path).exists()
+
+    appearance_path(tmp_path).write_text(json.dumps({"accent_color": "#123456"}), encoding="utf-8")
+    assert read_appearance(tmp_path)["show_letterhead"] is True
 
 
 def test_reset_is_safe_when_nothing_was_saved(tmp_path) -> None:

@@ -13,7 +13,9 @@ manifest = ModuleManifest(
     ),
     author="OpenConstructionERP Core Team",
     category="business",
-    depends=["oe_users", "oe_projects", "oe_contacts"],
+    # oe_contracts: a subcontract agreement can sit under the GC's prime
+    # contract, and its pay applications roll up into that contract's claims.
+    depends=["oe_users", "oe_projects", "oe_contacts", "oe_contracts"],
     auto_install=True,
     enabled=True,
 )

@@ -155,3 +155,161 @@ export function resolveMarketPacks<T extends RegionalPackFacts>(
   if (!applied) return { packs, applied: null };
   return { packs: [applied, ...packs.filter((p) => p !== applied)], applied };
 }
+
+/**
+ * The bands packs are offered in, most important first.
+ *
+ * Until now the packs page listed whatever `GET /partner-pack/installed`
+ * returned, and that endpoint sorts by slug because a lookup wants a stable
+ * order, not a persuasive one. Forty-three cards alphabetised by slug put
+ * `aus` first, `batimatech-ca` between Austria and Belgium because the sort
+ * never sees the display name, and the United States at the very bottom. A
+ * reader scanning that grid learns nothing about which pack matters to them.
+ *
+ * The order here is by construction market, largest first, which is the same
+ * order the industry itself uses when it sizes these markets: the United
+ * States, China, India, then Europe in aggregate. Everything else follows.
+ * The bands are deliberately coarse, because a finer ranking would be a claim
+ * we cannot support and would need re-litigating every year.
+ *
+ * `home` sits above all of them. A reader in Poland is not served by seeing
+ * the United States first, however large that market is, and the whole point
+ * of a country pack is that it carries the reader's own standards.
+ *
+ * Why Turkey and Russia are not in `europe`: the band is a standards family,
+ * not a landmass. `europe` is the EN/Eurocode world plus the United Kingdom,
+ * which is what makes those packs substitutable enough to sit together in one
+ * group. Turkey prices against TS and Russia against GESN, so grouping either
+ * under a European heading would tell a reader something untrue about what
+ * the pack contains. Both land in `rest`, which claims nothing.
+ */
+export const PACK_MARKET_BANDS = [
+  'home',
+  'americas',
+  'china',
+  'india',
+  'europe',
+  'rest',
+  'cross-region',
+] as const;
+
+/** One of {@link PACK_MARKET_BANDS}. */
+export type PackMarketBand = (typeof PACK_MARKET_BANDS)[number];
+
+/**
+ * ISO 3166-1 alpha-2 for the Americas, north to south including the Caribbean.
+ *
+ * Written out in full rather than as the four countries we ship packs for, so
+ * a Chilean or Colombian pack added later lands in the right band without
+ * anyone remembering this file exists. The same reasoning applies to
+ * {@link EUROPE_COUNTRIES}.
+ */
+const AMERICAS_COUNTRIES = new Set([
+  'ag', 'ar', 'bb', 'bo', 'br', 'bs', 'bz', 'ca', 'cl', 'co', 'cr', 'cu',
+  'dm', 'do', 'ec', 'gd', 'gt', 'gy', 'hn', 'ht', 'jm', 'kn', 'lc', 'mx',
+  'ni', 'pa', 'pe', 'py', 'sr', 'sv', 'tt', 'us', 'uy', 'vc', 've',
+]);
+
+/** ISO 3166-1 alpha-2 for the EN/Eurocode standards family plus the UK. */
+const EUROPE_COUNTRIES = new Set([
+  'ad', 'al', 'at', 'ba', 'be', 'bg', 'ch', 'cy', 'cz', 'de', 'dk', 'ee',
+  'es', 'fi', 'fr', 'gb', 'gr', 'hr', 'hu', 'ie', 'is', 'it', 'li', 'lt',
+  'lu', 'lv', 'mc', 'md', 'me', 'mk', 'mt', 'nl', 'no', 'pl', 'pt', 'ro',
+  'rs', 'se', 'si', 'sk', 'sm', 'ua', 'xk',
+]);
+
+/**
+ * Which band a pack belongs to, given the country the reader is probably in.
+ *
+ * `homeCountry` is the browser's guess from `detectCountry`, so it is a hint
+ * and never a gate: the only thing it changes is which card is drawn first.
+ * `xx` is excluded from matching it for the same reason `resolveCountryOffer`
+ * excludes it - it is a pack's own word for "no single market", and a reader
+ * whose browser somehow said `xx` must not be handed a vertical pack as
+ * though it were their country's.
+ *
+ * A pack that names no country at all is cross-region too. `doker-formwork`
+ * is the live example: an industry pack with a bare `de` locale that carries
+ * no region subtag, so {@link packCountryCode} reports `null` for it, which is
+ * the honest answer and not a defect.
+ */
+export function packMarketBand(
+  pack: RegionalPackFacts,
+  homeCountry?: string | null,
+): PackMarketBand {
+  const code = packCountryCode(pack);
+  if (code === null || code === 'xx') return 'cross-region';
+
+  const home = homeCountry?.trim().toLowerCase();
+  if (home && home !== 'xx' && home === code) return 'home';
+
+  if (AMERICAS_COUNTRIES.has(code)) return 'americas';
+  if (code === 'cn') return 'china';
+  if (code === 'in') return 'india';
+  if (EUROPE_COUNTRIES.has(code)) return 'europe';
+  return 'rest';
+}
+
+/** Position of a pack's band in {@link PACK_MARKET_BANDS}; lower sorts first. */
+export function packMarketRank(
+  pack: RegionalPackFacts,
+  homeCountry?: string | null,
+): number {
+  return PACK_MARKET_BANDS.indexOf(packMarketBand(pack, homeCountry));
+}
+
+/**
+ * Packs in the order a reader should meet them.
+ *
+ * Band first, then the pack's display name inside the band. The name has to
+ * come from the caller rather than from `partner_name`, because what the card
+ * shows is the translated `modules.pp_name_*` string and sorting on anything
+ * else would order the grid by a name nobody on screen can see. For the same
+ * reason the comparison runs through `Intl.Collator` at the reader's own
+ * locale: `Ö` belongs after `O` for a German reader and after `Z` for a
+ * Swedish one, and a plain `<` gets both wrong.
+ *
+ * Returns a new array; the input is not mutated, because it is a React Query
+ * cache entry and sorting it in place would reorder every other consumer's
+ * copy of the same object.
+ */
+export interface PackOrderOptions<T extends RegionalPackFacts> {
+  /** Lower-case ISO 3166-1 alpha-2 from `detectCountry`, or null. */
+  homeCountry?: string | null;
+  /** The name the card actually renders for this pack. */
+  nameOf: (pack: T) => string;
+  /** BCP 47 tag for the collation; defaults to the runtime's own locale. */
+  locale?: string;
+}
+
+export function sortPacksByMarket<T extends RegionalPackFacts>(
+  packs: readonly T[],
+  options: PackOrderOptions<T>,
+): T[] {
+  const { homeCountry = null, nameOf, locale } = options;
+  const collator = new Intl.Collator(locale, { sensitivity: 'base', numeric: true });
+  return [...packs].sort((a, b) => {
+    const rankDelta = packMarketRank(a, homeCountry) - packMarketRank(b, homeCountry);
+    if (rankDelta !== 0) return rankDelta;
+    return collator.compare(nameOf(a), nameOf(b));
+  });
+}
+
+/**
+ * The packs of each band, in band order, with empty bands dropped.
+ *
+ * The page renders a heading per band, and a heading over nothing reads as a
+ * loading state or a bug. Dropping empty bands here rather than in the markup
+ * keeps that decision in one place and lets a test assert it.
+ */
+export function groupPacksByMarket<T extends RegionalPackFacts>(
+  packs: readonly T[],
+  options: PackOrderOptions<T>,
+): { band: PackMarketBand; packs: T[] }[] {
+  const ordered = sortPacksByMarket(packs, options);
+  const home = options.homeCountry ?? null;
+  return PACK_MARKET_BANDS.map((band) => ({
+    band,
+    packs: ordered.filter((p) => packMarketBand(p, home) === band),
+  })).filter((group) => group.packs.length > 0);
+}

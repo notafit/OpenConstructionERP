@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Radovi na ovoj mjeri započeli su {start}, prije nego što je prijava podnesena {filed}. Većina programa ne financira ništa od mjere koja je već započela",
+      "unevidenced": "Radovi su započeli prije vremena, {start}, i u spisu stoji da je nadležno tijelo to dopustilo, ali nije navedeno nikakvo pisano dopuštenje",
+      "evidence": "Upišite broj pisanog dopuštenja za raniji početak radova, kako bi spis sam po sebi bio dokaz",
+      "suggestion": "Prije daljnjeg trošenja provjerite uvjete programa. Ako je raniji početak dopušten pisanim putem, zabilježite to; ako nije, obratite se nadležnom tijelu prije nego što prijava ide dalje"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Zahtjev za isplatu {draw} obuhvaća troškove nastale prije {period_start}, dana kad počinje razdoblje dodjele",
+      "after": "Zahtjev za isplatu {draw} obuhvaća troškove nastale nakon {period_end}, dana kad završava razdoblje dodjele",
+      "spans": "Zahtjev za isplatu {draw} na oba kraja prelazi razdoblje dodjele od {period_start} do {period_end}",
+      "suggestion": "Troškove izvan razdoblja prebacite u zaseban zahtjev za isplatu i riješite ih s nadležnim tijelom, umjesto da jedan zahtjev obuhvaća oboje"
+    },
+    "own_share_is_covered": {
+      "fail": "Program zahtijeva vlastito sudjelovanje od {rate} posto, odnosno {required}, a u prijavi je navedeno {recorded}",
+      "suggestion": "Prije podnošenja navedite odakle dolazi preostalo vlastito sudjelovanje, jer ga program izračunava na osnovicu prihvatljivog troška, a ne na ukupan iznos projekta"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Prijave na ovom projektu, njih {count}, zajedno iznose {intensity} posto prihvatljivog troška, što prelazi gornju granicu intenziteta potpore od {cap} posto koju propisuje najstroži od njihovih programa",
+      "suggestion": "Javno financiranje zbraja se kroz programe i razine vlasti. Smanjite traženi iznos u jednoj prijavi ili provjerite mogu li se mjere razdvojiti tako da svaka nosi vlastite troškove"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Razdoblje dodjele završilo je {period_end}, a konačni dokaz o namjeni još nije započet",
+      "late": "Konačni dokaz o namjeni dospio je {due}, a podnesen je {submitted}",
+      "overdue": "Konačni dokaz o namjeni dospio je {due} i još nije podnesen",
+      "suggestion": "Podnesite ono što postoji umjesto da čekate da sve bude potpuno. Većina nadležnih tijela produljuje rok na zahtjev, a nijedno ne produljuje rok koji je već istekao"
+    },
+    "errors": {
+      "application_not_found": "Prijava nije pronađena",
+      "programme_code_taken": "Program s ovom oznakom već postoji u ovoj državi",
+      "programme_not_found": "Program nije pronađen",
+      "programme_has_applications": "Ovaj program ima prijave i ne može se obrisati. Umjesto toga zatvorite ga.",
+      "application_code_taken": "Prijava s ovom oznakom već postoji u ovom projektu",
+      "approved_application_not_deletable": "Odobrena prijava ne može se obrisati. Umjesto toga promijenite joj status u Povučeno ili Zatvoreno.",
+      "approval_needs_period_end": "Za odobrenje je potreban kraj razdoblja dodjele, jer se od njega računaju svi kasniji rokovi",
+      "draw_needs_approval": "Zahtjev za isplatu može se podnijeti samo za odobrenu prijavu",
+      "draw_not_found": "Zahtjev za isplatu nije pronađen",
+      "paid_draw_not_deletable": "Zahtjev za isplatu sa statusom Isplaćeno ne može se obrisati",
+      "proof_not_found": "Dokaz o namjeni nije pronađen",
+      "obligation_not_found": "Rok nije pronađen",
+      "eligible_exceeds_amount": "Prihvatljivi dio ne može biti veći od iznosa",
+      "allocation_not_found": "Raspodjela troška nije pronađena"
+    }
+  }
+}

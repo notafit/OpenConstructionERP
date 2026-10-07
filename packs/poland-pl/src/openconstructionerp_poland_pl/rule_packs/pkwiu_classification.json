@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "pkwiu_classification",
+  "name": "PKWiU — Classification of Products and Services",
+  "standard": "PKWiU 2015 (Polska Klasyfikacja Wyrobow i Uslug)",
+  "jurisdiction": "PL",
+  "description": "Validates BOQ items against the PKWiU (Polska Klasyfikacja Wyrobow i Uslug) classification used in Polish public procurement and VAT determination. Checks that construction works items carry a valid PKWiU section F (Budownictwo) code, that the code format matches the PKWiU hierarchy, and that the VAT rate applied is consistent with the PKWiU classification (8% for residential construction services under certain conditions, 23% standard).",
+  "applies_to": ["boq", "estimate", "tender", "validation"],
+  "enables_rule_ids": [
+    "pkwiu.code_present_per_item",
+    "pkwiu.code_format_valid",
+    "pkwiu.section_f_construction_classification",
+    "pkwiu.vat_rate_consistent_with_code",
+    "pkwiu.residential_reduced_vat_8_pct_if_applicable",
+    "pkwiu.standard_vat_23_pct_default",
+    "pkwiu.pkwiu_version_2015_or_later"
+  ],
+  "regulator": "GUS (Glowny Urzad Statystyczny)",
+  "publication_year": 2015
+}

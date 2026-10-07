@@ -22,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import Numeric, and_, case, cast, func, select
+from sqlalchemy import Numeric, and_, case, cast, func, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.partner_pack.scope import scope_project_query
@@ -253,6 +253,14 @@ async def compute_boq_summary(
         ),
         else_=_qty * _rate,
     )
+    # Section headers are structural grouping elements (unit "" or "section",
+    # quantity 0, rate 0). They carry no price by design and must not be
+    # counted as leaf positions or inflate the "zero price" metric.
+    _is_section = and_(
+        func.lower(func.coalesce(func.trim(Position.unit), "")).in_(("", "section")),
+        _qty == 0,
+        _rate == 0,
+    )
     pos_agg_stmt = (
         select(
             BOQ.id,
@@ -263,7 +271,7 @@ async def compute_boq_summary(
             func.sum(case((_rate == 0, 1), else_=0)),
         )
         .join(BOQ, BOQ.id == Position.boq_id)
-        .where(BOQ.project_id.in_(project_ids))
+        .where(BOQ.project_id.in_(project_ids), not_(_is_section))
         .group_by(BOQ.id, BOQ.project_id)
     )
     pos_agg_rows = (await session.execute(pos_agg_stmt)).all()

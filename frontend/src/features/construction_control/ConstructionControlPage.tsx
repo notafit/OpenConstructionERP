@@ -11,8 +11,8 @@
 // Asset Register pick their project; RequiresProject shows a single consistent
 // empty state when no project is selected.
 
-import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import {
   ClipboardCheck,
   Boxes,
@@ -30,15 +30,34 @@ import { MaterialsLabsSection } from './sections/MaterialsLabsSection';
 import { AsBuiltSection } from './sections/AsBuiltSection';
 import { HoldWitnessSection } from './sections/HoldWitnessSection';
 import { HandoverSection } from './sections/HandoverSection';
-
-type PillarTab = 'inspections' | 'materials' | 'asbuilt' | 'gates' | 'handover';
+import {
+  DEFAULT_CONSTRUCTION_CONTROL_TAB,
+  isConstructionControlTab,
+  type ConstructionControlTab as PillarTab,
+} from './constructionControlTabs';
 
 const TAB_PANEL = tabIds('construction-control');
 
 export function ConstructionControlPage() {
   const { t } = useTranslation();
   const activeProjectId = useActiveProjectId();
-  const [activeTab, setActiveTab] = useState<PillarTab>('inspections');
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // The active tab lives in ?tab=, so a case step or a shared link can open
+  // the Handover tab directly (/projects/:projectId/construction-control
+  // ?tab=handover) and a reload keeps the tab. Switches write it back,
+  // replacing rather than pushing, and keep any other params.
+  const rawTab = searchParams.get('tab');
+  const activeTab: PillarTab = isConstructionControlTab(rawTab) ? rawTab : DEFAULT_CONSTRUCTION_CONTROL_TAB;
+  const setActiveTab = (next: PillarTab) =>
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set('tab', next);
+        return params;
+      },
+      { replace: true },
+    );
 
   const tabs: TabBarTab<PillarTab>[] = [
     {

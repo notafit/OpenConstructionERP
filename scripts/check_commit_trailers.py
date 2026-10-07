@@ -75,8 +75,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Forbid AI co-author / generated-by trailers in commit messages.",
     )
-    parser.add_argument("message_file", nargs="?", help="a single commit-message file to scan (commit-msg hook mode)")
-    parser.add_argument("--range", dest="rev_range", help="a git revision range to scan, e.g. origin/main..HEAD")
+    parser.add_argument(
+        "message_file",
+        nargs="?",
+        help="a single commit-message file to scan (commit-msg hook mode)",
+    )
+    parser.add_argument(
+        "--range",
+        dest="rev_range",
+        help="a git revision range to scan, e.g. origin/main..HEAD",
+    )
     args = parser.parse_args()
 
     offenders: list[str] = []
@@ -93,7 +101,10 @@ def main() -> int:
         where = args.rev_range or "all commits reachable from HEAD"
 
     if offenders:
-        print(f"ERROR: forbidden AI attribution trailer in {where} ({len(offenders)}):", file=sys.stderr)
+        print(
+            f"ERROR: forbidden AI attribution trailer in {where} ({len(offenders)}):",
+            file=sys.stderr,
+        )
         for line in offenders:
             print(f"  {line}", file=sys.stderr)
         print(

@@ -226,6 +226,16 @@ def test_localize_status(status: str, locale: str, expected: str) -> None:
 
 def test_localize_status_unknown_locale_falls_back_to_english() -> None:
     assert intl.localize_status("closed", "zz") == "Closed"
+    # Right-to-left languages stay English: the PDF cannot lay them out.
+    assert intl.localize_status("closed", "ar") == "Closed"
+
+
+def test_localize_status_new_languages_and_regions() -> None:
+    assert intl.localize_status("answered", "fr") == "Répondu"
+    assert intl.localize_status("open", "pt-BR") == "Aberto"
+    assert intl.localize_status("void", "tr") == "Geçersiz"
+    assert intl.localize_status("answered", "ja") == "回答済み"
+    assert intl.localize_discipline("structural", "es_MX") == "Estructuras"
 
 
 def test_localize_status_region_tagged_locale() -> None:
@@ -239,7 +249,7 @@ def test_localize_status_unknown_status_humanised() -> None:
 
 def test_every_status_localises_in_every_locale() -> None:
     for status in intl.RFI_STATUSES:
-        for locale in ("en", "de", "ru"):
+        for locale in sorted(intl._SUPPORTED_LOCALES):
             label = intl.localize_status(status, locale)
             assert label and label.strip()
 
@@ -263,7 +273,7 @@ def test_localize_discipline_unknown_falls_back() -> None:
 
 def test_every_discipline_localises_in_every_locale() -> None:
     for discipline in intl.RFI_DISCIPLINES:
-        for locale in ("en", "de", "ru"):
+        for locale in sorted(intl._SUPPORTED_LOCALES):
             label = intl.localize_discipline(discipline, locale)
             assert label and label.strip()
 
@@ -291,14 +301,17 @@ def test_explain_unknown_locale_falls_back_to_english() -> None:
 
 def test_status_label_parity_across_locales() -> None:
     en_keys = set(intl._STATUS_LABELS["en"])
-    assert set(intl._STATUS_LABELS["de"]) == en_keys
-    assert set(intl._STATUS_LABELS["ru"]) == en_keys
+    assert en_keys == set(intl.RFI_STATUSES)
+    for locale, table in intl._STATUS_LABELS.items():
+        assert set(table) == en_keys, locale
 
 
 def test_discipline_label_parity_across_locales() -> None:
     en_keys = set(intl._DISCIPLINE_LABELS["en"])
-    assert set(intl._DISCIPLINE_LABELS["de"]) == en_keys
-    assert set(intl._DISCIPLINE_LABELS["ru"]) == en_keys
+    assert en_keys == set(intl.RFI_DISCIPLINES)
+    assert set(intl._DISCIPLINE_LABELS) == set(intl._STATUS_LABELS)
+    for locale, table in intl._DISCIPLINE_LABELS.items():
+        assert set(table) == en_keys, locale
 
 
 def test_explainer_parity_across_locales() -> None:

@@ -88,6 +88,13 @@ class _BaseRepo:
             await self.session.delete(entity)
             await self.session.flush()
 
+    async def list_by_ids(self, entity_ids: list[uuid.UUID]) -> list[Any]:
+        """Every row whose id is in ``entity_ids``, in one query. Empty in, empty out."""
+        if not entity_ids:
+            return []
+        stmt = select(self.model).where(self.model.id.in_(set(entity_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
 
 class SubcontractorRepository(_BaseRepo):
     """CRUD + filters for Subcontractor."""
@@ -273,6 +280,16 @@ class CertificateRepository(_BaseRepo):
         )
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_for_subcontractors(
+        self,
+        subcontractor_ids: list[uuid.UUID],
+    ) -> list[Certificate]:
+        """Certificates of several subcontractors in one query (claim rollup)."""
+        if not subcontractor_ids:
+            return []
+        stmt = select(Certificate).where(Certificate.subcontractor_id.in_(set(subcontractor_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_expiring_within(
         self,
         days: int,
@@ -341,6 +358,13 @@ class WorkPackageRepository(_BaseRepo):
         )
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def list_for_agreements(self, agreement_ids: list[uuid.UUID]) -> list[WorkPackage]:
+        """Work packages of several agreements in one query (claim rollup)."""
+        if not agreement_ids:
+            return []
+        stmt = select(WorkPackage).where(WorkPackage.agreement_id.in_(set(agreement_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
 
 class PaymentApplicationRepository(_BaseRepo):
     """CRUD for PaymentApplication."""
@@ -359,6 +383,40 @@ class PaymentApplicationRepository(_BaseRepo):
         if status is not None:
             stmt = stmt.where(PaymentApplication.status == status)
         stmt = stmt.order_by(PaymentApplication.submitted_at.desc().nullslast())
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_for_agreements(self, agreement_ids: list[uuid.UUID]) -> list[PaymentApplication]:
+        """Pay applications under several agreements in one query (claim rollup)."""
+        if not agreement_ids:
+            return []
+        stmt = select(PaymentApplication).where(PaymentApplication.agreement_id.in_(set(agreement_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_for_claims(self, claim_ids: list[uuid.UUID]) -> list[PaymentApplication]:
+        """Pay applications included in any of the given GC progress claims."""
+        if not claim_ids:
+            return []
+        stmt = select(PaymentApplication).where(PaymentApplication.progress_claim_id.in_(set(claim_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def lock_by_ids(self, payment_ids: list[uuid.UUID]) -> list[PaymentApplication]:
+        """Read pay applications under a row lock, for the include path.
+
+        Two people including the same pay application into two different GC
+        claims at once would otherwise both read ``progress_claim_id IS NULL``
+        and both win. ``FOR UPDATE`` makes the second wait for the first to
+        commit and then read the claim id it wrote, so its 409 fires.
+        ``populate_existing`` matters: without it an instance already in the
+        identity map keeps the value it was loaded with before the lock.
+        """
+        if not payment_ids:
+            return []
+        stmt = (
+            select(PaymentApplication)
+            .where(PaymentApplication.id.in_(set(payment_ids)))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         return list((await self.session.execute(stmt)).scalars().all())
 
     async def count_open_for_agreements(
@@ -417,6 +475,42 @@ class PaymentApplicationLineRepository(_BaseRepo):
     ) -> list[PaymentApplicationLine]:
         stmt = select(PaymentApplicationLine).where(
             PaymentApplicationLine.payment_application_id == payment_application_id,
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def page_for_application(
+        self,
+        payment_application_id: uuid.UUID,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[PaymentApplicationLine], int]:
+        """One page of a pay application's lines, and how many it has.
+
+        Ordered by id so a second page follows the first rather than
+        overlapping it; the rows carry nothing else to order by.
+        """
+        base = select(PaymentApplicationLine).where(
+            PaymentApplicationLine.payment_application_id == payment_application_id,
+        )
+        total = (await self.session.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
+        stmt = base.order_by(PaymentApplicationLine.id).offset(offset).limit(limit)
+        return list((await self.session.execute(stmt)).scalars().all()), total
+
+    async def count_for_work_package(self, work_package_id: uuid.UUID) -> int:
+        """How many pay application lines are billed against one work package."""
+        stmt = select(func.count()).where(PaymentApplicationLine.work_package_id == work_package_id)
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def list_for_applications(
+        self,
+        payment_application_ids: list[uuid.UUID],
+    ) -> list[PaymentApplicationLine]:
+        """Lines of several pay applications in one query (claim rollup)."""
+        if not payment_application_ids:
+            return []
+        stmt = select(PaymentApplicationLine).where(
+            PaymentApplicationLine.payment_application_id.in_(set(payment_application_ids)),
         )
         return list((await self.session.execute(stmt)).scalars().all())
 
@@ -534,3 +628,89 @@ class LienWaiverRepository(_BaseRepo):
             .order_by(LienWaiver.created_at.desc())
         )
         return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_for_payment_apps(
+        self,
+        payment_application_ids: list[uuid.UUID],
+    ) -> list[LienWaiver]:
+        """Waivers attached to any of several pay applications (claim rollup)."""
+        if not payment_application_ids:
+            return []
+        stmt = select(LienWaiver).where(LienWaiver.payment_application_id.in_(set(payment_application_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+
+class PrimeContractReader:
+    """Read-only access to the GC's contract, schedule of values and claims.
+
+    Those tables belong to the contracts module, which does not know that
+    subcontractors exist. The models are imported inside each method rather
+    than at the top of this file, so importing the subcontractors module never
+    imports contracts, and contracts can import the subcontractors rollup the
+    same lazy way without a cycle. Nothing here writes: the rollup suggests,
+    and the contracts module's own commit route is the only writer of a claim.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get_claim(self, claim_id: uuid.UUID) -> Any:
+        from app.modules.contracts.models import ProgressClaim  # noqa: PLC0415
+
+        return await self.session.get(ProgressClaim, claim_id)
+
+    async def get_contract(self, contract_id: uuid.UUID) -> Any:
+        from app.modules.contracts.models import Contract  # noqa: PLC0415
+
+        return await self.session.get(Contract, contract_id)
+
+    async def list_contract_lines(self, contract_id: uuid.UUID) -> list[Any]:
+        from app.modules.contracts.models import ContractLine  # noqa: PLC0415
+
+        stmt = (
+            select(ContractLine)
+            .where(ContractLine.contract_id == contract_id)
+            .order_by(ContractLine.order_index.asc(), ContractLine.code.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_lines_by_ids(self, line_ids: list[uuid.UUID]) -> list[Any]:
+        from app.modules.contracts.models import ContractLine  # noqa: PLC0415
+
+        if not line_ids:
+            return []
+        stmt = select(ContractLine).where(ContractLine.id.in_(set(line_ids)))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_claim_lines(self, claim_id: uuid.UUID) -> list[Any]:
+        from app.modules.contracts.models import ProgressClaimLine  # noqa: PLC0415
+
+        stmt = select(ProgressClaimLine).where(ProgressClaimLine.progress_claim_id == claim_id)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_claims_for_contract(self, contract_id: uuid.UUID) -> list[Any]:
+        from app.modules.contracts.models import ProgressClaim  # noqa: PLC0415
+
+        stmt = select(ProgressClaim).where(ProgressClaim.contract_id == contract_id)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def list_active_client_contracts(self, project_id: uuid.UUID) -> list[Any]:
+        """The prime contracts a subcontract on this project can sit under."""
+        from app.modules.contracts.models import Contract  # noqa: PLC0415
+
+        stmt = select(Contract).where(
+            Contract.project_id == project_id,
+            Contract.counterparty_type == "client",
+            Contract.status == "active",
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def paid_total(self, contract_id: uuid.UUID) -> Any:
+        """Net paid on the contract's claims, asked of the contracts repository itself.
+
+        Reused rather than re-queried so the preview's "prior claims" figure is
+        the same number the progress preview shows for the same claim.
+        """
+        from app.modules.contracts.repository import ProgressClaimRepository  # noqa: PLC0415
+
+        return await ProgressClaimRepository(self.session).paid_total(contract_id)

@@ -6,8 +6,18 @@
  * All endpoints are prefixed with /v1/punchlist/.
  */
 
-import { apiGet, apiPost, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
+import {
+  API_BASE,
+  apiGet,
+  apiPost,
+  apiPatch,
+  apiDelete,
+  downloadWithAuth,
+  type Page,
+} from '@/shared/lib/api';
 import { listRoster, type RosterMember } from '@/features/teams/api';
+import { roleHasPermission } from '@/shared/lib/permissionGates';
+import { useAuthStore } from '@/stores/useAuthStore';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -39,6 +49,7 @@ export type PunchCategory =
 export interface PunchItem {
   id: string;
   project_id: string;
+  contract_id?: string | null;
   title: string;
   description: string;
   priority: PunchPriority;
@@ -65,6 +76,15 @@ export interface PunchItem {
   resolved_at: string | null;
   verified_at: string | null;
   reopen_history?: ReopenHistoryEntry[];
+  /**
+   * What it costs to put the item right, as a decimal string, or null when
+   * nobody has priced it (which is not zero). QMS counts it into the cost of
+   * poor quality, and it is the open-items value a retainage release at
+   * substantial completion holds money back against.
+   */
+  rework_cost: string | null;
+  /** ISO code the cost is in. Rendered as stored, never relabelled. */
+  rework_cost_currency: string;
 }
 
 export interface ReopenHistoryEntry {
@@ -120,6 +140,7 @@ export interface PunchFilters {
 
 export interface CreatePunchPayload {
   project_id: string;
+  contract_id?: string | null;
   title: string;
   description?: string;
   priority?: PunchPriority;
@@ -132,9 +153,14 @@ export interface CreatePunchPayload {
   location_x?: number | null;
   location_y?: number | null;
   trade?: string;
+  /** Decimal string with a dot, e.g. "1250.5". */
+  rework_cost?: string;
+  /** Send the project's currency: the backend defaults to USD otherwise. */
+  rework_cost_currency?: string;
 }
 
 export interface UpdatePunchPayload {
+  contract_id?: string | null;
   title?: string;
   description?: string;
   priority?: PunchPriority;
@@ -146,6 +172,10 @@ export interface UpdatePunchPayload {
   location_y?: number | null;
   trade?: string | null;
   resolution_notes?: string | null;
+  /** null clears the price. */
+  rework_cost?: string | null;
+  /** Never null: the column is NOT NULL and the API refuses it. Omit to keep. */
+  rework_cost_currency?: string;
 }
 
 export interface TeamMember {
@@ -321,6 +351,21 @@ export async function fetchPunchDrawings(projectId: string): Promise<PunchDrawin
   }));
 }
 
+/**
+ * Download the project's punch list as a PDF, printed on the company
+ * letterhead when one is set.
+ *
+ * Route is GET /export/pdf/ WITH a trailing slash (router.py). No ?locale= is
+ * sent, unlike the RFI export: the route takes none, because its headings are
+ * English literals in the service, and it declares Content-Language: en.
+ */
+export async function downloadPunchListPdf(projectId: string): Promise<void> {
+  await downloadWithAuth(
+    `${API_BASE}/v1/punchlist/export/pdf/?project_id=${encodeURIComponent(projectId)}`,
+    `punchlist_${projectId}.pdf`,
+  );
+}
+
 export async function fetchPunchSummary(projectId: string): Promise<PunchSummary> {
   if (!projectId)
     return {
@@ -367,13 +412,19 @@ interface UserListEntry {
 export async function fetchTeamMembers(projectId: string): Promise<TeamMember[]> {
   if (!projectId) return [];
 
+  // The workspace directory needs users.list; a role without it would only
+  // collect a 403 here, so it gets the project roster alone.
+  const role = useAuthStore.getState().userRole;
+  const canListUsers = roleHasPermission(role, 'users.list');
   const [roster, users] = await Promise.all([
     listRoster(projectId, { includeInactive: false })
       .then((page) => page.items)
       .catch(() => [] as RosterMember[]),
-    apiGet<UserListEntry[] | { items: UserListEntry[] }>('/v1/users/?limit=100').catch(
-      () => [] as UserListEntry[],
-    ),
+    canListUsers
+      ? apiGet<UserListEntry[] | { items: UserListEntry[] }>('/v1/users/?limit=100').catch(
+          () => [] as UserListEntry[],
+        )
+      : Promise.resolve([] as UserListEntry[]),
   ]);
 
   const list = Array.isArray(users) ? users : users.items ?? [];
@@ -384,7 +435,6 @@ export async function fetchTeamMembers(projectId: string): Promise<TeamMember[]>
       name: u.full_name?.trim() || u.email,
       email: u.email,
       avatar_url: null,
-      detail: u.email,
       assignable: true,
       on_roster: false,
     }));
@@ -393,7 +443,7 @@ export async function fetchTeamMembers(projectId: string): Promise<TeamMember[]>
   // project whose roster is all subcontractor gangs without accounts has plenty
   // of rows and nobody assignable, and keying on row count instead of on
   // assignability would leave the list empty on exactly that project.
-  if (!roster.some((m) => m.user_id && !m.user_is_inactive)) return workspace;
+  if (!roster.some((m) => m.user_id && !m.user_is_inactive)) return withDisambiguation(workspace);
 
   const rostered = new Set(roster.map((m) => m.user_id).filter((id): id is string => !!id));
   const rosterRows: TeamMember[] = roster.map((m) => ({
@@ -410,5 +460,27 @@ export async function fetchTeamMembers(projectId: string): Promise<TeamMember[]>
   // before anybody filled the roster in points at one of them, and an option
   // that is missing makes the editor read "Unassigned" for an item that is
   // assigned to somebody.
-  return [...rosterRows, ...workspace.filter((u) => !rostered.has(u.id))];
+  return withDisambiguation([...rosterRows, ...workspace.filter((u) => !rostered.has(u.id))]);
+}
+
+const nameKey = (name: string) => name.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+
+/**
+ * Show an email beside a name only where the name alone is ambiguous.
+ *
+ * Every account in the picker used to read "Name - email", which put the whole
+ * workspace's addresses on screen for anyone opening a snag, and in any screen
+ * recording or screen share of it. The name is what a site manager picks by;
+ * the address only earns its place when two people in the list share a name
+ * and there is nothing else to tell them apart. A roster row keeps its firm and
+ * site role, which already does that job without an address.
+ */
+export function withDisambiguation(members: TeamMember[]): TeamMember[] {
+  const counts = new Map<string, number>();
+  for (const m of members) counts.set(nameKey(m.name), (counts.get(nameKey(m.name)) ?? 0) + 1);
+  return members.map((m) => {
+    const shared = (counts.get(nameKey(m.name)) ?? 0) > 1;
+    const detail = m.detail || (shared && m.email && nameKey(m.email) !== nameKey(m.name) ? m.email : undefined);
+    return { ...m, detail };
+  });
 }

@@ -95,6 +95,36 @@ _CUSTOMER_CONTACT_EMAILS: dict[str, str] = {
 
 _CUSTOMER_NAMES: list[str] = list(_CUSTOMER_CONTACT_EMAILS)
 
+# How the seed names each contract. ``seed_service_demo`` writes contracts from
+# these and ``seeded_row_ids`` recognises them by the same helpers.
+_CONTRACT_DESCRIPTION = "Planned maintenance and reactive callout cover for the site plant."
+
+
+# (tier, response minutes, resolution minutes) of the seed's SLA definitions.
+_SLA_TIERS: tuple[tuple[str, int, int], ...] = (
+    ("gold", 60, 240),  # 1h response / 4h resolution
+    ("silver", 240, 1440),  # 4h / 24h
+    ("bronze", 480, 4320),  # 8h / 72h
+)
+_CHECKLIST_ASSET_TYPES = 5
+
+
+def _checklist_name(asset_type: str) -> str:
+    return f"{asset_type.title()} routine inspection"
+
+
+def _checklist_description(asset_type: str) -> str:
+    return f"Quarterly PPM checklist for {asset_type}"
+
+
+def _contract_number(idx: int) -> str:
+    return f"SC-{idx + 1:02d}"
+
+
+def _contract_title(idx: int) -> str:
+    return f"Service contract - {_CUSTOMER_NAMES[idx % len(_CUSTOMER_NAMES)]}"
+
+
 _ASSET_TYPES: list[str] = [
     "boiler",
     "chiller",
@@ -268,11 +298,7 @@ async def seed_service_demo(
 
     # ── SLA definitions ──────────────────────────────────────────────────
     slas: list[SLADefinition] = []
-    for tier, response, resolution in (
-        ("gold", 60, 240),  # 1h response / 4h resolution
-        ("silver", 240, 1440),  # 4h / 24h
-        ("bronze", 480, 4320),  # 8h / 72h
-    ):
+    for tier, response, resolution in _SLA_TIERS:
         sla = SLADefinition(
             name=tier,
             description=_SLA_TEXT[tier],
@@ -292,10 +318,10 @@ async def seed_service_demo(
 
     # ── Checklists ───────────────────────────────────────────────────────
     checklists: list[AssetInspectionChecklist] = []
-    for at in _ASSET_TYPES[:5]:
+    for at in _ASSET_TYPES[:_CHECKLIST_ASSET_TYPES]:
         cl = AssetInspectionChecklist(
-            name=f"{at.title()} routine inspection",
-            description=f"Quarterly PPM checklist for {at}",
+            name=_checklist_name(at),
+            description=_checklist_description(at),
             asset_type=at,
             items=[
                 {"question": "Visual inspection complete?", "type": "bool", "required": True},
@@ -355,9 +381,9 @@ async def seed_service_demo(
         contract = ServiceContract(
             customer_id=customer_id,
             project_id=pid,
-            contract_number=f"SC-{idx + 1:02d}",
-            title=f"Service contract - {_CUSTOMER_NAMES[idx % len(_CUSTOMER_NAMES)]}",
-            description="Planned maintenance and reactive callout cover for the site plant.",
+            contract_number=_contract_number(idx),
+            title=_contract_title(idx),
+            description=_CONTRACT_DESCRIPTION,
             period_start=period_start.isoformat(),
             period_end=period_end.isoformat(),
             sla_definition_id=slas[idx % len(slas)].id,
@@ -777,3 +803,110 @@ async def seed_service_recurring_schedules(
     await session.flush()
     logger.info("Service recurring schedules seeded: %s", counters)
     return counters
+
+
+async def seeded_row_ids(session: AsyncSession, project_ids: list[uuid.UUID]) -> list[tuple[type, list, str]]:
+    """Service contracts in ``project_ids`` exactly as :func:`seed_service_demo` wrote them.
+
+    A contract matches on number, title and description of the seed contract
+    with the same index, all three at once. The seed numbers contracts
+    ``SC-01`` onwards by position in the project list, so the index is read
+    from the number and the title must be the customer that index names.
+
+    Assets, tickets, work orders with their items and debriefs, and asset
+    schedules hang off the contract with CASCADE and go with it.
+
+    Returns:
+        ``(model, ids, label)`` groups; ``label`` names the group in reports.
+    """
+    if not project_ids:
+        return []
+    rows = (
+        await session.execute(
+            select(
+                ServiceContract.id,
+                ServiceContract.contract_number,
+                ServiceContract.title,
+                ServiceContract.description,
+            ).where(ServiceContract.project_id.in_(project_ids))
+        )
+    ).all()
+    ids = []
+    for r in rows:
+        number = str(r.contract_number or "")
+        if not number.startswith("SC-") or not number[3:].isdigit():
+            continue
+        idx = int(number[3:]) - 1
+        if (
+            idx >= 0
+            and number == _contract_number(idx)
+            and r.title == _contract_title(idx)
+            and r.description == _CONTRACT_DESCRIPTION
+        ):
+            ids.append(r.id)
+    return [(ServiceContract, ids, "service_contracts")]
+
+
+async def seeded_global_ids(session: AsyncSession) -> list[tuple[type, list, str]]:
+    """Company-wide rows :func:`seed_service_demo` wrote: SLA tiers, checklists and customers.
+
+    None of them belongs to a project. An SLA tier matches on name, text and
+    both windows, a checklist on name, text and asset type, a customer contact
+    on firm name and address together, as a customer with nobody recorded as
+    its author. The caller decides whether they may go: while a demo project
+    or a person's contract still uses one, it stays.
+
+    Returns:
+        ``(model, ids, label)`` groups; ``label`` names the group in reports.
+    """
+    from app.modules.contacts.models import Contact
+
+    tiers = {(name, _SLA_TEXT[name], response, resolution) for name, response, resolution in _SLA_TIERS}
+    slas = [
+        r.id
+        for r in (
+            await session.execute(
+                select(
+                    SLADefinition.id,
+                    SLADefinition.name,
+                    SLADefinition.description,
+                    SLADefinition.response_time_minutes,
+                    SLADefinition.resolution_time_minutes,
+                )
+            )
+        ).all()
+        if (r.name, r.description, r.response_time_minutes, r.resolution_time_minutes) in tiers
+    ]
+    lists = {(_checklist_name(at), _checklist_description(at), at) for at in _ASSET_TYPES[:_CHECKLIST_ASSET_TYPES]}
+    checklists = [
+        r.id
+        for r in (
+            await session.execute(
+                select(
+                    AssetInspectionChecklist.id,
+                    AssetInspectionChecklist.name,
+                    AssetInspectionChecklist.description,
+                    AssetInspectionChecklist.asset_type,
+                )
+            )
+        ).all()
+        if (r.name, r.description, r.asset_type) in lists
+    ]
+    customers = [
+        r.id
+        for r in (
+            await session.execute(
+                select(Contact.id, Contact.company_name, Contact.primary_email).where(
+                    Contact.contact_type == "customer",
+                    Contact.company_name.in_(_CUSTOMER_NAMES),
+                    Contact.created_by.is_(None),
+                )
+            )
+        ).all()
+        if _CUSTOMER_CONTACT_EMAILS.get(r.company_name) == r.primary_email
+    ]
+    return [
+        (SLADefinition, slas, "service_sla_definitions"),
+        (AssetInspectionChecklist, checklists, "service_checklists"),
+        (Contact, customers, "service_customers"),
+    ]

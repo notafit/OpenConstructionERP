@@ -137,6 +137,11 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
+// Every test here mounts the whole hub, two hundred and more cards. On a
+// saturated CPU one mount alone can outlast the 15s default, so the file
+// gets the room a lighter file does not need.
+vi.setConfig({ testTimeout: 60_000 });
+
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
 const numbers = buildCaseNumbers(PLAYBOOKS);

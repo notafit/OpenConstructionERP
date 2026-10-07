@@ -23,6 +23,7 @@ cannot read/mutate contracts of projects they don't own. The catalog endpoint
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from decimal import Decimal
@@ -50,13 +51,12 @@ from app.modules.contracts.models import (
     ContractSecurity,
     EOTClaim,
     FeeStructure,
-    FinalAccount,
     GainshareConfiguration,
     LDClause,
     ProgressClaim,
     ProgressClaimLine,
-    RetentionSchedule,
 )
+from app.modules.contracts.payment_plan import MILESTONE_GROSS_BASIS
 from app.modules.contracts.repository import (
     ContractDocumentRepository,
     ContractMilestoneRepository,
@@ -68,12 +68,14 @@ from app.modules.contracts.repository import (
     GainshareConfigurationRepository,
     LDClauseRepository,
     ProgressClaimLineRepository,
+    RetentionReleaseRepository,
     RetentionScheduleRepository,
 )
 from app.modules.contracts.schemas import (
     AIAApplicationResponse,
     AutoGenerateClaimRequest,
     ContractCloneRequest,
+    ContractCountryDefaultsResponse,
     ContractCreate,
     ContractDashboardResponse,
     ContractDocumentCreate,
@@ -84,7 +86,9 @@ from app.modules.contracts.schemas import (
     ContractLineResponse,
     ContractLineUpdate,
     ContractListResponse,
+    ContractMilestoneActivityLink,
     ContractMilestoneCreate,
+    ContractMilestoneLinkResponse,
     ContractMilestoneResponse,
     ContractMilestoneUpdate,
     ContractPartyCreate,
@@ -120,6 +124,7 @@ from app.modules.contracts.schemas import (
     LDClauseCreate,
     LDClauseResponse,
     LDClauseUpdate,
+    PaymentPlanResponse,
     ProgressClaimCommitRequest,
     ProgressClaimCreate,
     ProgressClaimLineCreate,
@@ -129,13 +134,24 @@ from app.modules.contracts.schemas import (
     ProgressClaimPopulatePreviewResponse,
     ProgressClaimResponse,
     ProgressClaimUpdate,
+    RetentionPolicyResponse,
+    RetentionPolicyUpdate,
+    RetentionReleaseApprove,
+    RetentionReleaseBill,
+    RetentionReleaseCreate,
+    RetentionReleasePreviewRequest,
+    RetentionReleasePreviewResponse,
+    RetentionReleaseResponse,
     RetentionScheduleCreate,
     RetentionScheduleResponse,
     RetentionScheduleUpdate,
+    RetentionSummaryResponse,
+    SovReconcileConfirm,
+    SovReconcileExclusion,
     TemplateCatalogueEntry,
     TemplateClauseSetRequest,
 )
-from app.modules.contracts.service import ContractsService
+from app.modules.contracts.service import PERCENT_REGRESSED_META_KEY, ContractsService
 
 router = APIRouter(tags=["contracts"])
 logger = logging.getLogger(__name__)
@@ -209,7 +225,7 @@ def _contract_to_response(item: Contract) -> ContractResponse:
     )
 
 
-def _line_to_response(item: ContractLine) -> ContractLineResponse:
+def _line_to_response(item: ContractLine, *, billed: bool = False) -> ContractLineResponse:
     return ContractLineResponse(
         id=item.id,
         contract_id=item.contract_id,
@@ -224,6 +240,7 @@ def _line_to_response(item: ContractLine) -> ContractLineResponse:
         total_value=item.total_value,
         order_index=item.order_index,
         metadata=getattr(item, "metadata_", {}) or {},
+        billed=billed,
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
@@ -247,6 +264,11 @@ def _claim_to_response(item: ProgressClaim) -> ProgressClaimResponse:
         paid_at=item.paid_at,
         currency=item.currency,
         milestone_id=item.milestone_id,
+        period_from=item.period_from,
+        period_to=item.period_to,
+        application_date=item.application_date,
+        completed_stored_to_date=getattr(item, "completed_stored_to_date", None),
+        retention_held_to_date=getattr(item, "retention_held_to_date", None),
         metadata=getattr(item, "metadata_", {}) or {},
         created_at=item.created_at,
         updated_at=item.updated_at,
@@ -296,6 +318,24 @@ async def list_contracts(
         offset=offset,
         limit=limit,
     )
+
+
+@router.get("/country-defaults/", response_model=ContractCountryDefaultsResponse)
+async def get_contract_country_defaults(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    project_id: uuid.UUID = Query(...),
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> ContractCountryDefaultsResponse:
+    """The payment terms a new contract on this project starts from, and where each came from.
+
+    A project with no country, or a country with no row, answers
+    ``has_defaults: false`` and no values: the form leaves the fields for a
+    person to fill rather than borrowing another country's figures.
+    """
+    await verify_project_access(project_id, user_id, session)
+    service = ContractsService(session)
+    return ContractCountryDefaultsResponse.model_validate(await service.country_defaults_for_project(project_id))
 
 
 @router.post("/contracts/", response_model=ContractResponse, status_code=201)
@@ -456,6 +496,7 @@ async def preview_compliance_gate(
     contract = await _verify_contract_access(session, contract_id, user_id)
     service = ContractsService(session)
     report, pack_ids = await service.run_compliance_gate(contract)
+    labels = await service._compliance_labels(contract)
 
     def _serialise(r: object) -> dict:
         return {
@@ -464,6 +505,7 @@ async def preview_compliance_gate(
             "severity": r.severity.value,
             "message": r.message,
             "element_ref": r.element_ref,
+            "element_label": labels.get(str(r.element_ref)) if r.element_ref else None,
             "suggestion": r.suggestion,
         }
 
@@ -597,7 +639,10 @@ async def list_contract_lines(
     await _verify_contract_access(session, contract_id, user_id)
     service = ContractsService(session)
     lines = await service.line_repo.list_for_contract(contract_id)
-    return [_line_to_response(ln) for ln in lines]
+    # The same query the service's refusal runs, so a line the screen shows
+    # as editable is one the server will let it edit.
+    billed = await service.claim_line_repo.claims_billing_lines([ln.id for ln in lines])
+    return [_line_to_response(ln, billed=ln.id in billed) for ln in lines]
 
 
 @router.post(
@@ -719,9 +764,9 @@ async def create_retention_schedule(
     _perm: None = Depends(RequirePermission("contracts.create")),
 ) -> RetentionScheduleResponse:
     await _verify_contract_access(session, data.contract_id, user_id)
-    repo = RetentionScheduleRepository(session)
-    obj = RetentionSchedule(**data.model_dump())
-    obj = await repo.create(obj)
+    # A schedule's accrual rule is the ladder the engine reads, so the service
+    # holds it to the accrual lock the retention policy editor keeps.
+    obj = await ContractsService(session).create_retention_schedule(data)
     return RetentionScheduleResponse.model_validate(obj)
 
 
@@ -759,10 +804,7 @@ async def update_retention_schedule(
     if obj is None:
         raise HTTPException(status_code=404, detail="Retention schedule not found")
     await _verify_contract_access(session, obj.contract_id, user_id)
-    fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
-    if fields:
-        await repo.update_fields(schedule_id, **fields)
-        await session.refresh(obj)
+    obj = await ContractsService(session).update_retention_schedule(schedule_id, data)
     return RetentionScheduleResponse.model_validate(obj)
 
 
@@ -781,7 +823,7 @@ async def delete_retention_schedule(
     if obj is None:
         raise HTTPException(status_code=404, detail="Retention schedule not found")
     await _verify_contract_access(session, obj.contract_id, user_id)
-    await repo.delete(schedule_id)
+    await ContractsService(session).delete_retention_schedule(schedule_id)
 
 
 # ── FeeStructure ─────────────────────────────────────────────────────────
@@ -1105,9 +1147,8 @@ async def update_progress_claim(
             },
         )
     fields.pop("status", None)
-    if fields:
-        await service.claim_repo.update_fields(claim_id, **fields)
-        await session.refresh(obj)
+    # Through the service, so a corrected period string moves its date too.
+    await service.update_progress_claim_fields(obj, fields)
     return _claim_to_response(obj)
 
 
@@ -1123,7 +1164,28 @@ async def delete_progress_claim(
 ) -> None:
     await _verify_claim_access(session, claim_id, user_id)
     service = ContractsService(session)
-    await service.claim_repo.delete(claim_id)
+    # Through the service, which refuses a claim past draft: its lines go
+    # with it, and the claim line routes already refuse exactly that.
+    await service.delete_progress_claim(claim_id)
+
+
+@router.get("/progress-claims/{claim_id}/validation")
+async def progress_claim_validation(
+    claim_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> dict:
+    """Run the payment application rules over one progress claim.
+
+    Returns the report status, score and the grouped error and warning lists
+    for a traffic-light panel. It is the same report the submit action blocks
+    on, built by the same method, so what the panel shows is what submitting
+    will do.
+    """
+    await _verify_claim_access(session, claim_id, user_id)
+    service = ContractsService(session)
+    return await service.validate_claim(claim_id)
 
 
 @router.post(
@@ -1266,13 +1328,14 @@ async def commit_populated_claim_lines(
     user_id: CurrentUserId,
     _perm: None = Depends(RequirePermission("contracts.update")),
 ) -> ProgressClaimResponse:
-    """Persist a populated / edited set of claim lines and roll up totals.
+    """Persist the ticked rows of a populate preview and roll up totals.
 
-    Idempotent: existing claim lines are replaced wholesale, values are
-    recomputed server-side (so a tampered total cannot inflate the claim), the
-    claim's gross / retention / prior / net are re-rolled, and
-    ``contracts.claim.populated`` is emitted. Only valid on a draft or submitted
-    claim. Requires ``contracts.update`` and project-level access.
+    Idempotent: the claim's lines on the ticked SoV lines are replaced, and its
+    lines on every other SoV line are left as they are. Values are recomputed
+    server-side (so a tampered total cannot inflate the claim), the claim's
+    gross / retention / prior / net are re-rolled over all its lines, and
+    ``contracts.claim.populated`` is emitted. Only valid on a draft claim.
+    Requires ``contracts.update`` and project-level access.
     """
     await _verify_claim_access(session, claim_id, user_id)
     service = ContractsService(session)
@@ -1315,15 +1378,34 @@ async def create_claim_line(
     _perm: None = Depends(RequirePermission("contracts.update")),
 ) -> ProgressClaimLineResponse:
     claim = await _verify_claim_access(session, data.progress_claim_id, user_id)
-    # The line breakdown is part of the immutable audit trail once the claim
-    # leaves draft / submitted. Mirror the PATCH / auto-generate guard so a raw
-    # POST cannot append (and thereby alter) lines on a billed claim
-    # (approved / certified / paid / rejected).
+    # The line breakdown is part of the record once the claim leaves draft.
+    # Mirror the PATCH / auto-generate guard so a raw POST cannot append (and
+    # thereby alter) lines on a claim that is already with the payer.
     service = ContractsService(session)
     service._assert_claim_editable(claim)
+    # A line on an instalment claim is a breakdown of its agreed amount; on
+    # any other claim it bills progress, which a contract its payment plan
+    # bills does not take as well.
+    if claim.gross_basis != MILESTONE_GROSS_BASIS:
+        await service.refuse_progress_billing_on_plan_contract(claim)
     repo = ProgressClaimLineRepository(session)
-    obj = ProgressClaimLine(**data.model_dump())
+    fields = data.model_dump()
+    # A line entered as a percent alone arrives with a zero value, which billed
+    # nothing. The percent is to date, so the period value is worked out from it.
+    if data.period_completed_pct > 0 and not data.period_completed_value:
+        derived = await service.claim_line_value_from_percent(claim, data.contract_line_id, data.period_completed_pct)
+        if derived is not None:
+            fields["period_completed_value"] = derived
+    # Column D and the running total are derived, never client-authored: the
+    # same "claims before this one" the generators use, plus this period.
+    fields.update(
+        await service.claim_line_running_totals(claim, data.contract_line_id, fields["period_completed_value"])
+    )
+    obj = ProgressClaimLine(**fields)
     obj = await repo.create(obj)
+    # Totals and retention follow the lines, so a hand-added line bills.
+    await service.roll_claim_retention(claim.id, gross_follows_lines=True)
+    await session.refresh(obj)
     return ProgressClaimLineResponse.model_validate(obj)
 
 
@@ -1343,10 +1425,9 @@ async def update_claim_line(
     if obj is None:
         raise HTTPException(status_code=404, detail="Claim line not found")
     claim = await _verify_claim_access(session, obj.progress_claim_id, user_id)
-    # The claim line breakdown is part of the immutable audit trail once the
-    # parent claim leaves draft / submitted (approved / certified / paid /
-    # rejected). Mirror the service guard used by the auto-generate / populate
-    # paths so a raw PATCH cannot rewrite a billed line.
+    # The claim line breakdown is part of the record once the parent claim
+    # leaves draft. Mirror the service guard used by the auto-generate and
+    # populate paths so a raw PATCH cannot rewrite a line the payer is reading.
     service = ContractsService(session)
     service._assert_claim_editable(claim)
     fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
@@ -1354,17 +1435,33 @@ async def update_claim_line(
         # cumulative_completed_value is cumulative-to-date, never client-authored:
         # accepting it lets the inline editor clobber the running total and corrupt
         # earned-value + the AIA 'previous' column. Recompute it server-side with
-        # the same semantics as commit_preview_to_claim: prior non-rejected period
-        # values on this SoV line (excluding this claim) + this period's value.
+        # the same semantics as commit_preview_to_claim: what the claims before
+        # this one in billing order billed on this SoV line + this period's value.
         fields.pop("cumulative_completed_value", None)
+        # A changed percent with the value left as it was (or zero) means the
+        # percent is what was edited, so the period value follows it.
+        new_pct = fields.get("period_completed_pct")
+        sent_value = fields.get("period_completed_value", obj.period_completed_value)
+        if (
+            new_pct is not None
+            and new_pct > 0
+            and (not sent_value or (new_pct != obj.period_completed_pct and sent_value == obj.period_completed_value))
+        ):
+            derived = await service.claim_line_value_from_percent(claim, obj.contract_line_id, new_pct)
+            if derived is not None:
+                fields["period_completed_value"] = derived
         period_value = fields.get("period_completed_value", obj.period_completed_value)
-        prior_by_line = await repo.prior_period_value_by_line(
-            claim.contract_id,
-            exclude_claim_id=obj.progress_claim_id,
-        )
-        prior = prior_by_line.get(obj.contract_line_id, Decimal("0"))
-        fields["cumulative_completed_value"] = (prior + Decimal(str(period_value or 0))).quantize(Decimal("0.0001"))
+        fields.update(await service.claim_line_running_totals(claim, obj.contract_line_id, period_value))
         await repo.update_fields(line_id, **fields)
+        await session.refresh(obj)
+        if "period_completed_value" in fields:
+            # A value typed in by hand replaces whatever the percent asked for,
+            # so a regression recorded for this line no longer describes it.
+            entries = list((claim.metadata_ or {}).get(PERCENT_REGRESSED_META_KEY) or [])
+            kept = [e for e in entries if str(e.get("contract_line_id")) != str(obj.contract_line_id)]
+            if len(kept) != len(entries):
+                await service.record_percent_regressed(claim, kept)
+        await service.roll_claim_retention(claim.id, gross_follows_lines=True)
         await session.refresh(obj)
     return ProgressClaimLineResponse.model_validate(obj)
 
@@ -1383,8 +1480,14 @@ async def delete_claim_line(
     obj = await repo.get_by_id(line_id)
     if obj is None:
         raise HTTPException(status_code=404, detail="Claim line not found")
-    await _verify_claim_access(session, obj.progress_claim_id, user_id)
+    claim = await _verify_claim_access(session, obj.progress_claim_id, user_id)
+    # Deleting a line rewrites the claim as surely as editing one, so the
+    # same guard applies: it used to delete lines off an approved claim.
+    service = ContractsService(session)
+    service._assert_claim_editable(claim)
     await repo.delete(line_id)
+    # The claim is what its lines say, a claim with none included.
+    await service.roll_claim_retention(claim.id, gross_follows_lines=True)
 
 
 # ── AIA G702/G703 payment applications (US/CA/AU only) ─────────────────────
@@ -1432,8 +1535,13 @@ async def export_aia_application_pdf(
 
     await _verify_claim_access(session, claim_id, user_id)
     service = ContractsService(session)
-    payload = await service.build_aia_application(claim_id)
-    pdf_bytes = render_aia_application_pdf(payload)
+    # English, like every other word on the form and the Content-Language
+    # below. The request's language would have printed one row in German or
+    # Russian on an English page.
+    payload = await service.build_aia_application(claim_id, locale="en")
+    # ReportLab layout is CPU-bound and synchronous; in a thread it does not
+    # stall every other request on the event loop while the form is drawn.
+    pdf_bytes = await asyncio.to_thread(render_aia_application_pdf, payload)
     safe_num = "".join(c for c in str(payload.get("application_number") or "app") if c.isalnum() or c in "-_") or "app"
     filename = f"AIA_G702_{safe_num}.pdf"
     return StreamingResponse(
@@ -1468,9 +1576,7 @@ async def create_final_account(
     _perm: None = Depends(RequirePermission("contracts.close")),
 ) -> FinalAccountResponse:
     await _verify_contract_access(session, data.contract_id, user_id)
-    repo = FinalAccountRepository(session)
-    obj = FinalAccount(**data.model_dump())
-    obj = await repo.create(obj)
+    obj = await ContractsService(session).create_final_account(data)
     return FinalAccountResponse.model_validate(obj)
 
 
@@ -1508,10 +1614,9 @@ async def update_final_account(
     if obj is None:
         raise HTTPException(status_code=404, detail=translate("errors.final_account_not_found", locale=get_locale()))
     await _verify_contract_access(session, obj.contract_id, user_id)
-    fields = {k: v for k, v in data.model_dump(exclude_unset=True).items() if v is not None}
-    if fields:
-        await repo.update_fields(account_id, **fields)
-        await session.refresh(obj)
+    # The service holds the status to the lifecycle and keeps the figures of an
+    # agreed or closed account, the same rule Close keeps.
+    obj = await ContractsService(session).update_final_account(account_id, data)
     return FinalAccountResponse.model_validate(obj)
 
 
@@ -1530,7 +1635,8 @@ async def delete_final_account(
     if obj is None:
         raise HTTPException(status_code=404, detail=translate("errors.final_account_not_found", locale=get_locale()))
     await _verify_contract_access(session, obj.contract_id, user_id)
-    await repo.delete(account_id)
+    # An agreed or closed account is refused; a draft or disputed one goes.
+    await ContractsService(session).delete_final_account(account_id)
 
 
 @router.post(
@@ -1638,6 +1744,53 @@ async def sov_status(
     }
 
 
+@router.get("/contracts/{contract_id}/sov/reconcile-change-orders")
+async def sov_reconcile_preview(
+    contract_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> dict:
+    """Changes approved before they reached the schedule of values, and what posting them adds."""
+    await _verify_contract_access(session, contract_id, user_id)
+    return await ContractsService(session).sov_reconcile_preview(contract_id)
+
+
+@router.post("/contracts/{contract_id}/sov/reconcile-change-orders")
+async def sov_reconcile_apply(
+    contract_id: uuid.UUID,
+    body: SovReconcileConfirm,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> dict:
+    """Post the previewed changes as schedule of values lines, once a person confirms them.
+
+    Posts the ticked subset. Nothing is posted if any key in ``source_keys``
+    is no longer on offer (409 ``reconcile_preview_stale``).
+    """
+    await _verify_contract_access(session, contract_id, user_id)
+    return await ContractsService(session).sov_reconcile_apply(contract_id, body.source_keys, actor_id=user_id)
+
+
+@router.post("/contracts/{contract_id}/sov/reconcile-change-orders/exclusions")
+async def sov_reconcile_set_exclusion(
+    contract_id: uuid.UUID,
+    body: SovReconcileExclusion,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> dict:
+    """Set a change aside as already on the schedule of values, or take that back.
+
+    Returns the preview as it stands after the decision.
+    """
+    await _verify_contract_access(session, contract_id, user_id)
+    return await ContractsService(session).sov_reconcile_set_exclusion(
+        contract_id, body.source_key, excluded=body.excluded, reason=body.reason, actor_id=user_id
+    )
+
+
 # ── Retention release ────────────────────────────────────────────────────
 
 
@@ -1649,12 +1802,15 @@ async def release_retention(
     user_id: CurrentUserId,
     _perm: None = Depends(RequirePermission("contracts.update")),
 ) -> dict:
-    """Release retention for a contract for the given event.
+    """Propose a retention release for the given event (older shape).
 
     Body:
-        event: str - e.g. "substantial_completion" / "punch_list_complete" /
-            "defects_liability_end" or a key from custom_schedule.
-        custom_schedule: dict[event_name → percent] - optional override.
+        event: str - a release event, canonical or an older alias such as
+            "punch_list_complete" / "defects_liability_end".
+        custom_schedule: dict[event_name → percent of held] - optional override.
+
+    The release is proposed, not paid: approve it and bill it on a claim
+    through ``/retention-releases/{id}``.
     """
     await _verify_contract_access(session, contract_id, user_id)
     service = ContractsService(session)
@@ -1676,6 +1832,155 @@ async def release_retention(
         custom_schedule=custom,
         actor_id=user_id,
     )
+
+
+async def _verify_release_access(session: SessionDep, release_id: uuid.UUID, user_id: str) -> None:
+    row = await RetentionReleaseRepository(session).get_by_id(release_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Retention release not found")
+    await _verify_contract_access(session, row.contract_id, user_id)
+
+
+@router.get("/contracts/{contract_id}/retention", response_model=RetentionSummaryResponse)
+async def retention_summary(
+    contract_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> RetentionSummaryResponse:
+    """Retention on a contract: accrued, paid back, committed and free to release, with every release."""
+    await _verify_contract_access(session, contract_id, user_id)
+    service = ContractsService(session)
+    summary = await service.retention_summary(await service.get_contract(contract_id))
+    return RetentionSummaryResponse(
+        **{k: v for k, v in summary.items() if k != "releases"},
+        releases=[RetentionReleaseResponse.model_validate(r) for r in summary["releases"]],
+    )
+
+
+@router.get("/contracts/{contract_id}/retention/policy", response_model=RetentionPolicyResponse)
+async def get_retention_policy(
+    contract_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> RetentionPolicyResponse:
+    """How this contract holds retention, where the rule came from and what can still change."""
+    await _verify_contract_access(session, contract_id, user_id)
+    service = ContractsService(session)
+    contract = await service.get_contract(contract_id)
+    return RetentionPolicyResponse.model_validate(await service.retention_policy_view(contract))
+
+
+@router.put("/contracts/{contract_id}/retention/policy", response_model=RetentionPolicyResponse)
+async def put_retention_policy(
+    contract_id: uuid.UUID,
+    data: RetentionPolicyUpdate,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> RetentionPolicyResponse:
+    """Change how this contract holds retention.
+
+    The ladder is refused with 409 once a claim has left draft: from then on
+    it is part of what that claim certified. The statute reference and the
+    notes stay editable for the life of the contract.
+    """
+    await _verify_contract_access(session, contract_id, user_id)
+    service = ContractsService(session)
+    contract = await service.get_contract(contract_id)
+    return RetentionPolicyResponse.model_validate(await service.set_retention_policy(contract, data))
+
+
+@router.post(
+    "/contracts/{contract_id}/retention/releases/preview",
+    response_model=RetentionReleasePreviewResponse,
+)
+async def preview_retention_release(
+    contract_id: uuid.UUID,
+    data: RetentionReleasePreviewRequest,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> RetentionReleasePreviewResponse:
+    """What a release for the event would pay. Writes nothing."""
+    await _verify_contract_access(session, contract_id, user_id)
+    preview = await ContractsService(session).preview_retention_release(contract_id, data)
+    return RetentionReleasePreviewResponse(**preview)
+
+
+@router.post(
+    "/contracts/{contract_id}/retention/releases",
+    response_model=RetentionReleaseResponse,
+    status_code=201,
+)
+async def create_retention_release(
+    contract_id: uuid.UUID,
+    data: RetentionReleaseCreate,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> RetentionReleaseResponse:
+    """Propose a release. It pays nothing until it is approved and billed on a claim."""
+    await _verify_contract_access(session, contract_id, user_id)
+    row = await ContractsService(session).create_retention_release(contract_id, data, user_id)
+    return RetentionReleaseResponse.model_validate(row)
+
+
+@router.post("/retention-releases/{release_id}/approve", response_model=RetentionReleaseResponse)
+async def approve_retention_release(
+    release_id: uuid.UUID,
+    data: RetentionReleaseApprove,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.approve_retention_release")),
+) -> RetentionReleaseResponse:
+    """Approve a proposed release; 422 while a document it needs is missing."""
+    await _verify_release_access(session, release_id, user_id)
+    row = await ContractsService(session).approve_retention_release(release_id, data, user_id)
+    return RetentionReleaseResponse.model_validate(row)
+
+
+@router.post("/retention-releases/{release_id}/bill", response_model=RetentionReleaseResponse)
+async def bill_retention_release(
+    release_id: uuid.UUID,
+    data: RetentionReleaseBill,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> RetentionReleaseResponse:
+    """Bill an approved release on a draft claim of the same contract."""
+    await _verify_release_access(session, release_id, user_id)
+    await _verify_claim_access(session, data.progress_claim_id, user_id)
+    row = await ContractsService(session).bill_retention_release(release_id, data, user_id)
+    return RetentionReleaseResponse.model_validate(row)
+
+
+@router.post("/retention-releases/{release_id}/void", response_model=RetentionReleaseResponse)
+async def void_retention_release(
+    release_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> RetentionReleaseResponse:
+    """Void a release; one billed on a claim that is still editable comes off that claim."""
+    await _verify_release_access(session, release_id, user_id)
+    row = await ContractsService(session).void_retention_release(release_id, user_id)
+    return RetentionReleaseResponse.model_validate(row)
+
+
+@router.post("/progress-claims/{claim_id}/retention/recalculate", response_model=ProgressClaimResponse)
+async def recalculate_claim_retention(
+    claim_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> ProgressClaimResponse:
+    """Work a draft claim's retention out again from its policy."""
+    claim = await _verify_claim_access(session, claim_id, user_id)
+    service = ContractsService(session)
+    service._assert_claim_editable(claim)
+    return _claim_to_response(await service.roll_claim_retention(claim_id))
 
 
 # ── Lien waivers ─────────────────────────────────────────────────────────
@@ -2483,6 +2788,66 @@ async def delete_contract_milestone(
     await _verify_contract_access(session, obj.contract_id, user_id)
     service = ContractsService(session)
     await service.delete_milestone(milestone_id)
+
+
+# ── Payment plan ───────────────────────────────────────────────────────────
+
+
+@router.get("/contracts/{contract_id}/payment-plan", response_model=PaymentPlanResponse)
+async def contract_payment_plan(
+    contract_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.read")),
+) -> PaymentPlanResponse:
+    """The contract's instalments with live forecasts, totals and the payment_plan findings."""
+    await _verify_contract_access(session, contract_id, user_id)
+    service = ContractsService(session)
+    return PaymentPlanResponse.model_validate(await service.payment_plan(contract_id))
+
+
+@router.put("/contracts/milestones/{milestone_id}/activity", response_model=ContractMilestoneLinkResponse)
+async def link_contract_milestone_activity(
+    milestone_id: uuid.UUID,
+    data: ContractMilestoneActivityLink,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.update")),
+) -> ContractMilestoneLinkResponse:
+    """Link an instalment to the schedule activity it waits for, or unlink it with ``null``.
+
+    A dedicated route because the milestone PATCH drops nulls, so it cannot
+    clear a link.
+    """
+    obj = await session.get(ContractMilestone, milestone_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Contract milestone not found")
+    await _verify_contract_access(session, obj.contract_id, user_id)
+    service = ContractsService(session)
+    milestone, warnings = await service.link_milestone_activity(milestone_id, data.activity_id)
+    response = ContractMilestoneResponse.model_validate(milestone).model_dump()
+    return ContractMilestoneLinkResponse(**response, warnings=warnings)
+
+
+@router.post(
+    "/contracts/milestones/{milestone_id}/raise-claim",
+    response_model=ProgressClaimResponse,
+    status_code=201,
+)
+async def raise_contract_milestone_claim(
+    milestone_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contracts.submit_claim")),
+) -> ProgressClaimResponse:
+    """Raise the draft claim for a reached instalment. Nothing is submitted or invoiced."""
+    obj = await session.get(ContractMilestone, milestone_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Contract milestone not found")
+    await _verify_contract_access(session, obj.contract_id, user_id)
+    service = ContractsService(session)
+    claim = await service.raise_claim_for_milestone(milestone_id)
+    return _claim_to_response(claim)
 
 
 # ── Completeness validation ────────────────────────────────────────────────

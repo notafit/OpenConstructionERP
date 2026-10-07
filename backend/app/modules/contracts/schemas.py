@@ -4,25 +4,122 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
+from app.modules.contracts.country_defaults import (
+    PAYMENT_TERM_FIELDS,
+    PAYMENT_TERMS_KEY,
+    VALUATION_INTERVALS,
+    validate_release_split,
+)
 from app.modules.contracts.models import CLAUSE_RISK_LEVELS
+from app.modules.contracts.retention import (
+    CANONICAL_RELEASE_EVENTS,
+    OTHER_RELEASE_EVENTS,
+    RELEASE_EVENT_ALIASES,
+    TIER_MODES,
+    canonical_release_event,
+    policy_from_rule,
+)
 
 # ── Contract ─────────────────────────────────────────────────────────────
 
 CONTRACT_TYPES = "lump_sum|gmp|cost_plus|tm|unit_price|design_build|combination|remeasurement"
 COUNTERPARTY_TYPES = "client|subcontractor"
 CONTRACT_STATUSES = "draft|active|suspended|completed|terminated"
-RETENTION_RELEASE_EVENTS = "practical_completion|final_account|handover"
+#: Every name a contract's release event has been written under. Accepted on
+#: input so an old client keeps working, and stored and returned under its
+#: canonical name (see ``contracts.retention``), so one event has one name.
+RETENTION_RELEASE_EVENTS = "|".join(sorted({*CANONICAL_RELEASE_EVENTS, *RELEASE_EVENT_ALIASES}))
+#: What a retention release can be booked against.
+RETENTION_RELEASE_ROW_EVENTS = "|".join(
+    sorted({*CANONICAL_RELEASE_EVENTS, *OTHER_RELEASE_EVENTS, *RELEASE_EVENT_ALIASES})
+)
+
+#: A release event under its canonical name, whatever name it arrived under.
+ReleaseEvent = Annotated[str, AfterValidator(canonical_release_event)]
 
 
-class ContractCreate(BaseModel):
-    """Create a new contract."""
+def _readable_release_split(value: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Refuse a release split that would strand retention, where it is written."""
+    if value is None:
+        return None
+    steps = [
+        {**step, "event": canonical_release_event(str(step.get("event") or ""))} if isinstance(step, dict) else step
+        for step in value
+    ]
+    return validate_release_split(steps)
+
+
+#: How retention is paid back, step by step. ``release_percent_of_held`` is the
+#: percent of what is held at that event, so "half at completion, the rest at
+#: the end of the defects period" is 50 then 100.
+ReleaseSplit = Annotated[list[dict[str, Any]] | None, AfterValidator(_readable_release_split)]
+
+
+class ContractPaymentTermFields(BaseModel):
+    """The payment terms a contract states beside its retention rate.
+
+    All optional. On create, a field left out is filled from the usual figure
+    of the project's country where there is one and left empty where there is
+    not; a field sent always wins. They are stored under
+    ``terms["payment_terms"]``.
+    """
+
+    retention_cap_percent: Decimal | None = Field(default=None, ge=0, le=100)
+    retention_release_split: ReleaseSplit = None
+    payment_period_days: int | None = Field(default=None, ge=0, le=365)
+    valuation_interval: str | None = Field(default=None, pattern=rf"^({'|'.join(VALUATION_INTERVALS)})$")
+    certificate_name: str | None = Field(default=None, max_length=200)
+
+
+def _readable_terms(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Hold a ``payment_terms`` block written straight into ``terms`` to the typed fields' rules.
+
+    The service reads that block as figures the author sent, so they win over
+    the country's defaults and drive the release rule. They have to pass the
+    same checks as the typed fields, or a split that strands retention is
+    stored and followed, and a step of the wrong shape crashes the create with
+    a 500. Refused here they come back as a 422 naming the field. Keys the
+    block carries beside the payment terms are kept as they are.
+    """
+    if value is None or PAYMENT_TERMS_KEY not in value or value[PAYMENT_TERMS_KEY] is None:
+        return value
+    block = value[PAYMENT_TERMS_KEY]
+    if not isinstance(block, dict):
+        raise ValueError(f"terms.{PAYMENT_TERMS_KEY} must be an object of payment terms")
+    sent = {field: block[field] for field in PAYMENT_TERM_FIELDS if field in block}
+    try:
+        typed = ContractPaymentTermFields.model_validate(sent)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in exc.errors()
+        )
+        raise ValueError(f"terms.{PAYMENT_TERMS_KEY} is not valid: {problems}") from None
+    cleaned = dict(block)
+    for field in sent:
+        figure = getattr(typed, field)
+        cleaned[field] = format(figure.normalize(), "f") if isinstance(figure, Decimal) else figure
+    return {**value, PAYMENT_TERMS_KEY: cleaned}
+
+
+#: Contract terms, with any payment-terms block inside them checked like the typed fields.
+ContractTerms = Annotated[dict[str, Any], AfterValidator(_readable_terms)]
+
+
+class ContractCreate(ContractPaymentTermFields):
+    """Create a new contract.
+
+    ``retention_percent`` and ``retention_release_event`` are optional: left
+    out, they start from the usual figure of the project's country (see
+    ``contracts.country_defaults``), and the contract records which figures
+    were filled that way under ``metadata["country_defaults"]``.
+    """
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -37,14 +134,14 @@ class ContractCreate(BaseModel):
     end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     total_value: Decimal = Field(default=Decimal("0"))
     currency: str = Field(default="", max_length=3)
-    retention_percent: Decimal = Field(default=Decimal("5.00"), ge=0, le=100)
-    retention_release_event: str = Field(
-        default="practical_completion",
+    retention_percent: Decimal | None = Field(default=None, ge=0, le=100)
+    retention_release_event: ReleaseEvent | None = Field(
+        default=None,
         pattern=rf"^({RETENTION_RELEASE_EVENTS})$",
     )
     status: str = Field(default="draft", pattern=rf"^({CONTRACT_STATUSES})$")
     signed_at: str | None = None
-    terms: dict[str, Any] = Field(default_factory=dict)
+    terms: ContractTerms = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     # The clause template this contract is drawn from, if any. Only the code is
     # accepted; the version is resolved server-side at create time and stored
@@ -55,11 +152,13 @@ class ContractCreate(BaseModel):
     template_code: str | None = Field(default=None, max_length=80)
 
 
-class ContractUpdate(BaseModel):
-    """Partial update for a contract."""
+class ContractUpdate(ContractPaymentTermFields):
+    """Partial update for a contract. Payment terms lock with the other financial terms."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
+    # Renamable while the contract is a draft; see ContractsService.update_contract.
+    code: str | None = Field(default=None, min_length=1, max_length=80)
     title: str | None = Field(default=None, max_length=500)
     contract_type: str | None = Field(default=None, pattern=rf"^({CONTRACT_TYPES})$")
     counterparty_type: str | None = Field(default=None, pattern=rf"^({COUNTERPARTY_TYPES})$")
@@ -70,13 +169,13 @@ class ContractUpdate(BaseModel):
     total_value: Decimal | None = None
     currency: str | None = Field(default=None, max_length=3)
     retention_percent: Decimal | None = Field(default=None, ge=0, le=100)
-    retention_release_event: str | None = Field(
+    retention_release_event: ReleaseEvent | None = Field(
         default=None,
         pattern=rf"^({RETENTION_RELEASE_EVENTS})$",
     )
     status: str | None = Field(default=None, pattern=rf"^({CONTRACT_STATUSES})$")
     signed_at: str | None = None
-    terms: dict[str, Any] | None = None
+    terms: ContractTerms | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -99,7 +198,8 @@ class ContractResponse(BaseModel):
     original_contract_value: Decimal | None = None
     currency: str
     retention_percent: Decimal
-    retention_release_event: str
+    # Rows stored before the vocabulary was unified still hold an alias.
+    retention_release_event: ReleaseEvent
     status: str
     signed_at: str | None = None
     terms: dict[str, Any] = Field(default_factory=dict)
@@ -113,6 +213,30 @@ class ContractResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
     updated_at: datetime
+
+
+class ContractCountryDefaultsResponse(BaseModel):
+    """The payment terms a new contract on this project starts from.
+
+    ``has_defaults`` is False for a project with no country, or a country the
+    table has no row for; ``values`` is then empty and the form leaves every
+    field for a person to fill. It never answers with another country's row.
+    """
+
+    project_id: UUID
+    country_code: str | None = None
+    has_defaults: bool
+    standard_form: str | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # "table", or "regional_pack" when the release split is the pack's.
+    release_split_source: str | None = None
+    # The flat rate a subcontract agreement on this project starts from, and
+    # the field of ``values`` it is: the country's rate, or its cap where the
+    # rate runs above it (an agreement holds every payment at one rate and has
+    # no ceiling). None when the country has no usual rate.
+    subcontract_retention_percent: str | None = None
+    subcontract_retention_from: str | None = None
 
 
 class ContractListResponse(BaseModel):
@@ -190,6 +314,12 @@ class ContractLineResponse(BaseModel):
     total_value: Decimal
     order_index: int
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
+    # True when a progress claim has billed on this line. The server then
+    # refuses to change or delete it whatever the contract's status, and the
+    # screen reads this to stop offering either. Filled in by the listing;
+    # every other response describes a line just created or just changed,
+    # which a billed line cannot be, so False is the truth there.
+    billed: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -250,15 +380,33 @@ class ContractTypeConfigurationResponse(BaseModel):
 # ── RetentionSchedule ────────────────────────────────────────────────────
 
 
+def _readable_accrual_rule(value: dict[str, Any]) -> dict[str, Any]:
+    """Refuse a policy that cannot be applied, where it is written.
+
+    The retention engine reads this rule on every claim and answers 422 when
+    it cannot, rather than falling back to a flat rate in silence. Checking it
+    here means the tiers are refused by the call that stores them, not by
+    every payment application afterwards.
+    """
+    try:
+        policy_from_rule(value, fallback_rate=0)
+    except ValueError as exc:
+        raise ValueError(f"accrual_rule cannot be applied: {exc}") from exc
+    return value
+
+
+AccrualRule = Annotated[dict[str, Any], AfterValidator(_readable_accrual_rule)]
+
+
 class RetentionScheduleCreate(BaseModel):
     contract_id: UUID
-    accrual_rule: dict[str, Any] = Field(default_factory=dict)
+    accrual_rule: AccrualRule = Field(default_factory=dict)
     release_rule: dict[str, Any] = Field(default_factory=dict)
     notes: str | None = None
 
 
 class RetentionScheduleUpdate(BaseModel):
-    accrual_rule: dict[str, Any] | None = None
+    accrual_rule: AccrualRule | None = None
     release_rule: dict[str, Any] | None = None
     notes: str | None = None
 
@@ -273,6 +421,156 @@ class RetentionScheduleResponse(BaseModel):
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RetentionPolicyTier(BaseModel):
+    """One step of the accrual ladder: the rate from a point of completion on."""
+
+    from_percent_complete: Decimal = Field(..., ge=0, le=100)
+    rate: Decimal = Field(..., ge=0, le=100)
+
+
+class RetentionPolicyUpdate(BaseModel):
+    """What a person may change about how a contract holds retention.
+
+    Every field is optional and only the ones sent are written, because the
+    three groups they fall into are locked at different times: the ladder
+    itself stops being editable once a claim has left draft, while the words
+    around it never do. See
+    :meth:`ContractsService.set_retention_policy`.
+    """
+
+    tiers: list[RetentionPolicyTier] | None = None
+    tier_mode: str | None = Field(default=None, pattern=rf"^({'|'.join(TIER_MODES)})$")
+    stored_materials_rate: Decimal | None = Field(default=None, ge=0, le=100)
+    cap_percent_of_contract_sum: Decimal | None = Field(default=None, ge=0, le=100)
+    statute_reference: str | None = Field(default=None, max_length=200)
+    effective_date: date | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class RetentionPolicyLock(BaseModel):
+    """The claim that stopped the accrual ladder being editable."""
+
+    claim_id: UUID
+    claim_number: str
+    claim_status: str
+
+
+class RetentionPolicyResponse(BaseModel):
+    """The accrual policy in force, and what about it can still be changed."""
+
+    contract_id: UUID
+    #: The schedule carrying the policy, or None when the contract's own flat
+    #: rate is standing in for one.
+    retention_schedule_id: UUID | None = None
+    source: str
+    tiers: list[RetentionPolicyTier] = Field(default_factory=list)
+    tier_mode: str
+    stored_materials_rate: Decimal | None = None
+    cap_percent_of_contract_sum: Decimal | None = None
+    statute_reference: str | None = None
+    effective_date: str | None = None
+    #: True once a claim has left draft, when the ladder is history.
+    accrual_locked: bool = False
+    locked_by_claim: RetentionPolicyLock | None = None
+    #: The field names a PUT would refuse right now, so the editor can say so
+    #: before the person types rather than after they save.
+    locked_fields: list[str] = Field(default_factory=list)
+
+
+# ── Retention releases ───────────────────────────────────────────────────
+
+
+class RetentionReleasePreviewRequest(BaseModel):
+    """What a release for ``event`` would pay, before anyone commits to it.
+
+    ``amount`` sizes the release by hand, for an event the rule gives no
+    percentage for (``rate_step_down``) or an agreed figure. ``open_items_value``
+    replaces the value of the open punch items the service reads itself.
+    """
+
+    event: ReleaseEvent = Field(..., pattern=rf"^({RETENTION_RELEASE_ROW_EVENTS})$")
+    amount: Decimal | None = Field(default=None, ge=0)
+    open_items_value: Decimal | None = Field(default=None, ge=0)
+
+
+class RetentionReleaseCreate(RetentionReleasePreviewRequest):
+    """Propose a release. It pays nothing until it is approved and billed on a claim."""
+
+    released_on: date | None = None
+    document_ids: list[UUID] = Field(default_factory=list)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class RetentionReleaseApprove(BaseModel):
+    """Approve a proposed release; ``document_ids`` are added to the evidence it carries."""
+
+    document_ids: list[UUID] = Field(default_factory=list)
+
+
+class RetentionReleaseBill(BaseModel):
+    """Bill an approved release on an editable claim of the same contract."""
+
+    progress_claim_id: UUID
+
+
+class RetentionReleasePreviewResponse(BaseModel):
+    """The figures a person confirms before a release is proposed."""
+
+    contract_id: UUID
+    event: str
+    currency: str
+    # Retention held and not already committed to another release.
+    held: Decimal
+    percent_of_held: Decimal | None = None
+    open_items_value: Decimal
+    open_items_count: int
+    # Open punch items with no cost on them, which the withholding cannot see.
+    open_items_without_cost: int
+    # punch_list, request (the caller stated the value) or unavailable.
+    open_items_source: str
+    withheld_for_open_items: Decimal
+    amount: Decimal
+    remaining: Decimal
+    # retention_schedule, regional_pack or default.
+    rule_source: str
+    statute_reference: str | None = None
+    required_documents: list[str] = Field(default_factory=list)
+    bonded: bool
+    # A release for this completion event exists already, so a new one is refused.
+    already_released: bool
+
+
+class RetentionReleaseResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: UUID
+    contract_id: UUID
+    event: ReleaseEvent
+    status: str
+    amount: Decimal
+    withheld_for_open_items: Decimal
+    released_on: date | None = None
+    progress_claim_id: UUID | None = None
+    document_ids: list[str] = Field(default_factory=list)
+    created_by: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
+    created_at: datetime
+    updated_at: datetime
+
+
+class RetentionSummaryResponse(BaseModel):
+    """Retention on a contract: accrued, paid back, committed and still free to release."""
+
+    contract_id: UUID
+    currency: str
+    accrued: Decimal
+    released: Decimal
+    held: Decimal
+    pending_release: Decimal
+    available_for_release: Decimal
+    releases: list[RetentionReleaseResponse] = Field(default_factory=list)
 
 
 # ── FeeStructure ─────────────────────────────────────────────────────────
@@ -449,6 +747,15 @@ class ProgressClaimResponse(BaseModel):
     paid_at: str | None = None
     currency: str
     milestone_id: UUID | None = None
+    # The period strings above parsed to dates, which is what orders the
+    # contract's claims. Null when the string is empty or unreadable.
+    period_from: date | None = None
+    period_to: date | None = None
+    application_date: date | None = None
+    # Payment application lines 4 and 5 as this claim certified them. Null
+    # on a claim the retention engine has not worked out.
+    completed_stored_to_date: Decimal | None = None
+    retention_held_to_date: Decimal | None = None
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
     updated_at: datetime
@@ -476,6 +783,8 @@ class ProgressClaimLineCreate(BaseModel):
     period_completed_value: Decimal = Field(default=Decimal("0"))
     period_completed_pct: Decimal = Field(default=Decimal("0"), ge=0, le=100)
     cumulative_completed_value: Decimal = Field(default=Decimal("0"))
+    assessed_qty: Decimal = Field(default=Decimal("0"))
+    certified_qty: Decimal = Field(default=Decimal("0"))
 
 
 class ProgressClaimLineUpdate(BaseModel):
@@ -483,6 +792,8 @@ class ProgressClaimLineUpdate(BaseModel):
     period_completed_value: Decimal | None = None
     period_completed_pct: Decimal | None = Field(default=None, ge=0, le=100)
     cumulative_completed_value: Decimal | None = None
+    assessed_qty: Decimal | None = None
+    certified_qty: Decimal | None = None
 
 
 class ProgressClaimLineResponse(BaseModel):
@@ -495,6 +806,17 @@ class ProgressClaimLineResponse(BaseModel):
     period_completed_value: Decimal
     period_completed_pct: Decimal
     cumulative_completed_value: Decimal
+    # G703 column D as stored when the line was written. None on a line
+    # written before the column existed; the G703 builder then derives it.
+    prior_completed_value: Decimal | None = None
+    materials_stored_value: Decimal = Decimal("0")
+    # G703 column I on this line, on work and on stored materials, and the
+    # rate that gives it. Null until the retention engine has run.
+    retention_to_date: Decimal | None = None
+    retention_stored_to_date: Decimal | None = None
+    retention_rate: Decimal | None = None
+    assessed_qty: Decimal
+    certified_qty: Decimal
     created_at: datetime
     updated_at: datetime
 
@@ -546,10 +868,21 @@ class ProgressClaimPopulatePreviewItem(BaseModel):
     observed_pct: Decimal = Field(default=Decimal("0"))
     period_label: str | None = None
     recorded_at: datetime | None = None
-    # Derived figures at the observed percent.
+    # Derived figures at the observed percent. The observed percent is to
+    # date, so the period value is what it adds over the earlier claims.
     period_completed_qty: Decimal = Field(default=Decimal("0"))
     period_completed_value: Decimal = Field(default=Decimal("0"))
+    prior_completed_value: Decimal = Field(default=Decimal("0"))
     cumulative_completed_value: Decimal = Field(default=Decimal("0"))
+    # The observed percent is below what the earlier claims already billed on
+    # this line. The period value is held at zero; a person decides whether
+    # the earlier claims overstated the work.
+    percent_regressed: bool = False
+    # Set on a line a change order added beside the line it adjusts: it has
+    # no bill position of its own and is billed at the percent observed on
+    # that line's position, which ``boq_position_id`` then is.
+    adjusts_contract_line_id: UUID | None = None
+    adjusts_line_code: str = ""
 
 
 class ProgressClaimPopulatePreviewResponse(BaseModel):
@@ -611,11 +944,14 @@ class FinalAccountCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     contract_id: UUID
-    final_contract_value: Decimal = Field(default=Decimal("0"))
-    total_paid: Decimal = Field(default=Decimal("0"))
-    retention_held: Decimal = Field(default=Decimal("0"))
-    retention_released: Decimal = Field(default=Decimal("0"))
-    final_balance: Decimal = Field(default=Decimal("0"))
+    # None means "not stated", which is not zero: the service keeps an agreed
+    # final account's figure or reads it from the claims. A default of 0 here
+    # made the Close button record that no retention was ever held.
+    final_contract_value: Decimal | None = None
+    total_paid: Decimal | None = None
+    retention_held: Decimal | None = None
+    retention_released: Decimal | None = None
+    final_balance: Decimal | None = None
     sign_off_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     sign_off_by: str | None = None
     status: str = Field(default="draft", pattern=rf"^({FINAL_ACCOUNT_STATUSES})$")
@@ -729,14 +1065,21 @@ class AIAG703Line(BaseModel):
     line_number: int
     item_number: str
     description: str
-    scheduled_value: Decimal
+    # None on the row for money no schedule line carries: it has no scheduled
+    # value, so nothing to measure a percent or a balance against. Printed as
+    # empty cells, never as zero. Required all the same, so a row that forgets
+    # them fails here rather than printing a blank nobody meant.
+    scheduled_value: Decimal | None
     previous_value: Decimal
     this_period_value: Decimal
     materials_stored: Decimal
     total_completed_stored: Decimal
-    percent_complete: Decimal
-    balance_to_finish: Decimal
+    percent_complete: Decimal | None
+    balance_to_finish: Decimal | None
     retainage: Decimal
+    # Column I split into work and stored materials; they add up to it.
+    retainage_completed_work: Decimal = Decimal("0")
+    retainage_stored_materials: Decimal = Decimal("0")
 
 
 class AIAG702Summary(BaseModel):
@@ -747,8 +1090,15 @@ class AIAG702Summary(BaseModel):
     contract_sum_to_date: Decimal
     total_completed_stored: Decimal
     retainage: Decimal
+    # Line 5a (of completed work) and 5b (of stored material); 5 = 5a + 5b.
+    retainage_completed_work: Decimal = Decimal("0")
+    retainage_stored_materials: Decimal = Decimal("0")
     total_earned_less_retainage: Decimal
     previous_certificates_total: Decimal
+    # Where line 7 came from: "snapshot" when it is the previous claim's
+    # certified line 6, "reconstructed" while it is rebuilt from the prior
+    # claims' stored gross and retention.
+    previous_certificates_basis: str | None = None
     current_payment_due: Decimal
     balance_to_finish: Decimal
 
@@ -986,7 +1336,14 @@ class EOTClaimResponse(BaseModel):
 # == ContractDocument (documents register) =================================
 
 
-DOC_ROLES = "executed_agreement|drawing|specification|bond|insurance|correspondence|variation|other"
+#: What a registered contract document is. The close-out roles are the
+#: evidence a retention release asks for (see the progress billing block of
+#: the regional packs); they are neutral names, not any form's number.
+DOC_ROLES = (
+    "executed_agreement|drawing|specification|bond|insurance|correspondence|variation|"
+    "certificate_substantial_completion|acceptance_protocol|affidavit_payment_of_debts|"
+    "affidavit_release_of_liens|consent_of_surety|final_lien_waiver|final_invoice|other"
+)
 
 
 class ContractDocumentCreate(BaseModel):
@@ -1031,6 +1388,9 @@ class ContractDocumentResponse(BaseModel):
 
 MILESTONE_TRIGGERS = "date|completion|approval"
 MILESTONE_STATUSES = "pending|reached|invoiced|paid"
+#: What a payment-plan instalment is for. The statutory deposit ceilings read
+#: ``deposit``; nothing infers it from the order or the dates.
+MILESTONE_KINDS = "deposit|progress|final"
 
 
 class ContractMilestoneCreate(BaseModel):
@@ -1046,6 +1406,10 @@ class ContractMilestoneCreate(BaseModel):
     percent_of_contract: Decimal | None = Field(default=None, ge=0, le=100)
     trigger: str = Field(default="date", pattern=rf"^({MILESTONE_TRIGGERS})$")
     status: str = Field(default="pending", pattern=rf"^({MILESTONE_STATUSES})$")
+    kind: str = Field(default="progress", pattern=rf"^({MILESTONE_KINDS})$")
+    lag_days: int = Field(default=0, ge=0, le=365)
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    client_visible: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1059,6 +1423,10 @@ class ContractMilestoneUpdate(BaseModel):
     percent_of_contract: Decimal | None = Field(default=None, ge=0, le=100)
     trigger: str | None = Field(default=None, pattern=rf"^({MILESTONE_TRIGGERS})$")
     status: str | None = Field(default=None, pattern=rf"^({MILESTONE_STATUSES})$")
+    kind: str | None = Field(default=None, pattern=rf"^({MILESTONE_KINDS})$")
+    lag_days: int | None = Field(default=None, ge=0, le=365)
+    payment_terms_days: int | None = Field(default=None, ge=0, le=365)
+    client_visible: bool | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -1074,9 +1442,84 @@ class ContractMilestoneResponse(BaseModel):
     percent_of_contract: Decimal | None = None
     trigger: str
     status: str
+    kind: str = "progress"
+    activity_id: UUID | None = None
+    schedule_id: UUID | None = None
+    lag_days: int = 0
+    payment_terms_days: int | None = None
+    forecast_reached_date: str | None = None
+    forecast_due_date: str | None = None
+    reached_at: str | None = None
+    client_visible: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
     updated_at: datetime
+
+
+# Payment plan: instalments that follow the schedule =======================
+
+
+class ContractMilestoneActivityLink(BaseModel):
+    """Which schedule activity an instalment follows; ``null`` stops following one."""
+
+    activity_id: UUID | None
+
+
+class ContractMilestoneLinkResponse(ContractMilestoneResponse):
+    """The instalment after linking, with anything the person should know about the link.
+
+    ``warnings`` holds codes, not sentences: ``date_trigger_ignores_schedule``
+    (the instalment's trigger is a fixed date, so the link does not move it).
+    Linking an activity that is not a milestone is refused outright (422
+    ``activity_not_milestone``), so it never appears here.
+    """
+
+    warnings: list[str] = Field(default_factory=list)
+
+
+class PaymentPlanLine(ContractMilestoneResponse):
+    """One instalment as the plan reads today.
+
+    ``forecast_reached_date`` and ``forecast_due_date`` are worked out from the
+    linked activity's current finish when the plan is read, not copied from
+    the stored columns, which schedule events refresh.
+    """
+
+    forecast_at: str | None = None
+    #: When the instalment would fall due on the contract's own date, lag and
+    #: terms applied; the baseline ``forecast_due_date`` moved from.
+    planned_due_date: str | None = None
+    amount: Decimal
+    activity_name: str | None = None
+    activity_missing: bool = False
+    client_status: str
+    days_moved: int | None = None
+    claim_id: UUID | None = None
+    claim_status: str | None = None
+
+
+class PaymentPlanFinding(BaseModel):
+    """A failed ``payment_plan`` rule, worded in the caller's language."""
+
+    rule_id: str
+    severity: str
+    message: str
+    element_ref: str | None = None
+    suggestion: str | None = None
+    details: dict[str, str] = Field(default_factory=dict)
+
+
+class PaymentPlanResponse(BaseModel):
+    """A contract's payment plan: its instalments, their totals and the rule findings."""
+
+    contract_id: UUID
+    currency: str
+    contract_total: Decimal
+    scheduled_total: Decimal
+    percent_scheduled: Decimal | None = None
+    default_payment_terms_days: int | None = None
+    lines: list[PaymentPlanLine] = Field(default_factory=list)
+    findings: list[PaymentPlanFinding] = Field(default_factory=list)
 
 
 # Final-account readiness checklist (close-out conditions) ==================
@@ -1174,8 +1617,8 @@ class ContractTemplateCreate(BaseModel):
     # of must not need a migration to be grouped.
     family: str = Field(default="", max_length=40)
     description: str = Field(default="")
-    retention_release_event: str = Field(
-        default="practical_completion",
+    retention_release_event: ReleaseEvent = Field(
+        default="substantial_completion",
         pattern=rf"^({RETENTION_RELEASE_EVENTS})$",
     )
     clauses: list[TemplateClauseInput] = Field(default_factory=list)
@@ -1194,7 +1637,7 @@ class ContractTemplateUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=500)
     family: str | None = Field(default=None, max_length=40)
     description: str | None = None
-    retention_release_event: str | None = Field(
+    retention_release_event: ReleaseEvent | None = Field(
         default=None,
         pattern=rf"^({RETENTION_RELEASE_EVENTS})$",
     )
@@ -1236,7 +1679,7 @@ class ContractTemplateResponse(BaseModel):
     name: str
     family: str = ""
     description: str = ""
-    retention_release_event: str
+    retention_release_event: ReleaseEvent
     status: str
     published_at: datetime | None = None
     published_by: str | None = None
@@ -1262,7 +1705,7 @@ class TemplateCatalogueEntry(BaseModel):
     name: str
     family: str
     description: str = ""
-    retention_release_event: str
+    retention_release_event: ReleaseEvent
     clause_count: int
     source: str
     editable: bool
@@ -1334,3 +1777,26 @@ class ContractSigningSessionResponse(BaseModel):
     content_hash_current: bool
     stale_signatories: list[str] = Field(default_factory=list)
     signed_roles: list[str] = Field(default_factory=list)
+
+
+class SovReconcileConfirm(BaseModel):
+    """Body for ``POST /contracts/{id}/sov/reconcile-change-orders``.
+
+    The source keys the person ticked in the preview. The server posts only
+    when every one of them is still on offer; the ones left unticked stay on
+    offer.
+    """
+
+    source_keys: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class SovReconcileExclusion(BaseModel):
+    """Body for ``POST /contracts/{id}/sov/reconcile-change-orders/exclusions``.
+
+    ``excluded=True`` sets the change aside as already on the schedule of
+    values (a line added by hand), ``False`` takes that decision back.
+    """
+
+    source_key: str = Field(..., min_length=1, max_length=120)
+    excluded: bool = True
+    reason: str = Field(default="", max_length=500)

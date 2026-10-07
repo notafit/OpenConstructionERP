@@ -13,11 +13,11 @@ Endpoints:
 """
 
 import logging
-import re
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.core.money import read_written_amount
 from app.dependencies import CurrentUserId, RequirePermission, SessionDep, verify_project_access
 from app.modules.ncr.schemas import (
     NCRCreate,
@@ -30,36 +30,36 @@ from app.modules.ncr.service import NCRService
 router = APIRouter(tags=["ncr"])
 logger = logging.getLogger(__name__)
 
-# Matches a free-text cost_impact like "BRL 12000", "USD 1,250.50" or "12000".
-# Group 1 = optional leading 3-letter ISO code; group 2 = the numeric amount.
-_COST_IMPACT_RE = re.compile(r"^\s*([A-Za-z]{3})?\s*([\d.,]+)\s*$")
 
-
-def _parse_cost_impact(raw: str | None) -> tuple[str, str | None]:
+def _parse_cost_impact(
+    raw: str | None,
+    *,
+    currency_hint: str | None = None,
+) -> tuple[str, str | None, str | None]:
     """Best-effort split of an NCR's free-text ``cost_impact`` into amount + ISO currency.
 
-    The NCR ``cost_impact`` column is free text (e.g. ``"BRL 12000"``) - amount and
+    The NCR ``cost_impact`` column is free text (e.g. ``"BRL 12.000,00"``) - amount and
     currency jammed into one string. ``ChangeOrder.cost_impact`` is a numeric MoneyType
     whose ``_to_decimal`` coercion returns 0 for any non-numeric input, so passing the
     raw string silently zeroes the escalated change order's cost.
 
-    This returns ``(numeric_amount_str, currency_or_none)``:
-      * a leading 3-letter ISO code (if present) is stripped out and returned separately;
-      * thousands separators (``,``) are removed so the numeric part survives coercion;
-      * if the string cannot be parsed, the amount falls back to ``"0"`` and currency to
-        ``None`` (the caller then uses the project currency).
+    Read with :func:`app.core.money.read_written_amount`, so the decimal separator is
+    the one the person used: ``"BRL 12.000,00"`` is twelve thousand, not twelve, and a
+    trailing code (``"12000 EUR"``) counts. ``currency_hint`` (the project currency)
+    only settles a lone separator followed by three digits.
+
+    Returns ``(numeric_amount_str, currency_or_none, needs_review)``. When no single
+    non-negative amount can be read the amount is ``"0"``; the currency written with
+    it is still returned, otherwise ``None`` and the caller uses the project currency.
+    ``needs_review`` is ``"ambiguous"`` or ``"unreadable"`` when the text holds digits
+    that do not make one clear amount, so the order can say a person must enter it
+    (``AMOUNT_NEEDS_REVIEW_KEY`` in ``app.modules.changeorders.events``), else ``None``.
     """
-    if not raw:
-        return "0", None
-    match = _COST_IMPACT_RE.match(raw)
-    if not match:
-        # Ambiguous / unparseable free text: keep amount safe and defer currency to project.
-        return "0", None
-    code, amount = match.groups()
-    # Strip thousands separators so "12,000" -> "12000" instead of truncating to 12.
-    amount = amount.replace(",", "")
-    currency = code.upper() if code else None
-    return amount or "0", currency
+    written = read_written_amount(raw, currency_hint=currency_hint)
+    needs_review = written.status if written.status in ("ambiguous", "unreadable") else None
+    if written.amount is None or written.amount < 0:
+        return "0", written.currency, needs_review
+    return str(written.amount), written.currency, None
 
 
 def _get_service(session: SessionDep) -> NCRService:
@@ -197,18 +197,34 @@ async def create_variation_from_ncr(
 ) -> dict:
     """Create a change order/variation pre-filled from an NCR with cost impact.
 
-    The NCR must have a non-empty cost_impact value.
+    The NCR must have a non-empty cost_impact value and must not be void.
     Pre-fills the change order with the NCR title, description, and cost impact.
+    Repeating the call returns the change order already linked to the NCR
+    instead of creating another one.
     """
     ncr = await service.get_ncr(ncr_id)
     # IDOR guard: ncr.update is a global role; without this any holder could
     # escalate an NCR in a project they cannot access into a change order.
     await verify_project_access(ncr.project_id, str(user_id), session)
+    # Row lock shared with app.modules.changeorders.events, which drafts the
+    # same change order when the NCR is closed. Both sides take it before
+    # reading change_order_id, so whichever runs second sees the first one's
+    # link instead of minting a second order.
+    await session.refresh(ncr, with_for_update=True)
 
     if not ncr.cost_impact:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="NCR has no cost impact - cannot create a variation.",
+        )
+
+    # A void NCR was raised in error. It is frozen like a closed one, and unlike
+    # a closed one (whose cost is often recovered after the fix is verified) it
+    # has no cost to recover, so it does not become a change order.
+    if ncr.status == "void":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A void NCR was raised in error and has no cost to recover, so no change order is created from it.",
         )
 
     # Lazy import changeorders module
@@ -220,6 +236,29 @@ async def create_variation_from_ncr(
         from app.modules.projects.models import Project
 
         repo = ChangeOrderRepository(session)
+
+        # One NCR, one change order. Every call used to mint another change
+        # order carrying the same cost and re-point the NCR at the newest,
+        # leaving the earlier ones in the project's change order register with
+        # metadata that still names this NCR, so a double click or a retry
+        # counted the cost twice. The RFI handoff already works this way: when
+        # the linked change order still exists it is returned unchanged, and a
+        # link whose change order was deleted falls through and mints afresh.
+        if ncr.change_order_id:
+            try:
+                existing_order_id = uuid.UUID(str(ncr.change_order_id))
+            except (ValueError, TypeError):
+                existing_order_id = None
+            existing_order = await repo.get_by_id(existing_order_id) if existing_order_id is not None else None
+            if existing_order is not None:
+                logger.info("NCR %s already linked to change order %s - returning it", ncr_id, existing_order.code)
+                return {
+                    "change_order_id": str(existing_order.id),
+                    "code": existing_order.code,
+                    "ncr_id": str(ncr_id),
+                    "title": existing_order.title,
+                }
+
         count = await repo.count_for_project(ncr.project_id)
         code = f"CO-{count + 1:03d}"
 
@@ -227,8 +266,10 @@ async def create_variation_from_ncr(
         # Passing it raw to ChangeOrder.cost_impact (a numeric MoneyType) coerces
         # to Decimal('0'), silently dropping the cost, and the ChangeOrder.currency
         # column was left blank - so the rollup treated the lost amount as base
-        # currency. Split a clean numeric amount + any leading ISO code here.
-        amount, parsed_currency = _parse_cost_impact(ncr.cost_impact)
+        # currency. Split a clean numeric amount + any ISO code written with it
+        # here, read in the separator convention it was typed in.
+        project_currency = await session.scalar(select(Project.currency).where(Project.id == ncr.project_id))
+        amount, parsed_currency, needs_review = _parse_cost_impact(ncr.cost_impact, currency_hint=project_currency)
 
         # Guard the escalated amount exactly as ChangeOrderCreate does: an
         # absurd-magnitude NCR cost (e.g. a fat-fingered 16-digit value) would
@@ -247,7 +288,6 @@ async def create_variation_from_ncr(
         # Prefer the currency parsed from the NCR's own cost_impact; otherwise fall
         # back to the project's real currency. NEVER hardcode "EUR" - load the
         # project's currency, and leave blank ("") if the project has none set.
-        project_currency = await session.scalar(select(Project.currency).where(Project.id == ncr.project_id))
         currency = parsed_currency or (project_currency or "")
 
         description_parts = [
@@ -279,6 +319,9 @@ async def create_variation_from_ncr(
                 "ncr_number": ncr.ncr_number,
                 # Preserve the original free-text value for traceability/audit.
                 "ncr_cost_impact_raw": ncr.cost_impact,
+                # Same key the automatic draft sets: the amount is 0 because the
+                # text could not be read as one amount, not because it is free.
+                **({"amount_needs_review": needs_review} if needs_review else {}),
             },
         )
         session.add(order)

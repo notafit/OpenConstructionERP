@@ -50,6 +50,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Same reason as ci.yml: a release candidate branch can be gated by hand.
+  workflow_dispatch:
 
 jobs:
   backend-postgres:
@@ -69,6 +71,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
       - name: Create empty frontend dist (hatchling force-include)
         run: |
           mkdir -p ../frontend/dist
@@ -204,6 +208,23 @@ jobs:
       - name: Run cost region currency table tests
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pytest tests/unit/costs/test_region_currency_fallback.py -q -p no:cacheprovider
+      # The streamed cost base import. A country base read into one pandas frame
+      # peaked at 2 to 8 GiB, on a server whose 3 GB floor leaves about 1.8 GiB
+      # for an import, so the loader reads the parquet a few thousand rows at a
+      # time. The unit file holds the stream to a frozen copy of the whole-frame
+      # import row for row and flush for flush, and bounds its traced memory
+      # against the base size, so a convenience read of the whole file fails
+      # here on the commit that brings it back. The integration file compares
+      # what PostgreSQL ends up holding through the real COPY. Attached for the
+      # same reason as the suites around it: tests/unit runs in no lane that
+      # blocks a merge, and the integration file only ran nightly. The real
+      # bases and their resident peak are measured in "Pack cost bases" below.
+      - name: Run streamed cost import tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          pytest tests/unit/test_cwicr_import_streams_in_batches.py
+          tests/integration/costs/test_cwicr_streamed_import_on_postgres.py
+          -q -p no:cacheprovider --timeout=300 --timeout-method=thread
       # The AI rate limit on the compliance NL builder. Attached for the same
       # reason as the suites around it, and for a sharper one: the guard it
       # covers was written on the wrong endpoint. check_ai_rate_limit shipped
@@ -355,6 +376,37 @@ jobs:
             -q -p no:cacheprovider --timeout=300 --timeout-method=thread | tee doclang.log
           if grep -qE '[0-9]+ skipped' doclang.log; then
             echo "::error::A document language test skipped instead of running. This step proved nothing about the headers it is here to gate." >&2
+            exit 1
+          fi
+      # What still points at a document, and what the Issue Hub can see.
+      #
+      # Both files existed before this step and neither was run by a lane
+      # anybody reads, which is the same as not having them: a gate that
+      # nothing executes records a decision instead of enforcing one.
+      #
+      # test_document_reference_integrity holds the twenty-eight unconstrained
+      # document references and checks the runtime registry against them three
+      # ways - coverage, resolution in the ORM, and impact classification
+      # against column nullability. The last one is the reason the endpoint can
+      # tell a user that a row will be "left pointing at nothing" rather than
+      # merely unlinked, so it has to stay true to the schema rather than to
+      # somebody's memory of it. test_issue_hub_sources does the same job for
+      # the defect registers the hub does not read.
+      #
+      # The integration file boots the application against the service
+      # container this job already provides, the same trade the step above
+      # makes: three or four minutes locally, where the cost is a PostgreSQL
+      # cluster this job does not have to start, and far less here.
+      - name: Run document reference and issue hub gates
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          pytest tests/unit/test_document_reference_integrity.py \
+            tests/unit/test_issue_hub_sources.py \
+            tests/integration/test_document_references_endpoint.py \
+            -q -p no:cacheprovider --timeout=600 --timeout-method=thread | tee docrefs.log
+          if grep -qE '[0-9]+ skipped' docrefs.log; then
+            echo "::error::A document reference gate skipped instead of running. This step proved nothing about the references it is here to pin." >&2
             exit 1
           fi
       # The unit vocabulary, attached for the same reason as the suite above it.
@@ -773,6 +825,28 @@ jobs:
           pytest tests/modules/bim_hub/test_cad_upload_cross_link.py
           tests/modules/bim_hub/test_sheets_pdf_cross_link.py
           -q -p no:cacheprovider --timeout=300 --timeout-method=thread
+      # The funding module's own tests ran in no lane anyone reads, for the same
+      # reason as the BIM guards above: the sharded backend lane runs tests/unit
+      # only and no step here named tests/modules/funding. Only its PG backfill
+      # test was gated, through the tests/pg step. Named file by file like the
+      # other tests/modules steps, so a new file in that directory is ungated
+      # until it is added here. Measured 2026-09-21 on Windows: 185 passed,
+      # 0 skipped, about three minutes, most of it cluster boot and clones.
+      - name: Run funding module tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          pytest tests/modules/funding/test_funding_dates.py
+          tests/modules/funding/test_funding_derived_obligation_keeps_its_wording.py
+          tests/modules/funding/test_funding_list_pages.py
+          tests/modules/funding/test_funding_messages.py
+          tests/modules/funding/test_funding_obligation_is_translatable.py
+          tests/modules/funding/test_funding_obligation_row_predating_columns.py
+          tests/modules/funding/test_funding_service.py
+          tests/modules/funding/test_funding_validator_money_formatting.py
+          tests/modules/funding/test_funding_validators.py
+          tests/modules/funding/test_migration_names_match_the_models.py
+          tests/modules/funding/test_module_registration.py
+          -q -p no:cacheprovider --timeout=300 --timeout-method=thread
       # The cost base pipeline produces the parquet editions people download from us, so it
       # needs a blocking gate. It needs no database; it is attached here because this is the
       # only merge-blocking lane that runs pytest, and an ungated test is the situation this
@@ -1072,6 +1146,38 @@ jobs:
           tests/modules/property_dev/test_owner_scoped_delete_invariant.py
           tests/modules/property_dev/test_service_surface_resolves.py
           -q -p no:cacheprovider --timeout=300 --timeout-method=thread
+      # Named here because the guard existed and no push lane collected it.
+      # Measured 2026-09-23 against an export: the frozen -k chain in ci.yml
+      # selects "no tests collected (7 deselected)" on this file, the
+      # tenant_isolation marker selects the same nothing, and the named
+      # tests/modules list above does not include it. Unfiltered it is 7 tests.
+      # So the only lane that ran it was the nightly, which is not one of the
+      # two we act on, and "pinned" meant "somebody reads it in the morning".
+      #
+      # What it pins is worth the step. A claim's stored gross, retention and
+      # net are asserted together after a create, an update and a delete on a
+      # cost-plus contract, so a net written over a stale gross goes red on the
+      # second assertion rather than shipping as a wrong figure on a payment
+      # application. Its two siblings in the same file cover the engine path, so
+      # the whole file is named rather than the one test.
+      #
+      # test_contracts_mixed_shape_certificate.py rides the same step and is a
+      # different kind of guard: three of its six tests are xfail(strict=True)
+      # because the defect they describe is real and not yet fixed. It is strict
+      # rather than plain so the lane cannot go quietly green when somebody
+      # repairs the branch: the xpass fails the step and the marker has to be
+      # removed with the fix. It is xfail rather than a hard red because this is
+      # a lane we act on, and a lane carrying a permanently red test teaches
+      # everyone to skim past red. To see them fail on demand, add --runxfail.
+      # The three that pass are controls and are not padding: the lump-sum one
+      # localizes the fault to the flat retention branch rather than to the
+      # certificate builder, so a reader does not go and edit the wrong file.
+      - name: Run contract claim line write guards
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          pytest tests/modules/test_contracts_claim_line_writes.py
+          tests/modules/test_contracts_mixed_shape_certificate.py
+          -q -p no:cacheprovider --timeout=300 --timeout-method=thread
       # Two steps rather than one because two halves is how the integration set
       # was actually measured, and a single process holding all eighteen files
       # has never been run anywhere. The extra cluster boot is seconds; a first
@@ -1098,6 +1204,8 @@ jobs:
           tests/integration/test_resources_idor.py
           tests/integration/test_schedule_advanced_idor.py
           tests/integration/test_schedule_idor.py
+          tests/integration/test_schedule_percent_type_preview.py
+          tests/integration/test_schedule_bim_links_add.py
           tests/integration/test_service_idor.py
           tests/integration/test_snag_warranty_idor.py
           tests/integration/test_subcontractors_idor.py
@@ -1345,19 +1453,31 @@ jobs:
     # anywhere the test can read, so a change to that scheme would pass here and
     # break in the browser. Worth knowing before trusting this entry further
     # than it goes.
+    #
+    # The Uzbek locale entry is here because nothing else in either workflow
+    # sees the class it covers. A straight ASCII apostrophe where Uzbek Latin
+    # writes the turned comma after o and g, or the modifier letter for the
+    # glottal stop, passes every locale gate in the hygiene workflow: those look
+    # for lost diacritics, mojibake and mixed scripts, and a plain quote is none
+    # of them. The one test that reads for it ran only in the other workflow,
+    # where it was already failing on five older strings, so sixty-one new ones
+    # arrived over two days behind a failure count that did not move.
     timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
     env:
-      # Twelve of the thirty-nine files below are jsdom component tests, which
+      # Fourteen of the fifty-three files below are jsdom component tests, which
       # are the expensive kind, and this runner has four cores rather than the
       # twelve the local measurement was taken on. Both figures are counted by
       # parsing this list, never by adding one to what the comment said: it read
       # "nine of twenty-one" while the list held thirty-four, because parallel
-      # sessions each appended an entry without recounting. Counted two ways
-      # this time and they agree: twelve entries end in .tsx and twelve import
-      # the React testing library, and they are the same twelve. The whole-program type check
+      # sessions each appended an entry without recounting. It drifted the same
+      # way again and said "twelve of thirty-nine" at fifty entries, so the
+      # habit the previous paragraph warned about survived the warning. Counted
+      # two ways this time and they agree: fourteen entries end in .tsx and
+      # fourteen import the React testing library, and it is the same fourteen,
+      # compared as sets rather than as counts. The whole-program type check
       # and the build in the other workflow already need this ceiling and are
       # skipped on macOS because a 9 GB heap does not fit that runner at all.
       # Running the tests under the default heap would be betting the gate on
@@ -1368,6 +1488,9 @@ jobs:
       # exists to prevent in the first place.
       FRONTEND_TEST_FILES: >-
         src/app/__tests__/clashTriageVocabulary.test.ts
+        src/app/__tests__/everyTranslationKeepsItsPlaceholders.test.ts
+        src/app/__tests__/pluralFormsAreChosenByI18nextNotByJavaScript.test.ts
+        src/app/__tests__/uzLocaleResolves.test.ts
         src/app/layout/Header.titleKeys.test.ts
         src/app/layout/navCatalog.test.ts
         src/features/assemblies/__tests__/preview-totals-no-blended-scalar.test.tsx
@@ -1383,6 +1506,7 @@ jobs:
         src/features/contracts/findingKeys.test.ts
         src/features/dashboard/__tests__/DashboardWidgetScope.test.tsx
         src/features/dashboard/__tests__/LatestSitePhotosScope.test.tsx
+        src/features/documents/DocumentDeleteWarning.test.ts
         src/features/dwg-takeoff/lib/__tests__/blocks.test.ts
         src/features/dwg-takeoff/lib/__tests__/dxf-renderer.test.ts
         src/features/dwg-takeoff/lib/__tests__/issue-426-render.test.ts
@@ -1391,20 +1515,29 @@ jobs:
         src/features/field-time/workingTime.test.ts
         src/features/file-manager/SheetsIndexPage.test.tsx
         src/features/file-manager/sheetsInsights.test.ts
+        src/features/funding/api.test.ts
+        src/features/funding/fundingInsights.test.ts
+        src/features/funding/obligationLabel.test.ts
         src/features/geo-hub/__tests__/cropPolygonPositionsAreNeverMutatedAfterConstruction.test.tsx
         src/features/integrations/calendarFeed.test.ts
+        src/features/issues/IssueHubLink.test.ts
         src/features/module-builder/api.test.ts
         src/features/module-builder/draft.test.ts
         src/features/module-builder/fields.test.ts
+        src/features/modules/__tests__/profileSignaturePopulation.test.ts
+        src/features/modules/advancedModeGap.test.ts
+        src/features/modules/profileDifference.test.ts
         src/features/punchlist/assignee.test.tsx
         src/features/punchlist/punchlistInsights.test.ts
         src/features/schedule/ScheduleResourcePanel.test.tsx
         src/shared/lib/__tests__/formatCompactCurrency.test.ts
         src/shared/lib/__tests__/formattersReadTheLocalePerCall.test.ts
+        src/shared/lib/__tests__/packsAreOfferedByMarketSize.test.ts
         src/shared/lib/__tests__/theCallSitesJoinListsInTheReadersLanguage.test.tsx
         src/shared/lib/apiHelpers.fetchAllPages.test.ts
         src/shared/lib/i18nInterpolatedKeys.test.ts
         src/shared/lib/projectFileFormats.test.ts
+        src/shared/ui/ModuleGuide.test.tsx
         tests/pwa/manifest.test.ts
         tests/pwa/service-worker.test.ts
     steps:
@@ -1641,7 +1774,7 @@ jobs:
       # identical in schema to the working tree. Measured, at the time this job
       # was written: v15.4.0..HEAD adds zero migration revisions and changes
       # zero model files, so a pin at 15.4.0 would leave this job with nothing
-      # at all to heal. From 15.3.1 there are eight columns across six tables.
+      # at all to heal. From 15.3.0 there are eight columns across six tables.
       #
       # Moving this pin BACKWARDS is always safe; it only widens what is
       # covered. Moving it FORWARDS has two failure modes, and both are loud
@@ -1664,7 +1797,7 @@ jobs:
       #   COVERED - arrives with NO revision recorded, because the wheel it came
       #     from shipped no alembic.ini. The current code stamps it at head on
       #     boot and alembic_head_matches reads true afterwards. That is the
-      #     15.3.1 cohort, and it is the whole of what this job proves.
+      #     15.3.0 cohort, and it is the whole of what this job proves.
       #   NOT COVERED - arrives already stamped at an OLDER revision, which is
       #     every install from 15.4.0 onward. Nothing advances that stamp, so
       #     alembic_head_matches reads false in perpetuity, and the replay an
@@ -1685,7 +1818,7 @@ jobs:
       # dimension plus a per-cohort branch in check 4, not a new job. Not done
       # here: widening the DDL gate was the task, and changing what the
       # verifier asserts about a shipped behaviour is a separate decision.
-      OE_UPGRADE_FROM_VERSION: "15.3.1"
+      OE_UPGRADE_FROM_VERSION: "15.3.0"
       OE_UPGRADE_AGED_STATE: ${{ github.workspace }}/aged-database-state.json
       DATABASE_URL: postgresql+asyncpg://oe:oe@localhost:5432/openconstructionerp_upgrade
       DATABASE_SYNC_URL: postgresql+psycopg2://oe:oe@localhost:5432/openconstructionerp_upgrade
@@ -1749,3 +1882,180 @@ jobs:
         # code, the schema moved, /api/health agrees that it moved, and an
         # authenticated read of the affected register answers 200.
         run: python scripts/verify_upgrade_from_previous_release.py
+
+  # Every pack installed the way an admin installs it, each on a fresh
+  # database cloned from a booted template. The unit suite checks pack wiring
+  # from the outside and never installs anything, and every layer of the
+  # installer is fail-soft, so this is the only place a pack that installs half
+  # a workspace goes red. About a hundred demo projects in total, so it is split
+  # six ways and kept out of the main job's thirty minutes (the file skips
+  # itself unless OE_PACK_MATRIX is set).
+  pack-installs:
+    name: Pack installs (shard ${{ matrix.shard }}/6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      OE_TEST_DB: pg
+      OE_PACK_MATRIX: '1'
+      OE_PACK_SHARD: ${{ matrix.shard }}/6
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Create empty frontend dist (hatchling force-include)
+        run: |
+          mkdir -p ../frontend/dist
+          touch ../frontend/dist/.gitkeep
+      - name: Install dependencies
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,server]"
+      - name: Install every pack on a fresh database
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          pytest tests/pg/test_every_pack_installs.py -v -rA -p no:cacheprovider
+          --timeout=1800 --timeout-method=thread --durations=0
+
+  # Every cost base a pack resolves to, downloaded from the public CWICR
+  # repository and imported on a fresh database, with the import's own memory
+  # peak printed next to the largest PostgreSQL backend. This is where the
+  # 3 GB floor in CLAUDE.md principle 1 is measured rather than repeated. The
+  # parquet cache is keyed on the loader so a changed file list refetches.
+  cost-bases:
+    name: Pack cost bases (shard ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      OE_TEST_DB: pg
+      OE_COST_BASE_MATRIX: '1'
+      OE_COST_BASE_SHARD: ${{ matrix.shard }}/3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Create empty frontend dist (hatchling force-include)
+        run: |
+          mkdir -p ../frontend/dist
+          touch ../frontend/dist/.gitkeep
+      - name: Install dependencies
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,server]"
+      - name: Restore the downloaded cost bases
+        uses: actions/cache@v4
+        with:
+          path: ~/.openestimator/cache
+          key: cwicr-parquet-${{ matrix.shard }}-${{ hashFiles('backend/app/modules/costs/base_registry.py') }}
+      - name: Load every pack cost base and measure the import
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          pytest tests/pg/test_every_pack_cost_base_loads.py -v -s -rA -p no:cacheprovider
+          --timeout=1800 --timeout-method=thread --durations=0
+
+  # The packs as an installed wheel sees them. The unit gates read the tree and
+  # the publish workflow reads the archive only at tag time, with a floor of
+  # fifteen packs rather than the list. This builds the wheel, installs it into
+  # a clean virtualenv and asks discovery from outside the repository, so a pack
+  # that only a source checkout can see goes red before a tag exists. The
+  # frontend is a stub: the question is about the packs, not the bundle.
+  pack-wheel:
+    name: Packs in the installed wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Create empty frontend dist (hatchling force-include)
+        run: |
+          mkdir -p frontend/dist
+          touch frontend/dist/.gitkeep
+      - name: Build and install the wheel into a clean virtualenv
+        id: install
+        run: |
+          python -m pip install --upgrade build
+          (cd backend && python -m build --wheel --outdir "$RUNNER_TEMP/dist/")
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install "$RUNNER_TEMP"/dist/*.whl
+      - name: Ask the installed wheel which packs it lists
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" "$GITHUB_WORKSPACE/scripts/check_wheel_ships_every_pack.py" "$GITHUB_WORKSPACE"
+
+  # Every GET route of a fresh install, called as the demo admin. The boot is
+  # the one a self-hosted user gets: demo seed on, the showcase and flagship
+  # projects installed, every module mounted, so a route that breaks only on
+  # seeded data or only with all modules loaded together goes red here. The
+  # report table (JSON and Markdown) is uploaded whatever the verdict, since
+  # a red run is read from it. The file skips itself unless OE_API_SMOKE is set,
+  # which keeps the full seed out of the main job's thirty minutes.
+  api-smoke:
+    name: API smoke on a fresh install
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      OE_TEST_DB: pg
+      OE_API_SMOKE: '1'
+      SEED_DEMO: 'true'
+      OE_TEST_FAST_STARTUP: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Create empty frontend dist (hatchling force-include)
+        run: |
+          mkdir -p ../frontend/dist
+          touch ../frontend/dist/.gitkeep
+      - name: Install dependencies
+        id: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,server]"
+      - name: Call every GET route as the demo admin
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          OE_DATA_DIR: ${{ runner.temp }}/oe-data
+          OE_API_SMOKE_REPORT_DIR: ${{ runner.temp }}/api-smoke
+        run: >-
+          pytest tests/pg/test_every_get_route_answers_on_a_fresh_install.py -v -rA -p no:cacheprovider
+          --timeout=2700 --timeout-method=thread
+      - name: Upload the route report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-smoke-report
+          path: ${{ runner.temp }}/api-smoke/
+          if-no-files-found: warn

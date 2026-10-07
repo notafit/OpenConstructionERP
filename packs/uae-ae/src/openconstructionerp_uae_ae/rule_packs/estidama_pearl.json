@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "estidama_pearl",
+  "name": "Estidama Pearl Rating System — Sustainable Development",
+  "standard": "Estidama Pearl Building Rating System (PBRS) v1.0",
+  "jurisdiction": "AE",
+  "description": "Validates project documentation against the Estidama Pearl Building Rating System (PBRS) mandated by Abu Dhabi Urban Planning Council (now part of DMT). All new buildings in Abu Dhabi must achieve a minimum 1 Pearl rating. Checks that credit submissions cover the seven categories: Integrated Development Process (IDP), Natural Systems (NS), Livable Buildings (LB), Precious Water (PW), Resourceful Energy (RE), Stewarding Materials (SM), and Innovating Practice (IP).",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "estidama.pearl_rating_target_set",
+    "estidama.pearl_1_minimum_mandatory",
+    "estidama.idp_integrated_development_process_documented",
+    "estidama.ns_natural_systems_credits_assessed",
+    "estidama.lb_livable_buildings_credits_assessed",
+    "estidama.pw_precious_water_credits_assessed",
+    "estidama.re_resourceful_energy_credits_assessed",
+    "estidama.sm_stewarding_materials_credits_assessed",
+    "estidama.ip_innovating_practice_credits_assessed",
+    "estidama.design_rating_submission_present",
+    "estidama.construction_rating_submission_provisions",
+    "estidama.leed_or_estidama_declared"
+  ],
+  "regulator": "DMT (Department of Municipalities and Transport, Abu Dhabi)",
+  "publication_year": 2010
+}

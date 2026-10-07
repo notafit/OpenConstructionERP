@@ -383,14 +383,19 @@ const FIXED_ALLOWED: ReadonlyArray<{ file: string; snippet: string; why: string 
   /* FIXED-ALLOWED:START */
   [
   {
-    file: 'features/finance/FinancePage.tsx',
-    snippet: 'unit_rate: lineAmount.toFixed(2),',
-    why: 'A field of the invoice line posted to the API, which parses it as a decimal.',
+    file: 'features/finance/invoiceLines.ts',
+    snippet: "return Number.isFinite(value) ? value.toFixed(decimals) : '';",
+    why: 'The value of an <input type="number"> and of the invoice line posted to the API; both parse a plain decimal.',
   },
   {
-    file: 'features/finance/FinancePage.tsx',
-    snippet: 'amount: lineAmount.toFixed(2),',
-    why: 'The same invoice line, same request. Grouping it would reach the server as a different number.',
+    file: 'features/finance/markInvoicePaid.ts',
+    snippet: 'amount: cash.toFixed(2),',
+    why: 'Body of the record-payment POST, which the server parses as a decimal.',
+  },
+  {
+    file: 'features/finance/markInvoicePaid.ts',
+    snippet: 'withholding_amount: withheld.toFixed(2),',
+    why: 'The same record-payment request. Grouping it would reach the server as a different number.',
   },
   {
     file: 'features/procurement/ProcurementPage.tsx',
@@ -513,6 +518,24 @@ function sourceFiles(dir: string, found: string[] = []): string[] {
   return found;
 }
 
+// The tree is walked, read and classified once, here, while the file is
+// collected. Doing it inside the tests put two thousand cold reads and two
+// full-tree censuses on the per-test clock, and under a loaded suite that alone
+// ran past the timeout: the census then reported nothing, which is worse than
+// red. Collection has no per-test timeout, and nothing below writes to the tree.
+const SOURCES = sourceFiles(SRC).map((file) => ({
+  rel: relative(SRC, file).replace(/\\/g, '/'),
+  text: readFileSync(file, 'utf8'),
+}));
+const TEXT_BY_REL = new Map(SOURCES.map((s) => [s.rel, s.text]));
+const readRel = (rel: string) => TEXT_BY_REL.get(rel) ?? readFileSync(join(SRC, rel), 'utf8');
+const BROWSER_LOCALE_OFFENDERS = SOURCES.flatMap(({ rel, text }) =>
+  browserLocaleSites(text, rel).map((h) => `${h.file}:${h.line}  ${h.text}`),
+);
+const FIXED_DECIMAL_OFFENDERS = SOURCES.flatMap(({ rel, text }) =>
+  fixedDecimalSites(text, rel).map((h) => `${h.file}:${h.line}  ${h.text}`),
+);
+
 describe('every number and date is written in the language the reader picked', () => {
   const original = i18next.language;
   afterAll(() => {
@@ -520,16 +543,13 @@ describe('every number and date is written in the language the reader picked', (
   });
 
   it('finds no call site that asks the browser instead', () => {
-    const offenders = sourceFiles(SRC).flatMap((file) => {
-      const rel = relative(SRC, file).replace(/\\/g, '/');
-      return browserLocaleSites(readFileSync(file, 'utf8'), rel).map((h) => `${h.file}:${h.line}  ${h.text}`);
-    });
+    const offenders = BROWSER_LOCALE_OFFENDERS;
 
     // 308 of these existed across 140 files. Pass `getIntlLocale()` from
     // `shared/lib/formatters` as the first argument, or call one of the
     // fmt* helpers in that module.
     expect(offenders).toEqual([]);
-  }, 60_000);
+  });
 
   it('is looking at real files, so an empty result means something', () => {
     // A tree walk that visits nothing also finds no offenders, so the size of
@@ -538,8 +558,8 @@ describe('every number and date is written in the language the reader picked', (
     // in the run where it is already too late to matter. Failing here reports
     // the real number ("expected 0 to be greater than 500") in the one run
     // that needs it.
-    expect(sourceFiles(SRC).length).toBeGreaterThan(500);
-  }, 60_000);
+    expect(SOURCES.length).toBeGreaterThan(500);
+  });
 
   it('lists every deliberate exemption, so adding one shows up as a diff', () => {
     expect(ALLOWED.map((a) => `${a.file} :: ${a.snippet}`)).toEqual([
@@ -558,7 +578,7 @@ describe('every number and date is written in the language the reader picked', (
     // exemption nobody can see any more, and it would silently cover the next
     // bare call that happens to land on a line containing the same text.
     const stale = ALLOWED.filter(
-      (a) => !readFileSync(join(SRC, a.file), 'utf8').includes(a.snippet),
+      (a) => !readRel(a.file).includes(a.snippet),
     ).map((a) => a.file);
     expect(stale).toEqual([]);
   });
@@ -595,10 +615,7 @@ describe('every number and date is written in the language the reader picked', (
   });
 
   it('finds no toFixed on a number a person reads', () => {
-    const offenders = sourceFiles(SRC).flatMap((file) => {
-      const rel = relative(SRC, file).replace(/\\/g, '/');
-      return fixedDecimalSites(readFileSync(file, 'utf8'), rel).map((h) => `${h.file}:${h.line}  ${h.text}`);
-    });
+    const offenders = FIXED_DECIMAL_OFFENDERS;
 
     // 508 of these existed across 178 files. Call `fmtFixed` from
     // `shared/lib/formatters` instead, or `fmtPercent` where the call is
@@ -606,7 +623,7 @@ describe('every number and date is written in the language the reader picked', (
     // it belongs to one of the MACHINE rules above or, failing those, to
     // FIXED_ALLOWED with the argument written down.
     expect(offenders).toEqual([]);
-  }, 60_000);
+  });
 
   it('recognises a fixed-decimal number wherever it is written', () => {
     expect(fixedDecimalSites('<span>{row.qty.toFixed(2)}</span>')).toHaveLength(1);
@@ -657,14 +674,15 @@ describe('every number and date is written in the language the reader picked', (
   });
 
   it('lists every argued toFixed exemption, so adding one shows up as a diff', () => {
-    // Eighteen entries covering twenty sites in eleven files, against 139
+    // Nineteen entries covering twenty-one sites in twelve files, against 139
     // exempted by a rule.
     // The ratio is the point: rules carry the categories that repeat, and
     // anything left over has to be argued in a sentence someone can disagree
     // with. A list long enough to skim is a list nobody reads.
     expect(FIXED_ALLOWED.map((a) => `${a.file} :: ${a.snippet}`)).toEqual([
-      'features/finance/FinancePage.tsx :: unit_rate: lineAmount.toFixed(2),',
-      'features/finance/FinancePage.tsx :: amount: lineAmount.toFixed(2),',
+      "features/finance/invoiceLines.ts :: return Number.isFinite(value) ? value.toFixed(decimals) : '';",
+      'features/finance/markInvoicePaid.ts :: amount: cash.toFixed(2),',
+      'features/finance/markInvoicePaid.ts :: withholding_amount: withheld.toFixed(2),',
       'features/procurement/ProcurementPage.tsx :: amount_subtotal: String(poSubtotal.toFixed(2)),',
       'features/procurement/ProcurementPage.tsx :: amount_total: String(poTotal.toFixed(2)),',
       'features/procurement/ProcurementPage.tsx :: updated.amount = (qty * rate).toFixed(2);',
@@ -684,7 +702,7 @@ describe('every number and date is written in the language the reader picked', (
     ]);
     expect(FIXED_ALLOWED.filter((a) => a.why.length < 20)).toEqual([]);
     const stale = FIXED_ALLOWED.filter(
-      (a) => !readFileSync(join(SRC, a.file), 'utf8').includes(a.snippet),
+      (a) => !readRel(a.file).includes(a.snippet),
     ).map((a) => a.file);
     expect(stale).toEqual([]);
   });

@@ -48,13 +48,9 @@ def main() -> int:
     print("  effective_powered_by =", MANIFEST.effective_powered_by)
 
     pub = MANIFEST.to_public_dict()
-    print(
-        "to_public_dict OK      ; rule_pack count =", len(pub["validation_rule_packs"])
-    )
+    print("to_public_dict OK      ; rule_pack count =", len(pub["validation_rule_packs"]))
 
-    pack_root = (
-        pathlib.Path(__file__).parent / "src" / "openconstructionerp_saudi_vision2030"
-    )
+    pack_root = pathlib.Path(__file__).parent / "src" / "openconstructionerp_saudi_vision2030"
     rp_dir = pack_root / "rule_packs"
     expected = set(MANIFEST.validation_rule_packs)
     shipped: set[str] = set()
@@ -85,19 +81,13 @@ def main() -> int:
     assert loc["_meta"]["locale"] == "ar", "ar.json must declare locale=ar"
     keys = len(loc["translation"])
     cov = loc["_meta"]["coverage"]
-    print(
-        f"  locale ar            keys = {keys}  direction = rtl  coverage = {cov[:60]}..."
-    )
-    assert keys >= 60, (
-        f"ar.json needs >=60 high-traffic keys for partner pack, got {keys}"
-    )
+    print(f"  locale ar            keys = {keys}  direction = rtl  coverage = {cov[:60]}...")
+    assert keys >= 60, f"ar.json needs >=60 high-traffic keys for partner pack, got {keys}"
 
     # ---- onboarding ----
     ob = yaml.safe_load((pack_root / "onboarding.yaml").read_text(encoding="utf-8"))
     assert ob.get("direction") == "rtl", "onboarding.yaml must declare direction=rtl"
-    print(
-        f"  onboarding           version = {ob['version']}  steps = {len(ob['steps'])}  direction = rtl"
-    )
+    print(f"  onboarding           version = {ob['version']}  steps = {len(ob['steps'])}  direction = rtl")
     for st in ob["steps"]:
         t = st.get("title_i18n", {})
         assert "ar" in t and "en" in t, f"step {st['id']}: title_i18n missing ar or en"
@@ -108,9 +98,7 @@ def main() -> int:
     # RTL-safety probe: must contain an Arabic glyph in the wordmark and
     # a direction="rtl" attribute on the primary text element.
     assert 'direction="rtl"' in logo_xml, "logo.svg primary text must set direction=rtl"
-    assert "حزمة" in logo_xml or "السعودية" in logo_xml, (
-        "logo.svg must contain Arabic primary wordmark for RTL safety"
-    )
+    assert "حزمة" in logo_xml or "السعودية" in logo_xml, "logo.svg must contain Arabic primary wordmark for RTL safety"
     print("  logo.svg             well-formed XML, contains Arabic + direction=rtl")
 
     print("SMOKE TEST PASSED")

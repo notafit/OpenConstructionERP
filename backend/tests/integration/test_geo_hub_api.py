@@ -126,6 +126,33 @@ async def tenant_b(http_client):
     }
 
 
+async def _ensure_anchor(client: AsyncClient, tenant: dict[str, str]) -> dict:
+    """Anchor the tenant's project and return the anchor.
+
+    A test that needs the anchor makes it here instead of relying on
+    ``TestAnchors`` having run first. The full suite is split across shards
+    by test count with no regard for files, so a shard can open this module
+    in the middle, and ``-k`` filters deselect siblings the same way. The
+    POST is an upsert under the one-anchor-per-project constraint, so calling
+    it again is harmless.
+    """
+    res = await client.post(
+        "/api/v1/geo-hub/anchors/",
+        json={
+            "project_id": tenant["project_id"],
+            "lat": "52.5200",
+            "lon": "13.4050",
+            "alt": "34.0",
+            "epsg_code": 4326,
+            "region_code": "DE-BE",
+            "address": "Alexanderplatz, Berlin",
+        },
+        headers=tenant["headers"],
+    )
+    assert res.status_code in (200, 201), res.text
+    return res.json()
+
+
 # ── Anchors (8 tests) ───────────────────────────────────────────────────
 
 
@@ -198,11 +225,7 @@ class TestAnchors:
 
     @pytest.mark.asyncio
     async def test_anchor_patch(self, http_client, tenant_a):
-        anchors = await http_client.get(
-            f"/api/v1/geo-hub/anchors/?project_id={tenant_a['project_id']}",
-            headers=tenant_a["headers"],
-        )
-        anchor_id = anchors.json()[0]["id"]
+        anchor_id = (await _ensure_anchor(http_client, tenant_a))["id"]
         res = await http_client.patch(
             f"/api/v1/geo-hub/anchors/{anchor_id}",
             json={"address": "Marienplatz, Munich", "accuracy_m": "1.5"},
@@ -219,23 +242,7 @@ class TestAnchors:
         tenant_a,
         tenant_b,
     ):
-        # The sibling create test is deselected by the tenant-isolation -k
-        # filter, so create the anchor here (idempotent per project).
-        created = await http_client.post(
-            "/api/v1/geo-hub/anchors/",
-            json={
-                "project_id": tenant_a["project_id"],
-                "lat": "52.5200",
-                "lon": "13.4050",
-                "alt": "34.0",
-                "epsg_code": 4326,
-                "region_code": "DE-BE",
-                "address": "Alexanderplatz, Berlin",
-            },
-            headers=tenant_a["headers"],
-        )
-        assert created.status_code in (200, 201), created.text
-        anchor_id = created.json()["id"]
+        anchor_id = (await _ensure_anchor(http_client, tenant_a))["id"]
         # tenant_b tries to mutate tenant_a's project anchor — must 404.
         res = await http_client.patch(
             f"/api/v1/geo-hub/anchors/{anchor_id}",
@@ -252,23 +259,7 @@ class TestAnchors:
         tenant_a,
         tenant_b,
     ):
-        # The sibling create test is deselected by the tenant-isolation -k
-        # filter, so create the anchor here (idempotent per project).
-        created = await http_client.post(
-            "/api/v1/geo-hub/anchors/",
-            json={
-                "project_id": tenant_a["project_id"],
-                "lat": "52.5200",
-                "lon": "13.4050",
-                "alt": "34.0",
-                "epsg_code": 4326,
-                "region_code": "DE-BE",
-                "address": "Alexanderplatz, Berlin",
-            },
-            headers=tenant_a["headers"],
-        )
-        assert created.status_code in (200, 201), created.text
-        anchor_id = created.json()["id"]
+        anchor_id = (await _ensure_anchor(http_client, tenant_a))["id"]
         res = await http_client.get(
             f"/api/v1/geo-hub/anchors/{anchor_id}",
             headers=tenant_b["headers"],
@@ -705,13 +696,23 @@ class TestImageryAndTerrain:
 
     @pytest.mark.asyncio
     async def test_list_terrain_sources(self, http_client, tenant_a):
+        # Its own source rather than the one test_terrain_source_admin_only
+        # creates: the suite's shards split this module by test count, so
+        # that test may run in another process. Names are unique.
+        name = f"Listed-{uuid.uuid4().hex[:8]}"
+        created = await http_client.post(
+            "/api/v1/geo-hub/terrain-sources/",
+            json={"name": name, "provider": "ellipsoid"},
+            headers=tenant_a["headers"],
+        )
+        assert created.status_code == 201, created.text
         res = await http_client.get(
             "/api/v1/geo-hub/terrain-sources/",
             headers=tenant_a["headers"],
         )
         assert res.status_code == 200
         names = [t["name"] for t in res.json()]
-        assert "Ellipsoid" in names
+        assert name in names
 
 
 # ── Overlays + GeoJSON/KML (6 tests) ───────────────────────────────────
@@ -823,6 +824,18 @@ class TestOverlays:
 
     @pytest.mark.asyncio
     async def test_export_geojson_merges_overlays(self, http_client, tenant_a):
+        # Two overlays of its own, so the merge has something to merge even
+        # when the import tests ran in another shard.
+        for path, field, doc in (
+            ("import-geojson", "geojson", _SAMPLE_GEOJSON),
+            ("import-kml", "kml", _SAMPLE_KML),
+        ):
+            imported = await http_client.post(
+                f"/api/v1/geo-hub/overlays/{path}/",
+                json={"project_id": tenant_a["project_id"], "name": f"Export {path}", "kind": "boundary", field: doc},
+                headers=tenant_a["headers"],
+            )
+            assert imported.status_code == 201, imported.text
         res = await http_client.get(
             f"/api/v1/geo-hub/overlays/export-geojson/?project_id={tenant_a['project_id']}",
             headers=tenant_a["headers"],
@@ -904,11 +917,23 @@ class TestViewpoints:
 
     @pytest.mark.asyncio
     async def test_viewpoint_patch(self, http_client, tenant_a):
-        vps = await http_client.get(
-            f"/api/v1/geo-hub/viewpoints/?project_id={tenant_a['project_id']}",
+        # Its own viewpoint, not the one the create test may have made in
+        # another shard.
+        created = await http_client.post(
+            "/api/v1/geo-hub/viewpoints/",
+            json={
+                "project_id": tenant_a["project_id"],
+                "name": f"Patch me {uuid.uuid4().hex[:6]}",
+                "camera_lat": "52.520",
+                "camera_lon": "13.405",
+                "camera_alt": "500",
+                "heading": "0",
+                "pitch": "-45",
+            },
             headers=tenant_a["headers"],
         )
-        vp_id = vps.json()[0]["id"]
+        assert created.status_code == 201, created.text
+        vp_id = created.json()["id"]
         res = await http_client.patch(
             f"/api/v1/geo-hub/viewpoints/{vp_id}",
             json={"description": "From south-east"},
@@ -976,6 +1001,7 @@ class TestViewpoints:
 class TestMapConfig:
     @pytest.mark.asyncio
     async def test_map_config_returns_bundle(self, http_client, tenant_a):
+        await _ensure_anchor(http_client, tenant_a)
         res = await http_client.get(
             f"/api/v1/geo-hub/map-config/{tenant_a['project_id']}",
             headers=tenant_a["headers"],
@@ -1024,6 +1050,7 @@ class TestAnchoredProjects:
         http_client,
         tenant_a,
     ):
+        anchor = await _ensure_anchor(http_client, tenant_a)
         res = await http_client.get(
             "/api/v1/geo-hub/projects",
             headers=tenant_a["headers"],
@@ -1031,10 +1058,11 @@ class TestAnchoredProjects:
         assert res.status_code == 200, res.text
         rows = res.json()
         assert isinstance(rows, list)
-        # The earlier anchor test seeded ``tenant_a['project_id']`` with an
-        # anchor — it should appear in the global pin list.
-        ids = {r["project_id"] for r in rows}
-        assert tenant_a["project_id"] in ids
+        # The anchored project appears in the global pin list, pinned by its
+        # anchor rather than by an address fallback.
+        by_id = {r["project_id"]: r for r in rows}
+        assert tenant_a["project_id"] in by_id
+        assert by_id[tenant_a["project_id"]]["anchor_id"] == anchor["id"]
         # And every row carries the minimum fields the frontend needs to
         # paint a pin.
         for r in rows:
@@ -1052,6 +1080,8 @@ class TestAnchoredProjects:
     ):
         # tenant_b is a non-admin editor — tenant_a's anchored project
         # must NOT appear in tenant_b's list (single-tenant per-project).
+        # Anchored here, or its absence would prove nothing.
+        await _ensure_anchor(http_client, tenant_a)
         res = await http_client.get(
             "/api/v1/geo-hub/projects",
             headers=tenant_b["headers"],
@@ -1114,3 +1144,51 @@ class TestAnchoredProjects:
         assert row["anchor_id"] is None
         assert abs(float(row["lat"]) - 52.5173885) < 1e-6
         assert abs(float(row["lon"]) - 13.3951309) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_newer_projects_without_a_location_do_not_crowd_out_the_pins(self, http_client):
+        """``limit`` counts pins, not every project the caller can see.
+
+        It used to be applied before the projects without a location were
+        dropped, so a caller whose newest projects had none got fewer pins
+        than the limit, down to an empty map, while older located projects
+        existed. The admin view of a large install is where that bites; a
+        fresh account and a small limit show the same thing.
+        """
+        email, meta = await _register(http_client, "crowded")
+        await _set_role(email, "editor")
+        owner = {"headers": await _login(http_client, email, meta["_password"])}
+
+        async def _project(label: str) -> str:
+            res = await http_client.post(
+                "/api/v1/projects/",
+                json={"name": f"{label} {uuid.uuid4().hex[:6]}", "currency": "EUR"},
+                headers=owner["headers"],
+            )
+            assert res.status_code == 201, res.text
+            return res.json()["id"]
+
+        anchored = await _project("Anchored")
+        await _ensure_anchor(http_client, {**owner, "project_id": anchored})
+
+        address_only = await _project("AddrOnly")
+        from sqlalchemy import update
+
+        from app.database import async_session_factory
+        from app.modules.projects.models import Project
+
+        async with async_session_factory() as s:
+            await s.execute(
+                update(Project)
+                .where(Project.id == uuid.UUID(address_only))
+                .values(address={"city": "Munich", "lat": 48.1371, "lon": 11.5754})
+            )
+            await s.commit()
+
+        for _ in range(3):
+            await _project("Unlocated")
+
+        res = await http_client.get("/api/v1/geo-hub/projects?limit=2", headers=owner["headers"])
+        assert res.status_code == 200, res.text
+        ids = [r["project_id"] for r in res.json()]
+        assert ids == [address_only, anchored], f"the two located projects, newest first, got {ids}"

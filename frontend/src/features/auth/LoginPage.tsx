@@ -13,7 +13,7 @@ import {
   Sun, Moon, Monitor,
 } from 'lucide-react';
 import { Button, Input, Logo, LogoWithText, CountryFlag } from '@/shared/ui';
-import { useAuthStore } from '@/stores/useAuthStore';
+import { readRememberChoice, saveRememberChoice, useAuthStore } from '@/stores/useAuthStore';
 import { useBrandingStore } from '@/stores/useBrandingStore';
 import { BrandingEditorModal } from '@/app/layout/CustomBranding';
 import { extractErrorMessageFromBody } from '@/shared/lib/api';
@@ -100,9 +100,8 @@ export function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [rememberMe, setRememberMe] = useState(
-    () => localStorage.getItem('oe_remember') === '1',
-  );
+  // Checked unless the user unchecked it last time they signed in here.
+  const [rememberMe, setRememberMe] = useState(readRememberChoice);
   const [langOpen, setLangOpen] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [brandOpen, setBrandOpen] = useState(false);
@@ -237,6 +236,20 @@ export function LoginPage() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
+  // OIDC configuration (fetched once on mount)
+  const [oidcConfig, setOidcConfig] = useState<{
+    enabled: boolean;
+    issuer_url: string;
+    client_id: string;
+    scopes: string;
+  } | null>(null);
+  useEffect(() => {
+    fetch('/api/v1/users/auth/oidc/config/')
+      .then((r) => r.json())
+      .then((d) => setOidcConfig(d))
+      .catch(() => setOidcConfig(null));
+  }, []);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError('');
@@ -269,6 +282,7 @@ export function LoginPage() {
         return;
       }
       const data = await res.json();
+      saveRememberChoice(rememberMe);
       setTokens(data.access_token, data.refresh_token, rememberMe, email);
       navigate(nextPath, { replace: true });
     } catch {
@@ -311,6 +325,12 @@ export function LoginPage() {
 
       if (!res.ok) {
         const data = await res.json().catch(() => null);
+        // A real administrator exists, so the server no longer opens the
+        // demo administrator without a password (app.core.demo_admin).
+        if (data?.detail?.error === 'demo_admin_superseded') {
+          setError(t('auth.demo_admin_superseded', 'This installation has an administrator. Please sign in with your own account.'));
+          return;
+        }
         const parsed = extractErrorMessageFromBody(data);
         setError(parsed || t('auth.demo_login_failed', 'Demo login failed. Please try again.'));
         return;
@@ -875,6 +895,34 @@ export function LoginPage() {
                 <Button type="submit" variant="primary" size="lg" loading={loading} className="w-full btn-shimmer">{t('auth.login', 'Sign in')}</Button>
               </div>
             </form>
+
+            {/* OIDC / SSO login - shown when the server has OIDC enabled */}
+            {oidcConfig?.enabled && (
+              <div className="mt-3 animate-stagger-in" style={{ animationDelay: '440ms' }}>
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="flex-1 border-t border-border-light" />
+                  <span className="text-2xs text-content-tertiary">{t('auth.or', { defaultValue: 'or' })}</span>
+                  <div className="flex-1 border-t border-border-light" />
+                </div>
+                <Button
+                  variant="secondary"
+                  size="lg"
+                  className="w-full"
+                  icon={<ShieldCheck size={16} />}
+                  onClick={() => {
+                    const params = new URLSearchParams({
+                      client_id: oidcConfig.client_id,
+                      response_type: 'code',
+                      scope: oidcConfig.scopes,
+                      redirect_uri: `${window.location.origin}/auth/oidc/callback`,
+                    });
+                    window.location.href = `${oidcConfig.issuer_url}/protocol/openid-connect/auth?${params}`;
+                  }}
+                >
+                  {t('auth.sso_login', { defaultValue: 'Sign in with SSO' })}
+                </Button>
+              </div>
+            )}
 
             <div className="mt-4 border-t border-border-light pt-3.5 animate-stagger-in" style={{ animationDelay: '460ms' }}>
               <p className="text-center text-xs text-content-secondary">

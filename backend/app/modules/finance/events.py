@@ -12,7 +12,7 @@ silently divorced from real procurement activity.
 The handlers in this module subscribe to those events and adjust the
 project's budget rows accordingly:
 
-* ``procurement.po.approved`` → committed += po.amount_total (TOP-30 #10:
+* ``procurement.po.approved`` → committed += po.amount_subtotal, net (TOP-30 #10:
   budget is committed when a PO is approved, the moment the spend is
   authorised, since a PO must be approved before it can be issued)
 * ``procurement.po.cancelled`` / ``procurement.po.reverted`` →
@@ -20,6 +20,16 @@ project's budget rows accordingly:
   commitment ledger must be reversible so a cancelled or reverted PO
   does not leave a phantom commitment on the budget)
 * ``procurement.gr.confirmed`` → committed -= gr.amount, actual += gr.amount
+* ``costmodel.budget.generated`` (a BOQ was locked) → the project's
+  ``ProjectBudget`` rows are seeded from the bill, net, per WBS, once per
+  BOQ (``FinanceService.seed_budget_from_boq``)
+
+The dashboard's project totals for committed, invoiced and paid do not come
+from these row counters; ``finance.cost_position`` reads them from the
+source records so an order and its invoice count once. After each of these
+handlers writes, ``FinanceService.sync_project_budget`` brings the rows to the
+same figures (an order paid beyond what was received, an order approved
+before its budget row existed), so the Budgets table adds up to the dashboard.
 
 The commitment a PO contributes is idempotent and reversible: each
 approved PO stamps a per-PO marker (``committed_from_po:<po_id>``) in the
@@ -165,6 +175,12 @@ async def _select_budget_row(
 
     Returns None when the project has no budget rows at all - handlers
     treat this as a no-op (we can't update what doesn't exist).
+
+    The row comes back row-locked until the handler commits. Every handler
+    copies the row's metadata, edits it and assigns the whole dict back, and
+    the oldest row can be a contingency line holding confirmed drawdowns. An
+    unlocked read let a drawdown confirmed between the read and the commit be
+    written back out of the row with the stale copy.
     """
     if wbs_id:
         stmt = (
@@ -172,6 +188,8 @@ async def _select_budget_row(
             .where(ProjectBudget.project_id == project_id)
             .where(ProjectBudget.wbs_id == wbs_id)
             .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         match = (await session.execute(stmt)).scalar_one_or_none()
         if match is not None:
@@ -182,12 +200,26 @@ async def _select_budget_row(
         .where(ProjectBudget.project_id == project_id)
         .order_by(ProjectBudget.created_at.asc())
         .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def _sync_budget(project_id: uuid.UUID) -> None:
+    """Bring the project's budget rows to the dashboard figures, in a session of its own."""
+    try:
+        from app.modules.finance.service import FinanceService
+
+        async with async_session_factory() as session:
+            await FinanceService(session).sync_project_budget(project_id)
+            await session.commit()
+    except Exception:
+        logger.exception("finance: budget rows not synced for project %s", project_id)
+
+
 async def _on_po_approved(event: Event) -> None:
-    """``procurement.po.approved`` → ProjectBudget.committed += amount_total.
+    """``procurement.po.approved`` → ProjectBudget.committed += amount_subtotal (net).
 
     Approval is the commitment moment (TOP-30 #10): a PO must be approved
     before it can be issued, so committing budget here gives a live committed
@@ -201,7 +233,12 @@ async def _on_po_approved(event: Event) -> None:
     """
     data = event.data or {}
     project_id = _coerce_uuid(data.get("project_id"))
-    amount = _to_decimal(data.get("amount_total"))
+    # Net of VAT, like the budget it is measured against and like the goods
+    # receipts that later release it: committing the gross left the order's
+    # VAT stuck in committed after full delivery. ``amount_total`` is only the
+    # fallback for an event published before the net was carried.
+    raw_net = data.get("amount_subtotal")
+    amount = _to_decimal(raw_net if raw_net not in (None, "") else data.get("amount_total"))
     marker_key = _committed_marker_key(data.get("po_id"))
     if project_id is None or amount == 0:
         return
@@ -233,6 +270,7 @@ async def _on_po_approved(event: Event) -> None:
                 md[marker_key] = str(amount)
                 budget.metadata_ = md
             await session.commit()
+            await _sync_budget(project_id)
             logger.info(
                 "finance: po.approved committed += %s on budget %s (project=%s, po=%s)",
                 amount,
@@ -293,6 +331,7 @@ async def _on_po_decommitted(event: Event) -> None:
             budget.committed = new_committed
             budget.metadata_ = md
             await session.commit()
+            await _sync_budget(project_id)
             logger.info(
                 "finance: po %s committed -= %s on budget %s (project=%s, po=%s)",
                 event.name,
@@ -379,6 +418,7 @@ async def _on_gr_confirmed(event: Event) -> None:
             budget.metadata_ = md
             budget.actual = current_actual + amount
             await session.commit()
+            await _sync_budget(project_id)
             logger.info(
                 "finance: gr.confirmed flipped %s from committed→actual on budget %s (project=%s, gr=%s)",
                 amount,
@@ -428,6 +468,55 @@ async def _on_claim_certified(event: Event) -> None:
         logger.exception("finance: _on_claim_certified failed for claim %s", claim_id)
 
 
+async def _on_budget_generated(event: Event) -> None:
+    """``costmodel.budget.generated`` -> seed the finance budget from the locked bill.
+
+    Locking a bill generates the cost model's budget lines and publishes this
+    event; the finance budget is the other half of the same step (see
+    ``FinanceService.seed_budget_from_boq``). Idempotent per bill, so a replay
+    or a later lock of the same bill replaces its share rather than adding it.
+    """
+    data = event.data or {}
+    project_id = _coerce_uuid(data.get("project_id"))
+    boq_id = _coerce_uuid(data.get("boq_id"))
+    if project_id is None or boq_id is None:
+        return
+    try:
+        from app.modules.finance.service import FinanceService
+
+        async with async_session_factory() as session:
+            await FinanceService(session).seed_budget_from_boq(project_id, boq_id)
+            await session.commit()
+    except Exception:
+        logger.exception("finance: budget seeding failed for boq %s (project %s)", boq_id, project_id)
+
+
+async def _on_pay_app_paid(event: Event) -> None:
+    """``subcontractors.payment_application.paid`` -> bring the budget rows to the records.
+
+    A payment application paid without a payable invoice of its own is still
+    incurred subcontract cost (``finance.cost_position``). The event names the
+    agreement, not the project, so the project is read from the agreement.
+    """
+    agreement_id = _coerce_uuid((event.data or {}).get("agreement_id"))
+    if agreement_id is None:
+        return
+    try:
+        from app.modules.subcontractors.models import SubcontractAgreement
+
+        async with async_session_factory() as session:
+            project_id = (
+                await session.execute(
+                    select(SubcontractAgreement.project_id).where(SubcontractAgreement.id == agreement_id)
+                )
+            ).scalar_one_or_none()
+    except Exception:
+        logger.exception("finance: project of agreement %s not resolved", agreement_id)
+        return
+    if project_id is not None:
+        await _sync_budget(project_id)
+
+
 _SUBSCRIPTIONS: list[tuple[str, callable]] = [  # type: ignore[type-arg]
     ("procurement.po.approved", _on_po_approved),
     # Max-Audit #10: a cancelled or reverted PO must shed its commitment so
@@ -438,19 +527,22 @@ _SUBSCRIPTIONS: list[tuple[str, callable]] = [  # type: ignore[type-arg]
     ("procurement.gr.confirmed", _on_gr_confirmed),
     # Gap E (Wave 6): certified progress claim → auto receivable invoice.
     ("contracts.claim.certified", _on_claim_certified),
+    # A locked bill becomes the finance budget, not only the cost model's.
+    ("costmodel.budget.generated", _on_budget_generated),
+    ("subcontractors.payment_application.paid", _on_pay_app_paid),
 ]
 
 
 def register_finance_subscribers() -> None:
     """Wire every entry of ``_SUBSCRIPTIONS`` into the global event bus.
 
-    Idempotent: subscribing the same handler twice is harmless because
-    the EventBus deduplicates on identity.  Called from the module
+    Idempotent: ``subscribe_once`` skips a handler already registered for
+    the same event name.  Called from the module
     ``on_startup`` hook so it runs once after the module loader has
     finished mounting routers.
     """
     for event_name, handler in _SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Finance: subscribed to %d cross-module event(s)",
         len(_SUBSCRIPTIONS),

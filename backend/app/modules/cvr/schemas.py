@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
 from app.modules.cvr.compute import q2, to_decimal
 from app.modules.cvr.validators import forecast_flags
@@ -103,6 +103,7 @@ class CvrLineCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     cost_code: str = Field(default="", max_length=100)
+    wbs_id: UUID | None = None
     description: str = Field(default="", max_length=500)
     cost_to_date: DecimalMoney = Field(default=Decimal("0"), ge=0)
     value_to_date: DecimalMoney = Field(default=Decimal("0"), ge=0)
@@ -120,6 +121,7 @@ class CvrLineUpdate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     cost_code: str | None = Field(default=None, max_length=100)
+    wbs_id: UUID | None = None
     description: str | None = Field(default=None, max_length=500)
     cost_to_date: DecimalMoney | None = Field(default=None, ge=0)
     value_to_date: DecimalMoney | None = Field(default=None, ge=0)
@@ -139,6 +141,7 @@ class CvrLineResponse(BaseModel):
     id: UUID
     report_id: UUID
     cost_code: str = ""
+    wbs_id: UUID | None = None
     description: str = ""
     cost_to_date: DecimalMoney = Decimal("0")
     value_to_date: DecimalMoney = Decimal("0")
@@ -281,12 +284,18 @@ class PaymentApplicationCreate(BaseModel):
 
     ``net_value`` is not accepted - it is always derived as
     ``gross_value - retention`` by the service so the figures cannot drift.
+
+    ``progress_claim_id`` raises the application from a contract progress
+    claim of the same project. The claim then fills every figure the caller
+    left unset: period (from the claim's period end), number, gross,
+    retention and currency. ``period`` is required only without a claim.
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_id: UUID
-    period: str = Field(..., pattern=_PERIOD_PATTERN, examples=["2026-06"])
+    period: str | None = Field(default=None, pattern=_PERIOD_PATTERN, examples=["2026-06"])
+    progress_claim_id: UUID | None = None
     application_number: str | None = Field(default=None, max_length=50, examples=["IPA-001"])
     gross_value: DecimalMoney = Field(default=Decimal("0"), ge=0)
     retention: DecimalMoney = Field(default=Decimal("0"), ge=0)
@@ -294,6 +303,12 @@ class PaymentApplicationCreate(BaseModel):
     status: str = Field(default="draft", pattern=_PAYAPP_STATUS_PATTERN)
     notes: str | None = Field(default=None, max_length=5000)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _period_or_claim(self) -> "PaymentApplicationCreate":
+        if not self.period and self.progress_claim_id is None:
+            raise ValueError("period is required unless the application is raised from a progress claim")
+        return self
 
 
 class PaymentApplicationUpdate(BaseModel):
@@ -307,6 +322,9 @@ class PaymentApplicationUpdate(BaseModel):
     currency: str | None = Field(default=None, max_length=3)
     status: str | None = Field(default=None, pattern=_PAYAPP_STATUS_PATTERN)
     notes: str | None = Field(default=None, max_length=5000)
+    # Link to (or, with an explicit null, unlink from) a progress claim of the
+    # same project. Linking on update never rewrites the figures.
+    progress_claim_id: UUID | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -325,6 +343,7 @@ class PaymentApplicationResponse(BaseModel):
     currency: str = ""
     status: str = "draft"
     notes: str | None = None
+    progress_claim_id: UUID | None = None
     created_by: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
@@ -335,4 +354,32 @@ class PaymentApplicationListResponse(BaseModel):
     """Paginated list of payment applications."""
 
     items: list[PaymentApplicationResponse]
+    total: int
+
+
+class ProgressClaimOption(BaseModel):
+    """One contract progress claim offered by the payment application picker."""
+
+    id: UUID
+    contract_id: UUID
+    contract_code: str = ""
+    claim_number: str = ""
+    status: str = ""
+    period: str | None = None
+    gross_amount: DecimalMoney = Decimal("0")
+    retention_amount: DecimalMoney = Decimal("0")
+    net_due: DecimalMoney = Decimal("0")
+    currency: str = ""
+
+
+class ProgressClaimOptionListResponse(BaseModel):
+    """Every progress claim the picker can offer, plus how many there are.
+
+    Not paged: the picker has to see every claim on the project, so ``total``
+    equals the length of ``items``. It is there so a reader can tell the whole
+    set from a part of it. Declared after :class:`ProgressClaimOption` because
+    ``from __future__ import annotations`` makes the field a string.
+    """
+
+    items: list[ProgressClaimOption]
     total: int

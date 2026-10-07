@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Práce na tomto opatření byly zahájeny dne {start}, tedy před podáním žádosti dne {filed} - po zahájení opatření většina programů nepodpoří vůbec nic",
+      "unevidenced": "Práce byly zahájeny předčasně, dne {start}, a ve spisu je uvedeno, že to poskytovatel povolil, chybí však odkaz na písemné povolení",
+      "evidence": "Zaznamenejte číslo jednací písemného povolení k předčasnému zahájení, aby spis obstál i při kontrole",
+      "suggestion": "Než vynaložíte další výdaje, ověřte podmínky programu. Pokud bylo předčasné zahájení povoleno písemně, zaznamenejte to; pokud ne, obraťte se na poskytovatele dřív, než žádost postoupí dál"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Čerpání {draw} zahrnuje výdaje z doby před {period_start}, kdy začíná období realizace",
+      "after": "Čerpání {draw} zahrnuje výdaje z doby po {period_end}, kdy končí období realizace",
+      "spans": "Čerpání {draw} přesahuje období realizace od {period_start} do {period_end} na začátku i na konci",
+      "suggestion": "Výdaje mimo období realizace přesuňte do samostatného čerpání a projednejte je s poskytovatelem, místo abyste obojí uplatňovali v jednom čerpání"
+    },
+    "own_share_is_covered": {
+      "fail": "Program vyžaduje vlastní podíl ve výši {rate} procent, tedy {required}, ale žádost uvádí {recorded}",
+      "suggestion": "Před podáním uveďte, odkud pochází zbývající vlastní podíl, protože program jej počítá ze základny způsobilých výdajů, a ne z celkových nákladů projektu"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Počet žádostí k tomuto projektu: {count}. Dohromady dosahují {intensity} procent způsobilých výdajů a překračují strop intenzity podpory {cap} procent, který stanovuje nejpřísnější z jejich programů",
+      "suggestion": "Veřejná podpora se sčítá napříč programy i úrovněmi veřejné správy. Snižte jeden z požadavků nebo ověřte, zda lze opatření oddělit tak, aby každé neslo vlastní výdaje"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Období realizace skončilo dne {period_end} a závěrečné vyúčtování dosud nebylo zahájeno",
+      "late": "Závěrečné vyúčtování mělo být podáno do {due}, podáno však bylo až dne {submitted}",
+      "overdue": "Závěrečné vyúčtování mělo být podáno do {due} a dosud podáno nebylo",
+      "suggestion": "Podejte to, co máte, a nečekejte, až bude vše úplné. Většina poskytovatelů termín na žádost prodlouží, ale žádný neprodlouží termín, který už uplynul"
+    },
+    "errors": {
+      "application_not_found": "Žádost nenalezena",
+      "programme_code_taken": "Program s tímto kódem v této zemi již existuje",
+      "programme_not_found": "Program nenalezen",
+      "programme_has_applications": "K tomuto programu existují žádosti, proto jej nelze smazat. Místo toho jej uzavřete.",
+      "application_code_taken": "Žádost s tímto kódem v tomto projektu již existuje",
+      "approved_application_not_deletable": "Schválenou žádost nelze smazat. Místo toho změňte její stav na Staženo nebo Uzavřeno.",
+      "approval_needs_period_end": "Schválení vyžaduje konec období realizace, protože se od něj počítají všechny pozdější termíny",
+      "draw_needs_approval": "Čerpat lze jen ze schválené žádosti",
+      "draw_not_found": "Čerpání nenalezeno",
+      "paid_draw_not_deletable": "Vyplacené čerpání nelze smazat",
+      "proof_not_found": "Vyúčtování nenalezeno",
+      "obligation_not_found": "Termín nenalezen",
+      "eligible_exceeds_amount": "Způsobilá část nesmí být vyšší než částka",
+      "allocation_not_found": "Výdaj nenalezen"
+    }
+  }
+}

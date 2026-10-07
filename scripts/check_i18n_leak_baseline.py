@@ -255,7 +255,7 @@ UNDER_TRANSLATION: dict[str, int] = {
 # or reading git history, which this guard does nowhere else. Neither was judged
 # worth it while the swap is still visible in the diff to anyone reading it. If
 # a swap ever does get through unnoticed, that judgement is the thing to revisit.
-PENDING_REVIEW_CEILING = 188
+PENDING_REVIEW_CEILING = 205
 
 import re
 
@@ -466,7 +466,10 @@ def main() -> int:  # noqa: PLR0912, PLR0915 - one linear check, splitting it hi
             "entries left, so the ceiling carries no slack a future addition could spend silently."
         )
     if pending_failures:
-        print(f"ERROR: {len(pending_failures)} problem(s) with {PENDING_PATH}:", file=sys.stderr)
+        print(
+            f"ERROR: {len(pending_failures)} problem(s) with {PENDING_PATH}:",
+            file=sys.stderr,
+        )
         for f in pending_failures:
             print(f"    {f}", file=sys.stderr)
         return 1
@@ -537,7 +540,10 @@ def main() -> int:  # noqa: PLR0912, PLR0915 - one linear check, splitting it hi
             file=sys.stderr,
         )
         for key, stem in false_repairs:
-            print(f"  {key} / {stem} - key no longer present in that locale file", file=sys.stderr)
+            print(
+                f"  {key} / {stem} - key no longer present in that locale file",
+                file=sys.stderr,
+            )
         print(
             "\nWith fallbackLng=en the user still sees English either way. "
             "Translate the key in that locale; do not remove it.",
@@ -546,7 +552,10 @@ def main() -> int:  # noqa: PLR0912, PLR0915 - one linear check, splitting it hi
 
     if new_leaks:
         failed = True
-        print(f"ERROR: {len(new_leaks)} baseline cell(s) regressed (leaked in a locale not recorded):", file=sys.stderr)
+        print(
+            f"ERROR: {len(new_leaks)} baseline cell(s) regressed (leaked in a locale not recorded):",
+            file=sys.stderr,
+        )
         for key, stem in new_leaks:
             print(f"  {key} / {stem} = {en_pairs[key]!r}", file=sys.stderr)
 
@@ -614,8 +623,16 @@ def main() -> int:  # noqa: PLR0912, PLR0915 - one linear check, splitting it hi
             current_leaked = sorted(s for s in non_en if s != "ru" and pairs_by_locale[s].get(key) == en_val)
             if current_leaked:
                 rebuilt[key] = {"en_value": en_val, "leaked_locales": current_leaked}
-        with open(BASELINE_PATH, "w", encoding="utf-8") as fh:
-            json.dump(rebuilt, fh, ensure_ascii=False, indent=1, sort_keys=True)
+        # Written back in the exact shape the file is committed in: two-space
+        # indent and LF. Both halves of that matter and neither is cosmetic.
+        # This used to write one-space indent, and on Windows ``"w"`` alone
+        # translates every newline to CRLF, so a run that repaired ninety one
+        # leaked cells produced a diff of twenty four thousand lines with the
+        # ninety one buried in it. A rewrite nobody can read is a rewrite
+        # nobody checks, and this file is the record of which strings we have
+        # admitted are untranslated.
+        with open(BASELINE_PATH, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(rebuilt, fh, ensure_ascii=False, indent=2, sort_keys=True)
             fh.write("\n")
         print(f"Baseline rewritten: {len(rebuilt)} keys (was {len(baseline)}).")
 

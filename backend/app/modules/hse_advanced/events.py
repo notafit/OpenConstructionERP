@@ -157,8 +157,8 @@ def register_subscribers() -> None:
     """Idempotently subscribe HSE Advanced cross-module handlers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("safety.incident.created", _on_safety_incident_created)
-    event_bus.subscribe("hse.capa.completed", _on_capa_completed)
-    event_bus.subscribe("qms.ncr.raised", _on_qms_ncr_safety_check)
+    event_bus.subscribe_once("safety.incident.created", _on_safety_incident_created)
+    event_bus.subscribe_once("hse.capa.completed", _on_capa_completed)
+    event_bus.subscribe_once("qms.ncr.raised", _on_qms_ncr_safety_check)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("HSE Advanced: 3 cross-module subscriber(s) registered")

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Search,
@@ -35,11 +35,14 @@ import {
   Pencil,
   AlertTriangle,
   Info,
+  Columns3,
+  FileDown,
 } from 'lucide-react';
 import { Button, Card, Badge, EmptyState, SkeletonTable, CountryFlag, CountryFlagBackdrop, Breadcrumb, ConfirmDialog, DismissibleInfo, IntroRichText, ModuleGuideButton, RecoveryCard } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { ApiError, apiGet, apiPost, apiPatch, apiDelete, triggerDownload, extractErrorMessageFromBody } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fmtList, fmtPercent, fmtFixed } from '@/shared/lib/formatters';
 import { formatCurrency, type FormatCurrencyOptions } from '@/shared/lib/money';
 import { copyToClipboard } from '@/shared/lib/browser';
@@ -517,7 +520,8 @@ const SOURCES = ['', 'cwicr', 'custom'] as const;
 // ~150ms even on cold-start. The user can navigate to the next page (or
 // scroll-trigger more) without re-fetching the same first batch — react-query
 // caches per (query, offset) key.
-const PAGE_SIZE = 10;
+const DEFAULT_PAGE_SIZE = 10;
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 
 /* ── API ───────────────────────────────────────────────────────────────── */
 
@@ -527,6 +531,7 @@ function buildSearchUrl(
   source: string,
   region: string,
   offset: number,
+  limit: number,
   category?: string,
   classificationPath?: string,
   catalogId?: string,
@@ -539,7 +544,7 @@ function buildSearchUrl(
   if (category) params.set('category', category);
   if (classificationPath) params.set('classification_path', classificationPath);
   if (catalogId) params.set('catalog_id', catalogId);
-  params.set('limit', String(PAGE_SIZE));
+  params.set('limit', String(limit));
   params.set('offset', String(offset));
   // Slim payload — CWICR rows can be 38 KB each (31 KB components + 6.6 KB
   // metadata); the list view doesn't render either. The expanded row
@@ -583,11 +588,13 @@ export function CostsPage() {
   const [classificationPath, setClassificationPath] = useState('');
   const [region, setRegion] = useState<string>(regionFromUrl || activeRegion);
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [showAddToBOQ, setShowAddToBOQ] = useState(false);
   const [showCreateAssembly, setShowCreateAssembly] = useState(false);
+  const [showCompare, setShowCompare] = useState(false);
   const [showCreateItem, setShowCreateItem] = useState(false);
   // Item being edited inline (manual / file_import / custom rows only).
   const [editItem, setEditItem] = useState<CostItem | null>(null);
@@ -792,15 +799,15 @@ export function CostsPage() {
     return () => clearTimeout(timer);
   }, [query]);
 
-  const searchUrl = buildSearchUrl(debouncedQuery, unit, source, region, offset, category, classificationPath, catalogId);
+  const searchUrl = buildSearchUrl(debouncedQuery, unit, source, region, offset, pageSize, category, classificationPath, catalogId);
 
   const { data, isLoading, isFetching, isError, error, refetch } = useQuery({
-    queryKey: ['costs', debouncedQuery, unit, source, category, classificationPath, region, offset, semanticSearch, catalogId],
+    queryKey: ['costs', debouncedQuery, unit, source, category, classificationPath, region, offset, pageSize, semanticSearch, catalogId],
     queryFn: async () => {
       // Use vector semantic search when toggled and query is present
       if (semanticSearch && debouncedQuery.length >= 2) {
         try {
-          const params = new URLSearchParams({ q: debouncedQuery, limit: String(PAGE_SIZE) });
+          const params = new URLSearchParams({ q: debouncedQuery, limit: String(pageSize) });
           if (region) params.set('region', region);
           const results = await apiGet<Array<Record<string, unknown>>>(`/v1/costs/vector/search/?${params}`);
           // Wrap in CostSearchResponse format
@@ -828,7 +835,7 @@ export function CostsPage() {
               };
             }),
             total: results.length,
-            limit: PAGE_SIZE,
+            limit: pageSize,
             offset: 0,
           } as CostSearchResponse;
         } catch (err) {
@@ -887,7 +894,7 @@ export function CostsPage() {
       ? rawItems.filter((i) => recentItems.some((r) => r.id === i.id))
       : rawItems;
   const total = specialTab ? items.length : rawTotal;
-  // hasMore: specialTab ? false : offset + PAGE_SIZE < rawTotal — for future load-more UI
+  // hasMore: specialTab ? false : offset + pageSize < rawTotal — for future load-more UI
 
   // Client-side column sorting
   const sortedItems = useMemo(() => {
@@ -1067,7 +1074,7 @@ export function CostsPage() {
     [navigate, region, regionCurrency, t],
   );
 
-  // handleLoadMore for future pagination: () => setOffset(prev => prev + PAGE_SIZE)
+  // handleLoadMore for future pagination: () => setOffset(prev => prev + pageSize)
 
   const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -1257,12 +1264,48 @@ export function CostsPage() {
 
       {/* Escalation Calculator (collapsible) */}
       {showEscalation && (
-        <EscalationCalculator className="animate-fade-in" />
+        <EscalationCalculator
+          className="animate-fade-in"
+          onApply={(escalatedAmount, factor) => {
+            const text = new Intl.NumberFormat(getNumberLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(escalatedAmount);
+            copyToClipboard(text).then((ok) => {
+              if (ok) {
+                addToast({
+                  type: 'success',
+                  title: t('common.copied', { defaultValue: 'Copied' }),
+                  message: t('costs.escalation_applied', {
+                    defaultValue: 'Escalated amount {{amount}} (factor {{factor}}) copied to clipboard',
+                    amount: text,
+                    factor: fmtFixed(factor, 4),
+                  }),
+                });
+              }
+            });
+          }}
+        />
       )}
 
       {/* Regional Adjust panel (collapsible, v3.12.0) */}
       {showRegionalAdjust && (
-        <RegionalAdjustPanel className="animate-fade-in" />
+        <RegionalAdjustPanel
+          className="animate-fade-in"
+          onApplyPreview={(preview) => {
+            const text = new Intl.NumberFormat(getNumberLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(preview.adjusted_rate);
+            copyToClipboard(text).then((ok) => {
+              if (ok) {
+                addToast({
+                  type: 'success',
+                  title: t('common.copied', { defaultValue: 'Copied' }),
+                  message: t('costs.regional_rate_copied', {
+                    defaultValue: 'Adjusted rate {{amount}} (factor {{factor}}) copied to clipboard',
+                    amount: text,
+                    factor: fmtFixed(preview.factor_applied, 4),
+                  }),
+                });
+              }
+            });
+          }}
+        />
       )}
 
       {hasNoCostData ? (
@@ -1673,9 +1716,9 @@ export function CostsPage() {
 
           {/* Pagination */}
           {(() => {
-            const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
-            const totalPages = Math.ceil(total / PAGE_SIZE);
-            const goToPage = (p: number) => setOffset((p - 1) * PAGE_SIZE);
+            const currentPage = Math.floor(offset / pageSize) + 1;
+            const totalPages = Math.ceil(total / pageSize);
+            const goToPage = (p: number) => setOffset((p - 1) * pageSize);
             // Show up to 5 page buttons around current
             const start = Math.max(1, currentPage - 2);
             const end = Math.min(totalPages, start + 4);
@@ -1683,14 +1726,28 @@ export function CostsPage() {
 
             return (
               <div className="mt-6 flex flex-col items-center gap-3">
-                <p className="text-xs text-content-tertiary">
-                  {t('costs.showing_range', {
-                    defaultValue: '{{from}}-{{to}} of {{total}}',
-                    from: offset + 1,
-                    to: Math.min(offset + PAGE_SIZE, total),
-                    total: total.toLocaleString(getNumberLocale()),
-                  })}
-                </p>
+                <div className="flex items-center gap-3">
+                  <p className="text-xs text-content-tertiary">
+                    {t('costs.showing_range', {
+                      defaultValue: '{{from}}-{{to}} of {{total}}',
+                      from: offset + 1,
+                      to: Math.min(offset + pageSize, total),
+                      total: total.toLocaleString(getNumberLocale()),
+                    })}
+                  </p>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-2xs text-content-quaternary">{t('costs.per_page', { defaultValue: 'per page' })}</span>
+                    <select
+                      value={pageSize}
+                      onChange={(e) => { setPageSize(Number(e.target.value)); setOffset(0); }}
+                      className="h-7 rounded-md border border-border bg-surface-primary px-1.5 text-xs text-content-secondary focus:outline-none focus:ring-1 focus:ring-oe-blue"
+                    >
+                      {PAGE_SIZE_OPTIONS.map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
                 {totalPages > 1 && (
                   <div className="flex items-center gap-1">
                     <button
@@ -1771,6 +1828,53 @@ export function CostsPage() {
               onClick={() => setShowCreateAssembly(true)}
             >
               {t('assemblies.create_assembly', { defaultValue: 'Create Assembly' })}
+            </Button>
+            {selectedIds.size >= 2 && selectedIds.size <= 5 && (
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Columns3 size={14} />}
+                onClick={() => setShowCompare(true)}
+              >
+                {t('costs.compare', { defaultValue: 'Compare' })}
+              </Button>
+            )}
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Star size={14} />}
+              onClick={() => {
+                setFavourites((prev) => {
+                  const next = new Set(prev);
+                  selectedIds.forEach((id) => next.add(id));
+                  saveFavourites(next);
+                  return next;
+                });
+                addToast({
+                  type: 'success',
+                  title: t('costs.added_to_favourites', { defaultValue: 'Added to favourites' }),
+                  message: t('costs.n_added_to_favourites', { defaultValue: '{{count}} items added to favourites', count: selectedIds.size }),
+                });
+              }}
+            >
+              {t('costs.favourite', { defaultValue: 'Favourite' })}
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<FileDown size={14} />}
+              onClick={() => {
+                const header = `${t('costs.code', 'Code')}\t${t('boq.description')}\t${t('boq.unit')}\t${t('costs.rate', 'Rate')}\t${t('costs.currency', { defaultValue: 'Currency' })}`;
+                const rows = selectedItems.map((i) => `${i.code}\t${i.description}\t${i.unit}\t${i.rate}\t${i.currency || regionCurrency}`);
+                const text = [header, ...rows].join('\n');
+                copyToClipboard(text).then((ok) => {
+                  if (ok) {
+                    addToast({ type: 'success', title: t('common.copied', { defaultValue: 'Copied' }), message: t('costs.items_exported', { defaultValue: '{{count}} items copied as tab-separated text', count: selectedIds.size }) });
+                  }
+                });
+              }}
+            >
+              {t('costs.export_selected', { defaultValue: 'Export' })}
             </Button>
             <Button
               variant="secondary"
@@ -1853,6 +1957,16 @@ export function CostsPage() {
           }}
         />
       )}
+
+      {/* ── Compare Panel ────────────────────────────────────────────── */}
+      {showCompare && selectedItems.length >= 2 && (
+        <ComparePanel
+          items={selectedItems}
+          regionCurrency={regionCurrency}
+          fmtMoney={fmtMoney}
+          onClose={() => setShowCompare(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1896,7 +2010,7 @@ function AddToBOQModal({
   // Fetch projects
   const { data: projects } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     retry: false,
     staleTime: 5 * 60_000,
   });
@@ -2233,13 +2347,13 @@ function AddToBOQModal({
                   })}
                 </span>
                 {mismatchedCount === 1 && items.length === 1
-                  ? t('costs_catalogs.fx_mismatch_one', {
+                  ? t('costs_catalogs.fx_mismatch_single', {
                       defaultValue:
                         'Item currency {{itemCurrency}}, project currency {{projectCurrency}}. The rate is copied as-is without conversion.',
                       itemCurrency: fmtList(mismatchedCurrencies),
                       projectCurrency,
                     })
-                  : t('costs_catalogs.fx_mismatch_many', {
+                  : t('costs_catalogs.fx_mismatch_multiple', {
                       defaultValue:
                         '{{count}} of the selected items are priced in {{itemCurrencies}}, while the project currency is {{projectCurrency}}. Rates are copied as-is without conversion.',
                       count: mismatchedCount,
@@ -2308,7 +2422,7 @@ function CreateAssemblyFromCostsModal({
   // the user is forced into an explicit choice at the next surface.
   const { data: projects } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     retry: false,
     staleTime: 5 * 60_000,
   });
@@ -2659,7 +2773,7 @@ function CreateCostItemModal({
   const unitOptions = useMemo(() => getUnitsForLocale(i18n.language), [i18n.language]);
   const { data: projects } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     retry: false,
     staleTime: 5 * 60_000,
   });
@@ -3868,5 +3982,255 @@ function CostItemRow({
       )}
       <ConfirmDialog {...confirmProps} />
     </>
+  );
+}
+
+/* ── Compare Panel ────────────────────────────────────────────────────── */
+
+function ComparePanel({
+  items,
+  regionCurrency,
+  fmtMoney,
+  onClose,
+}: {
+  items: CostItem[];
+  regionCurrency: string;
+  fmtMoney: (n: number, currency?: string | null) => string;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+
+  // Fetch full details for each item (components, metadata)
+  const detailQueries = useQueries({
+    queries: items.map((item) => ({
+      queryKey: ['costs', 'detail', item.id],
+      queryFn: () => apiGet<CostItem>(`/v1/costs/${item.id}`),
+      staleTime: 5 * 60_000,
+    })),
+  });
+  const details = detailQueries.map((q, i) => (q.data as CostItem) ?? items[i]);
+  const allLoaded = detailQueries.every((q) => !q.isLoading);
+
+  const rates = items.map((i) => i.rate);
+  const minRate = Math.min(...rates);
+  const maxRate = Math.max(...rates);
+
+  const money = (n: number, currency?: string) =>
+    fmtMoney(n, (currency || regionCurrency || '').trim().toUpperCase());
+
+  const pctDiff = (a: number, b: number) => {
+    if (b === 0) return '—';
+    const diff = ((a - b) / b) * 100;
+    const sign = diff > 0 ? '+' : '';
+    return `${sign}${fmtPercent(diff, 1)}`;
+  };
+
+  // Cost breakdown by type for each item
+  const breakdowns = details.map((detail) => {
+    const meta = detail.metadata_ ?? {};
+    const summed = (detail.components ?? []).reduce(
+      (acc, c) => {
+        const cost = Number(c.cost) || (Number(c.quantity) || 0) * (Number(c.unit_rate) || 0);
+        const ty = c.type || 'other';
+        if (ty === 'labor') acc.labor += cost;
+        else if (ty === 'material') acc.material += cost;
+        else if (ty === 'equipment' || ty === 'operator' || ty === 'electricity') acc.equipment += cost;
+        return acc;
+      },
+      { labor: 0, material: 0, equipment: 0 },
+    );
+    return {
+      labor: meta.labor_cost ?? summed.labor,
+      material: meta.material_cost ?? summed.material,
+      equipment: meta.equipment_cost ?? summed.equipment,
+      components: detail.components_count ?? detail.components?.length ?? 0,
+    };
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+      <div className="relative w-full max-w-5xl max-h-[85vh] overflow-auto rounded-2xl border border-border bg-surface-primary shadow-2xl m-4" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-border bg-surface-primary px-6 py-4">
+          <div className="flex items-center gap-2">
+            <Columns3 size={18} className="text-oe-blue" />
+            <h2 className="text-lg font-semibold text-content-primary">
+              {t('costs.compare_items', { defaultValue: 'Compare cost items' })}
+            </h2>
+            <Badge variant="neutral" size="sm">{items.length}</Badge>
+          </div>
+          <button onClick={onClose} aria-label={t('common.close', { defaultValue: 'Close' })} className="flex h-8 w-8 items-center justify-center rounded-lg text-content-tertiary hover:bg-surface-secondary transition-colors">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Comparison table */}
+        <div className="p-6">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border-light">
+                <th className="py-2 pr-4 text-left text-xs font-medium text-content-tertiary w-36">
+                  {t('costs.property', { defaultValue: 'Property' })}
+                </th>
+                {items.map((item) => (
+                  <th key={item.id} className="py-2 px-3 text-left text-xs font-medium text-content-secondary">
+                    <div className="truncate max-w-[200px]" title={item.code}>{item.code}</div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border-light">
+              {/* Description */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('boq.description')}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3 text-xs text-content-primary">
+                    <span className="line-clamp-3">{item.description}</span>
+                  </td>
+                ))}
+              </tr>
+              {/* Unit */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('boq.unit')}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3">
+                    <Badge variant="neutral" size="sm">{item.unit}</Badge>
+                  </td>
+                ))}
+              </tr>
+              {/* Rate */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.rate', 'Rate')}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3">
+                    <div className="flex items-center gap-2">
+                      <span className={`font-semibold tabular-nums ${item.rate === minRate ? 'text-semantic-success' : item.rate === maxRate ? 'text-semantic-error' : 'text-content-primary'}`}>
+                        {money(item.rate, item.currency)}
+                      </span>
+                      {items.length > 1 && items[0] && items[0].id !== item.id && (
+                        <span className="text-2xs text-content-quaternary tabular-nums">
+                          {pctDiff(item.rate, items[0].rate)}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                ))}
+              </tr>
+              {/* Rate bar */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.rate_comparison', { defaultValue: 'Rate spread' })}</td>
+                {items.map((item) => {
+                  const range = maxRate - minRate;
+                  const pct = range > 0 ? ((item.rate - minRate) / range) * 100 : 50;
+                  return (
+                    <td key={item.id} className="py-3 px-3">
+                      <div className="h-2 w-full rounded-full bg-surface-tertiary overflow-hidden">
+                        <div
+                          className="h-full rounded-full bg-oe-blue transition-all"
+                          style={{ width: `${Math.max(4, pct)}%` }}
+                        />
+                      </div>
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Currency */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.currency', { defaultValue: 'Currency' })}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3 text-xs text-content-secondary">
+                    {(item.currency || regionCurrency || '—').toUpperCase()}
+                  </td>
+                ))}
+              </tr>
+              {/* Region */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.region', { defaultValue: 'Region' })}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3 text-xs text-content-secondary">
+                    {item.region || '—'}
+                  </td>
+                ))}
+              </tr>
+              {/* Classification */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.classification', 'Class.')}</td>
+                {items.map((item) => {
+                  const cls = item.classification ?? {};
+                  return (
+                    <td key={item.id} className="py-3 px-3 text-xs text-content-secondary">
+                      {cls.collection || cls.code || cls.din276 || '—'}
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Cost breakdown */}
+              {allLoaded && (
+                <>
+                  <tr>
+                    <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">
+                      <div className="flex items-center gap-1">
+                        <HardHat size={12} className="text-amber-500" />
+                        {t('costs.labor', { defaultValue: 'Labor' })}
+                      </div>
+                    </td>
+                    {items.map((item, i) => (
+                      <td key={item.id} className="py-3 px-3 text-xs tabular-nums text-content-secondary">
+                        {breakdowns[i] && breakdowns[i].labor > 0 ? money(breakdowns[i].labor, item.currency) : '—'}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr>
+                    <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">
+                      <div className="flex items-center gap-1">
+                        <Package size={12} className="text-emerald-500" />
+                        {t('costs.material', { defaultValue: 'Material' })}
+                      </div>
+                    </td>
+                    {items.map((item, i) => (
+                      <td key={item.id} className="py-3 px-3 text-xs tabular-nums text-content-secondary">
+                        {breakdowns[i] && breakdowns[i].material > 0 ? money(breakdowns[i].material, item.currency) : '—'}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr>
+                    <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">
+                      <div className="flex items-center gap-1">
+                        <Hammer size={12} className="text-blue-500" />
+                        {t('costs.equipment', { defaultValue: 'Equipment' })}
+                      </div>
+                    </td>
+                    {items.map((item, i) => (
+                      <td key={item.id} className="py-3 px-3 text-xs tabular-nums text-content-secondary">
+                        {breakdowns[i] && breakdowns[i].equipment > 0 ? money(breakdowns[i].equipment, item.currency) : '—'}
+                      </td>
+                    ))}
+                  </tr>
+                  <tr>
+                    <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.components_label', { defaultValue: 'Components' })}</td>
+                    {items.map((item, i) => (
+                      <td key={item.id} className="py-3 px-3 text-xs text-content-secondary">
+                        {breakdowns[i] && breakdowns[i].components > 0 ? t('costs.n_resources', { defaultValue: '{{count}} resources', count: breakdowns[i].components }) : '—'}
+                      </td>
+                    ))}
+                  </tr>
+                </>
+              )}
+              {/* Source */}
+              <tr>
+                <td className="py-3 pr-4 text-xs text-content-tertiary font-medium">{t('costs.source', { defaultValue: 'Source' })}</td>
+                {items.map((item) => (
+                  <td key={item.id} className="py-3 px-3 text-xs text-content-secondary">
+                    <Badge variant={item.source === 'cwicr' ? 'blue' : 'neutral'} size="sm">
+                      {item.source === 'cwicr' ? 'CWICR' : item.source}
+                    </Badge>
+                  </td>
+                ))}
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   );
 }

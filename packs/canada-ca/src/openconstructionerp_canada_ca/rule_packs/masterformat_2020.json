@@ -1,0 +1,23 @@
+{
+  "rule_pack_id": "masterformat_2020",
+  "name": "CSI/CSC MasterFormat 2020 — Division Structure",
+  "name_fr-CA": "MasterFormat 2020 (CSI/CSC) — Structure des divisions",
+  "standard": "CSI MasterFormat 2020",
+  "jurisdiction": "CA",
+  "issuer": "Construction Specifications Institute (CSI) & Construction Specifications Canada (CSC)",
+  "edition": "2020 (Numbers & Titles)",
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Classifies a Canadian bill of quantities to MasterFormat 2020. MasterFormat is published jointly by CSI and Construction Specifications Canada, so the same work-results classification carries across the border: Level 1 Division 'NN', Level 2 Section 'NN NN', Level 3 Subsection 'NN NN NN' and Level 4 'NN NN NN.NN', with section titles and descriptions present and no duplicate or orphan section codes. Of that structure, what the pack actually checks is narrower: that every position carries a MasterFormat division code, that the code is a division in the 00 to 49 range, and that the bill contains the core divisions the completeness rule looks for. The Level 2 to Level 4 shapes above are what the standard defines, not what is verified here.",
+  "description_fr-CA": "Classe un bordereau de quantités canadien selon MasterFormat 2020. MasterFormat est publié conjointement par le CSI et Construction Specifications Canada, de sorte que la même classification des résultats de travaux s'applique des deux côtés de la frontière : division de niveau 1 « NN », section de niveau 2 « NN NN », sous-section de niveau 3 « NN NN NN » et niveau 4 « NN NN NN.NN », avec titres et descriptions de section présents, sans code de section en double ni orphelin. De cette structure, le pack vérifie seulement que chaque poste porte un code de division MasterFormat, que ce code est une division comprise entre 00 et 49, et que le bordereau comporte les divisions principales attendues par la règle de complétude ; les niveaux 2 à 4 relèvent de la norme, non d'un contrôle.",
+  "covers_divisions": "00-14, 21-23, 25-28, 31-35, 40-46, 48 (35 active Divisions; the unassigned numbers in the 00-49 band stay reserved)",
+  "severity_overrides": {},
+  "enables_rule_ids": [
+    "masterformat.classification_required",
+    "masterformat.valid_division",
+    "masterformat.completeness"
+  ]
+}

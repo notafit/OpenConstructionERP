@@ -7,9 +7,12 @@ Endpoints:
     GET    /schedules/?project_id=xxx           - List schedules for a project
     GET    /schedules/{id}                      - Get schedule detail
     PATCH  /schedules/{id}                      - Update schedule
-    DELETE /schedules/{id}                      - Delete schedule
+    DELETE /schedules/{id}                      - Archive schedule
+    POST   /schedules/{id}/restore/             - Restore previous status
+    DELETE /schedules/{id}/permanent/           - Permanently delete (admin)
     POST   /schedules/{id}/activities           - Add activity to schedule
     GET    /schedules/{id}/activities           - List activities for schedule
+    GET    /schedules/{id}/next-wbs-code        - Suggest the next WBS code in a section
     GET    /schedules/{id}/gantt                - Get Gantt chart data
     POST   /schedules/{id}/generate-from-boq   - Generate activities from BOQ
     POST   /schedules/{id}/calculate-cpm       - Calculate critical path
@@ -23,12 +26,14 @@ Endpoints:
     PATCH  /work-orders/{id}                    - Update work order
 """
 
+import asyncio
 import csv
 import io
 import logging
 import uuid
 import xml.etree.ElementTree as ET  # noqa: S405 - types + output tree building only; parsing routed through defusedxml below
 from decimal import Decimal
+from typing import Any, Literal
 
 import defusedxml.ElementTree as safe_ET
 from defusedxml.common import DefusedXmlException
@@ -41,7 +46,14 @@ from app.core.content_disposition import attachment_disposition
 from app.core.csv_safety import neutralise_formula
 from app.core.i18n import get_locale
 from app.core.validation.messages import translate
-from app.dependencies import CurrentUserId, CurrentUserPayload, RequirePermission, SessionDep, verify_project_access
+from app.dependencies import (
+    CurrentUserId,
+    CurrentUserPayload,
+    RequirePermission,
+    RequireRole,
+    SessionDep,
+    verify_project_access,
+)
 from app.modules.schedule.schemas import (
     ActivityBimLinkRequest,
     ActivityCreate,
@@ -57,6 +69,7 @@ from app.modules.schedule.schemas import (
     EvmSummaryResponse,
     GanttData,
     GenerateFromBOQRequest,
+    GenerationPreviewResponse,
     ImportResult,
     LaborCostByPhaseResponse,
     LinkPositionRequest,
@@ -70,6 +83,7 @@ from app.modules.schedule.schemas import (
     RelationshipUpdate,
     RiskAnalysisResponse,
     ScheduleCreate,
+    ScheduleDeleteImpactResponse,
     ScheduleDiffRequest,
     ScheduleDiffResponse,
     ScheduleListResponse,
@@ -77,6 +91,7 @@ from app.modules.schedule.schemas import (
     ScheduleStatsResponse,
     ScheduleUpdate,
     SnapshotEnvelopeResponse,
+    WbsCodeSuggestion,
     WorkCalendarResponse,
     WorkOrderCreate,
     WorkOrderResponse,
@@ -86,6 +101,7 @@ from app.modules.schedule.service import (
     ScheduleService,
     _effective_activity_status,
     _str_to_float,
+    coded_http_error,
     compute_duration,
     get_work_calendar,
 )
@@ -183,6 +199,7 @@ def _activity_to_response(activity: object) -> ActivityResponse:
         total_float=getattr(activity, "total_float", None),
         free_float=getattr(activity, "free_float", None),
         is_critical=getattr(activity, "is_critical", False),
+        client_visible=bool(getattr(activity, "client_visible", False)),
         # Constraint, code, BIM fields
         constraint_type=getattr(activity, "constraint_type", None),
         constraint_date=getattr(activity, "constraint_date", None),
@@ -190,6 +207,7 @@ def _activity_to_response(activity: object) -> ActivityResponse:
         bim_element_ids=getattr(activity, "bim_element_ids", None),
         # Per-activity work calendar (#348)
         calendar_id=getattr(activity, "calendar_id", None),
+        assignee_id=getattr(activity, "assignee_id", None),
         # Cost-loaded / progress-rigor columns. Built by hand like everything
         # else here, so a field added to ActivityResponse alone would still
         # come back null through every route that goes through this helper.
@@ -270,6 +288,7 @@ async def list_schedules(
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
     service: ScheduleService = Depends(_get_service),
+    archive_state: Literal["current", "archived", "all"] = "current",
 ) -> ScheduleListResponse:
     """List schedules for a given project, one page at a time.
 
@@ -278,7 +297,9 @@ async def list_schedules(
     complete list from a truncated one.
     """
     await _verify_schedule_project_owner(session, project_id, _user_id, payload)
-    schedules, total = await service.list_schedules_for_project(project_id, offset=offset, limit=limit)
+    schedules, total = await service.list_schedules_for_project(
+        project_id, offset=offset, limit=limit, archive_state=archive_state
+    )
     return ScheduleListResponse(
         items=[ScheduleResponse.model_validate(s) for s in schedules],
         total=total,
@@ -322,14 +343,14 @@ async def update_schedule(
 ) -> ScheduleResponse:
     """Update schedule metadata (name, description, status, dates)."""
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
-    schedule = await service.update_schedule(schedule_id, data)
+    schedule = await service.update_schedule(schedule_id, data, actor_payload=payload)
     return ScheduleResponse.model_validate(schedule)
 
 
 @router.delete(
     "/schedules/{schedule_id}",
     status_code=204,
-    summary="Delete schedule",
+    summary="Archive schedule, preserving activities, baselines and links",
     dependencies=[Depends(RequirePermission("schedule.delete"))],
 )
 async def delete_schedule(
@@ -339,9 +360,75 @@ async def delete_schedule(
     session: SessionDep,
     service: ScheduleService = Depends(_get_service),
 ) -> None:
-    """Delete a schedule and all its activities and work orders."""
+    """Archive, including when called by an admin. Permanent deletion is explicit."""
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
-    await service.delete_schedule(schedule_id)
+    await service.delete_schedule(schedule_id, actor_payload=payload)
+
+
+@router.post(
+    "/schedules/{schedule_id}/restore/",
+    response_model=ScheduleResponse,
+    dependencies=[Depends(RequirePermission("schedule.delete"))],
+)
+async def restore_schedule(
+    schedule_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ScheduleService = Depends(_get_service),
+) -> ScheduleResponse:
+    """Restore the previous status; legacy archives without history become draft."""
+    await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    schedule = await service.restore_schedule(schedule_id, actor_payload=payload)
+    return ScheduleResponse.model_validate(schedule)
+
+
+@router.delete(
+    "/schedules/{schedule_id}/permanent/",
+    status_code=204,
+    dependencies=[Depends(RequireRole("admin")), Depends(RequirePermission("schedule.purge"))],
+)
+async def purge_schedule(
+    schedule_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ScheduleService = Depends(_get_service),
+) -> None:
+    """Explicit admin-only destruction; the schedule must already be archived."""
+    await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    await service.purge_schedule(schedule_id, actor_payload=payload)
+
+
+@router.get(
+    "/schedules/{schedule_id}/delete-impact/",
+    response_model=ScheduleDeleteImpactResponse,
+    summary="What permanently deleting a schedule takes with it",
+    dependencies=[Depends(RequirePermission("schedule.read"))],
+)
+async def schedule_delete_impact(
+    schedule_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ScheduleService = Depends(_get_service),
+) -> ScheduleDeleteImpactResponse:
+    """Count what a delete reaches, and say whether this caller may do it.
+
+    The confirmation reads ``can_delete`` so it never offers a Delete the
+    server would refuse; ``blocked_reason`` says why in that case.
+    """
+    schedule = await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    impact = await service.delete_impact(schedule_id)
+    blocked: str | None = None
+    try:
+        await RequireRole("admin")(payload)
+        await RequirePermission("schedule.purge")(payload)
+    except HTTPException:
+        blocked = "permission_denied"
+    if blocked is None and schedule.status != "archived":
+        blocked = "schedule_not_archived"
+    return ScheduleDeleteImpactResponse(**impact, can_delete=blocked is None, blocked_reason=blocked)
 
 
 # ── Activity CRUD ────────────────────────────────────────────────────────────
@@ -369,8 +456,31 @@ async def create_activity(
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
     # Override body schedule_id with URL path parameter
     data.schedule_id = schedule_id
-    activity = await service.create_activity(data)
+    activity = await service.create_activity(data, actor_id=str(_user_id))
     return _activity_to_response(activity)
+
+
+@router.get(
+    "/schedules/{schedule_id}/next-wbs-code/",
+    response_model=WbsCodeSuggestion,
+    summary="Suggest the next WBS code in a section",
+    dependencies=[Depends(RequirePermission("schedule.read"))],
+)
+async def suggest_wbs_code(
+    schedule_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    parent_id: uuid.UUID | None = Query(default=None),
+    service: ScheduleService = Depends(_get_service),
+) -> WbsCodeSuggestion:
+    """Return the WBS code that continues the numbering under ``parent_id``.
+
+    The create dialog prefills this and the user may still change it. Without
+    ``parent_id`` the suggestion continues the top-level numbering.
+    """
+    await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    return WbsCodeSuggestion(wbs_code=await service.suggest_wbs_code(schedule_id, parent_id))
 
 
 @router.get(
@@ -460,8 +570,11 @@ async def get_gantt_data(
     response_model=list[ActivityResponse],
     status_code=201,
     summary="Generate activities from BOQ",
-    description="Auto-generate schedule activities from a BOQ. Creates one activity per "
-    "section with cost-proportional durations and sequential FS dependencies.",
+    description="Auto-generate schedule activities from a BOQ at every depth: one summary per "
+    "section, one task per priced position, sections worked by up to four crews to fit "
+    "total_project_days. A schedule that already has activities answers 409 "
+    "schedule_has_activities unless replace=true. The outcome, including warnings such "
+    "as plan_exceeds_window, is stored on the schedule under metadata.boq_generation.",
     dependencies=[Depends(RequirePermission("schedule.update"))],
 )
 async def generate_from_boq(
@@ -474,24 +587,77 @@ async def generate_from_boq(
 ) -> list[ActivityResponse]:
     """Generate schedule activities from a BOQ.
 
-    Creates one activity per BOQ section with cost-proportional durations
-    and sequential finish-to-start dependencies. Verifies the caller owns
-    the parent project (admins bypass) before mutating the schedule.
+    Verifies the caller owns the parent project (admins bypass) before
+    mutating the schedule. Refusals carry a code the client translates
+    (``boq_not_found``, ``boq_has_no_positions``, ``schedule_has_activities``);
+    an unexpected failure answers ``schedule_generation_failed`` with a
+    reference that is also in the server log.
     """
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
     try:
-        await service.generate_from_boq(schedule_id, body.boq_id, body.total_project_days)
+        created = await service.generate_from_boq(
+            schedule_id,
+            body.boq_id,
+            body.total_project_days,
+            replace=body.replace,
+            start_date=body.start_date,
+            workers_per_position=body.workers_per_position,
+        )
         # Re-fetch activities to avoid greenlet/lazy-loading issues
-        activities, _ = await service.list_activities_for_schedule(schedule_id, limit=5000)
+        activities, _ = await service.list_activities_for_schedule(schedule_id, limit=max(len(created), 1))
         return [_activity_to_response(a) for a in activities]
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("generate_from_boq failed: %s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to generate schedule from BOQ. Check server logs for details.",
+        reference = uuid.uuid4().hex[:8]
+        logger.exception("generate_from_boq failed [ref %s]: %s", reference, exc)
+        raise coded_http_error(
+            500,
+            "schedule_generation_failed",
+            f"The schedule could not be generated from this BOQ (reference {reference}).",
+            reference=reference,
         ) from exc
+
+
+@router.post(
+    "/schedules/{schedule_id}/generate-from-boq/preview/",
+    response_model=GenerationPreviewResponse,
+    summary="Preview generating activities from a BOQ",
+    description="Work out what generate-from-boq would write, and write nothing: counts, the planned "
+    "start and end against the window, the activities a confirmed generation would replace, and one "
+    "note per position whose duration is an estimate or that is left out. replace is ignored.",
+    dependencies=[Depends(RequirePermission("schedule.update"))],
+)
+async def preview_generate_from_boq(
+    schedule_id: uuid.UUID,
+    body: GenerateFromBOQRequest,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ScheduleService = Depends(_get_service),
+) -> GenerationPreviewResponse:
+    """Preview a generation from a BOQ; refusals carry the same codes as the generation."""
+    await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    try:
+        preview = await service.preview_generation(
+            schedule_id,
+            body.boq_id,
+            body.total_project_days,
+            start_date=body.start_date,
+            workers_per_position=body.workers_per_position,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        reference = uuid.uuid4().hex[:8]
+        logger.exception("preview_generation failed [ref %s]: %s", reference, exc)
+        raise coded_http_error(
+            500,
+            "schedule_generation_failed",
+            f"The schedule could not be generated from this BOQ (reference {reference}).",
+            reference=reference,
+        ) from exc
+    return GenerationPreviewResponse(**preview)
 
 
 @router.post(
@@ -596,7 +762,7 @@ async def get_evm_summary(
             target = _date.fromisoformat(as_of_date[:10])
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"as_of_date must be ISO YYYY-MM-DD, got {as_of_date!r}",
             ) from exc
     else:
@@ -658,7 +824,7 @@ async def update_activity(
     """Update a schedule activity. Recalculates duration if dates changed."""
     existing = await service.get_activity(activity_id)
     await _verify_schedule_owner(service, session, existing.schedule_id, _user_id, payload)
-    activity = await service.update_activity(activity_id, data)
+    activity = await service.update_activity(activity_id, data, actor_id=str(_user_id))
     return _activity_to_response(activity)
 
 
@@ -674,11 +840,16 @@ async def delete_activity(
     payload: CurrentUserPayload,
     session: SessionDep,
     service: ScheduleService = Depends(_get_service),
+    cascade: bool = Query(
+        default=False,
+        description="Delete a summary together with every activity under it. "
+        "Without it the children move up one level.",
+    ),
 ) -> None:
     """Delete an activity and its work orders."""
     existing = await service.get_activity(activity_id)
     await _verify_schedule_owner(service, session, existing.schedule_id, _user_id, payload)
-    await service.delete_activity(activity_id)
+    await service.delete_activity(activity_id, cascade=cascade)
 
 
 @router.post(
@@ -702,6 +873,27 @@ async def link_boq_position(
     return _activity_to_response(activity)
 
 
+@router.delete(
+    "/activities/{activity_id}/link-position/{boq_position_id}/",
+    response_model=ActivityResponse,
+    summary="Unlink BOQ position from activity",
+    dependencies=[Depends(RequirePermission("schedule.update"))],
+)
+async def unlink_boq_position(
+    activity_id: uuid.UUID,
+    boq_position_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: ScheduleService = Depends(_get_service),
+) -> ActivityResponse:
+    """Remove one BOQ position from an activity's links."""
+    existing = await service.get_activity(activity_id)
+    await _verify_schedule_owner(service, session, existing.schedule_id, _user_id, payload)
+    activity = await service.unlink_boq_position(activity_id, boq_position_id)
+    return _activity_to_response(activity)
+
+
 @router.patch(
     "/activities/{activity_id}/progress/",
     response_model=ActivityResponse,
@@ -719,7 +911,7 @@ async def update_activity_progress(
     """Update activity progress percentage. Auto-adjusts status."""
     existing = await service.get_activity(activity_id)
     await _verify_schedule_owner(service, session, existing.schedule_id, _user_id, payload)
-    activity = await service.update_progress(activity_id, body.progress_pct)
+    activity = await service.update_progress(activity_id, body.progress_pct, actor_id=str(_user_id))
     return _activity_to_response(activity)
 
 
@@ -737,14 +929,14 @@ async def update_activity_bim_links(
     session: SessionDep,
     service: ScheduleService = Depends(_get_service),
 ) -> ActivityResponse:
-    """Replace the full ``bim_element_ids`` array on an activity (4D linking).
+    """Replace the ``bim_element_ids`` array on an activity, or add to it (4D linking).
 
-    The caller supplies the complete desired list; partial add/remove should
-    be handled client-side by reading the current value first.
+    With ``mode: "add"`` the ids are merged into the stored list here, so a
+    client never has to send back a list it read earlier.
     """
     activity = await service.get_activity(activity_id)
     await _verify_schedule_owner(service, session, activity.schedule_id, _user_id, payload)
-    updated = await service.update_bim_links(activity_id, body.bim_element_ids)
+    updated = await service.update_bim_links(activity_id, body.bim_element_ids, add=body.mode == "add")
     return _activity_to_response(updated)
 
 
@@ -875,13 +1067,29 @@ async def create_relationship(
     await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
     from sqlalchemy import select
 
-    from app.modules.schedule.models import ScheduleRelationship
+    from app.modules.schedule.models import Activity, ScheduleRelationship
 
     # ── Reject self-referencing dependency ────────────────────────────────
     if data.predecessor_id == data.successor_id:
-        raise HTTPException(
-            status_code=400,
-            detail="An activity cannot depend on itself.",
+        raise coded_http_error(400, "schedule_dependency_self", "An activity cannot depend on itself.")
+
+    # ── Both ends must belong to this schedule ────────────────────────────
+    # The handler rewrites the successor's dependency list below, so an id
+    # from another schedule would let the caller edit a plan they may not
+    # even see. Answers like a missing activity.
+    member_ids = set(
+        (
+            await session.execute(
+                select(Activity.id).where(
+                    Activity.schedule_id == schedule_id,
+                    Activity.id.in_([data.predecessor_id, data.successor_id]),
+                )
+            )
+        ).scalars()
+    )
+    if member_ids != {data.predecessor_id, data.successor_id}:
+        raise coded_http_error(
+            404, "schedule_activity_not_in_schedule", "Both activities must belong to this schedule."
         )
 
     # ── Reject circular dependencies ─────────────────────────────────────
@@ -906,11 +1114,10 @@ async def create_relationship(
     while queue:
         current = queue.pop(0)
         if current == data.predecessor_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Adding this dependency would create a circular reference. Check the dependency chain for cycles."
-                ),
+            raise coded_http_error(
+                400,
+                "schedule_dependency_cycle",
+                "Adding this dependency would create a circular reference. Check the dependency chain for cycles.",
             )
         if current in visited:
             continue
@@ -955,6 +1162,54 @@ async def create_relationship(
     await service.activity_repo.update_fields(data.successor_id, dependencies=derived)
 
     return response
+
+
+@router.delete(
+    "/schedules/{schedule_id}/relationships/",
+    status_code=204,
+    summary="Delete the link between two activities",
+    dependencies=[Depends(RequirePermission("schedule.update"))],
+)
+async def delete_relationship_between(
+    schedule_id: uuid.UUID,
+    session: SessionDep,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    predecessor_id: uuid.UUID = Query(..., description="The activity the link leaves from."),
+    successor_id: uuid.UUID = Query(..., description="The activity the link goes to."),
+    service: ScheduleService = Depends(_get_service),
+) -> None:
+    """Delete the link from ``predecessor_id`` to ``successor_id`` in this schedule.
+
+    For a chart that knows the two bars but not the link's id, so it need not
+    list every link of a large schedule first. There is at most one link per
+    pair. Same checks and effects as deleting by id: the caller must reach the
+    schedule's project, and the successor's ``dependencies`` mirror is rebuilt.
+
+    Raises:
+        HTTPException: 404 ``relationship_not_found`` when the schedule holds
+            no such link.
+    """
+    from sqlalchemy import delete, select
+
+    from app.modules.schedule.models import ScheduleRelationship
+
+    await _verify_schedule_owner(service, session, schedule_id, _user_id, payload)
+    rel_id = (
+        await session.execute(
+            select(ScheduleRelationship.id).where(
+                ScheduleRelationship.schedule_id == schedule_id,
+                ScheduleRelationship.predecessor_id == predecessor_id,
+                ScheduleRelationship.successor_id == successor_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if rel_id is None:
+        raise coded_http_error(404, "relationship_not_found", "This schedule has no link between those activities.")
+    await session.execute(delete(ScheduleRelationship).where(ScheduleRelationship.id == rel_id))
+    await session.flush()
+    derived = await service._derive_dependencies_json(successor_id)
+    await service.activity_repo.update_fields(successor_id, dependencies=derived)
 
 
 @router.get(
@@ -2141,6 +2396,97 @@ async def import_msp_xml(
     )
 
 
+def _render_schedule_csv(
+    activity_rows: list[tuple[Any, ...]],
+    relationship_rows: list[tuple[str, str, Any, Any]],
+) -> str:
+    """Render the schedule CSV from plain activity and relationship values."""
+    # Build successor -> list of predecessor info
+    # Also map activity UUID -> activity_code for display
+    act_code_map: dict[str, str] = {}
+    for act_id, activity_code, wbs_code, *_rest in activity_rows:
+        act_code_map[act_id] = activity_code or wbs_code or act_id[:8]
+
+    predecessor_map: dict[str, list[str]] = {}
+    for succ_id, predecessor_id, lag_days, relationship_type in relationship_rows:
+        pred_code = act_code_map.get(predecessor_id, predecessor_id[:8])
+        lag_str = f"+{lag_days}d" if lag_days > 0 else ""
+        pred_label = f"{pred_code}{relationship_type}{lag_str}"
+        predecessor_map.setdefault(succ_id, []).append(pred_label)
+
+    # Also include inline dependencies
+    for act_id, *_rest, dependencies in activity_rows:
+        inline_deps = dependencies or []
+        for dep in inline_deps:
+            if isinstance(dep, dict):
+                pred_id = str(dep.get("activity_id", ""))
+                dep_type = dep.get("type", "FS")
+                lag = dep.get("lag_days", 0)
+                pred_code = act_code_map.get(pred_id, pred_id[:8])
+                lag_str = f"+{lag}d" if lag and lag > 0 else ""
+                pred_label = f"{pred_code}{dep_type}{lag_str}"
+                predecessor_map.setdefault(act_id, []).append(pred_label)
+
+    # Generate CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Activity Code",
+            "Name",
+            "WBS",
+            "Start",
+            "End",
+            "Duration (days)",
+            "Progress (%)",
+            "Total Float",
+            "Critical",
+            "Predecessors",
+        ]
+    )
+
+    for (
+        act_id,
+        activity_code,
+        wbs_code,
+        name,
+        start_date,
+        end_date,
+        duration_days,
+        progress_pct,
+        total_float,
+        is_critical,
+        _dependencies,
+    ) in activity_rows:
+        preds = predecessor_map.get(act_id, [])
+        # Deduplicate predecessors
+        preds = list(dict.fromkeys(preds))
+
+        # Neutralise every string-bearing cell so a value a user controls
+        # (activity name/code/WBS, or a derived predecessor label built from
+        # them) that starts with =, +, -, @, tab or CR cannot be interpreted as
+        # a formula when the CSV is opened in Excel / Sheets / LibreOffice
+        # (CSV/formula injection - OWASP). Numeric cells pass through unchanged.
+        writer.writerow(
+            [
+                neutralise_formula(activity_code or ""),
+                neutralise_formula(name),
+                neutralise_formula(wbs_code),
+                neutralise_formula(start_date),
+                neutralise_formula(end_date),
+                duration_days,
+                _str_to_float(progress_pct),
+                total_float if total_float is not None else "",
+                "Yes" if is_critical else "No",
+                neutralise_formula("; ".join(preds)),
+            ]
+        )
+
+    csv_content = output.getvalue()
+    output.close()
+    return csv_content
+
+
 @router.get(
     "/schedule/export/csv/",
     dependencies=[Depends(RequirePermission("schedule.read"))],
@@ -2174,80 +2520,31 @@ async def export_schedule_csv(
     rel_result = await session.execute(rel_stmt)
     relationships = list(rel_result.scalars().all())
 
-    # Build successor -> list of predecessor info
-    # Also map activity UUID -> activity_code for display
-    act_code_map: dict[str, str] = {}
-    for act in activities:
-        act_code_map[str(act.id)] = act.activity_code or act.wbs_code or str(act.id)[:8]
-
-    predecessor_map: dict[str, list[str]] = {}
-    for rel in relationships:
-        succ_id = str(rel.successor_id)
-        pred_code = act_code_map.get(str(rel.predecessor_id), str(rel.predecessor_id)[:8])
-        lag_str = f"+{rel.lag_days}d" if rel.lag_days > 0 else ""
-        pred_label = f"{pred_code}{rel.relationship_type}{lag_str}"
-        predecessor_map.setdefault(succ_id, []).append(pred_label)
-
-    # Also include inline dependencies
-    for act in activities:
-        act_id = str(act.id)
-        inline_deps = act.dependencies or []
-        for dep in inline_deps:
-            if isinstance(dep, dict):
-                pred_id = str(dep.get("activity_id", ""))
-                dep_type = dep.get("type", "FS")
-                lag = dep.get("lag_days", 0)
-                pred_code = act_code_map.get(pred_id, pred_id[:8])
-                lag_str = f"+{lag}d" if lag and lag > 0 else ""
-                pred_label = f"{pred_code}{dep_type}{lag_str}"
-                predecessor_map.setdefault(act_id, []).append(pred_label)
-
-    # Generate CSV
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "Activity Code",
-            "Name",
-            "WBS",
-            "Start",
-            "End",
-            "Duration (days)",
-            "Progress (%)",
-            "Total Float",
-            "Critical",
-            "Predecessors",
-        ]
-    )
-
-    for act in activities:
-        act_id = str(act.id)
-        preds = predecessor_map.get(act_id, [])
-        # Deduplicate predecessors
-        preds = list(dict.fromkeys(preds))
-
-        # Neutralise every string-bearing cell so a value a user controls
-        # (activity name/code/WBS, or a derived predecessor label built from
-        # them) that starts with =, +, -, @, tab or CR cannot be interpreted as
-        # a formula when the CSV is opened in Excel / Sheets / LibreOffice
-        # (CSV/formula injection - OWASP). Numeric cells pass through unchanged.
-        writer.writerow(
-            [
-                neutralise_formula(act.activity_code or ""),
-                neutralise_formula(act.name),
-                neutralise_formula(act.wbs_code),
-                neutralise_formula(act.start_date),
-                neutralise_formula(act.end_date),
-                act.duration_days,
-                _str_to_float(act.progress_pct),
-                act.total_float if act.total_float is not None else "",
-                "Yes" if act.is_critical else "No",
-                neutralise_formula("; ".join(preds)),
-            ]
+    # Snapshot the ORM rows into plain values on the loop; the renderer below
+    # never touches the session or a live instance.
+    activity_rows = [
+        (
+            str(act.id),
+            act.activity_code,
+            act.wbs_code,
+            act.name,
+            act.start_date,
+            act.end_date,
+            act.duration_days,
+            act.progress_pct,
+            act.total_float,
+            act.is_critical,
+            act.dependencies,
         )
+        for act in activities
+    ]
+    relationship_rows = [
+        (str(rel.successor_id), str(rel.predecessor_id), rel.lag_days, rel.relationship_type) for rel in relationships
+    ]
 
-    csv_content = output.getvalue()
-    output.close()
+    # Writing the file walks every activity (up to 5000) and is pure CPU, so it
+    # runs in a worker thread and a large schedule does not stall other requests.
+    csv_content = await asyncio.to_thread(_render_schedule_csv, activity_rows, relationship_rows)
 
     schedule_name = schedule.name.replace(" ", "_")[:40]
     filename = f"schedule_{schedule_name}.csv"
@@ -2356,12 +2653,16 @@ async def export_schedule_msp_xml(
                 lag = 0
             _add_link(succ, pred, str(dep.get("type", "FS")), lag)
 
-    xml_str = build_mspdi_xml(
+    # Serialising up to 5,000 tasks and their links into the XML tree is CPU
+    # work that grows with the programme; it runs in a worker thread so the
+    # event loop keeps serving. The inputs are plain dataclasses by now.
+    xml_str = await asyncio.to_thread(
+        build_mspdi_xml,
         MspdiProject(
             name=schedule.name or "Schedule",
             activities=mspdi_acts,
             predecessors_by_uid=preds_by_uid,
-        )
+        ),
     )
 
     schedule_name = schedule.name.replace(" ", "_")[:40]
@@ -2552,7 +2853,7 @@ async def critical_path_activities(
 
     if project_id is None and schedule_id is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Either project_id or schedule_id must be provided.",
         )
 
@@ -2765,7 +3066,7 @@ async def diff_schedule(
         base_label = "provided"
     else:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Provide base_baseline_id or base_envelope.",
         )
 
@@ -2817,3 +3118,9 @@ router.include_router(_interchange_router)
 from app.modules.schedule.evm_snapshot_router import evm_snapshot_router as _evm_snapshot_router  # noqa: E402
 
 router.include_router(_evm_snapshot_router)
+
+# Schedule import from a spreadsheet (Excel / CSV): preview with column
+# mapping, then commit as a new schedule or into a draft. Same prefix.
+from app.modules.schedule.tabular_import_router import tabular_import_router as _tabular_import_router  # noqa: E402
+
+router.include_router(_tabular_import_router)

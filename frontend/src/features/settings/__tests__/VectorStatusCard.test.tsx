@@ -127,6 +127,85 @@ describe('VectorStatusCard reindex reporting', () => {
     expect(toast.message).toContain('900');
   });
 
+  it('does not call a truncated pass a success', async () => {
+    // The backend walks a collection up to a ceiling and reports `truncated`
+    // when it stopped there with rows left over. Those rows are not in the
+    // search index and will not be found by a semantic search. The card used
+    // to read `indexed` and `skipped` only, so this arrived as plain green
+    // "Reindex complete" - the operator, who is the only party able to act on
+    // it, was the only party not told.
+    const toast = await reindexReturning({
+      indexed: 100000,
+      skipped: 0,
+      purged: false,
+      collection: COLLECTION,
+      scanned: 100000,
+      cap: 100000,
+      truncated: true,
+    });
+
+    expect(toast.type).toBe('warning');
+    expect(toast.title).not.toMatch(/complete/i);
+  });
+
+  it('says how far the truncated pass got and where it stopped', async () => {
+    // A warning with no numbers cannot be acted on: what the operator needs is
+    // how much was covered against the limit that cut it off, which is what
+    // tells them the collection has to be reindexed a project at a time.
+    const toast = await reindexReturning({
+      indexed: 99000,
+      skipped: 1000,
+      purged: false,
+      collection: COLLECTION,
+      scanned: 100000,
+      cap: 100000,
+      truncated: true,
+    });
+
+    expect(toast.message).toContain('100000');
+    expect(toast.message).toContain('99000');
+  });
+
+  it('leaves a note on the collection after the toast is gone', async () => {
+    // A toast is read once. "Part of this collection is not indexed" is a
+    // state of the system, not an event, so it has to outlive the toast.
+    await reindexReturning({
+      indexed: 100000,
+      skipped: 0,
+      purged: false,
+      collection: COLLECTION,
+      scanned: 100000,
+      cap: 100000,
+      truncated: true,
+    });
+
+    expect(await screen.findByText(/not reindexed/i)).toBeTruthy();
+  });
+
+  it('reports a complete pass as a success even though it now carries a limit', async () => {
+    // Every response carries `cap` and `scanned` now, truncated or not. A pass
+    // that fit inside the ceiling is an ordinary success and must not inherit
+    // the warning from the presence of those keys.
+    //
+    // Deliberately green on both sides of the change - the other three in this
+    // group fail against the previous card and this one does not. It is the
+    // control: without it, "warn on truncation" could be satisfied by warning
+    // on any response that carries the new keys at all, and the suite would
+    // not notice.
+    const toast = await reindexReturning({
+      indexed: 900,
+      skipped: 0,
+      purged: false,
+      collection: COLLECTION,
+      scanned: 900,
+      cap: 100000,
+      truncated: false,
+    });
+
+    expect(toast.type).toBe('success');
+    expect(screen.queryByText(/not reindexed/i)).toBeNull();
+  });
+
   it('treats partial skipping as a success, because rows without text always skip', async () => {
     // The guard is deliberately narrow. Rows with no indexable text are
     // ordinary and skip on every healthy run, so warning about them would

@@ -24,6 +24,8 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import io
 import uuid
 
@@ -208,21 +210,34 @@ async def test_complete_publishes_update_event(client, auth, project_id):
     to skip the lifecycle event entirely)."""
     from app.core.events import event_bus
 
+    created = (await _create_task(client, auth, project_id)).json()
+    task_id = created["id"]
+
     seen: list[dict] = []
+    delivered = asyncio.Event()
 
     async def _capture(ev):
-        seen.append(ev.data or {})
+        data = ev.data or {}
+        seen.append(data)
+        if data.get("task_id") == task_id:
+            delivered.set()
 
     event_bus.subscribe("tasks.task.updated", _capture)
     try:
-        created = (await _create_task(client, auth, project_id)).json()
-        await client.post(f"{TASKS}/{created['id']}/complete/", headers=auth)
+        await client.post(f"{TASKS}/{task_id}/complete/", headers=auth)
+        # The service publishes through ``publish_detached``, so the fan-out is
+        # its own task and is still pending when the response comes back. Wait
+        # on the handler rather than on the clock: a sleep long enough to be
+        # safe on a loaded CI runner is wasted on every green run, and one
+        # short enough to be cheap goes red for the wrong reason. If the
+        # publish really is missing this costs the timeout once and the
+        # assertion below still reports what was seen.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(delivered.wait(), timeout=10)
     finally:
         event_bus.unsubscribe("tasks.task.updated", _capture)
 
-    assert any(d.get("task_id") == created["id"] for d in seen), (
-        f"no tasks.task.updated event for completed task; saw {seen}"
-    )
+    assert any(d.get("task_id") == task_id for d in seen), f"no tasks.task.updated event for completed task; saw {seen}"
 
 
 @pytest.mark.asyncio

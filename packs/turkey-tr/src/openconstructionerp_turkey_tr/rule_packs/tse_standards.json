@@ -1,0 +1,22 @@
+{
+  "rule_pack_id": "tse_standards",
+  "name": "TSE — Turkish Standards Institution Construction Standards",
+  "standard": "TS EN / TS standards series",
+  "jurisdiction": "TR",
+  "description": "Validates BOQ items and specifications against key TSE (Turk Standartlari Enstitusu) construction standards. Covers TS EN 206 (concrete), TS 500 (reinforced concrete design), TS 648 (steel structures), TS 825 (thermal insulation), TS EN 1990-1999 (Eurocodes with Turkish National Annexes), and material testing standards. Checks that specification clauses cite the applicable TS standard and that material grades match TSE classifications.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "tse.standard_reference_present",
+    "tse.standard_version_current",
+    "tse.en_206_concrete_class_specified",
+    "tse.ts_500_rc_design_referenced",
+    "tse.ts_648_steel_referenced_if_applicable",
+    "tse.ts_825_thermal_insulation_referenced",
+    "tse.eurocode_national_annex_referenced",
+    "tse.material_grade_matches_tse",
+    "tse.g_mark_conformity_if_required",
+    "tse.test_certificate_requirement_noted"
+  ],
+  "regulator": "TSE (Turk Standartlari Enstitusu)",
+  "publication_year": 2024
+}

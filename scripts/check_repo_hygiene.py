@@ -327,6 +327,44 @@ def _git_tracked() -> list[str]:
     return [p for p in out.stdout.decode("utf-8").split("\0") if p]
 
 
+def _empty_package_data_globs(root: str, tracked: list[str]) -> tuple[list[str], int, int]:
+    """Package-data patterns in a pack's pyproject.toml that match no tracked file.
+
+    setuptools skips a package-data pattern that matches nothing without a word,
+    so a pack that declares ``rule_packs/*.json`` and ships no rule pack builds a
+    wheel identical to one that never asked. Eleven packs carried such a line on
+    2026-09-25, which reads as a promise of files the wheel does not have. A
+    pattern is matched segment by segment, the way setuptools globs it relative
+    to the package directory (every pack uses the ``src`` layout).
+
+    Returns the dead patterns, the number of patterns checked and the number of
+    pack pyproject files read, so the caller can print the population.
+    """
+    import fnmatch
+    import tomllib
+
+    dead: list[str] = []
+    checked = 0
+    pyprojects = sorted(p for p in tracked if re.fullmatch(r"packs/[^/]+/pyproject\.toml", p))
+    for pyproject in pyprojects:
+        with open(os.path.join(root, pyproject), "rb") as fh:
+            cfg = tomllib.load(fh)
+        package_data = cfg.get("tool", {}).get("setuptools", {}).get("package-data", {})
+        pack_dir = posixpath.dirname(pyproject)
+        for package, patterns in package_data.items():
+            base = f"{pack_dir}/src/{package.replace('.', '/')}/"
+            inside = [p[len(base) :].split("/") for p in tracked if p.startswith(base)]
+            for pattern in patterns:
+                checked += 1
+                parts = pattern.split("/")
+                if not any(
+                    len(rel) == len(parts) and all(fnmatch.fnmatchcase(a, b) for a, b in zip(rel, parts, strict=True))
+                    for rel in inside
+                ):
+                    dead.append(f"{pyproject}: {package} = {pattern!r}")
+    return dead, checked, len(pyprojects)
+
+
 def _zip_names(path: str) -> list[str]:
     # Both release artifact shapes. `make build-wheel` runs `python -m build`
     # with no --wheel, so it emits an sdist alongside the wheel, and a local
@@ -398,6 +436,35 @@ def main() -> int:
         checked_untracked = True
 
     bad = _offending(names)
+    dead_globs: list[str] = []
+    patterns_checked = packs_checked = 0
+    if not (args.zip or args.dir):
+        # Paths from the repository root whatever the working directory, so a
+        # run from a subdirectory reads the same packs as one from the root.
+        root = _repo_root()
+        if root is not None:
+            dead_globs, patterns_checked, packs_checked = _empty_package_data_globs(
+                root, sorted(_git_tracked_set(root))
+            )
+        if packs_checked == 0:
+            print(
+                "ERROR: the pack package-data check read no packs/*/pyproject.toml, so it "
+                "would pass without looking at anything.",
+                file=sys.stderr,
+            )
+            return 1
+    if dead_globs:
+        print(
+            f"ERROR: {len(dead_globs)} pack package-data pattern(s) match no tracked file:",
+            file=sys.stderr,
+        )
+        for line in dead_globs:
+            print(f"  {line}", file=sys.stderr)
+        print(
+            "\nsetuptools drops a pattern that matches nothing without a warning, so the "
+            "wheel silently lacks what the pattern promises. Add the files or remove the pattern.",
+            file=sys.stderr,
+        )
     if untracked:
         print(
             f"ERROR: {where} contains {len(untracked)} file(s) that git does not track:",
@@ -432,7 +499,7 @@ def main() -> int:
             "and out of build artifacts.",
             file=sys.stderr,
         )
-    if bad or untracked:
+    if bad or untracked or dead_globs:
         return 1
 
     # Say what was checked, not just that it passed. A gate whose report does
@@ -440,6 +507,8 @@ def main() -> int:
     scope = "no internal-only paths"
     if checked_untracked:
         scope += ", every file tracked or a declared build output"
+    if not (args.zip or args.dir):
+        scope += f", {patterns_checked} package-data pattern(s) in {packs_checked} pack(s) each match a file"
     print(f"repo hygiene OK: {len(names)} files in {where}, {scope}")
     return 0
 

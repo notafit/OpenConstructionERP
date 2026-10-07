@@ -15,10 +15,65 @@ from __future__ import annotations
 import io
 from datetime import UTC, datetime
 from html import escape
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.modules.meetings.models import Meeting, MinutesRecord
+
+#: The grey both minutes renderers draw their running head and footer in.
+_FURNITURE_GREY = "#999999"
+
+
+def draw_minutes_footer(canvas_obj: Any, doc: Any, appearance: dict[str, Any], *, margin: float) -> None:
+    """Draw the minutes footer: the page number, and a saved footer line.
+
+    Shared by :func:`build_minutes_pdf` and the export in
+    ``app.modules.meetings.router``, and follows the document appearance for
+    meeting minutes as the RFI footer does: the footer colour colours the
+    footer and page numbers can be switched off. The minutes print no footer
+    line of their own, so a saved one is added at the left margin rather than
+    put in place of one.
+
+    Expects the caller to have saved the canvas state and set the fill to
+    :data:`_FURNITURE_GREY`, which the running head is drawn in. The colour is
+    set again only when the footer's differs, so the default look draws the
+    page it always drew.
+
+    Args:
+        canvas_obj: The page's canvas.
+        doc: The document being built, for the page size and number.
+        appearance: The document appearance, read once for the whole document.
+        margin: The side margin both renderers lay the page out with.
+    """
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph
+
+    from app.core.pdf_fonts import BODY_FONT, pdf_fit_line, pdf_fitted_style
+
+    page_width = doc.pagesize[0]
+    colour = appearance.get("footer_color") or _FURNITURE_GREY
+    if colour != _FURNITURE_GREY:
+        canvas_obj.setFillColor(colors.HexColor(colour))
+    page_text = f"Page {doc.page}" if appearance.get("show_page_numbers", True) is not False else ""
+    if page_text:
+        canvas_obj.setFont(BODY_FONT, 7)
+        canvas_obj.drawRightString(page_width - margin, 10 * mm, page_text)
+    footer_text = str(appearance.get("footer_text") or "").strip()
+    if footer_text:
+        # A Paragraph, so a Thai or Devanagari line is shaped. Printed as saved,
+        # untranslated, on the page number's baseline and clear of it. Fitted
+        # onto one line rather than wrapped, because the paragraph is placed by
+        # the top of its box and a second line would land on the bottom edge.
+        style = ParagraphStyle(
+            "MinutesFooter", fontName=BODY_FONT, fontSize=7, leading=8, textColor=colors.HexColor(colour)
+        )
+        room = page_width - 2 * margin - 40 * mm
+        footer_text, _face, size = pdf_fit_line(footer_text, room, base=BODY_FONT)
+        line = Paragraph(escape(footer_text, quote=True), pdf_fitted_style(style, footer_text, size))
+        _, height = line.wrapOn(canvas_obj, room, 20)
+        line.drawOn(canvas_obj, margin, 10 * mm - height + 7)
 
 
 def minutes_pdf_filename(meeting: Meeting, content: dict) -> str:
@@ -55,6 +110,12 @@ def build_minutes_pdf(meeting: Meeting, minutes: MinutesRecord, project_name: st
         TableStyle,
     )
 
+    from app.core.pdf_branding import (
+        branded_appearance,
+        branded_doc_metadata,
+        branded_header_logo,
+        branded_letterhead,
+    )
     from app.core.pdf_fonts import (
         BODY_FONT,
         BOLD_FONT,
@@ -140,6 +201,11 @@ def build_minutes_pdf(meeting: Meeting, minutes: MinutesRecord, project_name: st
         return style_cell_label if col_index == 0 else None
 
     elements: list = []
+    # The firm's letterhead, when the company profile has one. The frame pads
+    # 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(USABLE_WIDTH - 12, doc_type="meeting_minutes")
+    if letterhead is not None:
+        elements.append(letterhead)
     elements.append(Paragraph("Meeting Minutes", style_title))
     status_tag = "ISSUED" if minutes.status == "issued" else "DRAFT"
     elements.append(
@@ -282,19 +348,35 @@ def build_minutes_pdf(meeting: Meeting, minutes: MinutesRecord, project_name: st
     elements.append(Paragraph(f"Generated: {stamp}{issued_note}", style_small))
 
     buf = io.BytesIO()
+    look = branded_appearance(doc_type="meeting_minutes")
 
     def _header_footer(canvas_obj, doc):  # type: ignore[no-untyped-def]
+        # On a page that opens with the letterhead, the letterhead is the page's
+        # header: the running head and the logo above it would repeat it.
+        under_letterhead = letterhead is not None and doc.page == 1
         canvas_obj.saveState()
-        canvas_obj.setFillColor(colors.HexColor("#999999"))
-        running_head = f"{project_name} - Minutes"
-        canvas_obj.setFont(pdf_font_for_text(running_head), 7)
-        canvas_obj.drawString(MARGIN, PAGE_HEIGHT - 12 * mm, running_head)
-        canvas_obj.setFont(BODY_FONT, 7)
-        canvas_obj.drawRightString(PAGE_WIDTH - MARGIN, 10 * mm, f"Page {doc.page}")
+        canvas_obj.setFillColor(colors.HexColor(_FURNITURE_GREY))
+        if not under_letterhead:
+            running_head = f"{project_name} - Minutes"
+            canvas_obj.setFont(pdf_font_for_text(running_head), 7)
+            canvas_obj.drawString(MARGIN, PAGE_HEIGHT - 12 * mm, running_head)
+        draw_minutes_footer(canvas_obj, doc, look, margin=MARGIN)
         canvas_obj.restoreState()
+        if not under_letterhead:
+            branded_header_logo(canvas_obj, doc)
 
     frame = Frame(MARGIN, MARGIN, USABLE_WIDTH, PAGE_HEIGHT - 2 * MARGIN, id="main")
-    doc = BaseDocTemplate(buf, pagesize=A4)
+    # The margins are the frame's, so the header logo, placed from the right
+    # margin, lines up with the text under it instead of reportlab's inch.
+    doc = BaseDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+        topMargin=MARGIN,
+        bottomMargin=MARGIN,
+        **branded_doc_metadata(),
+    )
     doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=_header_footer)])
     doc.build(elements)
 

@@ -1,10 +1,10 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { Suspense, lazy, useState, useCallback, useEffect, useLayoutEffect, useContext, createContext } from 'react';
-import { Routes, Route, Navigate, Outlet, useLocation, useParams } from 'react-router-dom';
+import { Routes, Route, Navigate, Outlet, useLocation, useMatch, useParams } from 'react-router-dom';
 import { AppLayout } from './layout';
 import { DashboardPage } from '@/features/dashboard';
-import { LoginPage, RegisterPage, ForgotPasswordPage, AuthedHome } from '@/features/auth';
+import { LoginPage, RegisterPage, ForgotPasswordPage, ResetPasswordPage, AuthedHome } from '@/features/auth';
 import { ProjectsPage, CreateProjectPage, ProjectDetailPage, ProjectSettingsPage } from '@/features/projects';
 // Import the lightweight BOQ pages from their source modules directly,
 // NOT via the `@/features/boq` barrel.  The barrel re-exports
@@ -18,9 +18,12 @@ import { BOQListPage } from '@/features/boq/BOQListPage';
 import { CreateBOQPage } from '@/features/boq/CreateBOQPage';
 import { TemplatesPage } from '@/features/boq/TemplatesPage';
 import { syncCustomUnitsFromServer } from '@/features/boq/boqHelpers';
+// Pure URL helpers, no React or grid code: safe on the eager edge.
+import { rulesTabFromParams } from '@/features/bim/quantityRuleLinks';
 import { NlRuleBuilderPanel } from '@/features/compliance';
 import { useModuleRouteElements } from '@/modules/ModuleRoutes';
 import { DatabaseSetupPage } from '@/features/setup';
+import { ModuleVideosSlot } from '@/features/videos/ModuleVideosSlot';
 import { Logo, ShortcutsDialog, CommandPalette, ToastContainer, DemoReadOnlyDialog, BackgroundInstallBanner, ErrorBoundary, NotFoundPage, ProductTour, OfflineBanner, PWAInstallPrompt } from '@/shared/ui';
 import { AdminOnly } from '@/shared/auth/AdminOnly';
 import GlobalSearchModal from '@/features/search/GlobalSearchModal';
@@ -31,10 +34,12 @@ import { useThemeStore } from '@/stores/useThemeStore';
 import { useBrandingStore } from '@/stores/useBrandingStore';
 import { usePreferencesStore } from '@/stores/usePreferencesStore';
 import { hydrateInfoBlocksFromServer } from '@/stores/useInfoBlockPrefsStore';
+import { useViewModeDefault } from './layout/useViewModeDefault';
 import { ddcVerifyIntegrity, ddcInjectMeta, DDC_ORIGIN } from '@/shared/lib/ddc-integrity';
 import { NavigationProgress } from '@/shared/lib/navigationProgress';
 import { useKeyboardShortcuts } from '@/shared/hooks/useKeyboardShortcuts';
 import { useTranslation } from 'react-i18next';
+import { ProjectRouteGate } from './ProjectRouteGate';
 import { getLanguageByCode } from './i18n';
 import { initErrorLogger } from '@/shared/lib/errorLogger';
 import { installDesktopExternalLinks } from '@/shared/lib/desktop';
@@ -66,6 +71,9 @@ const MatchElementsPage = lazy(() =>
 );
 const NotificationsPage = lazy(() =>
   import('@/features/notifications/NotificationsPage').then((m) => ({ default: m.NotificationsPage }))
+);
+const FundingPage = lazy(() =>
+  import('@/features/funding/FundingPage').then((m) => ({ default: m.FundingPage }))
 );
 const TenderingPage = lazy(() =>
   import('@/features/tendering/TenderingPage').then((m) => ({ default: m.TenderingPage }))
@@ -332,6 +340,9 @@ const BuyerPortalPage = lazy(() =>
   import('@/features/buyer-portal/BuyerPortalPage').then((m) => ({
     default: m.BuyerPortalPage,
   }))
+);
+const BidPortalPage = lazy(() =>
+  import('@/features/bid-portal/BidPortalPage').then((m) => ({ default: m.BidPortalPage }))
 );
 // Field-worker mobile shell + PIN-redemption auth. See
 // docs/architecture/FIELD_WORKER_MOBILE_DESIGN.md. Lazy-loaded in its
@@ -608,6 +619,9 @@ const OnboardingWizard = lazy(() =>
 const LoginPageNext = lazy(() =>
   import('@/features/auth/LoginPageNext').then((m) => ({ default: m.LoginPageNext }))
 );
+const OidcCallbackPage = lazy(() =>
+  import('@/features/auth/OidcCallback').then((m) => ({ default: m.OidcCallback }))
+);
 const QuickEstimatePage = lazy(() =>
   import('@/features/ai/QuickEstimatePage').then((m) => ({ default: m.QuickEstimatePage }))
 );
@@ -636,6 +650,9 @@ const EstimateCopilotPage = lazy(() =>
 );
 const PriceIndexPage = lazy(() =>
   import('@/features/price-index').then((m) => ({ default: m.PriceIndexPage }))
+);
+const ResourceIndexPage = lazy(() =>
+  import('@/features/price-index').then((m) => ({ default: m.ResourceIndexPage }))
 );
 const LaborRatesPage = lazy(() =>
   import('@/features/labor-rates').then((m) => ({ default: m.LaborRatesPage }))
@@ -695,6 +712,11 @@ const HowItWorksPage = lazy(() => import('@/features/help/HowItWorksPage'));
 const CasesPage = lazy(() =>
   import('@/features/cases').then((m) => ({ default: m.CasesPage }))
 );
+// Videos - tutorial and training videos. Lazy: the page is a list of posters,
+// and nothing on it is needed at boot.
+const VideosPage = lazy(() =>
+  import('@/features/videos').then((m) => ({ default: m.VideosPage }))
+);
 // The case editor, split from the hub: most readers never author one.
 const CaseEditorPage = lazy(() =>
   import('@/features/cases').then((m) => ({ default: m.CaseEditorPage }))
@@ -703,6 +725,24 @@ const CaseEditorPage = lazy(() =>
 // changelog it reuses does not weigh down the boot bundle.
 const InsidePage = lazy(() =>
   import('@/features/inside').then((m) => ({ default: m.InsidePage }))
+);
+
+// Module UIs that sit behind their backend counterpart (no data without
+// the backend module enabled).
+const JobsPage = lazy(() =>
+  import('@/features/jobs').then((m) => ({ default: m.JobsPage }))
+);
+const WorkflowsPage = lazy(() =>
+  import('@/features/enterprise-workflows').then((m) => ({ default: m.WorkflowsPage }))
+);
+const RebarSchedulePage = lazy(() =>
+  import('@/features/rebar-schedule').then((m) => ({ default: m.RebarSchedulePage }))
+);
+const RFQBiddingPage = lazy(() =>
+  import('@/features/rfq-bidding').then((m) => ({ default: m.RFQBiddingPage }))
+);
+const SavedViewsPage = lazy(() =>
+  import('@/features/saved-views').then((m) => ({ default: m.SavedViewsPage }))
 );
 
 // CPMView is keyed by the schedule it analyses, so the route reads :id and
@@ -791,6 +831,11 @@ function AppShell() {
       <ErrorBoundary scope="app">
         <AppLayout title={title}>
           <Suspense fallback={<PageLoadingInline />}>
+            {/* "Videos for this step": renders nothing on a screen with no
+                videos, and a failure in it must never take the page down. */}
+            <ErrorBoundary key={`videos:${location.pathname}`} fallback={null}>
+              <ModuleVideosSlot />
+            </ErrorBoundary>
             <ErrorBoundary key={location.pathname}>
               <PageTitleContext.Provider value={setTitle}>
                 <Outlet />
@@ -812,7 +857,27 @@ function P({ title, children }: { title: string; children: React.ReactNode }) {
   useLayoutEffect(() => {
     setTitle(title);
   }, [setTitle, title]);
+  // Pages under /projects/:projectId answer a gone project with one message.
+  // The project page itself keeps its own not-found state, which also cleans
+  // the recent-items list.
+  const { projectId } = useParams();
+  const isProjectPage = useMatch('/projects/:projectId') !== null;
+  if (projectId && !isProjectPage) return <ProjectRouteGate projectId={projectId}>{children}</ProjectRouteGate>;
   return <>{children}</>;
+}
+
+/** /bim/rules is one page with two halves: the quantity rules and the
+ *  compliance requirements (`?mode=requirements`, or a tab picked on the page,
+ *  which the page writes as `?tab=`). The top bar names the half on screen,
+ *  read from the URL by the same function the page uses. It reads as if every
+ *  tab were available: the page strips a tab or mode whose module is off, so
+ *  the URL it leaves names a half it shows. Both branches are the same
+ *  element type, so switching half does not remount. */
+function BimRulesRoute() {
+  const params = new URLSearchParams(useLocation().search);
+  return rulesTabFromParams(params, { requirements: true, ruleLibrary: true }) !== 'quantity_rules'
+    ? <P title="BIM Rules"><BIMQuantityRulesPage /></P>
+    : <P title="Quantity Rules"><BIMQuantityRulesPage /></P>;
 }
 
 /** Mounts global keyboard shortcuts, the shortcuts help dialog, and the command palette. */
@@ -964,6 +1029,9 @@ function useDocumentDirection() {
 export default function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   useDocumentDirection();
+  // The Simple / Advanced menu mode: the user's stored choice, or while there
+  // is none a default derived from the company profile.
+  useViewModeDefault();
 
   // DDC-CWICR-OE integrity verification
   if (typeof window !== 'undefined') {
@@ -1035,6 +1103,12 @@ export default function App() {
   // Dynamic routes from the module registry (lazy-loaded)
   const moduleRoutes = useModuleRouteElements({ Wrapper: P });
 
+  // A new tab is asking the open ones for their sign-in. Every route branches
+  // on isAuthenticated, so none renders yet: the login page would flash, and
+  // the desktop first-run check would read storage before the answer lands.
+  const authPending = useAuthStore((s) => s.authPending);
+  if (authPending) return <LoadingScreen />;
+
   return (
     <Suspense fallback={<LoadingScreen />}>
       {/* Route-transition pending feedback: a navigation commits inside a
@@ -1069,6 +1143,19 @@ export default function App() {
 
         {/* Public buyer-portal landing page — magic-link auth only, no app shell */}
         <Route path="/buyer-portal/:token" element={<BuyerPortalPage />} />
+
+        {/* Public subcontractor price-entry link - the token is the credential,
+            no login, no app shell. Raw fetch only, never the JWT client. It
+            lives under /tendering/ because the production proxy forwards an
+            allowlist of top-level segments and `tendering` is already on it. */}
+        <Route
+          path="/tendering/bid/:token"
+          element={
+            <Suspense fallback={<LoadingScreen />}>
+              <BidPortalPage />
+            </Suspense>
+          }
+        />
 
         {/* Public subcontractor payment portal — magic-link session, no app
             shell. ?token=<magic-link> deep-links straight to the submit form
@@ -1109,7 +1196,14 @@ export default function App() {
         <Route path="/login" element={isAuthenticated ? <AuthedHome /> : <LoginPage />} />
         <Route path="/login-next" element={isAuthenticated ? <AuthedHome /> : <Suspense fallback={<LoadingScreen />}><LoginPageNext /></Suspense>} />
         <Route path="/register" element={isAuthenticated ? <AuthedHome /> : <RegisterPage />} />
+        <Route path="/auth/oidc/callback" element={<Suspense fallback={<LoadingScreen />}><OidcCallbackPage /></Suspense>} />
         <Route path="/forgot-password" element={isAuthenticated ? <AuthedHome /> : <ForgotPasswordPage />} />
+        {/* The password-reset email links here (backend users/service.py).
+            Rendered signed in or not: AuthedHome would forward to the
+            dashboard and drop the token, and signing out on arrival would let
+            any link end a session. The page drops the local session itself
+            once the reset succeeds. */}
+        <Route path="/auth/reset" element={<ResetPasswordPage />} />
 
         {/* Onboarding — full-screen, no layout */}
         <Route path="/onboarding" element={
@@ -1158,7 +1252,7 @@ export default function App() {
         <Route path="/pipelines" element={<P title="Pipelines"><PipelinesPage /></P>} />
         <Route path="/bim" element={<P title="BIM Viewer"><BIMPage /></P>} />
         <Route path="/bim/federations" element={<P title="BIM Federations"><FederationsPage /></P>} />
-        <Route path="/bim/rules" element={<P title="BIM Rules"><BIMQuantityRulesPage /></P>} />
+        <Route path="/bim/rules" element={<BimRulesRoute />} />
         {/* Legacy alias — must come BEFORE /bim/:modelId so the literal
             "quantity-rules" segment isn't swallowed as a UUID model id. */}
         <Route path="/bim/quantity-rules" element={<Navigate to="/bim/rules" replace />} />
@@ -1201,6 +1295,7 @@ export default function App() {
         <Route path="/design-options" element={<P title="Design Options"><DesignOptionsPage /></P>} />
         <Route path="/formwork" element={<P title="Formwork"><FormworkPage /></P>} />
         <Route path="/price-index" element={<P title="Price Index"><PriceIndexPage /></P>} />
+        <Route path="/price-index/resource-index" element={<P title="Resource-index estimate"><ResourceIndexPage /></P>} />
         <Route path="/labor-rates" element={<P title="Labor Rates"><LaborRatesPage /></P>} />
         <Route path="/resource-summary" element={<P title="Resource Summary"><ResourceSummaryPage /></P>} />
         <Route path="/waste-factors" element={<P title="Waste Factors"><WasteFactorsPage /></P>} />
@@ -1255,6 +1350,7 @@ export default function App() {
         <Route path="/esg" element={<P title="ESG Site Performance"><EsgPage /></P>} />
         <Route path="/forms" element={<P title="Forms & checklists"><FormsPage /></P>} />
 
+        <Route path="/funding" element={<P title="Public Funding"><FundingPage /></P>} />
         <Route path="/tendering" element={<P title="Tendering"><TenderingPage /></P>} />
 
         <Route path="/changeorders" element={<P title="Change Orders"><ChangeOrdersPage /></P>} />
@@ -1280,8 +1376,9 @@ export default function App() {
             Register tab so there is one way in; old deep links still resolve. */}
         <Route path="/risk-analysis" element={<Navigate to="/risks?tab=montecarlo" replace />} />
 
-        {/* Requirements merged into BIM Rules page */}
-        <Route path="/requirements" element={<Navigate to="/bim/rules" replace />} />
+        {/* Requirements merged into BIM Rules page, as its Requirements tab
+            (the page drops the tab when oe_requirements is off). */}
+        <Route path="/requirements" element={<Navigate to="/bim/rules?tab=requirements" replace />} />
         <Route
           path="/requirements/matrix"
           element={<P title="EIR Matrix"><RequirementsMatrixPage /></P>}
@@ -1394,6 +1491,15 @@ export default function App() {
         <Route path="/setup/databases" element={<P title="Databases & Resources"><DatabaseSetupPage /></P>} />
         <Route path="/settings" element={<P title="Settings"><SettingsPage /></P>} />
         <Route path="/integrations" element={<P title="Integrations"><IntegrationsPage /></P>} />
+        <Route path="/jobs" element={<P title="Background Jobs"><JobsPage /></P>} />
+        <Route path="/workflows" element={<P title="Approval Workflows"><WorkflowsPage /></P>} />
+        <Route path="/projects/:projectId/workflows" element={<P title="Approval Workflows"><WorkflowsPage /></P>} />
+        <Route path="/rebar-schedule" element={<P title="Rebar Schedule"><RebarSchedulePage /></P>} />
+        <Route path="/projects/:projectId/rebar-schedule" element={<P title="Rebar Schedule"><RebarSchedulePage /></P>} />
+        <Route path="/rfq-bidding" element={<P title="RFQ Bidding"><RFQBiddingPage /></P>} />
+        <Route path="/projects/:projectId/rfq-bidding" element={<P title="RFQ Bidding"><RFQBiddingPage /></P>} />
+        <Route path="/saved-views" element={<P title="Saved Views"><SavedViewsPage /></P>} />
+        <Route path="/projects/:projectId/saved-views" element={<P title="Saved Views"><SavedViewsPage /></P>} />
         <Route path="/about" element={<P title="About"><AboutPage /></P>} />
         <Route path="/how-it-works" element={<P title="How it works"><HowItWorksPage /></P>} />
         {/* Cases (playbooks) - list at /cases, the stepper at /cases/:playbookId
@@ -1402,6 +1508,7 @@ export default function App() {
             and the form has no business loading for the ones who do not.
             /cases/new is declared before the stepper for readability only -
             the router ranks a static segment above a dynamic one regardless. */}
+        <Route path="/videos" element={<P title="Videos"><VideosPage /></P>} />
         <Route path="/cases" element={<P title="Cases"><CasesPage /></P>} />
         <Route path="/cases/new" element={<P title="Cases"><CaseEditorPage /></P>} />
         <Route path="/cases/:playbookId/edit" element={<P title="Cases"><CaseEditorPage /></P>} />

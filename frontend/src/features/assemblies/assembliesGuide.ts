@@ -7,8 +7,9 @@ import type { ModuleGuideContent } from '@/shared/ui';
  *
  * Consumed by <ModuleGuideButton content={assembliesGuide} /> in
  * AssembliesPage. Every string is inline-defaulted and read via
- * t(key, { defaultValue }), so these keys deliberately live nowhere in
- * en.ts or any locale file.
+ * t(key, { defaultValue }), so the keys are not in en.ts, the inline defaults
+ * are the English source; their translations live in the other locale files,
+ * so a changed default needs its translations redone too.
  *
  * Spotlight selectors target stable hooks that exist on the /assemblies
  * list page (the data-testid grid and the data-guide action buttons),

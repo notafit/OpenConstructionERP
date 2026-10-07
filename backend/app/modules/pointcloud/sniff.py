@@ -7,7 +7,7 @@ file *header* - point count, bounding box, scale/offset, units, which scalar
 fields the cloud carries - so the scan list shows real extents instantly,
 WITHOUT decoding the 5-200 GB point payload.
 
-It is the one library exception the plan grants the 2 GB core (section 9: "the
+It is the one library exception the plan grants the 3 GB core (section 9: "the
 backend imports zero point-cloud libraries, exception: ``laspy`` for header
 sniff"):
 
@@ -328,7 +328,7 @@ def sniff_header_from_prefix(prefix: bytes, fmt: str) -> ScanHeader:
     """Sniff a header from a byte prefix read off object storage.
 
     The service range-reads only :data:`HEADER_PREFIX_BYTES` from MinIO/S3 and
-    hands them here, so a 200 GB cloud is never pulled into the 2 GB core. Only
+    hands them here, so a 200 GB cloud is never pulled into the 3 GB core. Only
     the seekable LAS/LAZ family can be sniffed from a prefix; E57 needs a real
     file handle, so a prefix sniff of E57 reports the reader as the limiter (the
     service then spills E57 headers to a temp file instead).

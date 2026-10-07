@@ -26,6 +26,17 @@ The escalation tier reconstructs from the ``deadline_escalated`` notifications'
 ``metadata.level`` so a target is escalated at most once. This reuses the
 *technique* of ``escalation_service`` (notification-store tier dedup), not the
 service itself, which is bound to approval Instance/Route/Step and not reusable.
+
+A few sources also want a heads-up before the date passes. Those listed in
+:data:`APPROACHING_NOTIFY` get one ``deadline_approaching`` notification per
+due date once the item enters their window, deduped the same migration-free
+way on ``(entity, metadata.due_date)``. Payment-plan instalments are the first:
+the project managers hear a week ahead that a client payment falls due. The
+client is never reminded from here; that is a separate opt-in
+(``terms.payment_plan.client_reminders``) this module does not send.
+
+Each pass also heals stale payment-plan forecasts (see
+``service.heal_stale_plan_forecasts``).
 """
 
 from __future__ import annotations
@@ -73,6 +84,29 @@ ESCALATED_TYPE = "deadline_escalated"
 # Days an item must sit overdue before it escalates up to the managers.
 ESCALATE_GRACE_DAYS = 3
 
+# Sources that are reminded ahead of their date, keyed by collector module key,
+# with how many days ahead. A source not listed here is only nudged once it is
+# overdue.
+#
+# Built modules are listed with the widest window a spec may ask for
+# (``DueFeature.remind_days_before`` is at most 30). Each record then carries
+# its own module's window in ``remind_days`` and is reminded only inside it,
+# see :func:`_inside_own_window`.
+APPROACHING_NOTIFY: dict[str, int] = {"contracts_payment_plan": 7, deadlines_service.BUILT_MODULES: 30}
+
+# A built module's reminder names the module the person built rather than a
+# platform source, so it has its own wording.
+BUILT_APPROACHING_TITLE_KEY = "notifications.deadline.built.approaching.title"
+BUILT_APPROACHING_BODY_KEY = "notifications.deadline.built.approaching.body"
+
+APPROACHING_TYPE = "deadline_approaching"
+
+# One reminder per due date, and at most this many due dates per entity. A
+# forecast that slips every few days would otherwise send a fresh "due soon"
+# each time it moves, which is the perpetual mailer MAX_OVERDUE_NUDGES exists
+# to stop.
+MAX_APPROACHING_REMINDERS = 3
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -92,7 +126,8 @@ async def _project_manager_ids(session: AsyncSession, project_id: uuid.UUID) -> 
 
     Always includes the project owner (guaranteed present and accountable),
     plus any default-team member in a manager-ish role. Fail-soft: if the teams
-    module is unavailable the owner alone is returned.
+    module is unavailable the owner alone is returned. Deactivated accounts are
+    dropped, so the list can come back empty.
     """
     ids: list[uuid.UUID] = []
     seen: set[uuid.UUID] = set()
@@ -126,35 +161,57 @@ async def _project_manager_ids(session: AsyncSession, project_id: uuid.UUID) -> 
     except Exception:  # noqa: BLE001 - teams module missing -> owner-only fallback
         logger.debug("Deadline manager resolve fell back to owner for project %s", project_id)
 
-    return ids
+    return await _active_users(session, ids)
 
 
-async def _is_real_user(session: AsyncSession, user_id: uuid.UUID) -> bool:
-    """True when the id names a row that exists in the users table.
+async def _active_users(session: AsyncSession, user_ids: list[uuid.UUID]) -> list[uuid.UUID]:
+    """The ids, in order, that name an active, non-erased row in the users table.
 
     Parsing as a UUID says the value is well formed, not that anybody is behind
     it. ``owner_user_id`` is normalised from columns that carry no foreign key,
     so it can hold the id of a user who was never created or has since been
     removed. Notifying such an id violates the notification foreign key, and the
     failed flush poisons the session for the rest of the sweep.
+
+    Existing is not enough either. A deactivated account is someone who no
+    longer takes part, and the showcase kept piling overdue reminders on one,
+    dozens a day, that nobody would ever act on while the item sat unowned.
     """
-    found = await session.execute(select(User.id).where(User.id == user_id).limit(1))
-    return found.scalar_one_or_none() is not None
+    if not user_ids:
+        return []
+    rows = await session.execute(
+        select(User.id).where(
+            User.id.in_(user_ids),
+            User.is_active.is_(True),
+            User.deleted_at.is_(None),
+        )
+    )
+    active = set(rows.scalars().all())
+    return [uid for uid in user_ids if uid in active]
 
 
 async def _overdue_recipients(session: AsyncSession, item: DeadlineItem) -> list[uuid.UUID]:
-    """Who to nudge for an overdue item: the owner if a real user, else managers.
+    """Who to nudge for an overdue item: the owner if an active user, else managers.
 
-    "A real user" has to mean present in the table. An id that merely parses is
-    exactly the case the managers fallback exists to cover.
+    "An active user" has to mean present in the table and switched on. An id
+    that merely parses, or names a deactivated account, is exactly the case the
+    managers fallback exists to cover. With no active manager either, nobody
+    is nudged.
     """
     owner = _as_uuid(item.owner_user_id)
-    if owner is not None and await _is_real_user(session, owner):
+    if owner is not None and await _active_users(session, [owner]):
         return [owner]
     project_id = _as_uuid(item.project_id)
     if project_id is None:
         return []
-    return await _project_manager_ids(session, project_id)
+    managers = await _project_manager_ids(session, project_id)
+    if not managers:
+        logger.info(
+            "Overdue %s %s has no active owner or manager to notify; skipped",
+            item.entity_type,
+            item.entity_id,
+        )
+    return managers
 
 
 async def _already_notified(session: AsyncSession, item: DeadlineItem, now: datetime) -> bool:
@@ -220,14 +277,37 @@ async def _already_escalated(session: AsyncSession, item: DeadlineItem) -> bool:
 
 
 def _overdue_context(item: DeadlineItem) -> dict[str, object]:
-    return {"module": item.module, "title": item.title, "days_overdue": item.days_overdue}
+    # ``source_label`` when there is one: "built_modules" would mean nothing to
+    # the reader, the module's own name does.
+    return {"module": item.source_label or item.module, "title": item.title, "days_overdue": item.days_overdue}
 
 
-async def _notify_overdue(session: AsyncSession, item: DeadlineItem, recipients: list[uuid.UUID]) -> None:
+def _inside_own_window(item: DeadlineItem) -> bool:
+    """Whether a due-soon item is within the window its own source asked for."""
+    return item.remind_days is None or -item.days_overdue <= item.remind_days
+
+
+def _approaching_keys(item: DeadlineItem) -> tuple[str, str]:
+    if item.module == deadlines_service.BUILT_MODULES:
+        return BUILT_APPROACHING_TITLE_KEY, BUILT_APPROACHING_BODY_KEY
+    return "notifications.deadline.approaching.title", "notifications.deadline.approaching.body"
+
+
+async def _notify_overdue(
+    session: AsyncSession,
+    item: DeadlineItem,
+    recipients: list[uuid.UUID],
+    outbox: list[tuple[str, dict[str, object]]],
+) -> None:
     """Create the in-app notification and fan the digest for each recipient.
 
     Called ONLY inside the renotify-dedup gate so a still-overdue item does not
     pile a fresh in-app row or digest row on every tick.
+
+    Realtime emails land in ``outbox`` rather than going out here. The in-app
+    row is the dedupe record, and it is written inside a savepoint that can
+    still roll back; an email sent before that is decided would be sent again
+    on the next tick, because the record of it is gone.
     """
     svc = NotificationService(session)
     context = _overdue_context(item)
@@ -258,6 +338,7 @@ async def _notify_overdue(session: AsyncSession, item: DeadlineItem, recipients:
                 "entity_id": item.entity_id,
             },
             channel="email",
+            deferred=outbox,
         )
 
 
@@ -310,6 +391,109 @@ async def _maybe_escalate(session: AsyncSession, item: DeadlineItem, now: dateti
     return True
 
 
+async def _already_reminded(session: AsyncSession, item: DeadlineItem) -> bool:
+    """True when this entity was already told its current due date is close.
+
+    Counted per due date, not per row: one reminder writes a row for every
+    recipient, so a row count would hit the ceiling after a single reminder
+    to a team of three.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(Notification).where(
+                    Notification.entity_type == item.entity_type,
+                    Notification.entity_id == item.entity_id,
+                    Notification.notification_type == APPROACHING_TYPE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    dates = {(n.metadata_ or {}).get("due_date") for n in rows if (n.metadata_ or {}).get("module") == item.module}
+    return item.due_date in dates or len(dates) >= MAX_APPROACHING_REMINDERS
+
+
+def _approaching_context(item: DeadlineItem) -> dict[str, object]:
+    return {
+        "module": item.source_label or item.module,
+        "title": item.title,
+        "due_date": item.due_date,
+        "days_until": -item.days_overdue,
+    }
+
+
+async def _notify_approaching(
+    session: AsyncSession,
+    item: DeadlineItem,
+    recipients: list[uuid.UUID],
+    outbox: list[tuple[str, dict[str, object]]],
+) -> None:
+    """The approaching twin of :func:`_notify_overdue`, with the same outbox rule."""
+    svc = NotificationService(session)
+    context = _approaching_context(item)
+    title_key, body_key = _approaching_keys(item)
+    for recipient in recipients:
+        await svc.create(
+            user_id=recipient,
+            notification_type=APPROACHING_TYPE,
+            title_key=title_key,
+            entity_type=item.entity_type,
+            entity_id=item.entity_id,
+            body_key=body_key,
+            body_context=context,
+            action_url=item.action_url,
+            metadata={"module": item.module, "due_date": item.due_date, "level": 0},
+        )
+        await svc.enqueue_or_dispatch(
+            event_type=f"deadlines.{item.module}.approaching",
+            user_id=recipient,
+            payload={
+                "title_key": title_key,
+                "body_key": body_key,
+                "body_context": context,
+                "action_url": item.action_url,
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+            },
+            channel="email",
+            deferred=outbox,
+        )
+
+
+async def _remind_approaching(session: AsyncSession, items: list[DeadlineItem]) -> int:
+    """Send the ahead-of-time reminders, one savepoint per item. Returns how many."""
+    reminded = 0
+    for item in items:
+        outbox: list[tuple[str, dict[str, object]]] = []
+        try:
+            async with session.begin_nested():
+                recipients = await _overdue_recipients(session, item)
+                if not recipients or await _already_reminded(session, item):
+                    continue
+                await _notify_approaching(session, item, recipients, outbox)
+        except Exception:
+            logger.exception("Deadline reminder failed for item %s", item.id)
+            continue
+        for name, data in outbox:
+            event_bus.publish_detached(name, data, source_module="oe_notifications")
+        event_bus.publish_detached(
+            f"deadlines.{item.module}.approaching",
+            {
+                "entity_type": item.entity_type,
+                "entity_id": item.entity_id,
+                "project_id": item.project_id,
+                "module": item.module,
+                "days_until": -item.days_overdue,
+                "due_date": item.due_date,
+            },
+            source_module="deadlines",
+        )
+        reminded += 1
+    return reminded
+
+
 async def sweep_overdue(session: AsyncSession, *, now: datetime | None = None) -> int:
     """Scan every overdue item and nudge/escalate the ones not yet handled.
 
@@ -323,24 +507,52 @@ async def sweep_overdue(session: AsyncSession, *, now: datetime | None = None) -
     session in a rollback-only state, and every later item would then raise
     ``PendingRollbackError`` instead of doing its work. That is how one
     unresolvable row silences deadline notifications for every project.
+
+    The nudge and the escalation get a savepoint each. They shared one, so an
+    escalation that raised rolled back the nudge's dedupe record after its
+    email had already been published, and every later tick sent it again.
+
+    Every collection runs before the first write. A collector that fails rolls
+    the whole session back (see ``service._collect_all``), and a rollback after
+    a nudge would erase the dedupe record of an email that already went out.
+    The forecast heal therefore runs after collecting too: it changes no date
+    a reminder reads, only those of instalments not reached yet. The
+    approaching reminders run last and are not counted in the return value.
     """
     now = now or _utc_now()
     overdue = await deadlines_service.collect_overdue_for_sweep(session, now=now)
+    approaching: list[DeadlineItem] = []
+    for module, days in APPROACHING_NOTIFY.items():
+        approaching.extend(await deadlines_service.collect_approaching_for_sweep(session, module, days, now=now))
+    approaching = [item for item in approaching if _inside_own_window(item)]
+    try:
+        async with session.begin_nested():
+            await deadlines_service.heal_stale_plan_forecasts(session)
+    except Exception:
+        logger.exception("Payment-plan forecast heal failed")
     actioned = 0
     for item in overdue:
         notified = False
+        outbox: list[tuple[str, dict[str, object]]] = []
         try:
             async with session.begin_nested():
                 recipients = await _overdue_recipients(session, item)
                 if recipients and not await _already_notified(session, item, now):
-                    await _notify_overdue(session, item, recipients)
+                    await _notify_overdue(session, item, recipients, outbox)
                     notified = True
-                # Escalation is independently deduped (once per entity), so it
-                # runs every tick but fires at most once past the grace window.
-                await _maybe_escalate(session, item, now)
         except Exception:
             logger.exception("Deadline sweep failed for item %s", item.id)
             continue
+        try:
+            # Escalation is independently deduped (once per entity), so it
+            # runs every tick but fires at most once past the grace window.
+            async with session.begin_nested():
+                await _maybe_escalate(session, item, now)
+        except Exception:
+            logger.exception("Deadline escalation failed for item %s", item.id)
+        # The nudge's savepoint has released, so its record stands.
+        for name, data in outbox:
+            event_bus.publish_detached(name, data, source_module="oe_notifications")
         if notified:
             # Published only after the savepoint released, so the timeline never
             # announces a nudge whose write was rolled back.
@@ -357,6 +569,9 @@ async def sweep_overdue(session: AsyncSession, *, now: datetime | None = None) -
                 source_module="deadlines",
             )
             actioned += 1
+    reminded = await _remind_approaching(session, approaching)
+    if reminded:
+        logger.info("deadline sweeper sent %d due-soon reminder(s)", reminded)
     return actioned
 
 

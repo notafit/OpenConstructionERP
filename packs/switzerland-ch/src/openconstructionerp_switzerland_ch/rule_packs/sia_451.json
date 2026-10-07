@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "sia_451",
+  "name": "SIA 451 — Kostenplanung im Hochbau",
+  "name_fr": "SIA 451 — Planification des couts de construction",
+  "standard": "SIA 451",
+  "jurisdiction": "CH",
+  "regulator": "SIA (Schweizerischer Ingenieur- und Architektenverein)",
+  "applies_to": [
+    "estimate",
+    "boq",
+    "validation"
+  ],
+  "description": "Reference document for SIA 451, which governs Kostenplanung im Hochbau and defines the cost estimation stages that correspond to the SIA 112 project phases. An estimate has to say which phase it belongs to, because the precision a Swiss client reads into a figure depends on it, and the cost plan itself is structured to BKP. What the regime asks of an estimate is that the phase is declared and is one the project model recognises, that the cost plan is classified to BKP, that the detail carried matches the declared phase rather than a later one, and that the cost plan and the priced bill agree. This document enables no automated check; see why_no_rules.",
+  "description_fr": "Document de reference sur la norme SIA 451, qui regit la planification des couts de construction et definit les etapes d'estimation correspondant aux phases de projet SIA 112. Un devis doit indiquer la phase a laquelle il se rapporte, car la precision attendue en depend, et le plan des couts suit la classification CFC. La norme demande que la phase soit declaree et reconnue dans le modele de projet, que le plan des couts soit classe au CFC, que le niveau de detail corresponde a la phase declaree et que le plan des couts concorde avec le bordereau chiffre. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swiss Baukostenplaner or quantity surveyor before they are relied on for a public submission. No edition year is pinned here and no phase numbering is reproduced; both must be confirmed against the SIA before this is relied on.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules, for two reasons worth stating separately. The engine registers no Swiss cost-planning rules, so there is nothing correct to name. And the designation itself is one of the points flagged for review below: until a Swiss reviewer confirms which instrument this document describes, enabling rules under it would attach real checks to a reference that may need renaming.",
+  "enables_rule_ids": []
+}

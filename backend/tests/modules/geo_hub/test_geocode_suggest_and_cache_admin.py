@@ -233,8 +233,13 @@ async def test_cache_purge_default_30_days_only_sweeps_stale(
     http_client,
     tenant_a,
 ):
-    fresh = "purge" + "f" * 60
-    stale = "purge" + "s" * 60
+    # query_hash holds a SHA-256 hex digest and is String(64). The five-letter
+    # prefix leaves 59, not 60: at 65 characters PostgreSQL refuses the insert
+    # outright ("value too long for type character varying(64)") and the test
+    # fails before it reaches anything it means to check. The neighbouring
+    # helpers above use a four-letter prefix, which is why only this pair blew.
+    fresh = "purge" + "f" * 59
+    stale = "purge" + "s" * 59
     await _seed_cache_row(fresh, days_old=1)
     await _seed_cache_row(stale, days_old=45)
     res = await http_client.delete(

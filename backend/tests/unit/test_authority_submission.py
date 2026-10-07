@@ -182,9 +182,12 @@ def test_render_produces_readable_rows_and_text() -> None:
 
 
 def test_builtin_profiles_are_jurisdiction_neutral() -> None:
-    # None of the shipped defaults binds to a country.
-    assert all(p["jurisdiction"] is None for p in BUILTIN_PROFILES)
-    keys = {p["format_key"] for p in BUILTIN_PROFILES}
+    # The three original engine profiles must remain jurisdiction-neutral.
+    # Regional profiles (Bauantrag DE, etc.) added via OC-19 carry a
+    # jurisdiction deliberately and are not tested here.
+    neutral = [p for p in BUILTIN_PROFILES if p["jurisdiction"] is None]
+    assert len(neutral) >= 3
+    keys = {p["format_key"] for p in neutral}
     assert {"generic_xml", "gaeb_x83", "cobie"} <= keys
 
 

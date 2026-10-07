@@ -48,6 +48,7 @@ import {
 import clsx from 'clsx';
 import { useTranslation } from 'react-i18next';
 import { fmtFixed } from '@/shared/lib/formatters';
+import { usePreferencesStore } from '@/stores/usePreferencesStore';
 
 interface ProjectWeatherProps {
   lat: number | null | undefined;
@@ -83,17 +84,18 @@ const CACHE_PREFIX = 'oe.weather.';
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1h
 const FAILURE_TTL_MS = 1000 * 60 * 10; // 10min
 
-function cacheKey(lat: number, lng: number): string {
+function cacheKey(lat: number, lng: number, imperial?: boolean): string {
   // Round to 2 decimals — 1km precision is plenty for a building site and
   // dramatically increases cache hit rate across close projects.
-  return `${CACHE_PREFIX}${lat.toFixed(2)}_${lng.toFixed(2)}`;
+  const suffix = imperial ? '_f' : '';
+  return `${CACHE_PREFIX}${lat.toFixed(2)}_${lng.toFixed(2)}${suffix}`;
 }
 
 /** The days on a hit, `'refused'` when the last attempt for these
  *  coordinates was recently turned down, `null` when we know nothing. */
-function readCache(lat: number, lng: number): DailyForecast[] | 'refused' | null {
+function readCache(lat: number, lng: number, imperial?: boolean): DailyForecast[] | 'refused' | null {
   try {
-    const raw = localStorage.getItem(cacheKey(lat, lng));
+    const raw = localStorage.getItem(cacheKey(lat, lng, imperial));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as ForecastCache;
     const age = Date.now() - parsed.at;
@@ -105,10 +107,10 @@ function readCache(lat: number, lng: number): DailyForecast[] | 'refused' | null
   }
 }
 
-function writeCache(lat: number, lng: number, days: DailyForecast[]) {
+function writeCache(lat: number, lng: number, days: DailyForecast[], imperial?: boolean) {
   try {
     const entry: ForecastCache = { at: Date.now(), days };
-    localStorage.setItem(cacheKey(lat, lng), JSON.stringify(entry));
+    localStorage.setItem(cacheKey(lat, lng, imperial), JSON.stringify(entry));
   } catch {
     /* quota full, ignore */
   }
@@ -117,10 +119,10 @@ function writeCache(lat: number, lng: number, days: DailyForecast[]) {
 /** Remember that this location was refused, so the next render doesn't ask
  *  again inside the back-off window.  Only ever overwrites a cache entry we
  *  already decided was too stale to use. */
-function writeRefusal(lat: number, lng: number) {
+function writeRefusal(lat: number, lng: number, imperial?: boolean) {
   try {
     const entry: ForecastCache = { at: Date.now(), days: [], refused: true };
-    localStorage.setItem(cacheKey(lat, lng), JSON.stringify(entry));
+    localStorage.setItem(cacheKey(lat, lng, imperial), JSON.stringify(entry));
   } catch {
     /* quota full, ignore */
   }
@@ -130,8 +132,9 @@ async function fetchForecast(
   lat: number,
   lng: number,
   signal?: AbortSignal,
+  useImperial?: boolean,
 ): Promise<DailyForecast[] | null> {
-  const cached = readCache(lat, lng);
+  const cached = readCache(lat, lng, useImperial);
   if (cached === 'refused') return null;
   if (cached) return cached;
 
@@ -145,6 +148,7 @@ async function fetchForecast(
     daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum',
     timezone: 'auto',
     forecast_days: '15',
+    ...(useImperial ? { temperature_unit: 'fahrenheit' } : {}),
   });
   try {
     const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, {
@@ -153,7 +157,7 @@ async function fetchForecast(
     if (!res.ok) {
       // 429 is the one that actually happens: the public endpoint is shared
       // and a dashboard asks once per site on every load.
-      writeRefusal(lat, lng);
+      writeRefusal(lat, lng, useImperial);
       return null;
     }
     const body = (await res.json()) as {
@@ -167,7 +171,7 @@ async function fetchForecast(
     };
     const d = body.daily;
     if (!d || !d.time?.length) {
-      writeRefusal(lat, lng);
+      writeRefusal(lat, lng, useImperial);
       return null;
     }
     const days: DailyForecast[] = d.time.map((date, i) => ({
@@ -177,12 +181,12 @@ async function fetchForecast(
       tMax: d.temperature_2m_max[i] ?? 0,
       precipMm: d.precipitation_sum[i] ?? 0,
     }));
-    writeCache(lat, lng, days);
+    writeCache(lat, lng, days, useImperial);
     return days;
   } catch {
     // An abort is a navigation, not a refusal - caching it would blank the
     // widget for a location nothing is actually wrong with.
-    if (!signal?.aborted) writeRefusal(lat, lng);
+    if (!signal?.aborted) writeRefusal(lat, lng, useImperial);
     return null;
   }
 }
@@ -235,6 +239,9 @@ export function ProjectWeather({
   lat, lng, locale, className, variant = 'full',
 }: ProjectWeatherProps) {
   const { t, i18n } = useTranslation();
+  const measurementSystem = usePreferencesStore((s) => s.measurementSystem);
+  const isImperial = measurementSystem === 'imperial';
+  const tempUnit = isImperial ? '°F' : '°C';
   const [days, setDays] = useState<DailyForecast[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [refused, setRefused] = useState(false);
@@ -251,7 +258,7 @@ export function ProjectWeather({
     // window of the next, which reads as a widget that has given up.
     setRefused(false);
     setLoading(true);
-    fetchForecast(lat, lng, controller.signal)
+    fetchForecast(lat, lng, controller.signal, isImperial)
       .then((d) => {
         // An aborted effect has been superseded; its answer says nothing
         // about the location now on screen.
@@ -263,7 +270,7 @@ export function ProjectWeather({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [lat, lng]);
+  }, [lat, lng, isImperial]);
 
   if (typeof lat !== 'number' || typeof lng !== 'number') return null;
   // Decoration that the network turned down renders as nothing, in either
@@ -272,8 +279,11 @@ export function ProjectWeather({
   if (refused) return null;
 
   const resolvedLocale = locale || i18n.language || 'en';
-  const dayFmt = new Intl.DateTimeFormat(resolvedLocale, { weekday: 'short' });
-  const dateFmt = new Intl.DateTimeFormat(resolvedLocale, { day: 'numeric', month: 'short' });
+  // Weather dates are date-only (YYYY-MM-DD) and parse as UTC midnight, so
+  // display them in UTC to prevent the weekday/label shifting by one day at
+  // negative UTC offsets.
+  const dayFmt = new Intl.DateTimeFormat(resolvedLocale, { weekday: 'short', timeZone: 'UTC' });
+  const dateFmt = new Intl.DateTimeFormat(resolvedLocale, { day: 'numeric', month: 'short', timeZone: 'UTC' });
 
   /* ── Summary variant — one-line chip for project cards ─────────── */
   if (variant === 'summary') {
@@ -343,7 +353,7 @@ export function ProjectWeather({
           <div className="flex items-center gap-3 text-xs text-content-tertiary">
             <span className="flex items-center gap-1">
               <Thermometer size={11} />
-              {Math.round(days[0].tMin)}° / {Math.round(days[0].tMax)}°C
+              {Math.round(days[0].tMin)}° / {Math.round(days[0].tMax)}{tempUnit}
             </span>
             <span className="flex items-center gap-1">
               <Droplets size={11} />

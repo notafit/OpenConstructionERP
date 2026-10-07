@@ -3,6 +3,7 @@
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete, downloadWithAuth, API_BASE } from '@/shared/lib/api';
 import type { CostVariant, VariantStats } from '@/features/costs/api';
 import { resourceAwareTotalInBase } from './boqHelpers';
+import { toNum } from '@/shared/lib/money';
 
 /* ── Core BOQ types ──────────────────────────────────────────────────── */
 
@@ -25,8 +26,55 @@ export interface BOQ {
    * that existed before variation bills did.
    */
   variation_request_id?: string | null;
+  /** Price level reference (a day, month, quarter or year), or null. */
+  base_date?: string | null;
+  /**
+   * The date the bill's VAT is resolved on. Null means the bill is taxed on
+   * its `base_date`, which is every bill created before the field existed.
+   */
+  tax_date?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One bill as the bill register lists it, with its money and line count. */
+export interface BOQListRow {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  /** Money arrives as a Decimal string (v3 §10); coerce before arithmetic. */
+  direct_cost_total: number | string;
+  markups_total: number | string;
+  grand_total: number | string | null;
+  position_count: number;
+}
+
+/**
+ * The projects a refused `boqApi.listForProjects` call named, in request order:
+ * ids that name no project at all. Empty for any other error, such as a network
+ * failure or a missing permission, which name no project.
+ */
+export function failedBoqListProjectIds(error: unknown): string[] {
+  const detail = (error as { body?: { detail?: { project_ids?: unknown } } } | null)?.body?.detail;
+  const ids = detail && typeof detail === 'object' ? detail.project_ids : undefined;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+}
+
+/**
+ * The projects a `boqApi.listForProjects` answer left out, in request order.
+ * The server leaves out a project that is archived or no longer readable by
+ * this user, and answers every other one as a key, with an empty list when it
+ * has no bills, so a missing key is the only sign of a skipped project.
+ */
+export function skippedBoqListProjectIds(
+  requested: readonly string[],
+  register: Record<string, unknown>,
+): string[] {
+  return requested.filter((id) => !Object.prototype.hasOwnProperty.call(register, id));
 }
 
 /**
@@ -49,6 +97,9 @@ export interface Position {
   quantity: number;
   unit_rate: number;
   total: number;
+  net_cost_rate?: string | null;
+  target_rate?: string | null;
+  sale_rate?: string | null;
   classification: Record<string, string>;
   source: string;
   confidence: number | null;
@@ -111,6 +162,11 @@ export interface LinkPropagationMeta {
   /** Issue #133 — count of linked RESOURCE instances a master resource
    *  definition edit was fanned out to (separate from position links). */
   resource_propagated_to?: number;
+  /** Linked lines (positions or resources) that live in LOCKED bills and so
+   *  kept the old definition. Absent when nothing was skipped. */
+  locked_skipped?: number;
+  /** The locked bills those lines are in, sorted by name. */
+  locked_boqs?: { id: string; name: string }[];
 }
 
 /** One member of a reference-code link group. */
@@ -279,6 +335,10 @@ export interface CreateBOQData {
   project_id: string;
   name: string;
   description?: string;
+  /** Price level reference: the date the unit rates are current at. */
+  base_date?: string | null;
+  /** The date VAT is resolved on. Null or omitted means "same as base_date". */
+  tax_date?: string | null;
 }
 
 /**
@@ -368,6 +428,11 @@ export interface MeasurementLineInput {
   sign?: '+' | '-';
   ref?: string;
   unit?: string;
+  /** Dimension-based measurement fields (NRM/SMM style). */
+  nos?: number | null;
+  length?: number | null;
+  breadth?: number | null;
+  depth?: number | null;
 }
 
 /** One line as the server hands it back, with its own quantity worked out. */
@@ -401,6 +466,12 @@ export interface MeasurementSheet {
   has_errors: boolean;
   /** Only on a read: false when the position has no saved sheet yet. */
   stored?: boolean;
+  /**
+   * Decimals every line is rounded to before the lines are added, or null when
+   * the sheet adds the lines as measured. Each line's `quantity` is already
+   * the rounded figure.
+   */
+  row_decimals?: number | null;
   /**
    * Only on a compute: how the measured total compares with the quantity the
    * position carries right now. `matches` is true when they agree within
@@ -578,6 +649,29 @@ export function normalizePositions(positions: Position[]): Position[] {
  */
 export function isSection(pos: Pick<Position, 'unit'>): boolean {
   return !pos.unit || pos.unit.trim() === '' || pos.unit.trim().toLowerCase() === 'section';
+}
+
+/** Direct cost of a bill: the sum of its line items in the base currency.
+ *
+ * Section rows are headers and are skipped. Most carry a zero total, but a
+ * section written by an approved change order stores the sum of its lines on
+ * the header itself, so a sum over every row counted that change twice in the
+ * editor footer and everything read from it. The server's rollups skip
+ * sections the same way.
+ */
+export function billDirectCost(
+  positions: ReadonlyArray<Pick<Position, 'unit' | 'total' | 'quantity' | 'unit_rate' | 'metadata'>>,
+  baseCurrency: string | undefined | null,
+  fxRates: Array<{ currency: string; rate: number }> | undefined | null,
+): number {
+  // Same rule as the server's ``_is_section``: a header unit AND no quantity
+  // AND no rate. A priced line imported without a unit is still a line.
+  const isHeader = (p: Pick<Position, 'unit' | 'quantity' | 'unit_rate'>) =>
+    isSection(p) && !Number(p.quantity) && !Number(p.unit_rate);
+  return positions.reduce(
+    (sum, p) => (isHeader(p) ? sum : sum + resourceAwareTotalInBase(p, baseCurrency, fxRates)),
+    0,
+  );
 }
 
 /** A position nobody has typed into yet: no description and no quantity.
@@ -846,6 +940,8 @@ export interface CostAutocompleteBreakdown {
 }
 
 export interface CostAutocompleteItem {
+  /** The cost item's id, so a line picked from the list links to it (absent from older servers). */
+  id?: string;
   code: string;
   description: string;
   unit: string;
@@ -935,11 +1031,12 @@ export interface AIChatResponse {
 /* ── Per-position AI copilot types ───────────────────────────────────── */
 
 /**
- * A single concrete change the copilot proposes (or already applied) for one
- * BOQ position. Every action is catalog-sourced — ``source`` carries the cost
- * row's code/description and ``confidence`` (0..1) drives the auto-apply
- * threshold (>= 0.85 lands as ``auto_applied`` server-side, the rest come back
- * as ``needs_review`` confirm cards).
+ * A single concrete change the copilot proposes for one BOQ position. Every
+ * priced action is catalog-sourced — ``source`` carries the cost row's
+ * code/description. Chat never writes: every action arrives ``needs_review``
+ * and lands only when the estimator accepts it through the review endpoint.
+ * ``confidence`` (0..1) is shown and decides what the review list preselects.
+ * ``auto_applied`` only appears in threads stored before 18.1.
  *
  * ``payload`` carries the after-state and ``before`` the prior values, so the
  * dock can render a clean before -> after diff AND the editor can mirror the
@@ -981,7 +1078,7 @@ export interface CopilotAction {
   payload: Record<string, unknown>;
   /** Prior values for the touched fields — drives the diff + undo oldData. */
   before: Record<string, unknown>;
-  /** Model/catalog confidence (0..1). >= 0.85 auto-applies server-side. */
+  /** Model/catalog confidence (0..1). >= 0.85 is preselected for review. */
   confidence: number;
   /** Catalog provenance — code + human label of the source cost row. */
   source: { code?: string; description?: string } | null;
@@ -1009,6 +1106,13 @@ export interface CopilotChatResponse {
 export interface CopilotApplyResponse {
   position: Position;
   action: CopilotAction;
+}
+
+/** POST review response: the position after the accepted actions, plus the
+ *  assistant turn with each action's new status. */
+export interface CopilotReviewResponse {
+  position: Position;
+  message: CopilotMessage;
 }
 
 /* ── Cost Breakdown types ─────────────────────────────────────────── */
@@ -1238,6 +1342,8 @@ export interface ResourceSummaryResponse {
   resources: ResourceSummaryItem[];
   /** Issue #106 — sum of every resource.total_cost in this response. */
   grand_total?: number;
+  /** Native-currency amounts excluded from grand_total due to unusable FX. */
+  unconverted?: Record<string, number | string>;
 }
 
 /* ── Sensitivity Analysis types ───────────────────────────────────────── */
@@ -1594,10 +1700,20 @@ export interface CostSearchItem {
   description: string;
   unit: string;
   rate: number;
+  /** The unit rate a bill line receives when this item is added: the sum of
+   *  its components. ``null`` when the item has no components (it lands at
+   *  ``rate``) or a variant still to pick. */
+  buildup_rate?: number | null;
+  /** Hazardous materials the item is made of, as ids (``asbestos``). The
+   *  search ranks such items after ordinary hits; the picker badges them. */
+  hazards?: string[];
   currency?: string;
   region: string | null;
   classification: Record<string, string>;
   components: CostItemComponent[];
+  /** How many components the item has. A ``lite`` list row empties
+   *  ``components`` and keeps only this count. */
+  components_count?: number;
   /** Opaque CWICR metadata (variants, variant_stats, etc.) — type-erased. */
   metadata_?: Record<string, unknown>;
 }
@@ -1660,6 +1776,12 @@ export async function fetchCostSearch(
   if (params.source) qs.set('source', params.source);
   if (params.classification_path) qs.set('classification_path', params.classification_path);
   if (params.cursor) qs.set('cursor', params.cursor);
+  // Slim rows: a CWICR row's component breakdown and variant catalogues run
+  // to tens of kilobytes each and the list renders neither (it shows the
+  // variant count from ``metadata_.variant_stats``, which the slim row keeps).
+  // The modal's add flow reads the picked items in full from
+  // ``GET /v1/costs/{id}`` before it builds resources or opens a picker.
+  qs.set('lite', '1');
 
   const raw = await apiGet<{
     items: CostSearchItem[];
@@ -1670,7 +1792,17 @@ export async function fetchCostSearch(
     offset?: number;
   }>(`/v1/costs/?${qs.toString()}`);
 
-  const items = raw.items ?? [];
+  // ``rate`` is a Decimal on the server and arrives as a JSON string
+  // ("4465.43"). Coerce it here, once, so every consumer can treat it as the
+  // number the type promises: the modal's "No rate" badge, its selection
+  // preview and the add flow's fallback rate all read it as a number, and a
+  // string made every priced row look unpriced.
+  const items = (raw.items ?? []).map((item) => ({
+    ...item,
+    rate: toNum(item.rate as number | string | null | undefined),
+    buildup_rate:
+      item.buildup_rate == null ? null : toNum(item.buildup_rate as number | string),
+  }));
   const limit = raw.limit ?? params.limit ?? 50;
   const next_cursor = raw.next_cursor ?? null;
 
@@ -1718,6 +1850,21 @@ export function fetchCategoryTree(
 export const boqApi = {
   /* BOQ CRUD */
   list: (projectId: string) => apiGet<BOQ[]>(`/v1/boq/boqs/?project_id=${projectId}`),
+  /**
+   * The bill register of several projects in one request, keyed by project id.
+   * Each project's rows are what `GET /boqs/?project_id=` returns for it, with
+   * the page (50 bills by default) cut per project. Every readable project is
+   * a key. An archived or unreadable project is left out: read which with
+   * {@link skippedBoqListProjectIds}. An id that names no project refuses the
+   * whole call (404) and the error body names it: read it with
+   * {@link failedBoqListProjectIds}.
+   */
+  listForProjects: (projectIds: string[]) =>
+    apiPost<Record<string, BOQListRow[]>, { project_ids: string[] }>(
+      '/v1/boq/boqs/by-projects/',
+      { project_ids: projectIds },
+      { readOnly: true },
+    ),
   get: (boqId: string) => apiGet<BOQWithPositions>(`/v1/boq/boqs/${boqId}`),
   create: (data: CreateBOQData) => apiPost<BOQ>('/v1/boq/boqs/', data),
   deleteBoq: (boqId: string) => apiDelete(`/v1/boq/boqs/${boqId}`),
@@ -1770,7 +1917,10 @@ export const boqApi = {
    * which market's rules a sheet is written under, which is the project's
    * property and not the panel's.
    */
-  computeMeasurement: (posId: string, body: { lines: MeasurementLineInput[]; unit?: string }) =>
+  computeMeasurement: (
+    posId: string,
+    body: { lines: MeasurementLineInput[]; unit?: string; row_decimals?: number | null },
+  ) =>
     apiPost<MeasurementSheet>(`/v1/boq/positions/${posId}/measurement/compute/`, {
       ...body,
       strict: false,
@@ -1911,7 +2061,8 @@ export const boqApi = {
 
   /* AI Chat */
   aiChat: (boqId: string, data: AIChatRequest) =>
-    apiPost<AIChatResponse>(`/v1/boq/boqs/${boqId}/ai-chat/`, data),
+    // longRunning: the call waits for an AI provider (issue #499).
+    apiPost<AIChatResponse>(`/v1/boq/boqs/${boqId}/ai-chat/`, data, { longRunning: true }),
 
   /* ── Per-position AI copilot ──────────────────────────────────────── */
   /**
@@ -1931,6 +2082,7 @@ export const boqApi = {
     apiPost<CopilotChatResponse, { message: string }>(
       `/v1/boq/positions/${positionId}/copilot/`,
       { message },
+      { longRunning: true },
     ),
   /** Human-confirmed apply of a single ``needs_review`` action (server write). */
   positionCopilotApply: (positionId: string, action: CopilotAction) =>
@@ -1938,6 +2090,25 @@ export const boqApi = {
       `/v1/boq/positions/${positionId}/copilot/apply`,
       { action },
     ),
+  /**
+   * Accept and reject actions of one assistant turn by index. The server
+   * applies the accepted ones from what it stored with the turn and marks the
+   * rejected ones dismissed; indices in neither list stay pending.
+   */
+  positionCopilotReview: (
+    positionId: string,
+    messageId: string,
+    accept: number[],
+    reject: number[],
+  ) =>
+    apiPost<
+      CopilotReviewResponse,
+      { message_id: string; accept: number[]; reject: number[] }
+    >(`/v1/boq/positions/${positionId}/copilot/review`, {
+      message_id: messageId,
+      accept,
+      reject,
+    }),
 
   /* Recalculate rates from resource breakdowns */
   recalculateRates: (boqId: string) =>
@@ -1968,8 +2139,7 @@ export const boqApi = {
    * was applied either way. */
   getPriceAnalysis: (positionId: string, preset?: PriceAnalysisPreset | null) =>
     apiGet<PriceAnalysisResponse>(
-      `/v1/boq/positions/${encodeURIComponent(positionId)}/price-analysis/` +
-        (preset ? `?preset=${encodeURIComponent(preset)}` : ''),
+      `/v1/boq/positions/${encodeURIComponent(positionId)}/price-analysis/${preset ? `?preset=${encodeURIComponent(preset)}` : ''}`,
     ),
 
   /* The same analysis as a Markdown document, which is how a German bidder
@@ -1987,9 +2157,7 @@ export const boqApi = {
   ) => {
     const safe = (positionRef || 'position').replace(/[/\s]/g, '_');
     return downloadWithAuth(
-      `${API_BASE}/v1/boq/positions/${encodeURIComponent(positionId)}/price-analysis/` +
-        `?format=markdown` +
-        (preset ? `&preset=${encodeURIComponent(preset)}` : ''),
+      `${API_BASE}/v1/boq/positions/${encodeURIComponent(positionId)}/price-analysis/?format=markdown${preset ? `&preset=${encodeURIComponent(preset)}` : ''}`,
       `price_analysis_${safe}.md`,
     );
   },
@@ -2129,7 +2297,7 @@ export const boqApi = {
     unit?: string;
     classification?: Record<string, string>;
     locale?: string;
-  }) => apiPost<EnhanceDescriptionResponse>('/v1/boq/boqs/enhance-description/', data),
+  }) => apiPost<EnhanceDescriptionResponse>('/v1/boq/boqs/enhance-description/', data, { longRunning: true }),
 
   /* AI: Suggest prerequisites via LLM */
   suggestPrerequisites: (data: {
@@ -2138,7 +2306,7 @@ export const boqApi = {
     classification?: Record<string, string>;
     existing_descriptions?: string[];
     locale?: string;
-  }) => apiPost<SuggestPrerequisitesResponse>('/v1/boq/boqs/suggest-prerequisites/', data),
+  }) => apiPost<SuggestPrerequisitesResponse>('/v1/boq/boqs/suggest-prerequisites/', data, { longRunning: true }),
 
   /* AI: Check scope completeness via LLM */
   checkScope: (boqId: string, data: {
@@ -2146,7 +2314,7 @@ export const boqApi = {
     region?: string;
     currency?: string;
     locale?: string;
-  }) => apiPost<CheckScopeResponse>(`/v1/boq/boqs/${boqId}/check-scope/`, data),
+  }) => apiPost<CheckScopeResponse>(`/v1/boq/boqs/${boqId}/check-scope/`, data, { longRunning: true }),
 
   /* AI: Escalate rate via LLM */
   escalateRate: (data: {
@@ -2158,7 +2326,7 @@ export const boqApi = {
     target_year?: number;
     region?: string;
     locale?: string;
-  }) => apiPost<EscalateRateResponse>('/v1/boq/boqs/escalate-rate/', data),
+  }) => apiPost<EscalateRateResponse>('/v1/boq/boqs/escalate-rate/', data, { longRunning: true }),
 
   /* Custom Columns — manage user-defined fields per BOQ */
   listCustomColumns: (boqId: string) =>

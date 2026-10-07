@@ -26,6 +26,8 @@ import {
   Flame,
   Timer,
   UserCheck,
+  FileDown,
+  Loader2,
 } from 'lucide-react';
 import {
   Button,
@@ -51,7 +53,7 @@ import { buildPunchlistInsights } from './punchlistInsights';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { SectionIntro } from '@/features/validation';
-import { apiGet } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import {
@@ -63,6 +65,7 @@ import {
   deletePunchItem,
   transitionPunchStatus,
   bulkClose,
+  downloadPunchListPdf,
 } from './api';
 import type {
   PunchItem,
@@ -77,8 +80,12 @@ import type {
 import { punchlistGuide } from './punchlistGuide';
 import { PunchDetailDrawer } from './PunchDetailDrawer';
 import { AssigneeLabel } from './assignee';
+import { formatReworkCost, parseReworkCostInput, projectCurrencyCode } from './reworkCost';
 import { VoiceEntry, getField } from '@/features/voice';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import { fmtDate } from '@/shared/lib/formatters';
+import { PunchContractField } from './PunchContractField';
+import { isDateOnlyPast } from '@/shared/lib/dates';
+import { IssueHubLink } from '@/features/issues/IssueHubLink';
 
 // The pin board pulls in the PDF renderer (pdfjs-dist), which is heavy. Keep it
 // off the punchlist page's initial chunk so users who only use the list and
@@ -420,6 +427,7 @@ function PunchKpiBand({
 /* ── Add Punch Item Modal ─────────────────────────────────────────────── */
 
 interface PunchFormData {
+  contract_id: string;
   title: string;
   description: string;
   priority: PunchPriority;
@@ -433,9 +441,12 @@ interface PunchFormData {
   /** Normalised pin coordinates on the sheet (0..1), as entered text. */
   location_x: string;
   location_y: string;
+  /** Rework cost as typed, in the project's currency. Empty = not priced. */
+  rework_cost: string;
 }
 
 const EMPTY_FORM: PunchFormData = {
+  contract_id: '',
   title: '',
   description: '',
   priority: 'medium',
@@ -447,6 +458,7 @@ const EMPTY_FORM: PunchFormData = {
   page: '',
   location_x: '',
   location_y: '',
+  rework_cost: '',
 };
 
 /** Minimal drawing/document option for the punch-pin picker. */
@@ -478,17 +490,22 @@ const PRIORITY_RADIO_COLORS: Record<PunchPriority, string> = {
 };
 
 function AddPunchModal({
+  projectId,
   onClose,
   onSubmit,
   isPending,
   teamMembers,
   drawings,
+  currency,
 }: {
+  projectId: string;
   onClose: () => void;
   onSubmit: (data: PunchFormData) => void;
   isPending: boolean;
   teamMembers: TeamMember[];
   drawings: PunchDrawingOption[];
+  /** The project's ISO currency, '' when the project has none set. */
+  currency: string;
 }) {
   const { t } = useTranslation();
   const [form, setForm] = useState<PunchFormData>(EMPTY_FORM);
@@ -506,7 +523,13 @@ function AddPunchModal({
   };
   const xError = touched && coordError(form.location_x);
   const yError = touched && coordError(form.location_y);
-  const canSubmit = form.title.trim().length > 0 && !coordError(form.location_x) && !coordError(form.location_y);
+  const reworkInvalid = !parseReworkCostInput(form.rework_cost).ok;
+  const reworkError = touched && reworkInvalid;
+  const canSubmit =
+    form.title.trim().length > 0 &&
+    !coordError(form.location_x) &&
+    !coordError(form.location_y) &&
+    !reworkInvalid;
 
   // The roster leads and the rest of the workspace follows it. The grouping
   // only appears once there is a roster: over a plain workspace list, a lone
@@ -712,6 +735,42 @@ function AddPunchModal({
           />
         </WideModalField>
 
+        {/* Without a project currency there is nothing honest to record the
+            amount in: the API would stamp USD on it. */}
+        <PunchContractField projectId={projectId} value={form.contract_id || null}
+          onChange={value => set('contract_id', value ?? '')} disabled={isPending} />
+        <WideModalField
+          label={t('punch.field_rework_cost', { defaultValue: 'Rework cost' })}
+          htmlFor="punch-rework-cost"
+          error={
+            reworkError
+              ? t('punch.rework_cost_invalid', { defaultValue: 'Enter an amount of zero or more' })
+              : undefined
+          }
+          hint={
+            currency
+              ? t('punch.rework_cost_hint', {
+                  defaultValue: 'In {{currency}}. What it will cost to put this right. Leave empty until it is priced.',
+                  currency,
+                })
+              : t('punch.rework_cost_no_currency', {
+                  defaultValue: "Set the project's currency before pricing items.",
+                })
+          }
+        >
+          <input
+            id="punch-rework-cost"
+            type="text"
+            inputMode="decimal"
+            autoComplete="off"
+            value={form.rework_cost}
+            onChange={(e) => set('rework_cost', e.target.value)}
+            disabled={!currency}
+            placeholder="0.00"
+            className={clsx(inputCls, 'tabular-nums disabled:opacity-60')}
+          />
+        </WideModalField>
+
         {/* ── Pin on drawing ──────────────────────────────────────────────
             Tie the snag to a sheet and an optional normalised pin so it can
             be reopened on the drawing. The document picker reuses the project
@@ -817,7 +876,7 @@ const PunchKanbanCard = React.memo(function PunchKanbanCard({
     item.due_date &&
     item.status !== 'closed' &&
     item.status !== 'verified' &&
-    new Date(item.due_date) < new Date();
+    isDateOnlyPast(item.due_date);
 
   return (
     <Card
@@ -884,10 +943,7 @@ const PunchKanbanCard = React.memo(function PunchKanbanCard({
             >
               {isOverdue ? <AlertTriangle size={11} /> : <Calendar size={11} />}
               <span>
-                {new Date(item.due_date).toLocaleDateString(getIntlLocale(), {
-                  month: 'short',
-                  day: 'numeric',
-                })}
+                {fmtDate(item.due_date, { month: 'short', day: 'numeric' })}
               </span>
             </div>
           )}
@@ -1042,7 +1098,7 @@ export function PunchListPage() {
   // Data queries
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1052,6 +1108,9 @@ export function PunchListPage() {
   const breadcrumbProjectName = activeProjectId
     ? projects.find((p) => p.id === activeProjectId)?.name
     : undefined;
+  // Rework costs are entered in the project's currency and shown in the one
+  // each was recorded in.
+  const projectCurrency = projectCurrencyCode(projects.find((p) => p.id === projectId)?.currency);
 
   const { data: punchPage, isLoading, isError, error, refetch } = useQuery({
     queryKey: ['punchlist', projectId, filterPriority, filterStatus, filterCategory, filterAssignee],
@@ -1063,6 +1122,7 @@ export function PunchListPage() {
         assigned_to: filterAssignee || undefined,
       }),
     enabled: !!projectId,
+    refetchOnWindowFocus: true,
   });
   const punchItems = punchPage?.items ?? EMPTY_ITEMS;
 
@@ -1165,10 +1225,14 @@ export function PunchListPage() {
   }, [highlightId, punchItems, setSearchParams]);
 
   // Invalidation
-  const invalidateAll = useCallback(() => {
-    qc.invalidateQueries({ queryKey: ['punchlist'] });
-    qc.invalidateQueries({ queryKey: ['punchlist-summary'] });
-  }, [qc]);
+  const invalidateAll = useCallback(
+    () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: ['punchlist'] }),
+        qc.invalidateQueries({ queryKey: ['punchlist-summary'] }),
+      ]),
+    [qc],
+  );
 
   // The pin board renders over the project-wide (unfiltered) `punchlist-pins`
   // list, whose key is NOT matched by the ['punchlist'] invalidation above.
@@ -1200,8 +1264,10 @@ export function PunchListPage() {
   const transitionMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: PunchStatus }) =>
       transitionPunchStatus(id, status),
-    onSuccess: (_data, vars) => {
-      invalidateAll();
+    onSuccess: async (_data, vars) => {
+      // Hold the toast (and the pending state) until the list has refetched,
+      // so the row never announces a status its buttons do not show yet.
+      await invalidateAll();
       addToast({
         type: 'success',
         title: t('punch.status_updated', {
@@ -1242,26 +1308,50 @@ export function PunchListPage() {
     onSuccess: (data) => {
       invalidateAll();
       setSelectedIds(new Set());
+      // Only verified items are closed; the rest come back as `not_verified`
+      // and keep their status, which is a lifecycle answer, not a failure.
+      const notVerified = data.errors.filter((e) => e.error === 'not_verified').length;
+      const failed = data.errors.length - notVerified;
+      const details = [
+        data.skipped || failed
+          ? t('punch.bulk_close_detail', {
+              defaultValue: '{{skipped}} skipped, {{errors}} error(s)',
+              skipped: data.skipped,
+              errors: failed,
+            })
+          : '',
+        notVerified
+          ? t('punch.bulk_close_not_verified', {
+              defaultValue: 'Not verified yet, left as they were: {{n}}',
+              n: notVerified,
+            })
+          : '',
+      ].filter(Boolean);
       addToast({
         type: data.errors.length > 0 ? 'warning' : 'success',
         title: t('punch.bulk_close_done', {
           defaultValue: 'Closed {{closed}} item(s)',
           closed: data.closed,
         }),
-        message:
-          data.skipped || data.errors.length
-            ? t('punch.bulk_close_detail', {
-                defaultValue: '{{skipped}} skipped, {{errors}} error(s)',
-                skipped: data.skipped,
-                errors: data.errors.length,
-              })
-            : undefined,
+        message: details.length ? details.join(' · ') : undefined,
       });
     },
     onError: (e: Error) =>
       addToast({
         type: 'error',
         title: t('common.error', { defaultValue: 'Error' }),
+        message: e.message,
+      }),
+  });
+
+  // The printable punch list for the project, on the company letterhead when
+  // one is set. It covers every item of the project, not the filtered view.
+  const pdfMut = useMutation({
+    mutationFn: () => downloadPunchListPdf(projectId),
+    onError: (e: Error) =>
+      addToast({
+        type: 'error',
+        title: t('common.export_failed', { defaultValue: 'Export failed' }),
         message: e.message,
       }),
   });
@@ -1286,7 +1376,7 @@ export function PunchListPage() {
       }),
       message: t('punch.confirm_bulk_close_message', {
         defaultValue:
-          'Mark {{count}} punch item(s) as closed? Items already closed will be skipped.',
+          'Close {{count}} punch item(s)? Only verified items are closed. Items already closed are skipped and the rest keep their status.',
         count: selectedIds.size,
       }),
       confirmLabel: t('punch.action_close', { defaultValue: 'Close' }),
@@ -1301,9 +1391,12 @@ export function PunchListPage() {
       const pageNum = formData.page.trim() ? Number(formData.page) : undefined;
       const xNum = formData.location_x.trim() ? Number(formData.location_x) : undefined;
       const yNum = formData.location_y.trim() ? Number(formData.location_y) : undefined;
+      const rework = parseReworkCostInput(formData.rework_cost);
+      const reworkCost = rework.ok && rework.value !== null && projectCurrency ? rework.value : undefined;
       createMut.mutate({
         project_id: projectId,
         title: formData.title,
+        contract_id: formData.contract_id || null,
         description: formData.description || undefined,
         priority: formData.priority,
         category: formData.category,
@@ -1316,9 +1409,13 @@ export function PunchListPage() {
           formData.document_id && xNum != null && Number.isFinite(xNum) ? xNum : undefined,
         location_y:
           formData.document_id && yNum != null && Number.isFinite(yNum) ? yNum : undefined,
+        rework_cost: reworkCost,
+        // Sent even for an unpriced item, so a price added later from the
+        // drawer is not the first place the row learns its currency.
+        rework_cost_currency: projectCurrency || undefined,
       });
     },
-    [createMut, projectId],
+    [createMut, projectId, projectCurrency],
   );
 
   const handleTransition = useCallback(
@@ -1383,6 +1480,7 @@ export function PunchListPage() {
           <>
             <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={punchlistGuide} />
+            <IssueHubLink />
             {projectId && (
               <Button
                 variant="secondary"
@@ -1393,6 +1491,24 @@ export function PunchListPage() {
                 data-testid="punchlist-view-on-map"
               >
                 {t('geo_hub.view_on_map', { defaultValue: 'View on map' })}
+              </Button>
+            )}
+            {projectId && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => pdfMut.mutate()}
+                disabled={pdfMut.isPending}
+                data-testid="punchlist-export-pdf"
+                icon={
+                  pdfMut.isPending ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <FileDown size={14} />
+                  )
+                }
+              >
+                {t('rfi.export_pdf', { defaultValue: 'Export PDF' })}
               </Button>
             )}
             <VoiceEntry
@@ -1809,6 +1925,9 @@ export function PunchListPage() {
                       {t('punch.col_photos', { defaultValue: 'Photos' })}
                     </th>
                     <th className="px-4 py-3 text-right text-2xs font-semibold uppercase tracking-wider text-content-tertiary">
+                      {t('punch.col_rework_cost', { defaultValue: 'Rework cost' })}
+                    </th>
+                    <th className="px-4 py-3 text-right text-2xs font-semibold uppercase tracking-wider text-content-tertiary">
                       {t('common.actions', { defaultValue: 'Actions' })}
                     </th>
                   </tr>
@@ -1836,11 +1955,13 @@ export function PunchListPage() {
       {/* Add modal */}
       {showAddModal && (
         <AddPunchModal
+          projectId={projectId}
           onClose={() => setShowAddModal(false)}
           onSubmit={handleCreateSubmit}
           isPending={createMut.isPending}
           teamMembers={teamMembers}
           drawings={drawings}
+          currency={projectCurrency}
         />
       )}
 
@@ -1850,6 +1971,7 @@ export function PunchListPage() {
           itemId={detailItem.id}
           projectId={projectId}
           initialItem={detailItem}
+          projectCurrency={projectCurrency}
           onClose={() => setDetailItem(null)}
           onOpenPinBoard={handleOpenPinBoard}
         />
@@ -1912,20 +2034,13 @@ const PunchTableRow = React.memo(function PunchTableRow({
     item.due_date &&
     item.status !== 'closed' &&
     item.status !== 'verified' &&
-    new Date(item.due_date) < new Date();
+    isDateOnlyPast(item.due_date);
 
   const formattedDueDate = useMemo(() => {
     if (!item.due_date) return '-';
-    try {
-      return new Date(item.due_date).toLocaleDateString(getIntlLocale(), {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return item.due_date;
-    }
+    return fmtDate(item.due_date);
   }, [item.due_date]);
+  const reworkCost = formatReworkCost(item);
 
   return (
     <tr
@@ -2045,6 +2160,9 @@ const PunchTableRow = React.memo(function PunchTableRow({
         ) : (
           '-'
         )}
+      </td>
+      <td className="px-4 py-3 text-right text-sm text-content-secondary tabular-nums whitespace-nowrap">
+        {reworkCost ?? '-'}
       </td>
       <td className="px-4 py-3 text-right">
         <div className="flex items-center justify-end gap-1 flex-nowrap">

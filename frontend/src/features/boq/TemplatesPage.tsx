@@ -23,6 +23,7 @@ import { useToastStore } from '@/stores/useToastStore';
 import { apiGet, apiPost, ApiError } from '@/shared/lib/api';
 import { fmtNumber } from '@/shared/lib/formatters';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
+import { parseDecimalInput } from '@/shared/lib/parseDecimal';
 import { projectsApi, type Project } from '@/features/projects/api';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import type { BOQ } from './api';
@@ -235,7 +236,7 @@ export function TemplatesPage() {
   /* ── State ───────────────────────────────────────────────────────── */
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [area, setArea] = useState(1000);
+  const [area, setArea] = useState('1000');
   const activeProjectId = useActiveProjectId();
   const [projectId, setProjectId] = useState<string>(activeProjectId);
   const [boqName, setBoqName] = useState('');
@@ -318,15 +319,17 @@ export function TemplatesPage() {
     [templates, selectedId],
   );
 
+  const areaNum = parseDecimalInput(area) ?? 1000;
+
   const estimatedTotal = useMemo(() => {
     if (!selected) return 0;
-    return selected.avg_cost_per_m2 * area;
-  }, [selected, area]);
+    return selected.avg_cost_per_m2 * areaNum;
+  }, [selected, areaNum]);
 
   const generatedName = useMemo(() => {
     if (!selected) return '';
-    return `${selected.name} - ${fmt.format(area)}m\u00B2`;
-  }, [selected, area]);
+    return `${selected.name} - ${fmt.format(areaNum)}m\u00B2`;
+  }, [selected, areaNum]);
 
   /* ── Auto-populate BOQ name when template or area changes ────────── */
 
@@ -335,16 +338,17 @@ export function TemplatesPage() {
       setSelectedId((prev) => (prev === id ? null : id));
       const tpl = templates.find((t) => t.id === id);
       if (tpl) {
-        setBoqName(`${tpl.name} - ${fmt.format(area)}m\u00B2`);
+        setBoqName(`${tpl.name} - ${fmt.format(areaNum)}m\u00B2`);
       }
     },
-    [templates, area],
+    [templates, areaNum],
   );
 
   const handleAreaChange = useCallback(
-    (val: number) => {
-      setArea(val);
-      if (selected) {
+    (raw: string) => {
+      setArea(raw);
+      const val = parseDecimalInput(raw);
+      if (val !== null && selected) {
         setBoqName(`${selected.name} - ${fmt.format(val)}m\u00B2`);
       }
     },
@@ -357,9 +361,9 @@ export function TemplatesPage() {
       template_id: selected.id,
       project_id: projectId,
       boq_name: boqName || generatedName || undefined,
-      area_m2: area,
+      area_m2: areaNum,
     });
-  }, [selected, projectId, boqName, generatedName, area, createMutation]);
+  }, [selected, projectId, boqName, generatedName, areaNum, createMutation]);
 
   /* ── Render ──────────────────────────────────────────────────────── */
 
@@ -465,7 +469,11 @@ export function TemplatesPage() {
                   {tpl.name}
                 </p>
                 <p className="mt-0.5 text-xs text-content-tertiary">
-                  {tpl.positions} {t('boq.items', { defaultValue: 'items' })}
+                  {t('boq.item_count', {
+                    count: tpl.positions,
+                    defaultValue_one: '{{count}} item',
+                    defaultValue_other: '{{count}} items',
+                  })}
                 </p>
               </div>
 
@@ -526,11 +534,10 @@ export function TemplatesPage() {
                   {t('boq.area_m2', { defaultValue: 'Area (m\u00B2)' })}
                 </label>
                 <input
-                  type="number"
-                  min={1}
-                  step={50}
+                  type="text"
+                  inputMode="decimal"
                   value={area}
-                  onChange={(e) => handleAreaChange(Math.max(1, Number(e.target.value) || 1))}
+                  onChange={(e) => handleAreaChange(e.target.value)}
                   className="w-full rounded-lg border border-border-light bg-surface-elevated px-3.5 py-2.5 text-sm text-content-primary outline-none transition-colors focus:border-oe-blue focus:ring-2 focus:ring-oe-blue/20 tabular-nums"
                 />
               </div>

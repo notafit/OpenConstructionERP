@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cde_states import CDEState, CDEStateMachine
-from app.core.events import event_bus
+from app.core.events import publish_after_commit
 from app.core.json_merge import merge_metadata
 from app.modules.cde import readiness as cde_readiness
 from app.modules.cde.models import (
@@ -369,17 +369,37 @@ class CDEService:
         )
 
         # Emit event for cross-module handlers (notifications, analytics).
-        event_bus.publish_detached(
+        #
+        # The payload carries each value under two names. ``from_state`` /
+        # ``to_state`` / ``user_id`` are what this module has always sent and
+        # what the notifications and webhook consumers read. The core
+        # ``cde.container.promoted`` handler in ``core/event_handlers.py``
+        # reads ``old_state`` / ``new_state`` / ``promoted_by`` instead, so
+        # with only the first set it audited every transition as "" -> "" and
+        # never re-emitted ``cde.container.published``: nothing downstream of
+        # a publish ever ran. Sending both keeps every reader correct without
+        # touching the shared handler.
+        #
+        # Deferred to the commit rather than detached immediately. The
+        # subscribers open their own sessions and the published consumer
+        # checks the container really is ``published`` before it notifies
+        # anyone; a task scheduled before this transaction commits would read
+        # the old state on PostgreSQL and stand down.
+        publish_after_commit(
+            self.session,
             "cde.container.promoted",
-            data={
+            {
                 "project_id": str(container.project_id),
                 "container_id": str(container_id),
                 "container_code": container.container_code,
                 "from_state": current_state,
                 "to_state": target_state,
+                "old_state": current_state,
+                "new_state": target_state,
                 "reason": data.reason,
                 "gate_code": gate_code,
                 "user_id": user_id,
+                "promoted_by": user_id,
                 "user_role": user_role,
             },
             source_module="cde",
@@ -578,6 +598,7 @@ class CDEService:
                 linked_doc_id,
                 container_id,
             )
+            self._announce_revision_if_published(container, revision_id, revision_code, user_id)
             return revision
 
         # Upload mode: cross-link into the Documents hub when the revision
@@ -672,7 +693,51 @@ class CDEService:
             rev_number,
             container_id,
         )
+        self._announce_revision_if_published(container, revision_id, revision_code, user_id)
         return revision
+
+    def _announce_revision_if_published(
+        self,
+        container: DocumentContainer,
+        revision_id: uuid.UUID,
+        revision_code: str,
+        user_id: str | None,
+    ) -> None:
+        """Say so when a revision lands on a container that is already published.
+
+        The state machine has no way back from ``published``, so a container
+        crosses Gate B exactly once and ``cde.container.published`` fires once
+        per container. Every later revision added to it still becomes the
+        container's current revision at once, which is the change that leaves
+        measurements and links made against the previous one stale. Without
+        this the owners of those records heard about C01 and never about C02.
+
+        A name of its own rather than a second ``cde.container.published``:
+        that one means "crossed the approval gate" to the webhook and audit
+        readers, and a revision is not a gate. The CDE subscriber listens to
+        both. Deferred to the commit for the same reason the promote event is:
+        the subscriber reads the container's current revision in its own
+        session and must see the one this request wrote.
+
+        ``container.cde_state`` is the state read at the top of
+        ``create_revision``; nothing in between changes it.
+        """
+        if container.cde_state != CDEState.PUBLISHED.value:
+            return
+        publish_after_commit(
+            self.session,
+            "cde.revision.published",
+            {
+                "project_id": str(container.project_id),
+                "container_id": str(container.id),
+                "container_code": container.container_code,
+                "revision_id": str(revision_id),
+                "revision_code": revision_code,
+                "user_id": user_id,
+                "promoted_by": user_id,
+            },
+            source_module="cde",
+        )
 
     async def get_revision(self, revision_id: uuid.UUID) -> DocumentRevision:
         """Get revision by ID. Raises 404 if not found."""

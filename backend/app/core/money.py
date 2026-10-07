@@ -26,6 +26,7 @@ Usage::
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
@@ -36,198 +37,28 @@ from sqlalchemy.orm import mapped_column
 __all__ = [
     "CURRENCIES",
     "MoneyValue",
+    "WrittenAmount",
     "format_money",
     "minor_units",
     "money_columns",
     "money_quantum",
     "parse_money",
+    "read_written_amount",
 ]
 
 # ── Currency registry ─────────────────────────────────────────────────────────
+#
+# The table, the per-currency decimal count and the rounding quantum moved to
+# ``app.core.currency_registry`` so that the standard-library-only validator
+# modules can reach them; this module imports them straight back, so every
+# caller of ``from app.core.money import CURRENCIES, minor_units, money_quantum``
+# is unchanged. The explanation of which layer governs how many decimals -- value
+# here, document in the einvoice rules, screen in the frontend -- travelled with
+# them and sits above ``minor_units`` in that module.
 
-CURRENCIES: dict[str, dict[str, Any]] = {
-    # Europe
-    "EUR": {"symbol": "€", "name": "Euro", "decimals": 2},
-    "GBP": {"symbol": "£", "name": "British Pound", "decimals": 2},
-    "CHF": {"symbol": "CHF", "name": "Swiss Franc", "decimals": 2},
-    "SEK": {"symbol": "kr", "name": "Swedish Krona", "decimals": 2},
-    "NOK": {"symbol": "kr", "name": "Norwegian Krone", "decimals": 2},
-    "DKK": {"symbol": "kr", "name": "Danish Krone", "decimals": 2},
-    "PLN": {"symbol": "zł", "name": "Polish Zloty", "decimals": 2},
-    "CZK": {"symbol": "Kč", "name": "Czech Koruna", "decimals": 2},
-    "HUF": {"symbol": "Ft", "name": "Hungarian Forint", "decimals": 0},
-    "RON": {"symbol": "lei", "name": "Romanian Leu", "decimals": 2},
-    "BGN": {"symbol": "лв", "name": "Bulgarian Lev", "decimals": 2},
-    "HRK": {"symbol": "kn", "name": "Croatian Kuna", "decimals": 2},
-    "TRY": {"symbol": "₺", "name": "Turkish Lira", "decimals": 2},
-    "RUB": {"symbol": "₽", "name": "Russian Ruble", "decimals": 2},
-    "UAH": {"symbol": "₴", "name": "Ukrainian Hryvnia", "decimals": 2},
-    # Americas
-    "USD": {"symbol": "$", "name": "US Dollar", "decimals": 2},
-    "CAD": {"symbol": "C$", "name": "Canadian Dollar", "decimals": 2},
-    "MXN": {"symbol": "MX$", "name": "Mexican Peso", "decimals": 2},
-    "BRL": {"symbol": "R$", "name": "Brazilian Real", "decimals": 2},
-    "ARS": {"symbol": "$", "name": "Argentine Peso", "decimals": 2},
-    "CLP": {"symbol": "$", "name": "Chilean Peso", "decimals": 0},
-    "COP": {"symbol": "$", "name": "Colombian Peso", "decimals": 2},
-    "PEN": {"symbol": "S/.", "name": "Peruvian Sol", "decimals": 2},
-    "UYU": {"symbol": "$U", "name": "Uruguayan Peso", "decimals": 2},
-    "BOB": {"symbol": "Bs.", "name": "Bolivian Boliviano", "decimals": 2},
-    "PYG": {"symbol": "₲", "name": "Paraguayan Guaraní", "decimals": 0},
-    "VES": {"symbol": "Bs.S", "name": "Venezuelan Bolívar", "decimals": 2},
-    "DOP": {"symbol": "RD$", "name": "Dominican Peso", "decimals": 2},
-    "GTQ": {"symbol": "Q", "name": "Guatemalan Quetzal", "decimals": 2},
-    "CRC": {"symbol": "₡", "name": "Costa Rican Colón", "decimals": 2},
-    # Middle East & Africa
-    "AED": {"symbol": "د.إ", "name": "UAE Dirham", "decimals": 2},
-    "SAR": {"symbol": "﷼", "name": "Saudi Riyal", "decimals": 2},
-    "QAR": {"symbol": "﷼", "name": "Qatari Riyal", "decimals": 2},
-    # Audit I1 - three-decimal Gulf/oil-trading currencies. Adding them
-    # explicitly means ``format_money`` and ``MoneyValue.convert`` quantise
-    # to the correct fils/dirhams instead of rounding to 2 decimals.
-    "KWD": {"symbol": "د.ك", "name": "Kuwaiti Dinar", "decimals": 3},
-    "BHD": {"symbol": "ب.د", "name": "Bahraini Dinar", "decimals": 3},
-    "OMR": {"symbol": "ر.ع.", "name": "Omani Rial", "decimals": 3},
-    "JOD": {"symbol": "د.أ", "name": "Jordanian Dinar", "decimals": 3},
-    "IQD": {"symbol": "ع.د", "name": "Iraqi Dinar", "decimals": 3},
-    "LYD": {"symbol": "ل.د", "name": "Libyan Dinar", "decimals": 3},
-    "VND": {"symbol": "₫", "name": "Vietnamese Đồng", "decimals": 0},
-    "ISK": {"symbol": "kr", "name": "Icelandic Króna", "decimals": 0},
-    "BIF": {"symbol": "FBu", "name": "Burundian Franc", "decimals": 0},
-    "DJF": {"symbol": "Fdj", "name": "Djiboutian Franc", "decimals": 0},
-    "GNF": {"symbol": "FG", "name": "Guinean Franc", "decimals": 0},
-    "KMF": {"symbol": "CF", "name": "Comorian Franc", "decimals": 0},
-    "VUV": {"symbol": "VT", "name": "Vanuatu Vatu", "decimals": 0},
-    "XPF": {"symbol": "₣", "name": "CFP Franc", "decimals": 0},
-    "ZAR": {"symbol": "R", "name": "South African Rand", "decimals": 2},
-    "EGP": {"symbol": "E£", "name": "Egyptian Pound", "decimals": 2},
-    "NGN": {"symbol": "₦", "name": "Nigerian Naira", "decimals": 2},
-    "KES": {"symbol": "KSh", "name": "Kenyan Shilling", "decimals": 2},
-    "GHS": {"symbol": "₵", "name": "Ghanaian Cedi", "decimals": 2},
-    "MAD": {"symbol": "DH", "name": "Moroccan Dirham", "decimals": 2},
-    "TND": {"symbol": "د.ت", "name": "Tunisian Dinar", "decimals": 3},
-    "DZD": {"symbol": "DA", "name": "Algerian Dinar", "decimals": 2},
-    "ETB": {"symbol": "Br", "name": "Ethiopian Birr", "decimals": 2},
-    "UGX": {"symbol": "USh", "name": "Ugandan Shilling", "decimals": 0},
-    "TZS": {"symbol": "TSh", "name": "Tanzanian Shilling", "decimals": 2},
-    "RWF": {"symbol": "FRw", "name": "Rwandan Franc", "decimals": 0},
-    "XOF": {"symbol": "CFA", "name": "West African CFA Franc", "decimals": 0},
-    "XAF": {"symbol": "FCFA", "name": "Central African CFA Franc", "decimals": 0},
-    "AOA": {"symbol": "Kz", "name": "Angolan Kwanza", "decimals": 2},
-    "MZN": {"symbol": "MT", "name": "Mozambique Metical", "decimals": 2},
-    "BWP": {"symbol": "P", "name": "Botswana Pula", "decimals": 2},
-    "ZMW": {"symbol": "ZK", "name": "Zambian Kwacha", "decimals": 2},
-    "NAD": {"symbol": "N$", "name": "Namibia Dollar", "decimals": 2},
-    "MGA": {"symbol": "Ar", "name": "Malagasy Ariary", "decimals": 2},
-    # Asia-Pacific
-    "JPY": {"symbol": "¥", "name": "Japanese Yen", "decimals": 0},
-    "CNY": {"symbol": "¥", "name": "Chinese Yuan", "decimals": 2},
-    "KRW": {"symbol": "₩", "name": "South Korean Won", "decimals": 0},
-    "INR": {"symbol": "₹", "name": "Indian Rupee", "decimals": 2},
-    "AUD": {"symbol": "A$", "name": "Australian Dollar", "decimals": 2},
-    "NZD": {"symbol": "NZ$", "name": "New Zealand Dollar", "decimals": 2},
-    "SGD": {"symbol": "S$", "name": "Singapore Dollar", "decimals": 2},
-    "HKD": {"symbol": "HK$", "name": "Hong Kong Dollar", "decimals": 2},
-    "MYR": {"symbol": "RM", "name": "Malaysian Ringgit", "decimals": 2},
-    "THB": {"symbol": "฿", "name": "Thai Baht", "decimals": 2},
-    "IDR": {"symbol": "Rp", "name": "Indonesian Rupiah", "decimals": 0},
-    "PHP": {"symbol": "₱", "name": "Philippine Peso", "decimals": 2},
-}
+from app.core.currency_registry import CURRENCIES, minor_units, money_quantum
 
 _CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
-
-#: What an unknown code is worth. Two is the commonest subdivision by a wide
-#: margin, so it is the least wrong guess for a code nobody has entered yet.
-_DEFAULT_MINOR_UNITS = 2
-
-
-# ── Minor units: three layers, one source ─────────────────────────────────────
-#
-# How many decimal places a monetary amount carries is asked three times in this
-# platform, by three layers that want three different answers. They are listed
-# here because the whole subject collapses into a display bug the moment a
-# reader forgets that the layers are not interchangeable.
-#
-#   value     THIS module. The amount itself, as it is computed, converted,
-#             stored and put on the wire. Rounding here does not change how a
-#             number looks, it changes what the number IS: a quantum coarser
-#             than the currency's own subdivision destroys precision that no
-#             later layer can recover, and totals summed from components
-#             rounded here stop matching totals summed from unrounded ones.
-#             So this layer follows the currency's real subdivision and nothing
-#             else. Everything that rounds a value asks :func:`money_quantum`,
-#             and no rounding step in this platform is allowed to be a literal
-#             that ignores its currency.
-#
-#   document  ``app.modules.einvoice.rules.money_decimals``. What an invoice
-#             declares to a bank and a tax authority. It starts from the value
-#             layer's answer and caps it at the two decimals the EN 16931
-#             BR-DEC family permits for document amounts, which is why a Kuwaiti
-#             dinar is written with three digits in our own records and two on
-#             an invoice.
-#
-#   screen    ``frontend/src/shared/lib/money.ts``. What a person reads. It
-#             asks the running engine's CLDR data, because a screen follows the
-#             conventions of whoever is looking at it. It never reads this
-#             table and this table never reads it.
-#
-# The registry above is ISO 4217. ISO states how a currency is subdivided; CLDR
-# states how a person in a locale writes it, and the two part company on
-# fourteen codes (enumerated, with their ISO values and the reasoning, in
-# ``app.modules.einvoice.rules``). Where they disagree the value layer keeps
-# ISO's count, because a subunit that exists can appear in a payment whatever
-# local habit does with it.
-#
-# There are exactly two exceptions, HUF and IDR, and they are exceptions to the
-# rule rather than to the reasoning. ISO still lists a minor unit for both, but
-# the fillér left circulation in 1999 and the sen with it, so there is no
-# subunit for a second digit to mean and no payment that could carry one. Two
-# decimals there would not be a finer forint, only a pair of digits nothing can
-# settle. That is a decision, recorded here and beside the same two codes in the
-# einvoice rules, not a copy of CLDR that happens to agree.
-#
-# If you arrived here because a currency looked wrong on a screen: the screen is
-# the layer that does not read this file. Changing a count here to fix how
-# something renders moves a stored amount and an invoice total with it.
-
-
-def minor_units(currency_code: str | None) -> int:
-    """How many decimal places an amount in ``currency_code`` genuinely has.
-
-    The value-layer answer, and the one every rounding step in the platform is
-    derived from. This is the currency's own subdivision, uncapped: a Kuwaiti
-    dinar returns 3 here even though a document may only write 2.
-
-    Args:
-        currency_code: ISO 4217 code. Case and surrounding space are ignored;
-            blank, ``None`` and codes absent from the registry yield the
-            two-decimal default.
-
-    Returns:
-        The number of minor-unit digits, ``0`` for a currency with no subunit.
-    """
-    entry = CURRENCIES.get((currency_code or "").strip().upper())
-    if entry is None:
-        return _DEFAULT_MINOR_UNITS
-    return int(entry.get("decimals", _DEFAULT_MINOR_UNITS))
-
-
-def money_quantum(currency_code: str | None) -> Decimal:
-    """The rounding step for one amount in ``currency_code``.
-
-    ``Decimal("0.01")`` for a two-decimal currency, ``Decimal("1")`` for one
-    with no subunit, ``Decimal("0.001")`` for the Gulf dinars. Pass this to
-    :meth:`decimal.Decimal.quantize` instead of writing a literal: a literal
-    cannot know its currency, and that is how a yen acquires sub-yen precision
-    it cannot express and a dinar loses a fils it can.
-
-    Args:
-        currency_code: ISO 4217 code, normalised as in :func:`minor_units`.
-
-    Returns:
-        The quantum, exact and free of scientific notation.
-    """
-    return Decimal(1).scaleb(-minor_units(currency_code))
 
 
 # ── MoneyValue model ──────────────────────────────────────────────────────────
@@ -535,3 +366,167 @@ def _format_de(d: Decimal, decimals: int) -> str:
     en = _format_en(d, decimals)
     # Swap: comma → TEMP, dot → comma, TEMP → dot.
     return en.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+# ── Reading an amount a person typed as text ──────────────────────────────────
+
+#: Currency symbols that name one currency. ``$`` and ``¥`` name several, so
+#: they are stripped without deciding the currency. Longest first, so ``R$``
+#: is not read as ``$``.
+_WRITTEN_SYMBOLS: tuple[tuple[str, str | None], ...] = (
+    ("R$", "BRL"),
+    ("€", "EUR"),
+    ("£", "GBP"),
+    ("₽", "RUB"),
+    ("₹", "INR"),
+    ("₺", "TRY"),
+    ("$", None),
+    ("¥", None),
+)
+
+#: Characters people put between digit groups: space, no-break space, narrow
+#: no-break space, thin space and the Swiss apostrophes.
+_WRITTEN_GROUP_SPACES = "    '’"
+
+_WRITTEN_LEADING_CODE_RE = re.compile(r"^([A-Za-z]{3})(?![A-Za-z])\s*")
+_WRITTEN_TRAILING_CODE_RE = re.compile(r"(?<![A-Za-z])\s*([A-Za-z]{3})$")
+_WRITTEN_BODY_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_WRITTEN_SPACED_RE = re.compile(r"\d{1,3}(?: \d{3})+(?:[.,]\d+)?")
+
+
+@dataclass(frozen=True)
+class WrittenAmount:
+    """What :func:`read_written_amount` made of a piece of text.
+
+    ``status`` is one of:
+
+    * ``"read"``: ``amount`` holds the one amount the text can mean.
+    * ``"ambiguous"``: the text is a number but could mean two amounts, for
+      instance ``"12.500"`` in a currency with three decimals. ``amount`` is
+      ``None``; a person has to say which.
+    * ``"unreadable"``: there are digits, but not one clear amount
+      (``"approx. 5000"``, ``"5000-6000"``, ``"12.34.5"``).
+    * ``"blank"``: no digit at all, so no amount was written.
+
+    ``currency`` is the ISO code written with the amount, as a code or as a
+    symbol that names one currency. It is never the hint passed in.
+    """
+
+    amount: Decimal | None
+    currency: str | None
+    status: str
+
+
+def _valid_groups(parts: list[str], separator: str) -> bool:
+    """Whether ``parts`` (an integer split on ``separator``) are digit groups.
+
+    A lead of one to three digits followed by groups of three, or, for a
+    comma, the Indian layout: a lead of one or two digits, groups of two and a
+    final group of three.
+    """
+    if len(parts) < 2:
+        return False
+    lead, rest = parts[0], parts[1:]
+    if 1 <= len(lead) <= 3 and all(len(p) == 3 for p in rest):
+        return True
+    return separator == "," and 1 <= len(lead) <= 2 and len(rest[-1]) == 3 and all(len(p) == 2 for p in rest[:-1])
+
+
+def read_written_amount(raw: object, *, currency_hint: str | None = None) -> WrittenAmount:
+    """Read an amount a person typed as free text, in the convention they used.
+
+    Accepts an optional ISO code before or after the number (``"BRL 12.000,00"``,
+    ``"12000 EUR"``), a currency symbol, digit groups of dots, commas, spaces
+    or apostrophes, and a leading minus or accounting brackets.
+
+    The decimal separator is decided by the text, not by a locale guess:
+
+    * When both ``.`` and ``,`` appear, the last one is the decimal point and
+      the other must form proper digit groups.
+    * When one of them appears more than once, it is the group separator.
+    * When one of them appears once, it is the decimal point unless exactly
+      three digits follow and the part before could lead a group. Then it is a
+      group separator in a currency with fewer than three decimals
+      (``"12.000"`` euro is twelve thousand; nobody writes euro to the tenth of
+      a cent) and ``"ambiguous"`` in one with three (``"12.500"`` dinar).
+
+    The currency deciding that is the one written with the amount, else
+    ``currency_hint`` (typically the project currency), else the two-decimal
+    default.
+
+    Never raises. See :class:`WrittenAmount` for what comes back.
+    """
+    if isinstance(raw, Decimal | int) and not isinstance(raw, bool):
+        value = Decimal(raw)
+        if value.is_finite():
+            return WrittenAmount(amount=value, currency=None, status="read")
+        return WrittenAmount(amount=None, currency=None, status="unreadable")
+
+    text = str(raw if raw is not None else "").strip()
+    if not any(ch.isdigit() for ch in text):
+        return WrittenAmount(amount=None, currency=None, status="blank")
+
+    codes: list[str] = []
+    for pattern in (_WRITTEN_LEADING_CODE_RE, _WRITTEN_TRAILING_CODE_RE):
+        match = pattern.search(text)
+        if match is not None:
+            codes.append(match.group(1).upper())
+            text = (text[: match.start()] + text[match.end() :]).strip()
+    for symbol, code in _WRITTEN_SYMBOLS:
+        if text.startswith(symbol):
+            text = text[len(symbol) :].strip()
+        elif text.endswith(symbol):
+            text = text[: -len(symbol)].strip()
+        else:
+            continue
+        if code is not None:
+            codes.append(code)
+        break
+    if len(set(codes)) > 1 or any(code not in CURRENCIES for code in codes):
+        return WrittenAmount(amount=None, currency=None, status="unreadable")
+    currency = codes[0] if codes else None
+    unreadable = WrittenAmount(amount=None, currency=currency, status="unreadable")
+
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative, text = True, text[1:-1].strip()
+    if text[:1] in ("+", "-"):
+        negative, text = text[0] == "-", text[1:].strip()
+
+    body = "".join(" " if ch in _WRITTEN_GROUP_SPACES else ch for ch in text)
+    if " " in body:
+        if not _WRITTEN_SPACED_RE.fullmatch(body):
+            return unreadable
+        body = body.replace(" ", "")
+    if not _WRITTEN_BODY_RE.fullmatch(body):
+        return unreadable
+
+    separators = [ch for ch in body if ch in ".,"]
+    if not separators:
+        digits = body
+    elif len(set(separators)) == 2:
+        decimal_sep = separators[-1]
+        group_sep = "," if decimal_sep == "." else "."
+        whole, fraction = body.rsplit(decimal_sep, 1)
+        if separators.count(decimal_sep) != 1 or not _valid_groups(whole.split(group_sep), group_sep):
+            return unreadable
+        digits = f"{whole.replace(group_sep, '')}.{fraction}"
+    elif len(separators) > 1:
+        if not _valid_groups(body.split(separators[0]), separators[0]):
+            return unreadable
+        digits = body.replace(separators[0], "")
+    else:
+        whole, fraction = body.split(separators[0])
+        could_be_group = len(fraction) == 3 and len(whole) <= 3 and whole.strip("0") != ""
+        if not could_be_group:
+            digits = f"{whole}.{fraction}"
+        elif minor_units(currency or currency_hint) >= 3:
+            return WrittenAmount(amount=None, currency=currency, status="ambiguous")
+        else:
+            digits = whole + fraction
+
+    try:
+        value = Decimal(digits)
+    except InvalidOperation:
+        return unreadable
+    return WrittenAmount(amount=-value if negative else value, currency=currency, status="read")

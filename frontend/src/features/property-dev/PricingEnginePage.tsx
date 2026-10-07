@@ -194,7 +194,8 @@ function fmtMoney(amount: string | number, currency: string): string {
   return formatCurrency(n, currency);
 }
 
-function statusBadge(status: PriceList['status']): JSX.Element {
+function PriceListStatusBadge({ status }: { status: PriceList['status'] }): JSX.Element {
+  const { t } = useTranslation();
   const map: Record<
     PriceList['status'],
     { variant: 'success' | 'warning' | 'neutral'; label: string }
@@ -204,7 +205,7 @@ function statusBadge(status: PriceList['status']): JSX.Element {
     superseded: { variant: 'neutral', label: 'Superseded' },
   };
   const m = map[status];
-  return <Badge variant={m.variant}>{m.label}</Badge>;
+  return <Badge variant={m.variant}>{t(`pricingEngine.status_${status}`, { defaultValue: m.label })}</Badge>;
 }
 
 // ── Currency picker (ISO 4217 top-30 + free-form fallback) ───────────
@@ -1016,7 +1017,7 @@ function PriceListsTab({ devId }: PriceListsTabProps): JSX.Element {
               {rows.map((pl) => (
                 <tr key={pl.id} className="border-t border-border">
                   <td className="px-3 py-2 font-medium">{pl.name}</td>
-                  <td className="px-3 py-2">{statusBadge(pl.status)}</td>
+                  <td className="px-3 py-2"><PriceListStatusBadge status={pl.status} /></td>
                   <td className="px-3 py-2">{pl.effective_from}</td>
                   <td className="px-3 py-2">{pl.currency}</td>
                   <td className="px-3 py-2 text-right">

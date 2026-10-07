@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Os trabalhos desta medida começaram em {start}, antes da submissão da candidatura em {filed}. A maioria dos programas não financia nada quando a medida já começou",
+      "unevidenced": "Os trabalhos começaram antecipadamente, em {start}, e o processo indica que a entidade o autorizou, mas não identifica nenhuma autorização escrita",
+      "evidence": "Registe a referência da autorização escrita para o início antecipado, para que o processo se defenda por si próprio",
+      "suggestion": "Confirme os termos do programa antes de gastar mais. Se o início antecipado foi autorizado por escrito, registe-o; se não foi, consulte a entidade antes de a candidatura avançar"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "O levantamento {draw} inclui custos anteriores a {period_start}, o dia em que começa o período da atribuição",
+      "after": "O levantamento {draw} inclui custos posteriores a {period_end}, o dia em que termina o período da atribuição",
+      "spans": "O levantamento {draw} ultrapassa nos dois extremos o período da atribuição, que vai de {period_start} a {period_end}",
+      "suggestion": "Passe os custos fora do período para um levantamento próprio e trate-os com a entidade, em vez de juntar os dois tipos de custos no mesmo pedido"
+    },
+    "own_share_is_covered": {
+      "fail": "O programa exige uma contrapartida de {rate} por cento, ou seja, {required}, mas a candidatura regista {recorded}",
+      "suggestion": "Indique de onde vem o resto da contrapartida antes de submeter, porque o programa a calcula sobre a base de custo elegível e não sobre o total do projeto"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "A intensidade de apoio acumulada das candidaturas deste projeto (número de candidaturas: {count}) é de {intensity} por cento dos custos elegíveis e ultrapassa o limite de {cap} por cento que o mais exigente dos seus programas declara",
+      "suggestion": "O financiamento público acumula-se entre programas e entre níveis da administração. Reduza um dos pedidos, ou verifique se as medidas podem ser separadas para que cada uma suporte os seus próprios custos"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "O período da atribuição terminou em {period_end} e ainda não foi iniciado o comprovativo final de utilização",
+      "late": "O comprovativo final de utilização devia ser entregue até {due} e foi submetido em {submitted}",
+      "overdue": "O comprovativo final de utilização devia ser entregue até {due} e ainda não foi submetido",
+      "suggestion": "Entregue o que já existe em vez de esperar que esteja completo. A maioria das entidades prorroga um prazo a pedido e nenhuma prorroga um prazo que já passou"
+    },
+    "errors": {
+      "application_not_found": "Candidatura não encontrada",
+      "programme_code_taken": "Já existe um programa com esta referência neste país",
+      "programme_not_found": "Programa não encontrado",
+      "programme_has_applications": "Este programa tem candidaturas e não pode ser eliminado. Em vez disso, encerre-o.",
+      "application_code_taken": "Já existe uma candidatura com esta referência neste projeto",
+      "approved_application_not_deletable": "Uma candidatura aprovada não pode ser eliminada. Em vez disso, altere o estado para Retirada ou Encerrada.",
+      "approval_needs_period_end": "Uma aprovação precisa da data de fim do período da atribuição, porque todos os prazos seguintes contam a partir dela",
+      "draw_needs_approval": "Só é possível levantar fundos de uma candidatura aprovada",
+      "draw_not_found": "Levantamento não encontrado",
+      "paid_draw_not_deletable": "Um levantamento já pago não pode ser eliminado",
+      "proof_not_found": "Comprovativo de utilização não encontrado",
+      "obligation_not_found": "Prazo não encontrado",
+      "eligible_exceeds_amount": "A parte elegível não pode exceder o montante",
+      "allocation_not_found": "Alocação de custo não encontrada"
+    }
+  }
+}

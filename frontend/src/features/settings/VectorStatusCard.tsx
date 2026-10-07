@@ -54,6 +54,14 @@ interface ReindexResult {
   skipped: number;
   purged: boolean;
   collection: string;
+  /** How much of the collection the pass actually walked, against the ceiling
+   *  it was allowed to walk, and whether it stopped on that ceiling with rows
+   *  left over. Every reindex endpoint reports these; they are optional here
+   *  because a client can outlive the server it is talking to, and a missing
+   *  `truncated` has to read as "not truncated" rather than as a crash. */
+  scanned?: number;
+  cap?: number;
+  truncated?: boolean;
 }
 
 export default function VectorStatusCard() {
@@ -61,6 +69,12 @@ export default function VectorStatusCard() {
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const [purgeFirst, setPurgeFirst] = useState(false);
+  // Last truncated pass per collection. A toast is read once and dismissed;
+  // "part of this collection is not in the index" is a state of the system,
+  // so it stays on the row it belongs to until a later pass covers it.
+  const [truncated, setTruncated] = useState<
+    Record<string, { scanned: number; cap: number }>
+  >({});
 
   const statusQuery = useQuery({
     queryKey: ['vector-search-status'],
@@ -78,6 +92,46 @@ export default function VectorStatusCard() {
       return apiPost<ReindexResult>(url, {});
     },
     onSuccess: (result, collection) => {
+      // A collection too large for one pass is indexed up to a ceiling and the
+      // rest is left out of the search index entirely. That is reported first
+      // because it changes how every other number in this response reads: an
+      // `indexed` count that looks like a complete backfill is a count of the
+      // part that fit. The operator is the only party who can act on it, and
+      // until now they were the only party the response did not tell. The
+      // remedy is stated conditionally: narrowing the pass to one project
+      // helps only where the collection spans several, and the BIM elements
+      // of one converted model can exceed the ceiling on their own.
+      if (result.truncated) {
+        setTruncated((prev) => ({
+          ...prev,
+          [collection]: { scanned: result.scanned ?? 0, cap: result.cap ?? 0 },
+        }));
+        addToast({
+          type: 'warning',
+          title: t('vector_status.reindex_truncated', {
+            defaultValue: 'Reindex stopped at the row limit',
+          }),
+          message: t('vector_status.reindex_truncated_msg', {
+            defaultValue:
+              '{{collection}}: {{indexed}} of the first {{scanned}} records were indexed, then the pass stopped at its {{cap}}-record limit. The rest of the collection was not reindexed. If it spans several projects, reindexing them one at a time will cover more of it.',
+            collection,
+            indexed: result.indexed,
+            scanned: result.scanned ?? 0,
+            cap: result.cap ?? 0,
+          }),
+        });
+        qc.invalidateQueries({ queryKey: ['vector-search-status'] });
+        return;
+      }
+      // A pass that completed clears any limit warning left by an earlier one,
+      // so the note under a collection always describes its last reindex.
+      setTruncated((prev) => {
+        if (!(collection in prev)) return prev;
+        const next = { ...prev };
+        delete next[collection];
+        return next;
+      });
+
       // A 200 means the request completed, not that anything was indexed.
       // index_many() drops a row whose text will not encode and only logs it
       // at debug, so an unreachable or missing encoder returns every row as
@@ -212,6 +266,10 @@ export default function VectorStatusCard() {
                 (col: SearchStatusCollection) => {
                   const isReindexing =
                     reindexMut.isPending && reindexMut.variables === col.collection;
+                  // Read once. An element access by a non-literal key is not
+                  // narrowed by a truthiness test on the same expression, so
+                  // the reads inside the branch would each be optional again.
+                  const lastTruncation = truncated[col.collection];
                   return (
                     <div
                       key={col.collection}
@@ -228,12 +286,12 @@ export default function VectorStatusCard() {
                             <CheckCircle2
                               size={11}
                               className="text-emerald-500"
-                              aria-label="ready"
+                              aria-label={t('vector_status.collection_ready', { defaultValue: 'ready' })}
                             />
                           ) : (
                             <span
                               className="inline-block h-1.5 w-1.5 rounded-full bg-slate-300"
-                              aria-label="empty"
+                              aria-label={t('vector_status.collection_empty', { defaultValue: 'empty' })}
                             />
                           )}
                         </div>
@@ -245,6 +303,21 @@ export default function VectorStatusCard() {
                           </span>{' '}
                           vectors
                         </div>
+                        {lastTruncation && (
+                          <div className="mt-1 flex items-start gap-1 text-[11px] text-amber-600">
+                            <AlertCircle size={11} className="mt-0.5 shrink-0" />
+                            <span>
+                              {t('vector_status.truncated_note', {
+                                defaultValue:
+                                  'Last reindex covered {{scanned}} records and stopped at its {{cap}}-record limit. The remainder was not reindexed.',
+                                scanned: lastTruncation.scanned.toLocaleString(
+                                  getNumberLocale(),
+                                ),
+                                cap: lastTruncation.cap.toLocaleString(getNumberLocale()),
+                              })}
+                            </span>
+                          </div>
+                        )}
                       </div>
                       <Button
                         variant="ghost"

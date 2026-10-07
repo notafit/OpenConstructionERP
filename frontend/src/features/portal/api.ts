@@ -63,10 +63,14 @@ export interface InvitePayload {
   redirect_path?: string | null;
 }
 
+/** What happened to the invitation email; the copy-link is offered either way. */
+export type InviteEmailStatus = 'sent' | 'failed' | 'not_configured' | 'not_requested';
+
 export interface InviteResponse {
   user: PortalUser;
   magic_link_token: string;
   magic_link_expires_at: string;
+  email_status?: InviteEmailStatus;
 }
 
 export interface UserPatch {
@@ -218,12 +222,24 @@ export interface ProgressReport {
   generated_at: string;
   format: string;
   storage_key: string | null;
+  /** Set once a person released the report to the client portal. */
+  published_at: string | null;
 }
 
 export function listProgressReports(projectId: string): Promise<ProgressReport[]> {
   return apiGet<ProgressReport[]>(
     `/v1/reporting/reports/?project_id=${encodeURIComponent(projectId)}`,
   ).then((reports) => reports.filter((r) => r.report_type === 'progress_report'));
+}
+
+/** Release a report to the client portal; until then the client cannot see it. */
+export function publishProgressReport(reportId: string): Promise<ProgressReport> {
+  return apiPost<ProgressReport>(`/v1/reporting/reports/${encodeURIComponent(reportId)}/publish`, {});
+}
+
+/** Take a report back from the client portal. */
+export function unpublishProgressReport(reportId: string): Promise<ProgressReport> {
+  return apiPost<ProgressReport>(`/v1/reporting/reports/${encodeURIComponent(reportId)}/unpublish`, {});
 }
 
 /* ── Portal-user-facing (session-token) payment applications ───────────────
@@ -325,6 +341,17 @@ export class PortalUnauthorizedError extends Error {
   }
 }
 
+/** A refused portal request, carrying its HTTP status. Still an `Error` with the server's detail as message. */
+export class PortalHttpError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = 'PortalHttpError';
+  }
+}
+
 async function portalFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getPortalSessionToken();
   if (!token) throw new PortalUnauthorizedError('No portal session');
@@ -343,7 +370,7 @@ async function portalFetch<T>(path: string, init?: RequestInit): Promise<T> {
     const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
     const detail =
       typeof body.detail === 'string' ? body.detail : `Request failed (${res.status})`;
-    throw new Error(detail);
+    throw new PortalHttpError(detail, res.status);
   }
   return (await res.json()) as T;
 }
@@ -436,6 +463,84 @@ export interface PortalProgressReport {
 export interface PortalProgressReportList {
   items: PortalProgressReport[];
   total: number;
+}
+
+/** A schedule milestone someone marked for the client. */
+export interface PortalMilestone {
+  id: string;
+  name: string;
+  planned_date: string;
+  expected_date: string;
+  status: string;
+  is_done: boolean;
+  is_late: boolean;
+  /** Days from today to the expected date; negative when late. */
+  days_until: number;
+}
+
+export interface PortalMilestoneList {
+  items: PortalMilestone[];
+  window_days: number;
+}
+
+/** Late milestones and the ones expected within the next two weeks. */
+export function listProjectMilestones(projectId: string): Promise<PortalMilestoneList> {
+  return portalFetch<PortalMilestoneList>(
+    `/api/v1/portal/projects/${encodeURIComponent(projectId)}/milestones`,
+  );
+}
+
+/** One instalment of a contract's payment plan, as the client sees it. */
+export interface PortalPaymentPlanLine {
+  id: string;
+  sequence: number;
+  label: string;
+  /** Decimal string. */
+  amount: string;
+  /** Decimal string, or null when the instalment is a fixed amount. */
+  percent_of_contract: string | null;
+  /** Decided by the server; the portal never works out overdue itself. */
+  status: 'upcoming' | 'due' | 'invoiced' | 'paid' | 'overdue' | string;
+  milestone_name: string | null;
+  forecast_due_date: string | null;
+  original_due_date: string | null;
+  /** Days the due date moved against the contract; positive is later. */
+  days_moved: number | null;
+  days_until: number | null;
+  days_overdue: number | null;
+}
+
+export interface PortalPaymentPlan {
+  contract_id: string;
+  contract_title: string;
+  currency: string;
+  contract_total: string;
+  paid_total: string;
+  outstanding_total: string;
+  lines: PortalPaymentPlanLine[];
+}
+
+export interface PortalPaymentPlanList {
+  items: PortalPaymentPlan[];
+}
+
+/**
+ * The payment plans of a project's contracts that the builder shows the client.
+ *
+ * The route answers 404 when the caller holds no project or contract grant
+ * there, so it never confirms a project exists. For the card that means "no
+ * plan to show", not a failure: a consultant who was shared documents only
+ * must not be told their payment plan could not be loaded.
+ */
+export async function listProjectPaymentPlans(projectId: string): Promise<PortalPaymentPlanList> {
+  try {
+    return await portalFetch<PortalPaymentPlanList>(
+      `/api/v1/portal/projects/${encodeURIComponent(projectId)}/payment-plan`,
+    );
+  } catch (err) {
+    if (err instanceof PortalHttpError && err.status === 404) return { items: [] };
+    throw err;
+  }
 }
 
 /**
@@ -575,6 +680,9 @@ export interface PortalInvoice {
   currency_code: string;
   amount_total: string | null;
   status: string;
+  /** Owed by the client and past its due date. */
+  is_overdue?: boolean;
+  days_overdue?: number | null;
 }
 
 export interface PortalInvoiceList {
@@ -761,6 +869,21 @@ export async function fetchMyDocumentBlob(documentId: string): Promise<Blob | nu
     throw new Error(detail);
   }
   return res.blob();
+}
+
+/**
+ * Ask for a new sign-in link by email. The server answers the same way for
+ * every address, so this resolves without saying whether one was sent.
+ */
+export async function requestPortalMagicLink(email: string): Promise<void> {
+  const res = await fetch('/api/v1/portal/auth/magic-link', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    throw new Error(`Request failed (${res.status})`);
+  }
 }
 
 /** Consume a magic-link token, persist the session, and return it. */

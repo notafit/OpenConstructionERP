@@ -41,15 +41,20 @@ export const ROLES_WITH_OWNER_SCOPED_DELETE: readonly string[] = [
 ];
 
 /**
- * Roles admitted by `property_dev.lead.delete`, which stays at MANAGER.
- * Deliberately a different and shorter set: a lead delete is not owner
- * scoped, so role is the only wall and it has to stay high. Sharing one
- * constant with the owner-scoped deletes would quietly widen this one.
+ * Roles admitted by `property_dev.lead.delete`, which sits at EDITOR level
+ * the same as the owner-scoped deletes. The two constants remain separate
+ * because the sets coincide today but are derived from different permissions
+ * and may diverge if one of them is raised.
  */
 export const ROLES_WITH_LEAD_DELETE: readonly string[] = [
   'admin',
   'manager',
-  // Legacy aliases that resolve to admin.
+  'editor',
+  // Legacy and industry aliases that resolve to one of the three above.
   'superuser',
   'owner',
+  'estimator',
+  'quantity_surveyor',
+  'qs',
+  'user',
 ];

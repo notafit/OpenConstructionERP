@@ -80,6 +80,7 @@ from reportlab.platypus import (
 )
 
 from app.core.money import minor_units, money_quantum
+from app.core.pdf_branding import branded_cover_brand, branded_doc_metadata
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
@@ -820,7 +821,10 @@ def _build_page_handler(ctx: _PageContext):
         left = float(getattr(doc, "leftMargin", PAGE_MARGIN_MM * mm))
         right_edge = page_w - float(getattr(doc, "rightMargin", PAGE_MARGIN_MM * mm))
         header_y = page_h - (left - 4 * mm)
-        developer = (ctx.developer_name or "OpenConstructionERP")[:80]
+        # A development with no name of its own is headed by the workspace's
+        # brand (app name, then the company profile's legal name), never by
+        # the platform's when the firm has set one.
+        developer = (ctx.developer_name or branded_cover_brand())[:80]
         canvas.setFont(pdf_font_for_text(developer, bold=True), 14)
         canvas.setFillColor(colors.HexColor("#111827"))
         canvas.drawString(left, header_y, developer)
@@ -921,6 +925,16 @@ def _attr(obj: Any, name: str, default: Any = None) -> Any:
 
 def _development_name(development: Any) -> str:
     return str(_attr(development, "name", "") or "")
+
+
+def _document_author(development: Any) -> str:
+    """The author a document's properties name: the development, else the workspace.
+
+    The workspace side is the shared brand chain the other generators stamp
+    their metadata with, so a firm's buyer documents never credit the platform
+    once the firm has a name of its own.
+    """
+    return _development_name(development) or branded_doc_metadata()["author"]
 
 
 def _development_logo(development: Any) -> str | None:
@@ -1106,7 +1120,7 @@ def render_reservation_receipt_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "reservation_receipt.title", "Reservation Receipt"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Reservation {_attr(reservation, 'reservation_number', '')}",
         keywords=["reservation", "property", "receipt", doc_ref],
     )
@@ -1300,7 +1314,7 @@ def render_sales_contract_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "sales_contract.title", "Sale-Purchase Agreement"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"SPA {_attr(contract, 'contract_number', '')}",
         keywords=[
             "spa",
@@ -1582,7 +1596,7 @@ def render_payment_receipt_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "payment_receipt.title", "Payment Receipt"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Payment for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["payment", "receipt", "instalment", doc_ref],
     )
@@ -1689,7 +1703,7 @@ def render_handover_certificate_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "handover_certificate.title", "Certificate of Handover"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Handover for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["handover", "certificate", "property", doc_ref],
     )
@@ -1809,7 +1823,7 @@ def render_warranty_certificate_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "warranty_certificate.title", "Warranty Certificate"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Warranty for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["warranty", "certificate", doc_ref],
     )
@@ -1918,7 +1932,7 @@ def render_no_objection_certificate_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "noc.title", "No Objection Certificate"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"NOC for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["noc", "no objection", doc_ref],
     )
@@ -2014,7 +2028,7 @@ def render_tenant_lease_agreement_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "tenant_lease_agreement.title", "Tenant Lease Agreement"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Lease {_attr(lease, 'lease_number', '')}",
         keywords=["lease", "tenant", "rental", doc_ref],
     )
@@ -2149,7 +2163,7 @@ def render_move_in_checklist_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "move_in_checklist.title", "Move-in Checklist"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Move-in for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["move-in", "checklist", "handover", doc_ref],
     )
@@ -2274,7 +2288,7 @@ def render_mortgage_clearance_letter_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "mortgage_clearance_letter.title", "Mortgage Clearance Letter"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Mortgage clearance for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["mortgage", "clearance", "letter", doc_ref],
     )
@@ -2360,7 +2374,7 @@ def render_title_deed_transfer_request_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "title_deed_transfer_request.title", "Title Deed Transfer Request"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Title deed transfer for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["title", "deed", "transfer", doc_ref],
     )
@@ -2460,7 +2474,7 @@ def render_escrow_release_authorization_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "escrow_release_authorization.title", "Escrow Release Authorization"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=f"Escrow release for SPA {_attr(sales_contract, 'contract_number', '')}",
         keywords=["escrow", "release", "authorization", doc_ref],
     )
@@ -2564,7 +2578,7 @@ def render_refund_authorization_pdf(
     doc, frame = _build_doc(
         buf,
         title=_t(locale, "refund_authorization.title", "Refund Authorization"),
-        author=_development_name(development) or "OpenConstructionERP",
+        author=_document_author(development),
         subject=(
             f"Refund for SPA {_attr(sales_contract, 'contract_number', '')}"
             if _attr(sales_contract, "contract_number", None)

@@ -159,6 +159,8 @@ class ScheduleCreate(BaseModel):
     def _check_dates(self) -> "ScheduleCreate":
         _validate_date_range(self.start_date, self.end_date)
         _check_calendar_metadata(self.metadata)
+        if "_schedule_archive" in self.metadata:
+            raise ValueError("Schedule archive history is managed by the server")
         return self
 
 
@@ -172,7 +174,8 @@ class ScheduleUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=5000)
     start_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$", max_length=20)
     end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$", max_length=20)
-    status: str | None = Field(default=None, pattern=r"^(draft|active|completed|frozen|archived)$")
+    # Omission is allowed; explicit null must never reach the non-null column.
+    status: str = Field(default=None, pattern=r"^(draft|active|completed|frozen|archived)$")  # type: ignore[assignment]
     data_date: str | None = Field(default=None, max_length=20)
     metadata: dict[str, Any] | None = None
 
@@ -180,6 +183,8 @@ class ScheduleUpdate(BaseModel):
     def _check_dates(self) -> "ScheduleUpdate":
         _validate_date_range(self.start_date, self.end_date)
         _check_calendar_metadata(self.metadata)
+        if self.metadata is not None and "_schedule_archive" in self.metadata:
+            raise ValueError("Schedule archive history is managed by the server")
         return self
 
 
@@ -288,6 +293,8 @@ class ActivityCreate(BaseModel):
     remaining_duration: int | None = Field(default=None, ge=0, le=_MAX_SCHEDULE_DAYS)
     budgeted_units: Decimal | None = Field(default=None, ge=0)
     installed_units: Decimal | None = Field(default=None, ge=0)
+    # Contact responsible for the activity (id in the contacts module).
+    assignee_id: UUID | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("cost_planned", "cost_actual", "budgeted_units", "installed_units", mode="after")
@@ -333,6 +340,9 @@ class ActivityUpdate(BaseModel):
         pattern=r"^(not_started|in_progress|completed|delayed)$",
     )
     activity_type: str | None = Field(default=None, pattern=r"^(task|milestone|summary)$")
+    # Strict bool with a None default: an omitted field stays out of the
+    # update, and an explicit null is a 422 rather than a NOT NULL error.
+    client_visible: bool = Field(default=None)  # type: ignore[assignment]
     dependencies: list[ActivityDependency] | None = Field(default=None, max_length=1000)
     resources: list[ActivityResource] | None = Field(default=None, max_length=1000)
     boq_position_ids: list[UUID] | None = Field(default=None, max_length=10_000)
@@ -349,6 +359,8 @@ class ActivityUpdate(BaseModel):
     remaining_duration: int | None = Field(default=None, ge=0, le=_MAX_SCHEDULE_DAYS)
     budgeted_units: Decimal | None = Field(default=None, ge=0)
     installed_units: Decimal | None = Field(default=None, ge=0)
+    # Contact responsible for the activity; an explicit null unassigns it.
+    assignee_id: UUID | None = None
     metadata: dict[str, Any] | None = None
 
     @field_validator("cost_planned", "cost_actual", "budgeted_units", "installed_units", mode="after")
@@ -408,6 +420,7 @@ class ActivityResponse(BaseModel):
     total_float: int | None = None
     free_float: int | None = None
     is_critical: bool = False
+    client_visible: bool = False
 
     # Constraint, code, BIM fields
     constraint_type: str | None = None
@@ -419,6 +432,8 @@ class ActivityResponse(BaseModel):
     # dedicated PUT /activities/{id}/calendar/ endpoint; exposed here so the
     # grid can show and pick the activity's calendar. None -> schedule default.
     calendar_id: UUID | None = None
+    # Contact responsible for the activity. None -> unassigned.
+    assignee_id: UUID | None = None
 
     # ── Cost-loaded / progress-rigor columns ──────────────────────────────
     # ``cost_planned`` is the activity's share of BAC, so a client that cannot
@@ -457,16 +472,18 @@ class LinkPositionRequest(BaseModel):
 
 
 class ActivityBimLinkRequest(BaseModel):
-    """Request body for replacing the BIM element link set on an activity.
+    """Request body for the BIM element link set on an activity.
 
-    The full ``bim_element_ids`` list is replaced atomically - callers that
-    want to add/remove a single element should read the current list, mutate
-    it, then PATCH the whole array back.
+    ``replace`` (the default) stores ``bim_element_ids`` as the whole list.
+    ``add`` merges them into the stored list on the server. A client that
+    merged into a cached copy and sent the result back erased every link made
+    since that copy was read, by another tab, another user or itself.
     """
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
     bim_element_ids: list[str] = Field(default_factory=list)
+    mode: Literal["replace", "add"] = "replace"
 
 
 class ActivityBrief(BaseModel):
@@ -638,6 +655,13 @@ class GanttActivity(BaseModel):
     # calendar picker can show and clear the current assignment. None -> the
     # activity uses the schedule default.
     calendar_id: UUID | None = None
+    # Contact responsible for the activity, read by the table's assignee cell.
+    assignee_id: UUID | None = None
+    # That contact's display name, resolved on the server so every project
+    # member sees it, not only the one whose contact list holds it.
+    assignee_name: str | None = None
+    # Shown to the client in the portal's upcoming milestones.
+    client_visible: bool = False
     # Activity metadata passthrough. Generated activities carry provenance
     # markers here (e.g. duration_source/duration_method = "estimated_fallback"
     # when the duration was estimated from unit-based production rates), which
@@ -716,6 +740,25 @@ class GanttData(BaseModel):
     summary: GanttSummary = Field(default_factory=GanttSummary)
 
 
+class ScheduleDeleteImpactResponse(BaseModel):
+    """What deleting a schedule takes with it, for the confirmation to name."""
+
+    activity_count: int = 0
+    baseline_count: int = 0
+    payment_milestone_count: int = Field(
+        default=0,
+        description="Contract payment instalments linked to an activity of this schedule. "
+        "They stay, but go back to their contract dates.",
+    )
+    can_delete: bool = Field(
+        default=True, description="Whether the caller may permanently delete this archived schedule."
+    )
+    blocked_reason: str | None = Field(
+        default=None,
+        description="Why not: permission_denied or schedule_not_archived. Permanent deletion is admin-only.",
+    )
+
+
 # ── CPM & Risk Analysis schemas ─────────────────────────────────────────────
 
 
@@ -734,6 +777,90 @@ class GenerateFromBOQRequest(BaseModel):
             "If omitted, defaults to 365 (residential) or 540 (office) based on BOQ metadata."
         ),
     )
+    replace: bool = Field(
+        default=False,
+        description=(
+            "Delete the schedule's existing activities and links first, in the same transaction. "
+            "Without it a schedule that already has activities answers 409 schedule_has_activities."
+        ),
+    )
+    start_date: date | None = Field(
+        default=None,
+        description=(
+            "The day the plan starts, written to the schedule together with the plan. "
+            "When omitted: the schedule's start, else the project's planned start, else today. "
+            "total_project_days counts from this day."
+        ),
+    )
+    workers_per_position: int | None = Field(
+        default=None,
+        ge=1,
+        le=20,
+        description=(
+            "Workers on each position whose bill gives hours but no crew, at least. When omitted, the "
+            "fewest from 1 to 20 that fit the window without shortening any duration (without "
+            "total_project_days, the default window). Send the value the preview returned to write that plan."
+        ),
+    )
+
+
+class GenerationNote(BaseModel):
+    """Why one position's duration is an estimate, or why it was left out."""
+
+    position_id: str
+    ordinal: str = ""
+    description: str = ""
+    note: str = Field(
+        description="estimated_from_unit, cost_share, default_duration, skipped_zero_qty, "
+        "empty_section_dropped or blank_row_dropped."
+    )
+    days: int | None = Field(default=None, description="Working days planned for the position.")
+    basis: dict[str, Any] | None = Field(
+        default=None,
+        description="For estimated_from_unit: unit, rate (hours per unit), hours, gang (people), "
+        "hours_per_day, and capped_by_price with hours_from_unit when the price held the guess down.",
+    )
+
+
+class GenerationPreviewResponse(BaseModel):
+    """What generating from a bill would write, for a person to confirm."""
+
+    boq_id: str
+    boq_name: str = ""
+    boq_estimate_type: str | None = None
+    activity_count: int
+    positions_scheduled: int
+    # A control budget often carries no estimate type; most of its positions
+    # being lump sums gives it away all the same.
+    lump_sum_positions: int = 0
+    summary_count: int
+    estimated_count: int
+    skipped_count: int
+    note_counts: dict[str, int] = Field(default_factory=dict)
+    crews: int
+    # Workers on each position whose bill gives no crew, and whether the
+    # generator chose the number (``workers_assumed``) or the request did.
+    workers_per_position: int = 1
+    workers_assumed: bool = True
+    positions_without_workers: int = 0
+    # The window the workers were fitted to: {"days", "end", "default", "fits"},
+    # where default means no end date was given and the generator's own was
+    # used, and fits whether the plan fits it at its estimates.
+    fitted_window: dict[str, Any] | None = None
+    compressed_pct: int | None = None
+    fits: bool
+    planned_start: str
+    planned_end: str
+    requested_end: str | None = None
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    existing_activity_count: int = 0
+    existing_started_count: int = 0
+    # Contract payment instalments waiting for a milestone of this schedule:
+    # carried over to the same milestone in the new plan, or left to fall back
+    # to their contract dates.
+    instalments_relinked: int = 0
+    instalments_unlinked: int = 0
+    notes: list[GenerationNote] = Field(default_factory=list)
 
 
 class CPMActivityResult(BaseModel):
@@ -1161,3 +1288,12 @@ class ScheduleDiffResponse(BaseModel):
     relationships: list[DiffRelationshipChangeSchema] = Field(default_factory=list)
     calendars: list[DiffCalendarChangeSchema] = Field(default_factory=list)
     summary: DiffSummarySchema = Field(default_factory=DiffSummarySchema)
+
+
+class WbsCodeSuggestion(BaseModel):
+    """The WBS code that continues a section's numbering.
+
+    Empty when the section has no code of its own to continue from.
+    """
+
+    wbs_code: str

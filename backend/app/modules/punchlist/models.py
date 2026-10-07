@@ -7,10 +7,12 @@ Tables:
 """
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, column, event, select, table
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.db_types import CalendarDayDateTime
 from app.database import GUID, Base
 
 
@@ -25,6 +27,10 @@ class PunchItem(Base):
         nullable=False,
         index=True,
     )
+    # Optional module link: NULL explicitly means no contract was assigned.
+    # Keep punchlist installable without the contracts module; the service
+    # validates that an assigned contract belongs to this same project.
+    contract_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
     document_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     location_x: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -34,7 +40,8 @@ class PunchItem(Base):
     priority: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", index=True)
     assigned_to: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    due_date: Mapped[str | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A calendar day, kept as midnight UTC in a timestamp column (see app.core.calendar_day).
+    due_date: Mapped[datetime | None] = mapped_column(CalendarDayDateTime(), nullable=True)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     trade: Mapped[str | None] = mapped_column(String(100), nullable=True)
     photos: Mapped[list] = mapped_column(  # type: ignore[assignment]
@@ -66,7 +73,10 @@ class PunchItem(Base):
     # Stored as VARCHAR so there is no floating-point rounding on money values.
     # Service layer validates it as a Decimal string before persisting.
     rework_cost: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    rework_cost_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD", server_default="USD")
+    # No ORM default: an unset currency is filled from the project at insert
+    # time (see ``_stamp_rework_currency`` below), whichever module builds the
+    # row. The server default only covers raw SQL inserts.
+    rework_cost_currency: Mapped[str] = mapped_column(String(3), nullable=False, server_default="USD")
 
     # ── Clash linkage (cross-module) ──────────────────────────────────────
     # When a punch item is auto-created from a high/critical clash, this
@@ -87,3 +97,33 @@ class PunchItem(Base):
 
     def __repr__(self) -> str:
         return f"<PunchItem {self.title[:40]} ({self.status}/{self.priority})>"
+
+
+# Fallback when the project has no usable currency. Same value, and the same
+# reasoning, as ``PunchListService._rework_currency``: an undecided project
+# currency is a legitimate state and the column is NOT NULL.
+_FALLBACK_REWORK_CURRENCY = "USD"
+
+# A lightweight handle on the projects table: punchlist must stay loadable
+# without the projects module, so the ORM model is not imported here.
+_projects = table("oe_projects_project", column("id", GUID()), column("currency", String()))
+
+
+@event.listens_for(PunchItem, "before_insert")
+def _stamp_rework_currency(_mapper: object, connection: object, target: PunchItem) -> None:
+    """Price an item with no currency in its project's currency.
+
+    ``PunchListService.create_item`` resolves this itself, but the punchlist
+    event bridges, the inspections router and the field diary build
+    ``PunchItem`` directly, and the old model default stamped every one of
+    those USD, on a euro project too.
+    """
+    if (target.rework_cost_currency or "").strip():
+        return
+    code = ""
+    if target.project_id is not None:
+        found = connection.execute(  # type: ignore[attr-defined]
+            select(_projects.c.currency).where(_projects.c.id == target.project_id)
+        ).scalar_one_or_none()
+        code = str(found or "").strip().upper()
+    target.rework_cost_currency = code if len(code) == 3 and code.isalpha() else _FALLBACK_REWORK_CURRENCY

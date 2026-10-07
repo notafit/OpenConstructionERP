@@ -19,6 +19,7 @@ Endpoints:
     GET    /stats?project_id=X                        - Requirement statistics
 """
 
+import asyncio
 import csv
 import io
 import logging
@@ -249,7 +250,7 @@ async def create_set(
     effective_project_id = data.project_id or project_id
     if effective_project_id is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="project_id is required (body or ?project_id= query parameter)",
         )
     # IDOR guard: this route reads no row, so the project is whatever the
@@ -262,7 +263,7 @@ async def create_set(
     effective_name = (data.name or "").strip()
     if not effective_name:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="name is required and must be at least 1 character",
         )
     try:
@@ -277,7 +278,7 @@ async def create_set(
         )
     except ValidationError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=exc.errors(include_url=False),
         ) from exc
     try:
@@ -445,6 +446,17 @@ async def export_requirements(
     return await _export_dispatch(set_id, ext, service, str(user_id), session)
 
 
+def _render_requirements_csv(rows: list[dict[str, Any]]) -> str:
+    """Write the already-fetched export rows as CSV text (pure CPU, no DB)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_EXPORT_COLUMNS)
+    for r in rows:
+        writer.writerow([r.get(col, "") for col in _EXPORT_COLUMNS])
+    buf.seek(0)
+    return buf.getvalue()
+
+
 async def _export_dispatch(
     set_id: uuid.UUID,
     fmt: str,
@@ -473,7 +485,9 @@ async def _export_dispatch(
     if fmt == "xlsx":
         from app.modules.requirements.excel_io import export_xlsx
 
-        payload = export_xlsx(rows, title=safe_name)
+        # Writing the workbook walks every requirement and is pure CPU, so it runs
+        # in a worker thread instead of holding up every other request on the loop.
+        payload = await asyncio.to_thread(export_xlsx, rows, title=safe_name)
         return Response(
             content=payload,
             media_type=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
@@ -482,15 +496,11 @@ async def _export_dispatch(
             },
         )
 
-    # csv
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(_EXPORT_COLUMNS)
-    for r in rows:
-        writer.writerow([r.get(col, "") for col in _EXPORT_COLUMNS])
-    buf.seek(0)
+    # csv. Writing it walks every requirement and is pure CPU, so it runs in a
+    # worker thread as well.
+    content = await asyncio.to_thread(_render_requirements_csv, rows)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        iter([content]),
         media_type="text/csv",
         headers={
             "Content-Disposition": attachment_disposition(f"{safe_name}.csv"),
@@ -1432,8 +1442,9 @@ async def get_project_eir_matrix(
 # ── Mount vector status + reindex via the shared factory ────────────────
 #
 # Requirements rows are scoped by ``RequirementSet.project_id`` rather
-# than a direct column, so we pass a custom loader that performs the
+# than a direct column, so we pass a custom statement that performs the
 # join for us.
+from sqlalchemy import Select as _Select  # noqa: E402
 from sqlalchemy.orm import selectinload as _selectinload  # noqa: E402
 
 from app.core.vector_index import COLLECTION_REQUIREMENTS  # noqa: E402
@@ -1449,21 +1460,27 @@ from app.modules.requirements.vector_adapter import (  # noqa: E402
 )
 
 
-async def _requirements_loader(session: Any, project_id: uuid.UUID | None) -> list[Any]:
+async def _requirements_statement(_session: Any, project_id: uuid.UUID | None) -> _Select[Any]:
+    """Return the SELECT over requirements, scoped through their set.
+
+    Hands back the statement, not its rows: the factory is what orders, pages
+    and releases it, and a scope that returned a list would have read every
+    requirement in the deployment into memory before the first one was embedded.
+    """
     stmt = select(_Requirement).options(_selectinload(_Requirement.requirement_set))
     if project_id is not None:
         stmt = stmt.join(
             _RequirementSet,
             _Requirement.requirement_set_id == _RequirementSet.id,
         ).where(_RequirementSet.project_id == project_id)
-    return list((await session.execute(stmt)).scalars().all())
+    return stmt
 
 
 router.include_router(
     create_vector_routes(
         collection=COLLECTION_REQUIREMENTS,
         adapter=_requirement_vector_adapter,
-        loader=_requirements_loader,
+        statement_factory=_requirements_statement,
         read_permission="requirements.read",
         write_permission="requirements.update",
     )

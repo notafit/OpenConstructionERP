@@ -577,7 +577,25 @@ class ResourcesService:
         return resource
 
     async def delete_resource(self, resource_id: uuid.UUID) -> None:
-        await self.get_resource(resource_id)
+        """Delete a resource that has no worked assignment.
+
+        Assignments cascade with the resource, so a delete would take the
+        allocation history of work already done (in progress or completed,
+        timecard imports included) with it. Such a resource is set inactive.
+        """
+        resource = await self.get_resource(resource_id)
+        worked = 0
+        for worked_status in ("in_progress", "completed"):
+            _rows, count = await self.assignment_repo.list_for_resource(resource_id, status=worked_status, limit=1)
+            worked += count
+        if worked:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Resource {resource.code} has {worked} worked assignment(s) and cannot be deleted. "
+                    "Set its status to inactive instead."
+                ),
+            )
         await self.resource_repo.delete(resource_id)
         logger.info("Resource deleted: %s", resource_id)
 
@@ -1026,7 +1044,24 @@ class ResourcesService:
         return assignment
 
     async def delete_assignment(self, assignment_id: uuid.UUID) -> None:
-        await self.get_assignment(assignment_id)
+        """Delete an assignment that has not been worked.
+
+        An in-progress or completed assignment is allocation history of work
+        already done, the same history :meth:`delete_resource` refuses to drop.
+        An in-progress one is cancelled instead; a completed one is final
+        (``ASSIGNMENT_STATUS_TRANSITIONS``) and stays as the record.
+        """
+        assignment = await self.get_assignment(assignment_id)
+        if assignment.status == "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An assignment in progress has been worked and cannot be deleted. Cancel it instead.",
+            )
+        if assignment.status == "completed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A completed assignment is the record of work done and cannot be deleted.",
+            )
         await self.assignment_repo.delete(assignment_id)
 
     async def propose_assignment(

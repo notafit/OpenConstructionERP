@@ -709,6 +709,7 @@ async def test_escrow_balance_and_reconcile(
     http_client,
     manager_headers,
     editor_headers,
+    viewer_headers,
     development,
 ):
     acc = await http_client.post(
@@ -767,15 +768,40 @@ async def test_escrow_balance_and_reconcile(
     assert body["balance"] == "130000.00"
     assert body["unreconciled_count"] == 3
 
-    # Reconcile — editor cannot.
-    bad = await http_client.post(
+    # Reconcile is guarded twice and the two walls answer differently,
+    # so each assertion below names which one refused. A test that took
+    # whatever came back would still pass with one wall removed.
+    #
+    # Wall 1, the role gate. ``property_dev.escrow.reconcile`` sits at
+    # EDITOR, so a viewer is refused by RequirePermission before the
+    # handler body runs at all: 403, naming the permission.
+    reconcile_denied_by_role = await http_client.post(
+        f"/api/v1/property-dev/escrow-transactions/{debit_id}/reconcile",
+        json={"bank_reference": "BANK-REF-001"},
+        headers=viewer_headers,
+    )
+    assert reconcile_denied_by_role.status_code == 403, reconcile_denied_by_role.text
+    assert "Missing permission: property_dev.escrow.reconcile" in reconcile_denied_by_role.text
+
+    # Wall 2, ownership. An editor DOES hold that permission - it was
+    # lowered to EDITOR deliberately, because the route closes on
+    # ``_verify_owner_via_escrow_transaction`` (transaction -> account ->
+    # development -> project owner) and that is where the real gate is.
+    # So this editor clears the role gate and is stopped by ownership
+    # instead, which answers 404 rather than 403 on purpose: telling
+    # someone who may not know the transaction exists that it is
+    # forbidden would confirm that it exists.
+    reconcile_denied_by_ownership = await http_client.post(
         f"/api/v1/property-dev/escrow-transactions/{debit_id}/reconcile",
         json={"bank_reference": "BANK-REF-001"},
         headers=editor_headers,
     )
-    assert bad.status_code == 403
+    assert reconcile_denied_by_ownership.status_code == 404, reconcile_denied_by_ownership.text
+    assert "Missing permission" not in reconcile_denied_by_ownership.text
 
-    # Manager can.
+    # Manager can: that fixture is an admin AND it created the project,
+    # so it clears both walls. Being admin alone would not be enough -
+    # the owner check is strict and does not exempt admin.
     ok = await http_client.post(
         f"/api/v1/property-dev/escrow-transactions/{debit_id}/reconcile",
         json={"bank_reference": "BANK-REF-001"},
@@ -1077,6 +1103,7 @@ async def test_price_matrix_activate_and_bulk_recompute(
     http_client,
     manager_headers,
     editor_headers,
+    viewer_headers,
     development,
 ):
     pm = await http_client.post(
@@ -1101,12 +1128,34 @@ async def test_price_matrix_activate_and_bulk_recompute(
     assert pm.status_code == 201, pm.text
     matrix_id = pm.json()["id"]
 
-    # Editor cannot activate.
-    bad = await http_client.post(
+    # Two different walls stand in front of this endpoint and they answer
+    # differently, so the assertions below name which one refused. A test
+    # that took whatever came back would still pass with one wall removed.
+    #
+    # Wall 1, the role gate. ``property_dev.price_matrix.activate`` sits at
+    # EDITOR, so a viewer is refused by RequirePermission before the handler
+    # body runs at all: 403, naming the permission.
+    denied_by_role = await http_client.post(
+        f"/api/v1/property-dev/price-matrices/{matrix_id}/activate",
+        headers=viewer_headers,
+    )
+    assert denied_by_role.status_code == 403, denied_by_role.text
+    assert "Missing permission: property_dev.price_matrix.activate" in denied_by_role.text
+
+    # Wall 2, ownership. An editor DOES hold that permission - it was lowered
+    # to EDITOR deliberately, because every price-matrix route closes on
+    # ``_verify_owner_via_price_matrix`` and at MANAGER the routes were dead:
+    # the owning editor could not pass the role gate, and a manager who passed
+    # it could not pass the owner check. So this editor clears the role gate
+    # and is stopped by ownership instead, which answers 404 rather than 403
+    # on purpose - telling someone who may not know the matrix exists that it
+    # is forbidden would confirm that it exists.
+    denied_by_ownership = await http_client.post(
         f"/api/v1/property-dev/price-matrices/{matrix_id}/activate",
         headers=editor_headers,
     )
-    assert bad.status_code == 403
+    assert denied_by_ownership.status_code == 404, denied_by_ownership.text
+    assert "Missing permission" not in denied_by_ownership.text
 
     # Manager can.
     act = await http_client.post(
@@ -1125,12 +1174,21 @@ async def test_price_matrix_activate_and_bulk_recompute(
     body = rec.json()
     assert body["plots_updated"] >= 1
 
-    # Editor cannot bulk-recompute.
-    bad2 = await http_client.post(
+    # Bulk-recompute carries its own permission, also at EDITOR and also
+    # behind the owner check, so the same two walls answer the same two ways.
+    recompute_denied_by_role = await http_client.post(
+        f"/api/v1/property-dev/price-matrices/{matrix_id}/bulk-recompute",
+        headers=viewer_headers,
+    )
+    assert recompute_denied_by_role.status_code == 403, recompute_denied_by_role.text
+    assert "Missing permission: property_dev.price_matrix.bulk_recompute" in recompute_denied_by_role.text
+
+    recompute_denied_by_ownership = await http_client.post(
         f"/api/v1/property-dev/price-matrices/{matrix_id}/bulk-recompute",
         headers=editor_headers,
     )
-    assert bad2.status_code == 403
+    assert recompute_denied_by_ownership.status_code == 404, recompute_denied_by_ownership.text
+    assert "Missing permission" not in recompute_denied_by_ownership.text
 
 
 @pytest.mark.asyncio
@@ -1181,15 +1239,39 @@ async def test_regulator_report_rera_pdf(
     http_client,
     manager_headers,
     editor_headers,
+    viewer_headers,
     development,
 ):
-    # Editor blocked.
-    bad = await http_client.get(
+    # Two walls stand in front of this endpoint and they answer
+    # differently, so the assertions below name which one refused. An
+    # editor-404 on its own would still pass if the permission
+    # dependency were deleted outright.
+    #
+    # Wall 1, the role gate. ``property_dev.regulator_report.generate``
+    # sits at EDITOR, so a viewer is refused by RequirePermission before
+    # the handler body runs at all: 403, naming the permission.
+    denied_by_role = await http_client.get(
+        "/api/v1/property-dev/regulator-reports/RERA",
+        params={"dev_id": development["development_id"], "quarter": "2026-Q1"},
+        headers=viewer_headers,
+    )
+    assert denied_by_role.status_code == 403, denied_by_role.text
+    assert "Missing permission: property_dev.regulator_report.generate" in denied_by_role.text
+
+    # Wall 2, ownership. An editor DOES hold that permission - it was
+    # lowered to EDITOR deliberately, because every regulator-report
+    # route closes on ``_verify_owner_via_development``, which is where
+    # the real gate is. This development belongs to the manager fixture,
+    # so the editor clears the role gate and is stopped by ownership
+    # instead: 404 rather than 403, so that the refusal does not confirm
+    # the development exists.
+    denied_by_ownership = await http_client.get(
         "/api/v1/property-dev/regulator-reports/RERA",
         params={"dev_id": development["development_id"], "quarter": "2026-Q1"},
         headers=editor_headers,
     )
-    assert bad.status_code == 403, bad.text
+    assert denied_by_ownership.status_code == 404, denied_by_ownership.text
+    assert "Missing permission" not in denied_by_ownership.text
 
     # Manager OK + verify PDF starts with %PDF magic bytes + non-empty.
     ok = await http_client.get(

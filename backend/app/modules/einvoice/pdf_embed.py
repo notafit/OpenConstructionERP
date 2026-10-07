@@ -23,6 +23,7 @@ every automated receiver) is unaffected.
 
 from __future__ import annotations
 
+import html
 import io
 from decimal import Decimal
 
@@ -37,11 +38,13 @@ from pypdf.generic import (
 )
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph
 
-from app.core.pdf_fonts import pdf_font_for_text
+from app.core.pdf_fonts import pdf_font_for_text, pdf_shaping_for_text, pdf_style_for_text
 from app.core.validation.address import format_address_lines
 from app.modules.einvoice.bank import is_bic, is_iban
 from app.modules.einvoice.cii import EInvoice, Party, build_cii_xml
@@ -118,12 +121,15 @@ def _readable_pdf(inv: EInvoice, locale: str = DEFAULT_PDF_LOCALE) -> bytes:
     top = height - 25 * mm
 
     def put(x: float, y: float, text: str, *, base: str, size: int, align_right: bool = False) -> None:
-        """Draw one string, in another face only if this one cannot draw it.
+        """Draw one string, using Paragraph for complex-script shaping.
 
         The page is set in Helvetica and stays set in Helvetica. When a string
         needs a different face - a Chinese company name, a squared-metre unit -
-        that face is selected for the one string and the Helvetica state is put
-        back straight away, so the next string is unaffected.
+        or complex-script shaping (Thai tone marks, Devanagari reordering), the
+        text is drawn through a Paragraph so reportlab's shaper can act on it.
+        canvas.drawString bypasses shaping entirely (reportlab drops the
+        argument without rlbidi), so the Paragraph path is the only route that
+        renders Thai and Devanagari correctly.
 
         The test is which face can draw the characters, not which script they
         belong to, so an invoice that was already all-Latin takes the early
@@ -134,13 +140,21 @@ def _readable_pdf(inv: EInvoice, locale: str = DEFAULT_PDF_LOCALE) -> bytes:
         unconditionally would move the bytes of every invoice we have ever
         issued, and the two faces do not share a width table.
         """
-        draw = c.drawRightString if align_right else c.drawString
         face = pdf_font_for_text(text, base=base)
-        if face == base:
+        if face == base and not pdf_shaping_for_text(text, base=base):
+            draw = c.drawRightString if align_right else c.drawString
             draw(x, y, text)
             return
-        c.setFont(face, size)
-        draw(x, y, text)
+        # Paragraph path: needed when the base face cannot draw the text or
+        # when the text needs complex-script shaping (Thai, Devanagari).
+        style = ParagraphStyle("_put", fontName=base, fontSize=size, leading=size)
+        styled = pdf_style_for_text(style, text)
+        p = Paragraph(html.escape(text, quote=True), styled)
+        pw, ph = p.wrapOn(c, 9999, size * 2)
+        if align_right:
+            p.drawOn(c, x - pw, y - ph + size * 0.22)
+        else:
+            p.drawOn(c, x, y - ph + size * 0.22)
         c.setFont(base, size)
 
     def fit(text: str, *, base: str, size: int, budget: float, cap: int | None = None) -> str:

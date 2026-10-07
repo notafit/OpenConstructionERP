@@ -8,6 +8,7 @@
      archived  — Superseded (slate) */
 
 import clsx from 'clsx';
+import { useTranslation } from 'react-i18next';
 
 export const CDE_BADGE: Record<string, { label: string; cls: string }> = {
   wip: { label: 'WIP', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300' },
@@ -17,6 +18,7 @@ export const CDE_BADGE: Record<string, { label: string; cls: string }> = {
 };
 
 export function CDEBadge({ state, size = 'sm' }: { state: string | undefined; size?: 'xs' | 'sm' }) {
+  const { t } = useTranslation();
   if (!state) return null;
   const cfg = CDE_BADGE[state] ?? null;
   if (!cfg) return null;
@@ -27,9 +29,9 @@ export function CDEBadge({ state, size = 'sm' }: { state: string | undefined; si
         size === 'xs' ? 'px-1 py-px text-[9px]' : 'px-1.5 py-0.5 text-[10px]',
         cfg.cls,
       )}
-      title={`CDE state: ${state}`}
+      title={t(`cde.state_${state}`, { defaultValue: cfg.label })}
     >
-      {cfg.label}
+      {t(`cde.state_${state}`, { defaultValue: cfg.label })}
     </span>
   );
 }

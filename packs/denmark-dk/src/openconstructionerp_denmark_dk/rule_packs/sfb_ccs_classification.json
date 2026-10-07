@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "sfb_ccs_classification",
+  "name": "SfB / CCS — Danish Building Classification",
+  "standard": "SfB / CCS",
+  "jurisdiction": "DK",
+  "regulator": "Molio / cuneco",
+  "publication_year": 2020,
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for SfB and CCS, the classification systems a Danish bill of quantities is structured against. The classification asks that every priced line carries a code, that the code has the shape the system defines, that the element hierarchy is consistent and that building elements sit under a functional group that exists. None of that is implemented as a rule. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Danish quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared five ids under the sfb_ccs prefix (classification_code_required, valid_code_format, hierarchy_consistent, element_type_valid, no_orphan_positions), and the engine defines none of them and registers no rule set by that name. The classification rules the engine does implement are written for DIN 276, GAEB and MasterFormat and read those code shapes, so enabling one of them against SfB or CCS codes would report a correctly coded Danish bill as wrong. The universal BOQ hygiene checks run on every project regardless of this document and are not claimed here.",
+  "enables_rule_ids": []
+}

@@ -1,10 +1,18 @@
 """``.dockerignore`` coverage tests (BUG-B06 fix).
 
-Without a ``.dockerignore`` every ``docker build`` ships ~2 GB of
-context to the build daemon: the local SQLite DB (1 GB), customer BIM
-uploads, the marketing site, every test artefact, and — most
-dangerously — every ``.env`` file in the tree. That risks leaking
-secrets and customer data into published images.
+Without a ``.dockerignore`` every ``docker build`` ships gigabytes of
+context to the build daemon: customer BIM uploads, exports, the
+marketing site, every test artefact, and, most dangerously, every
+``.env`` file in the tree. That risks leaking secrets and customer
+data into published images.
+
+The database patterns below are a separate case and are deliberately
+kept although the product has no local SQLite database any more.
+PostgreSQL became the only supported engine in 6.6.0, but a working
+tree older than that can still be carrying a multi-gigabyte
+``openestimate.db``, and a pattern excluding a file nobody creates any
+more costs nothing, while dropping it would let exactly those trees
+bake that file into a published image.
 
 Docker's ignore-file semantics match ``gitignore`` (shipped via the
 moby/patternmatcher library); the ``pathspec`` package implements the

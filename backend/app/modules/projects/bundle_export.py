@@ -38,11 +38,12 @@ is pure orchestration over a SQLAlchemy session.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import io
 import json
 import logging
 import os
+import tempfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -419,6 +420,39 @@ def _sha256_of_bytes(data: bytes) -> tuple[str, int]:
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
+# The packing helpers below are the CPU and disk half of the export: they run
+# in a worker thread, one at a time, while the queries and storage reads stay
+# on the event loop. A full-scope bundle hashes and deflates every document,
+# photo, drawing and model of the project, and on the loop that froze every
+# other request on the worker for as long as it took. The zip is only ever
+# touched by one thread at a time because each call is awaited before the next.
+
+
+def _write_table(zf: zipfile.ZipFile, key: str, rows: list[dict[str, Any]]) -> None:
+    """Encode one table's rows as JSON and deflate them into the bundle."""
+    zf.writestr(f"tables/{key}.json", json.dumps(rows, indent=2, ensure_ascii=False, default=str))
+
+
+def _pack_file(zf: zipfile.ZipFile, origin: str, arc: str) -> tuple[str, int]:
+    """Hash a file on disk and deflate it into the bundle.
+
+    Returns ('', 0) without writing when the file cannot be read, which the
+    caller records as a missing attachment.
+    """
+    digest, size = _sha256_of(origin)
+    if size == 0 and not digest:
+        return "", 0
+    zf.write(origin, arc)
+    return digest, size
+
+
+def _pack_bytes(zf: zipfile.ZipFile, arc: str, data: bytes) -> tuple[str, int]:
+    """Hash an in-memory blob and deflate it into the bundle."""
+    digest, size = _sha256_of_bytes(data)
+    zf.writestr(arc, data)
+    return digest, size
+
+
 # An attachment is described by ``(path_in_zip, source, origin)`` where
 # ``source`` is either ``"fs"`` (``origin`` is an absolute filesystem path -
 # legacy document/photo/sheet/dwg uploads) or ``"key"`` (``origin`` is a
@@ -578,9 +612,63 @@ async def export_bundle(
 ) -> bytes:
     """Build the .ocep zip for one project and return its bytes.
 
-    For projects with multi-GB attachments callers should split scope -
-    e.g. ship metadata_only over email, then bim separately.
+    Holds the whole archive in memory, so it suits small scopes and tests.
+    The download route uses :func:`export_bundle_to_file` instead.
     """
+    path = await export_bundle_to_file(session, project_id, project_name, project_currency, user_email, options)
+    try:
+        return await asyncio.to_thread(Path(path).read_bytes)
+    finally:
+        remove_bundle_file(path)
+
+
+def remove_bundle_file(path: str) -> None:
+    """Best-effort delete of a bundle written by :func:`export_bundle_to_file`."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("bundle export: failed to remove temp file %s", path, exc_info=True)
+
+
+async def export_bundle_to_file(
+    session: AsyncSession,
+    project_id: str,
+    project_name: str,
+    project_currency: str | None,
+    user_email: str | None,
+    options: ExportOptions,
+) -> str:
+    """Build the .ocep zip for one project in a temp file and return its path.
+
+    The archive is written straight to disk. A full scope carries every
+    document, photo, drawing and model of the project, and building it in
+    memory put the whole archive in RAM, then a second copy when the route
+    handed the bytes to the response, on a server that has 3 GB for
+    everything. The caller owns the file and deletes it once it is sent,
+    see :func:`remove_bundle_file`. On failure the file is removed here.
+    """
+    fd, path = tempfile.mkstemp(prefix="oe-bundle-", suffix=".ocep")
+    os.close(fd)
+    try:
+        await _write_bundle(path, session, project_id, project_name, project_currency, user_email, options)
+    except BaseException:
+        remove_bundle_file(path)
+        raise
+    return path
+
+
+async def _write_bundle(
+    path: str,
+    session: AsyncSession,
+    project_id: str,
+    project_name: str,
+    project_currency: str | None,
+    user_email: str | None,
+    options: ExportOptions,
+) -> None:
+    """Write the .ocep zip for one project to ``path``."""
     opts = _options_from_scope(options)
 
     # 1. Collect every table.
@@ -619,14 +707,12 @@ async def export_bundle(
         engine_version=ENGINE_VERSION,
     )
 
-    # 4. Stream into a zip.
-    buf = io.BytesIO()
+    # 4. Stream into a zip on disk.
     attachments_index: list[dict[str, Any]] = []
     total_bytes = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         for key, rows in table_data.items():
-            payload = json.dumps(rows, indent=2, ensure_ascii=False, default=str)
-            zf.writestr(f"tables/{key}.json", payload)
+            await asyncio.to_thread(_write_table, zf, key, rows)
 
         for arc, source, origin in attachments:
             if source == "key":
@@ -645,8 +731,7 @@ async def export_bundle(
                         }
                     )
                     continue
-                digest, size = _sha256_of_bytes(data)
-                zf.writestr(arc, data)
+                digest, size = await asyncio.to_thread(_pack_bytes, zf, arc, data)
                 total_bytes += size
                 attachments_index.append(
                     {
@@ -658,7 +743,7 @@ async def export_bundle(
                 )
                 continue
 
-            digest, size = _sha256_of(origin)
+            digest, size = await asyncio.to_thread(_pack_file, zf, origin, arc)
             if size == 0 and not digest:
                 # File vanished between scan and write; record the gap.
                 attachments_index.append(
@@ -671,7 +756,6 @@ async def export_bundle(
                     }
                 )
                 continue
-            zf.write(origin, arc)
             total_bytes += size
             attachments_index.append(
                 {
@@ -699,7 +783,6 @@ async def export_bundle(
             "README.md",
             _readme_md(manifest, len(attachments)),
         )
-    return buf.getvalue()
 
 
 async def preview_bundle(
@@ -799,7 +882,9 @@ __all__ = [
     "BUNDLE_FORMAT",
     "BUNDLE_FORMAT_VERSION",
     "export_bundle",
+    "export_bundle_to_file",
     "preview_bundle",
+    "remove_bundle_file",
     "filename_for_bundle",
 ]
 

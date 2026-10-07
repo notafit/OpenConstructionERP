@@ -200,7 +200,9 @@ async def test_generated_value_report_completes_the_path(session: AsyncSession) 
     # With a value report generated on top of every other milestone, every step
     # the manager is asked to do is done and there is nothing left to nudge.
     assert all(s.done for s in checklist.steps)
-    assert checklist.next_actions == []
+    # ``next_actions`` is a tuple on the frozen dataclass, and ``() == []`` is
+    # False whatever it holds, so comparing against a list could never pass.
+    assert checklist.next_actions == ()
     assert checklist.adoption_score == 100
 
 

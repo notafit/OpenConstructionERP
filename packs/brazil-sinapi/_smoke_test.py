@@ -35,21 +35,15 @@ def main() -> int:
     print("  cwicr_regions        =", MANIFEST.cwicr_regions)
     print("  rule_packs           =", MANIFEST.validation_rule_packs)
     print("  metadata.country     =", MANIFEST.metadata.get("country"))
-    print(
-        "  metadata.metros      =", len(MANIFEST.metadata.get("preferred_metros", []))
-    )
+    print("  metadata.metros      =", len(MANIFEST.metadata.get("preferred_metros", [])))
     print("  primary_color        =", MANIFEST.branding.primary_color)
     print("  accent_color         =", MANIFEST.branding.accent_color)
     print("  effective_powered_by =", MANIFEST.effective_powered_by)
 
     pub = MANIFEST.to_public_dict()
-    print(
-        "to_public_dict OK      ; rule_pack count =", len(pub["validation_rule_packs"])
-    )
+    print("to_public_dict OK      ; rule_pack count =", len(pub["validation_rule_packs"]))
 
-    pack_root = (
-        pathlib.Path(__file__).parent / "src" / "openconstructionerp_brazil_sinapi"
-    )
+    pack_root = pathlib.Path(__file__).parent / "src" / "openconstructionerp_brazil_sinapi"
     rp_dir = pack_root / "rule_packs"
     expected = set(MANIFEST.validation_rule_packs)
     shipped: set[str] = set()
@@ -75,9 +69,7 @@ def main() -> int:
     print(f"  locale pt-BR         keys = {keys}  coverage = {cov}")
 
     ob = yaml.safe_load((pack_root / "onboarding.yaml").read_text(encoding="utf-8"))
-    print(
-        f"  onboarding           version = {ob['version']}  steps = {len(ob['steps'])}"
-    )
+    print(f"  onboarding           version = {ob['version']}  steps = {len(ob['steps'])}")
 
     ET.fromstring((pack_root / "logo.svg").read_text(encoding="utf-8"))
     print("  logo.svg             well-formed XML")

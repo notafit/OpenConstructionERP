@@ -53,7 +53,7 @@ class PointDecodeTooLarge(RuntimeError):
 
     The inline viewer decode materialises the full point set before decimating
     to ``max_points``, so an enormous cloud - or a LAZ/E57 whose header declares
-    a huge point count (a decompression bomb) - would exhaust the 2 GB core even
+    a huge point count (a decompression bomb) - would exhaust the 3 GB core even
     though the *returned* buffer stays small. We read the point count from the
     file header (cheap, no full decompress) and refuse above ``max_total_points``
     with this error, which the API maps to 413 with guidance to use the
@@ -94,7 +94,7 @@ _LAS_FORMATS = {"las", "laz", "copc"}
 
 # Inline-decode point ceiling. The viewer decode loads every point before
 # decimating, so we refuse a source whose declared point count would blow the
-# 2 GB core. Roughly aligned with the ~2 GiB raw-byte cap the service enforces
+# 3 GB core. Roughly aligned with the ~2 GiB raw-byte cap the service enforces
 # on the object pull (~2 GiB of uncompressed LAS is ~60 M points); anything
 # larger belongs on the out-of-core converter, not the inline preview. Callers
 # override via the ``max_total_points`` argument (the service wires it to a

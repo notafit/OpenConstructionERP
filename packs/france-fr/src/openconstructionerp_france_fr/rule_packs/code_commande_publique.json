@@ -1,0 +1,26 @@
+{
+  "rule_pack_id": "code_commande_publique",
+  "name": "Code de la commande publique — Public Procurement",
+  "standard": "Code de la commande publique (CCP, Ordonnance 2018-1074)",
+  "jurisdiction": "FR",
+  "description": "Validates public tender documents against the Code de la commande publique (effective 2019-04-01). Checks AAPC publication requirements, CCAG-Travaux references, allotissement (lot splitting) obligations, selection criteria documentation, threshold compliance (European and national), avance forfaitaire, and sous-traitance (subcontracting) declaration requirements.",
+  "applies_to": ["tender", "estimate", "validation"],
+  "enables_rule_ids": [
+    "ccp.aapc_published",
+    "ccp.procedure_type_defined",
+    "ccp.threshold_european_check",
+    "ccp.threshold_national_check",
+    "ccp.allotissement_justified",
+    "ccp.criteres_attribution_documented",
+    "ccp.ccag_travaux_referenced",
+    "ccp.ccag_version_2021_or_later",
+    "ccp.avance_forfaitaire_min_20_pct",
+    "ccp.delai_paiement_max_30_days",
+    "ccp.sous_traitance_declaration_present",
+    "ccp.variantes_autorisees_stated",
+    "ccp.dce_complet",
+    "ccp.acte_engagement_present"
+  ],
+  "regulator": "Direction des Affaires Juridiques (DAJ), Ministere de l'Economie",
+  "publication_year": 2019
+}

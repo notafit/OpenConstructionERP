@@ -35,13 +35,14 @@ Endpoints:
 """
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from app.core.demo_accounts import DEMO_ACCOUNT_EMAILS
-from app.core.rate_limiter import client_identifier, login_limiter
+from app.core.demo_privacy import redact_model
+from app.core.rate_limiter import client_identifier, login_limiter, registration_limiter
 from app.dependencies import (
     CurrentUserId,
     CurrentUserPayload,
@@ -126,6 +127,20 @@ class InfoBlocksPayload(BaseModel):
     blocks: dict[str, bool]
 
 
+class ViewModePayload(BaseModel):
+    """Request/response body for the user's Simple / Advanced menu choice.
+
+    ``mode`` is ``null`` until the user picks a mode themselves, and the
+    client then derives a default from the company profile. It is stored under
+    its own ``metadata_`` key, ``view_mode``, and never read from the
+    onboarding record's ``interface_mode``: old clients wrote ``advanced``
+    there on every profile save, whatever the user had chosen, so that copy
+    is not a choice anybody made.
+    """
+
+    mode: Literal["simple", "advanced"] | None = None
+
+
 class DashboardLayoutPayload(BaseModel):
     """Request/response body for the user's dashboard widget layout.
 
@@ -186,9 +201,18 @@ async def register(
     request: Request,
     service: UserService = Depends(_get_service),
 ) -> UserResponse:
-    """Register a new user account. Rate-limited per IP."""
+    """Register a new user account. Rate-limited per IP, per minute and per hour.
+
+    A taken email still answers 409 "Email already registered", because the
+    sign-up page shows that message and immediately logs a fresh account in
+    on 201, so a neutral answer would strand real users. What stops the 409
+    from being an enumeration oracle is the rate limit: the hourly cap, and
+    a client address that only a trusted proxy can override.
+    """
     client_ip = client_identifier(request)
     allowed, _remaining = login_limiter.is_allowed(f"reg_{client_ip}")
+    if allowed:
+        allowed, _remaining = registration_limiter.is_allowed(f"reg_{client_ip}")
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -407,6 +431,123 @@ async def refresh(
     return await service.refresh_tokens(data.refresh_token)
 
 
+# ── OIDC / Keycloak authentication ─────────────────────────────────────────
+
+
+@router.get("/auth/oidc/config/")
+async def oidc_config() -> dict:
+    """Return OIDC configuration for the frontend login page.
+
+    When OIDC is disabled, returns ``{"enabled": false}`` so the frontend
+    can hide the SSO button.
+    """
+    from app.config import get_settings
+
+    s = get_settings()
+    if not s.oidc_enabled or not s.oidc_issuer_url:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "issuer_url": s.oidc_issuer_url,
+        "client_id": s.oidc_client_id,
+        "scopes": s.oidc_scopes,
+    }
+
+
+@router.post("/auth/oidc/callback/", response_model=TokenResponse)
+async def oidc_callback(
+    request: Request,
+    service: UserService = Depends(_get_service),
+) -> TokenResponse:
+    """Exchange an OIDC authorization code for local JWT tokens.
+
+    The frontend redirects the user to the OIDC provider's authorization
+    endpoint. After consent, the provider redirects back with an authorization
+    code. The frontend POSTs that code here, and this endpoint:
+
+    1. Exchanges it for an ID token at the provider's token endpoint.
+    2. Validates the ID token signature and claims.
+    3. Finds or creates a local User matched by ``oidc_sub``.
+    4. Issues local JWT access + refresh tokens.
+    """
+    from app.config import get_settings
+
+    s = get_settings()
+    if not s.oidc_enabled:
+        raise HTTPException(status_code=400, detail="OIDC authentication is not enabled.")
+
+    body = await request.json()
+    code = body.get("code", "")
+    redirect_uri = body.get("redirect_uri", "")
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code is required.")
+
+    import httpx
+
+    # Discover provider endpoints
+    async with httpx.AsyncClient(timeout=10) as client:
+        well_known = f"{s.oidc_issuer_url.rstrip('/')}/.well-known/openid-configuration"
+        disc_resp = await client.get(well_known)
+        if disc_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Could not reach OIDC provider.")
+        disc = disc_resp.json()
+
+        # Exchange code for tokens
+        token_resp = await client.post(
+            disc["token_endpoint"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": s.oidc_client_id,
+                "client_secret": s.oidc_client_secret,
+            },
+        )
+        if token_resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="OIDC token exchange failed.")
+        tokens = token_resp.json()
+
+        # Fetch userinfo
+        userinfo_resp = await client.get(
+            disc["userinfo_endpoint"],
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        if userinfo_resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Could not fetch user info from OIDC provider.")
+        userinfo = userinfo_resp.json()
+
+    sub = userinfo.get("sub", "")
+    email = userinfo.get("email", "")
+    name = userinfo.get("name", "") or userinfo.get("preferred_username", "")
+    groups: list[str] = userinfo.get("groups", [])
+    if not sub or not email:
+        raise HTTPException(status_code=400, detail="OIDC provider did not return sub or email.")
+
+    # Resolve role from OIDC groups if a mapping is configured.
+    role_from_groups: str | None = None
+    if s.oidc_group_role_map:
+        import json
+
+        try:
+            group_map: dict[str, str] = json.loads(s.oidc_group_role_map)
+        except (json.JSONDecodeError, TypeError):
+            group_map = {}
+        for g in groups:
+            mapped = group_map.get(g)
+            if mapped:
+                role_from_groups = mapped
+                break
+
+    return await service.oidc_login(
+        oidc_sub=sub,
+        oidc_issuer=s.oidc_issuer_url,
+        email=email,
+        full_name=name,
+        auto_create=s.oidc_auto_create_users,
+        role_from_groups=role_from_groups,
+    )
+
+
 # ── Desktop first-run / bootstrap ───────────────────────────────────────────
 
 # These two endpoints are mounted at ``/api/v1/auth/`` (NOT
@@ -509,6 +650,7 @@ async def desktop_bootstrap(
 async def forgot_password(
     data: ForgotPasswordRequest,
     request: Request,
+    background: BackgroundTasks,
     service: UserService = Depends(_get_service),
 ) -> ForgotPasswordResponse:
     """Request a password reset token. Rate-limited per IP.
@@ -524,7 +666,7 @@ async def forgot_password(
             detail="Too many requests. Please wait a minute and try again.",
             headers={"Retry-After": "60"},
         )
-    return await service.forgot_password(data)
+    return await service.forgot_password(data, background)
 
 
 @router.post("/auth/reset-password/", response_model=ResetPasswordResponse)
@@ -1045,35 +1187,89 @@ async def get_custom_units(
     return CustomUnitsPayload(units=units)
 
 
+_CUSTOM_UNIT_MAX_LEN = 32
+_CUSTOM_UNITS_MAX = 200
+
+
+def _custom_unit_key(unit: str) -> str:
+    """Identity key for a custom unit, shared with the BOQ unit registry."""
+    try:
+        from app.modules.boq.units import unit_identity_key
+    except ImportError:  # BOQ module not installed: plain case-insensitive compare
+        return unit.strip().casefold()
+    return unit_identity_key(unit)
+
+
+def _is_registry_unit(unit: str) -> bool:
+    """True when the BOQ unit registry already offers ``unit`` to every user."""
+    try:
+        from app.modules.boq.units import is_registry_unit
+    except ImportError:
+        return False
+    return is_registry_unit(unit)
+
+
+def _merge_custom_units(existing: object, incoming: list[str]) -> list[str]:
+    """Add the genuinely new units of ``incoming`` to ``existing``.
+
+    Nothing already stored is removed or rewritten. An incoming unit is added
+    only when it is not in the unit registry and no stored unit has the same
+    identity key (so ``M3`` does not sit next to ``m3``). The first spelling
+    seen is the one kept. Stored entries come first under the list cap, so a
+    long request can never push out units the user already has.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    if isinstance(existing, list):
+        for raw in existing:
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            unit = raw.strip()[:_CUSTOM_UNIT_MAX_LEN]
+            key = _custom_unit_key(unit)
+            if key not in seen:
+                seen.add(key)
+                merged.append(unit)
+    for raw in incoming:
+        if len(merged) >= _CUSTOM_UNITS_MAX:
+            break
+        if not isinstance(raw, str):
+            continue
+        unit = raw.strip()[:_CUSTOM_UNIT_MAX_LEN]
+        if not unit or _is_registry_unit(unit):
+            continue
+        key = _custom_unit_key(unit)
+        if key not in seen:
+            seen.add(key)
+            merged.append(unit)
+    return merged
+
+
 @router.patch("/me/custom-units/", response_model=CustomUnitsPayload)
 async def save_custom_units(
     data: CustomUnitsPayload,
     user_id: CurrentUserId,
     service: UserService = Depends(_get_service),
 ) -> CustomUnitsPayload:
-    """Replace the user's saved custom-unit catalogue.
+    """Add units to the user's saved custom-unit catalogue.
 
-    Sanitises the payload: trims whitespace, drops empties / duplicates,
-    caps each unit at 32 chars and the list at 200 entries so a runaway
-    client can't bloat the JSON column.
+    The PATCH is additive and idempotent: it never removes a stored unit.
+    It used to replace the whole list with the body, and the client sent its
+    own local copy, so two sessions under one login overwrote each other and
+    a unit added in one was lost to the other's stale list. A body carrying
+    the full old list is therefore still safe: units already stored are kept,
+    and only units that are new (not in the unit registry, not already in the
+    list by identity key) are appended. The response is the resulting list.
+
+    Each unit is trimmed and capped at 32 chars, the list at 200 entries.
+    No UI removes a custom unit today; a removal would need its own explicit
+    operation rather than a smaller list sent here.
     """
-    seen: set[str] = set()
-    cleaned: list[str] = []
-    for raw in data.units:
-        if not isinstance(raw, str):
-            continue
-        u = raw.strip()[:32]
-        if u and u not in seen:
-            seen.add(u)
-            cleaned.append(u)
-        if len(cleaned) >= 200:
-            break
-
     user = await service.get_user(uuid.UUID(user_id))
     metadata: dict[str, Any] = dict(user.metadata_ or {})
-    metadata["custom_units"] = cleaned
+    merged = _merge_custom_units(metadata.get("custom_units", []), data.units)
+    metadata["custom_units"] = merged
     await service.update_profile(uuid.UUID(user_id), metadata_=metadata)
-    return CustomUnitsPayload(units=cleaned)
+    return CustomUnitsPayload(units=merged)
 
 
 # ── Module Info Blocks ────────────────────────────────────────────────────
@@ -1141,6 +1337,42 @@ async def save_info_blocks(
     return InfoBlocksPayload(blocks=cleaned)
 
 
+# ── Simple / Advanced view mode ───────────────────────────────────────────
+
+
+@router.get("/me/view-mode/", response_model=ViewModePayload)
+async def get_view_mode(
+    user_id: CurrentUserId,
+    service: UserService = Depends(_get_service),
+) -> ViewModePayload:
+    """Get the Simple / Advanced menu mode the user chose, or ``null``."""
+    user = await service.get_user(uuid.UUID(user_id))
+    metadata: dict[str, Any] = user.metadata_ or {}
+    stored = metadata.get("view_mode")
+    return ViewModePayload(mode=stored if stored in ("simple", "advanced") else None)
+
+
+@router.put("/me/view-mode/", response_model=ViewModePayload)
+async def save_view_mode(
+    data: ViewModePayload,
+    user_id: CurrentUserId,
+    service: UserService = Depends(_get_service),
+) -> ViewModePayload:
+    """Record the user's Simple / Advanced choice so it follows the login.
+
+    ``null`` clears the choice, which hands the menu back to the default the
+    client derives from the company profile. Keyed by ``CurrentUserId`` only.
+    """
+    user = await service.get_user(uuid.UUID(user_id))
+    metadata: dict[str, Any] = dict(user.metadata_ or {})
+    if data.mode is None:
+        metadata.pop("view_mode", None)
+    else:
+        metadata["view_mode"] = data.mode
+    await service.update_profile(uuid.UUID(user_id), metadata_=metadata)
+    return ViewModePayload(mode=data.mode)
+
+
 # ── Onboarding ────────────────────────────────────────────────────────────────
 
 
@@ -1174,9 +1406,22 @@ async def save_onboarding(
     user's metadata JSON under the ``onboarding`` key.  Also syncs the
     chosen modules into ``module_preferences`` so the sidebar reflects
     the selection immediately.
+
+    ``company_type`` is checked against the preset catalogue by the request
+    schema, so an unknown profile is a 422 and never reaches storage. A null
+    ``company_type`` is a module selection made without a profile and is
+    saved exactly as sent.
     """
     user = await service.get_user(uuid.UUID(user_id))
     metadata: dict[str, Any] = dict(user.metadata_ or {})
+    previous: dict[str, Any] = dict(metadata.get("onboarding") or {})
+
+    # A client that does not send ``company_size`` says nothing about it, so
+    # the stored answer stands. The wizard stopped asking for a team size and
+    # the Modules page never did, and both used to wipe the size an account
+    # had picked every time they saved a profile. An explicit null still
+    # clears it.
+    company_size = data.company_size if "company_size" in data.model_fields_set else previous.get("company_size")
 
     # "Full Enterprise" means the whole platform. Pin it to the backend's own
     # authoritative functional-module list rather than trusting whatever set the
@@ -1202,7 +1447,7 @@ async def save_onboarding(
 
     metadata["onboarding"] = {
         "company_type": data.company_type,
-        "company_size": data.company_size,
+        "company_size": company_size,
         "enabled_modules": effective_modules,
         "interface_mode": data.interface_mode,
         "completed": data.completed,
@@ -1218,7 +1463,7 @@ async def save_onboarding(
     return OnboardingResponse(
         completed=data.completed,
         company_type=data.company_type,
-        company_size=data.company_size,
+        company_size=company_size,
         enabled_modules=effective_modules,
         interface_mode=data.interface_mode,
     )
@@ -1308,6 +1553,22 @@ async def get_onboarding_size_presets() -> list[dict[str, Any]]:
     return get_all_size_presets()
 
 
+@router.get("/onboarding-presets/core/")
+async def get_onboarding_core_modules() -> dict[str, Any]:
+    """Return the module keys no company profile can switch off.
+
+    Public endpoint (no auth required), same as its two siblings. The profile
+    picker subtracts one preset's modules from another's to show what a switch
+    actually changes, and without this list it reports the core keys that some
+    presets re-list as gained or lost when nothing about them can move. The
+    third sibling rather than a field on ``/onboarding-presets/`` so the array
+    that endpoint returns keeps its shape.
+    """
+    from app.core.onboarding_presets import get_core_modules
+
+    return {"core_modules": get_core_modules()}
+
+
 # ── Admin: User management ─────────────────────────────────────────────────
 
 
@@ -1352,6 +1613,7 @@ async def admin_create_user(
     dependencies=[Depends(RequirePermission("users.list"))],
 )
 async def list_users(
+    viewer_id: CurrentUserId,
     service: UserService = Depends(_get_service),
     offset: int = Query(default=0, ge=0),
     # Directory/assignee pickers load the full active-user list in one call,
@@ -1368,28 +1630,11 @@ async def list_users(
     response - first/last names are blanked and the email's local part is
     replaced with a hash. Only the email domain remains visible. This way
     the public demo can show registration counts without leaking PII from
-    real users who signed up to try the product.
+    real users who signed up to try the product. The caller's own row stays
+    real.
     """
-    import os as _os
-
     users, _ = await service.list_users(offset=offset, limit=limit, is_active=is_active)
-    responses = [UserResponse.model_validate(u) for u in users]
-
-    if _os.environ.get("OE_DEMO_MODE", "").lower() in ("1", "true", "yes"):
-        import hashlib as _hl
-
-        def _scrub(r: UserResponse) -> UserResponse:
-            data = r.model_dump()
-            email = (data.get("email") or "").strip()
-            if "@" in email:
-                local, domain = email.split("@", 1)
-                short = _hl.sha1(local.encode("utf-8")).hexdigest()[:6]
-                data["email"] = f"user-{short}@{domain}"
-            data["full_name"] = ""
-            return UserResponse.model_validate(data)
-
-        responses = [_scrub(r) for r in responses]
-    return responses
+    return [redact_model(UserResponse.model_validate(u), subject_id=u.id, viewer_id=viewer_id) for u in users]
 
 
 @router.get(
@@ -1399,11 +1644,16 @@ async def list_users(
 )
 async def get_user(
     user_id: uuid.UUID,
+    viewer_id: CurrentUserId,
     service: UserService = Depends(_get_service),
 ) -> UserResponse:
-    """Get user by ID (admin/manager only)."""
+    """Get user by ID (admin/manager only).
+
+    Redacted in demo mode exactly like the list, so fetching one record by id
+    is not a way around the list's privacy.
+    """
     user = await service.get_user(user_id)
-    return UserResponse.model_validate(user)
+    return redact_model(UserResponse.model_validate(user), subject_id=user.id, viewer_id=viewer_id)
 
 
 @router.patch(
@@ -1414,12 +1664,13 @@ async def get_user(
 async def update_user(
     user_id: uuid.UUID,
     data: UserAdminUpdate,
+    viewer_id: CurrentUserId,
     service: UserService = Depends(_get_service),
 ) -> UserResponse:
-    """Update user (admin only)."""
+    """Update user (admin only). The echoed record is redacted in demo mode."""
     fields = data.model_dump(exclude_unset=True)
     user = await service.update_profile(user_id, **fields)
-    return UserResponse.model_validate(user)
+    return redact_model(UserResponse.model_validate(user), subject_id=user.id, viewer_id=viewer_id)
 
 
 @router.delete(

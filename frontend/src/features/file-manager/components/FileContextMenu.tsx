@@ -7,10 +7,14 @@
      - Download    — row.download_url
      - Copy link   — copies download_url to clipboard
      - Rename      — fires onRename(row) — caller opens inline editor
-     - Delete      — fires onDelete(row) — caller shows confirm + DELETE
+     - Delete      — fires onDelete(row); the caller soft-deletes into the
+                     recycle bin and offers Undo, so there is no confirm step.
+                     A document row carries the reference block above Delete
+                     instead, because the links break the moment the row
+                     leaves `documents` and Restore is what puts them back.
 */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Download,
@@ -25,6 +29,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useNavigate } from 'react-router-dom';
+import { DocumentDeleteWarning } from '@/features/documents/DocumentDeleteWarning';
 import { useToastStore } from '@/stores/useToastStore';
 import { copyToClipboard } from '../lib/tauri';
 import { downloadProtectedFile } from '../api';
@@ -98,10 +103,32 @@ export function FileContextMenu({
   }, [onClose]);
 
   /* Clamp the menu inside the viewport so it never opens off-screen.
-     200x180 covers the largest the menu can grow to (5 items, comfortable
-     padding); plenty of headroom for label growth. */
+     `w-48` fixes the width, so 200 covers X for good. The height is not
+     fixed: the items are conditional on kind, and the reference block below
+     arrives after its own query resolves. A constant that guesses short puts
+     the bottom of the menu past the fold, and since the menu clips its own
+     overflow the item that disappears is Delete. Measure instead.
+
+     ResizeObserver rather than a layout effect: the block that changes the
+     height is a child holding its own query, so the parent never re-renders
+     when it appears. jsdom has no ResizeObserver and no layout either, which
+     makes the clamp inert under test rather than broken - hence the guard. */
+  const [menuHeight, setMenuHeight] = useState(0);
+  useLayoutEffect(() => {
+    const node = menuRef.current;
+    if (!node) return;
+    const measure = () => setMenuHeight(node.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
   const adjustedX = Math.min(x, window.innerWidth - 200);
-  const adjustedY = Math.min(y, window.innerHeight - 200);
+  // Until the first measurement lands this is plain `y`, which is where the
+  // menu was going to open anyway; the layout effect corrects it before paint.
+  const adjustedY = Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8));
 
   const target = primaryModule(row.kind, row.extension);
   const moduleLabel = t(target.i18nKey, { defaultValue: target.label });
@@ -237,6 +264,13 @@ export function FileContextMenu({
           defaultValue: 'Rename is only available for documents',
         })}
       />
+      {/* What the delete severs, above Delete so it is read before the eye
+          lands on the item. Documents only - the endpoint answers for one of
+          the eight kinds, and letting the other seven ask would draw the
+          failure state on most rows in the manager. Renders nothing when
+          nothing points at the file, which is the usual case, so the menu
+          keeps its present shape. */}
+      {row.kind === 'document' && <DocumentDeleteWarning documentId={row.id} />}
       <div className="h-px bg-border-light" />
       <MenuItem
         icon={<Trash2 size={13} />}

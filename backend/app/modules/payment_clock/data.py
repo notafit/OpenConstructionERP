@@ -495,23 +495,47 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
             "condition this module cannot compute from a date alone."
         ),
     },
-    # The four United States regimes below are split public/private per state,
+    # The United States regimes below are split public/private per state,
     # because that is where American prompt payment law actually divides: the
     # public duty is owed by a governmental entity under one statute and the
     # private duty is owed by an owner under another, with different periods and
-    # different interest. The state pack configs
-    # (``app.modules.us_tx_pack.config`` and ``app.modules.us_ca_pack.config``)
-    # name these codes under ``payment_clock_regimes`` and carry the same
-    # provisions as reference data; the deadline arithmetic is written down here
-    # and nowhere else. None of the four has a notice sequence, so every one of
-    # them takes the application date as the due date and the statutory period as
-    # the final date for payment, the convention set out at the top of this file.
+    # different interest. Where a state gives its own agencies and its local
+    # governments different periods, the public side is split again by payer.
+    # The federal row covers work for a federal agency in every state.
+    #
+    # Every US row ends its statute_reference with the URL of the official text
+    # the figures were read from, and the notes say when that text was read
+    # through an archived capture because the live site refused the request. The
+    # owner-to-contractor leg is the clock; the contractor-to-subcontractor leg
+    # each statute adds is a second clock, written into the notes and not
+    # computed, the same as every other regime in this table.
+    #
+    # The Texas and California state pack configs (``app.modules.us_tx_pack.config``
+    # and ``app.modules.us_ca_pack.config``) name their four codes under
+    # ``payment_clock_regimes`` and carry the same provisions as reference data;
+    # the deadline arithmetic is written down here and nowhere else. The other
+    # states have no state pack yet, so no config names their codes.
+    #
+    # All but one take the application date as the due date and the statutory
+    # period as the final date for payment, the convention set out at the top of
+    # this file. Where a statute gives the owner N days to approve and then M days
+    # to pay, and both count the same kind of day, the final date is written as
+    # N plus M and the approval window as the payment notice deadline. New York's
+    # private act is the exception: its twelve business days to approve and
+    # thirty calendar days to pay cannot be added into one count, so it carries
+    # the approval deadline as the due date and the final date thirty days after
+    # it, the way the UK Act splits the two. Four rows make an application that
+    # is not answered in time deemed approved (Illinois private, Pennsylvania
+    # private and both Arizona rows), and only those four carry
+    # applied_sum_becomes_notified_sum.
     {
         "code": "us_tx_public_2251",
         "jurisdiction": "Texas, United States (public)",
         "country_code": "US",
         "statute": "Texas Prompt Payment Act, Government Code Chapter 2251",
-        "statute_reference": "sections 2251.021, 2251.022 and 2251.025",
+        "statute_reference": (
+            "sections 2251.021, 2251.022 and 2251.025; https://statutes.capitol.texas.gov/Docs/GV/htm/GV.2251.htm"
+        ),
         "due_date_basis": "application_date",
         "due_date_days": 0,
         "due_date_day_basis": "calendar",
@@ -550,7 +574,9 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
         "jurisdiction": "Texas, United States (private)",
         "country_code": "US",
         "statute": "Texas Prompt Payment to Contractors and Subcontractors Act, Property Code Chapter 28",
-        "statute_reference": "sections 28.002, 28.004 and 28.006",
+        "statute_reference": (
+            "sections 28.002, 28.004 and 28.006; https://statutes.capitol.texas.gov/Docs/PR/htm/PR.28.htm"
+        ),
         "due_date_basis": "application_date",
         "due_date_days": 0,
         "due_date_day_basis": "calendar",
@@ -584,7 +610,10 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
         "jurisdiction": "California, United States (public)",
         "country_code": "US",
         "statute": "California Public Contract Code § 20104.50 (Local Agency Public Construction Act)",
-        "statute_reference": "section 20104.50; legal rate under Code of Civil Procedure § 685.010(a)",
+        "statute_reference": (
+            "section 20104.50; legal rate under Code of Civil Procedure § 685.010(a); "
+            "https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=PCC&sectionNum=20104.50"
+        ),
         "due_date_basis": "application_date",
         "due_date_days": 0,
         "due_date_day_basis": "calendar",
@@ -623,7 +652,10 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
         "jurisdiction": "California, United States (private)",
         "country_code": "US",
         "statute": "California prompt payment on private works, Civil Code § 8800",
-        "statute_reference": "Civil Code §§ 8800 and 8812; Business and Professions Code § 7108.5",
+        "statute_reference": (
+            "Civil Code §§ 8800 and 8812; Business and Professions Code § 7108.5; "
+            "https://leginfo.legislature.ca.gov/faces/codes_displaySection.xhtml?lawCode=CIV&sectionNum=8800"
+        ),
         "due_date_basis": "application_date",
         "due_date_days": 0,
         "due_date_day_basis": "calendar",
@@ -655,6 +687,932 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
             "within seven days of receiving a progress payment under Business and Professions Code § 7108.5 "
             "at the same two percent a month, and retention on private work is released within 45 days of "
             "completion under § 8812; neither is computed by this regime."
+        ),
+    },
+    {
+        "code": "us_fed_ppa_construction",
+        "jurisdiction": "United States (federal)",
+        "country_code": "US",
+        "statute": "Prompt Payment Act, 31 U.S.C. chapter 39, and FAR 52.232-27 Prompt Payment for Construction Contracts",
+        "statute_reference": (
+            "31 U.S.C. §§ 3902(a)-(b), 3903(a)(6)-(7) and 3905(b); FAR 52.232-27(a)(1)(i), (a)(2) and (c) "
+            "(Jan 2017); https://www.law.cornell.edu/uscode/text/31/3903 and "
+            "https://www.acquisition.gov/far/52.232-27"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 7,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 14,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the Secretary of the Treasury for interest under 41 U.S.C. 7109, as published in the Federal Register"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "31 U.S.C. § 3902(a)",
+        "notes": (
+            "The clock for a progress payment owed by a federal agency on a construction contract, in any "
+            "state. FAR 52.232-27(a)(1)(i)(A) makes the payment due 14 days after the designated billing "
+            "office receives a proper payment request, so enter that date of receipt as the application date. "
+            "The clause counts calendar days, and where the due date falls on a Saturday, Sunday or legal "
+            "holiday the agency may pay on the next working day without a penalty (FAR 52.232-27(a)(3)), which "
+            "this count does not move. The solicitation may lengthen the 14 days where the agency needs the "
+            "time to inspect the work (31 U.S.C. § 3903(a)(6)(A)(ii)); state the final date for payment on the "
+            "application where it does. The seven days recorded as the payment notice deadline are the "
+            "agency's own: a request that is not a proper one must be returned within 7 days of receipt with "
+            "the reasons (§ 3903(a)(7)(B), FAR 52.232-27(a)(2)). Missing that does not make the applied sum "
+            "payable, which is why the no-notice effect is none; instead the days the agency has to pay without "
+            "interest shrink by however many days it ran over (§ 3903(a)(7)(C)), an adjustment this module "
+            "does not apply. Interest runs from the day after the due date to the day of payment (§ 3902(b)) "
+            "at the rate the Treasury sets for Contract Disputes Act interest, and the agency pays it without "
+            "being asked. Retained amounts approved for release fall due on the date the contract sets or, "
+            "failing one, 30 days after the contracting officer approves their release (FAR "
+            "52.232-27(a)(1)(i)(B)); the final payment falls due on the later of the 30th day after a proper "
+            "invoice and the 30th day after acceptance (FAR 52.232-27(a)(1)(ii)(A)); neither is computed here. "
+            "Downstream, the prime contractor must pay each subcontractor within 7 days of receiving the "
+            "agency's payment (§ 3905(b)(1), FAR 52.232-27(c)(1)), with interest at the same rate from the "
+            "day after that date, and the clause has to be passed to every lower tier; that second clock is "
+            "not computed either. Title 31 was read on law.cornell.edu and the January 2017 clause on "
+            "acquisition.gov."
+        ),
+    },
+    {
+        "code": "us_ny_public_state_179f",
+        "jurisdiction": "New York, United States (public, state agencies)",
+        "country_code": "US",
+        "statute": "New York State Finance Law § 139-f and Article 11-A (prompt payment by state agencies)",
+        "statute_reference": (
+            "State Finance Law §§ 139-f(1), (1-b) and (2), 179-e, 179-f(2)-(3) and 179-g; "
+            "https://www.nysenate.gov/legislation/laws/STF/139-F and "
+            "https://www.nysenate.gov/legislation/laws/STF/179-F"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 15,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the Commissioner of Taxation and Finance as the overpayment rate under Tax Law § 1096(e)"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "New York State Finance Law § 179-g",
+        "notes": (
+            "The clock for a progress payment owed by a New York state agency on a public construction "
+            "contract. Section 139-f(1-b) sends the payment to Article 11-A, where the required payment date is "
+            "thirty calendar days, excluding legal holidays, after the invoice is received (§ 179-f(2)), and "
+            "§ 179-e counts from the later of the day a proper invoice reached the designated payment office "
+            "and the day the agency received the work; enter the later of the two as the application date. "
+            "Legal holidays are left out of the count, which a calendar count here does not do, so move the "
+            "final date one day later for each legal holiday inside the window. A small business is owed "
+            "payment within fifteen calendar days on the same terms, so state the final date for payment on the "
+            "application for one. The fifteen days recorded as the payment notice deadline are the agency's "
+            "own: it has fifteen calendar days after receiving the invoice to notify the contractor of defects "
+            "in the work or in the invoice, seven for a small business (§ 179-f(3)). A late notice does not "
+            "make the applied sum payable; it shortens the time allowed for paying the corrected invoice by the "
+            "days of the delay, an adjustment this module does not apply. Interest runs at the overpayment "
+            "rate the Commissioner of Taxation and Finance sets (§ 179-g) and is not paid when it would come to "
+            "less than ten dollars. Downstream, the contractor must pay each subcontractor within seven "
+            "calendar days of receiving a payment from the public owner, with interest at the rate in General "
+            "Business Law § 756-b(1)(b) (§ 139-f(2)), a second clock this regime does not compute. The public "
+            "owner may retain no more than five percent of each progress payment, or up to ten percent where it "
+            "requires no performance bond and no labor and material bond (§ 139-f(1)). Public authorities are "
+            "sent to Public Authorities Law § 2880 instead, which was not read for this row. Read on "
+            "nysenate.gov, § 139-f as revised on 18 June 2021 and § 179-f as revised on 14 April 2017."
+        ),
+    },
+    {
+        "code": "us_ny_public_local_106b",
+        "jurisdiction": "New York, United States (public, local)",
+        "country_code": "US",
+        "statute": "New York General Municipal Law § 106-b (prompt payment by political subdivisions)",
+        "statute_reference": (
+            "General Municipal Law § 106-b(1)(a), (1)(c) and (2); https://www.nysenate.gov/legislation/laws/GMU/106-B"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the Commissioner of Taxation and Finance as the overpayment rate under Tax Law § 1096(e)"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "New York General Municipal Law § 106-b(1)(c)",
+        "notes": (
+            "The clock for a progress payment owed by a New York political subdivision other than the city of "
+            "New York, which the section leaves out. To promptly pay means payment within thirty days, "
+            "excluding legal holidays, of receipt of the requisition, so enter the date the requisition was "
+            "received as the application date. Legal holidays are left out of the count, which a calendar count "
+            "here does not do, so move the final date one day later for each legal holiday inside the window. "
+            "Where the municipal corporation requires an elected official to approve progress payments the "
+            "period is forty-five days on the same terms, so state the final date for payment on the "
+            "application for those bodies. A requisition that is not approvable under the contract does not "
+            "start the clock, but the section sets no deadline for saying so, so there is no payment notice "
+            "and silence has no consequence. Interest runs at the overpayment rate the Commissioner of Taxation "
+            "and Finance sets and is not paid when it would come to less than ten dollars. Downstream, the "
+            "contractor must pay each subcontractor within seven calendar days of receiving a payment from the "
+            "public owner, with interest at the rate in General Business Law § 756-b(1)(b) (§ 106-b(2)), a "
+            "second clock this regime does not compute. The public owner may retain no more than five percent "
+            "of each progress payment, or up to ten percent where it requires no performance bond and no labor "
+            "and material bond. Read on nysenate.gov as revised on 18 June 2021."
+        ),
+    },
+    {
+        "code": "us_ny_private_756a",
+        "jurisdiction": "New York, United States (private)",
+        "country_code": "US",
+        "statute": "New York General Business Law Article 35-E (prompt payment on private construction)",
+        "statute_reference": (
+            "General Business Law §§ 756(1), 756-a(2)(a) and (3), 756-b(1) and 756-c; "
+            "https://www.nysenate.gov/legislation/laws/GBS/756-A and "
+            "https://www.nysenate.gov/legislation/laws/GBS/756-B"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 12,
+        "due_date_day_basis": "business",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 12,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "due_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "New York General Business Law § 756-b(1)(a)",
+        "notes": (
+            "The clock for private construction in New York under a contract of one hundred fifty thousand "
+            "dollars or more (§ 756(1)); public works and the one to three family, small residential and "
+            "assisted residential projects the section lists are excluded. The owner must approve or "
+            "disapprove the invoice within twelve business days of receiving it with all the documentation the "
+            "contract requires, and must give a written statement of the items it does not approve "
+            "(§ 756-a(2)(a)); payment of an approved interim or final invoice is then due not later than thirty "
+            "days after the approval (§ 756-a(3)(a)). Enter the date the invoice and its documentation were "
+            "delivered as the application date. The two periods count different days, so this is the one US "
+            "regime that splits the due date from the final date: the due date here is the last day for the "
+            "approval decision, twelve business days on, and the final date is thirty days after it, which is "
+            "the latest the statute allows when the owner uses its whole approval window. Where the owner "
+            "approved sooner, payment falls due thirty days after that approval, so state the final date for "
+            "payment on the application. Business days need the New York holiday calendar to reproduce the "
+            "statutory date. The section does not say what an owner's silence past the twelve business days "
+            "does, so the no-notice effect is none. Interest runs from the next day at one "
+            "percent a month on the unpaid balance, or a higher rate the contract sets (§ 756-b(1)(a)), written "
+            "here as the 12 percent a year it comes to. Downstream, the contractor has the same twelve business "
+            "days to approve a subcontractor's invoice and must pay within seven days of receiving good funds "
+            "(§ 756-a(3)(b)), at the same rate notwithstanding any contrary agreement (§ 756-b(1)(b)); that "
+            "second clock is not computed. Retainage may not exceed five percent of the contract sum and must "
+            "be released within thirty days after final approval of the work (§ 756-c). Read on nysenate.gov, "
+            "§§ 756-a and 756-c as revised on 26 November 2023; a contract signed before that revision may be "
+            "governed by the earlier text, which was not read."
+        ),
+    },
+    {
+        "code": "us_fl_public_local_218735",
+        "jurisdiction": "Florida, United States (public, local government)",
+        "country_code": "US",
+        "statute": "Florida Local Government Prompt Payment Act, Florida Statutes § 218.735 (construction services)",
+        "statute_reference": (
+            "Florida Statutes § 218.735(1)(b), (2), (6), (8)(a) and (9) (2026); "
+            "https://www.flsenate.gov/Laws/Statutes/2026/218.735"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 20,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": 20,
+        "final_date_day_basis": "business",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("24.000"),
+        "interest_statute": "Florida Statutes § 218.735(9)",
+        "notes": (
+            "The clock for construction services bought by a Florida county, municipality, school board, "
+            "special taxing district or other local governmental entity. Payment is due 20 business days after the "
+            "payment request is stamped as received, or 25 business days where an agent must approve it before "
+            "it reaches the entity (§ 218.735(1)); enter the stamped date as the application date and state "
+            "the final date for payment on the application in the agent case. Business days need the Florida "
+            "holiday calendar to reproduce the statutory date. The twenty business days recorded as the payment "
+            "notice deadline are the entity's window to reject an improper request in writing, naming the "
+            "deficiency and what would cure it (§ 218.735(2)); a corrected request then has to be paid or "
+            "rejected within ten business days of being stamped, or later where the entity must approve it at a "
+            "meeting (§ 218.735(3)). In the agent case a request not rejected within "
+            "4 business days after the contractor's overdue notice is deemed accepted, a step this module does "
+            "not model, so the no-notice effect is none. Late payments bear interest at 2 percent a month or the "
+            "contract rate, whichever is greater (§ 218.735(9)), written here as the 24 percent a year it comes "
+            "to. Downstream, the contractor must pay its subcontractors and suppliers within 10 days of "
+            "receiving payment, and a subcontractor its own within 7 days (§ 218.735(6)); that second clock is "
+            "not computed. Retainage may not exceed 5 percent of each progress payment (§ 218.735(8)(a)), a rule "
+            "that does not apply to construction services of $200,000 or less. Read on flsenate.gov in the 2026 "
+            "Florida Statutes, last amended by chapter 2023-134. The state-agency leg (§§ 255.0705 to 255.078) "
+            "is not shipped: it leaves the general timing to § 215.422 and fixes 20 business days only for the "
+            "undisputed part of a disputed request, which is not one clock. Florida private work (§ 715.12) "
+            "leaves the payment date to the contract."
+        ),
+    },
+    {
+        "code": "us_il_public_state_540",
+        "jurisdiction": "Illinois, United States (public, state agencies)",
+        "country_code": "US",
+        "statute": "Illinois State Prompt Payment Act, 30 ILCS 540",
+        "statute_reference": (
+            "30 ILCS 540/3-2(1.05) and (1.1) and 540/7(a-5) and (b); "
+            "https://www.ilga.gov/Documents/legislation/ilcs/documents/003005400K3-2.htm"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 30,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 90,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "30 ILCS 540/3-2(1.05)",
+        "notes": (
+            "The clock for a payment owed by an Illinois state official or agency, construction included. For "
+            "state fiscal year 2012 and later a bill approved for payment must be paid within 90 days of receipt "
+            "of a proper bill or invoice (§ 3-2(1.05)), which displaces the 60 days still written in § 3-2(1); "
+            "enter the date the proper bill was received as the application date. The approval step inside "
+            "those 90 days follows rules made under § 3-3, which were not read for this row. The thirty days "
+            "recorded as the payment notice deadline are the agency's own: notice of a defect in a construction "
+            "bill must be given not later than 30 days after it was first submitted (§ 3-2(1.1)), and the "
+            "section gives a late notice no consequence for the sum, so the no-notice effect is none. Interest "
+            "is 1.0 percent a month, or one-thirtieth of one percent a day, after the 90-day period, written "
+            "here as the 12 percent a year it comes to. Downstream, a contractor must pay each subcontractor "
+            "and supplier within 10 business days or 15 calendar days of receiving payment, whichever is "
+            "earlier, with interest of 2 percent a month after that (§ 7(a-5) and (b)); that second clock is "
+            "not computed. The official ilga.gov pages refused the request, so the text was read from the "
+            "Internet Archive's January 2026 captures of them; § 3-2 carries P.A. 100-1064, effective 24 "
+            "August 2018, and § 7 P.A. 101-524, effective 1 January 2020."
+        ),
+    },
+    {
+        "code": "us_il_public_local_505",
+        "jurisdiction": "Illinois, United States (public, local government)",
+        "country_code": "US",
+        "statute": "Illinois Local Government Prompt Payment Act, 50 ILCS 505",
+        "statute_reference": (
+            "50 ILCS 505/3, 505/4 and 505/9; https://www.ilga.gov/Documents/legislation/ilcs/documents/005005050K4.htm"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 30,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 60,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "50 ILCS 505/4",
+        "notes": (
+            "The clock for a payment owed by an Illinois county, township, municipality, school district or "
+            "other local governmental unit; the Act does not apply to the State. The local official or agency "
+            "must approve or disapprove a bill within 30 days after receiving it or the goods or services, "
+            "whichever is later (§ 3), and an approved bill must be paid within 30 days after the approval "
+            "(§ 4), so enter the later of the two receipts as the application date. The sixty days written here "
+            "are the two windows end to end, the latest date when the approval takes its whole window; where "
+            "the bill was approved sooner, payment falls due 30 days after that approval, so state the final "
+            "date for payment on the application. The thirty-day approval window is recorded as the payment "
+            "notice deadline. A disapproval must be sent to the contractor in writing immediately, and the part "
+            "of a construction bill that is not disapproved still has to be paid; the Act attaches no "
+            "consequence to silence, so the no-notice effect is none. Interest is 1 percent of the unpaid amount "
+            "for each month or fraction of a month after the payment period, written here as the 12 percent a "
+            "year it comes to, although a part month counts as a whole one. Downstream, a contractor who "
+            "without reasonable cause fails to pay its subcontractors and suppliers within 15 days of receiving "
+            "payment owes them interest of 2 percent a month (§ 9); that second clock is not computed. The "
+            "official ilga.gov pages refused the request, so the text was read from the Internet Archive's "
+            "January 2026 captures of them; § 3 and § 9 carry P.A. 94-972, effective 1 July 2007."
+        ),
+    },
+    {
+        "code": "us_il_private_603",
+        "jurisdiction": "Illinois, United States (private)",
+        "country_code": "US",
+        "statute": "Illinois Contractor Prompt Payment Act, 815 ILCS 603",
+        "statute_reference": (
+            "815 ILCS 603/5, 603/10(1) and (2), 603/15(a) and 603/20; "
+            "https://www.ilga.gov/Documents/legislation/ilcs/documents/081506030K10.htm"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 25,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 40,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("10.000"),
+        "interest_statute": "815 ILCS 603/15(a)",
+        "notes": (
+            "The clock for private construction in Illinois. The Act excludes contracts that spend public funds "
+            "and work on single family homes or buildings of 12 or fewer residential units (§ 5(b)). The owner "
+            "must pay not more than 15 calendar days after approving the payment application, and the "
+            "application is deemed approved 25 days after the owner receives it unless before then the owner "
+            "gives a written statement of the amount withheld and the reason (§ 10(1)); enter the date the "
+            "owner received the application as the application date. That written statement is recorded as the "
+            "payment notice, and because an application nobody answered in time is deemed approved, the "
+            "no-notice effect is that the applied sum becomes payable. The forty days written here are the "
+            "25-day approval window and the 15 days to pay end to end, the latest date the Act allows; where "
+            "the owner approved sooner, payment falls due 15 calendar days after that approval, so state the "
+            "final date for payment on the application. Telling a lender or architect to process the "
+            "application is not approval under the Act. Late payments carry interest at 10 percent a year "
+            "(§ 15(a)), and after 7 calendar days' written notice an unpaid contractor may suspend work "
+            "(§ 15(b)). Downstream, the contractor must pay its subcontractor within 15 calendar days of its "
+            "own receipt of each periodic payment, final payment or retainage (§ 10(2)); that second clock is "
+            "not computed. Retainage may not exceed 10 percent of any payment before the contract is half "
+            "complete, and no more than 5 percent may be held after that (§ 20, P.A. 101-432, effective 20 "
+            "August 2019). The official ilga.gov pages refused the request, so the text was read from the "
+            "Internet Archive's January 2026 captures of them."
+        ),
+    },
+    {
+        "code": "us_wa_public_3976",
+        "jurisdiction": "Washington, United States (public)",
+        "country_code": "US",
+        "statute": "Washington interest on unpaid public contracts, RCW 39.76, and RCW 39.04.250",
+        "statute_reference": (
+            "RCW 39.76.011(1) and (2)(a)-(d) and RCW 39.04.250(1); "
+            "https://app.leg.wa.gov/RCW/default.aspx?cite=39.76.011 and "
+            "https://app.leg.wa.gov/RCW/default.aspx?cite=39.04.250"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 8,
+        "payment_notice_day_basis": "business",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "RCW 39.76.011(1)",
+        "notes": (
+            "The clock for a payment owed by any Washington public body - a state agency, county, city, town, "
+            "school district or other - on a public works contract. Payment is timely if it is made on the date "
+            "the contract specifies but not later than thirty days of receipt of a properly completed invoice "
+            "or receipt of the goods or services, whichever is later (RCW 39.76.011(2)(a)), so enter the later "
+            "of the two as the application date. Where the contract is funded by grant or federal money the "
+            "thirty calendar days run instead from the later of a compliant payment request and the day the "
+            "public body actually receives that money. The eight days recorded as the payment notice deadline "
+            "are working days: when the public body withholds any part of a payment on a public works contract "
+            "it must say so in writing within eight working days of the request, stating why and what the "
+            "contractor has to do (§ 2(b)); Washington holidays are not shipped, so supply them. A notice that "
+            "lacks those contents makes interest run from the ninth working day (§ 2(c)), and a withheld amount "
+            "is due thirty calendar days after the remedial work is done (§ 2(d)); neither is computed, and "
+            "missing the notice does not make the applied sum payable, so the no-notice effect is none. "
+            "Interest is one percent a month, at least one dollar a month (§ 1), written here as the 12 percent "
+            "a year it comes to; a claim disputed in good faith, with notice given before the payment date as "
+            "RCW 39.76.020 requires, carries none. Downstream, "
+            "the contractor must pay a subcontractor not later than ten days after receiving payment for its "
+            "work, and may hold back no more than 150 percent of an amount disputed in good faith (RCW "
+            "39.04.250); that second clock is not computed. These sections apply to public works contracts "
+            "entered into on or after 1 September 1992 and were read on app.leg.wa.gov. Washington has no "
+            "statute setting an owner's payment period on private work, so no private regime is shipped."
+        ),
+    },
+    {
+        "code": "us_pa_public_3932",
+        "jurisdiction": "Pennsylvania, United States (public)",
+        "country_code": "US",
+        "statute": "Pennsylvania Commonwealth Procurement Code, 62 Pa.C.S. Chapter 39 Subchapter D (prompt payment)",
+        "statute_reference": (
+            "62 Pa.C.S. §§ 3902, 3921(a), 3932(b)-(d), 3933(c) and 3934(b); "
+            "https://www.legis.state.pa.us/WU01/LI/LI/CT/HTM/62/62.HTM"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 15,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 45,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the Secretary of Revenue for overdue taxes under sections 806 and 806.1 of The Fiscal Code"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "62 Pa.C.S. § 3932(c)",
+        "notes": (
+            "The clock for a progress payment owed by a Pennsylvania government agency - a Commonwealth agency, "
+            "a political subdivision or a local authority - on a construction contract over $50,000 let by "
+            "competitive sealed bidding or proposals; Department of Transportation contracts are excluded "
+            "(§§ 3901 and 3902). The agency must pay strictly in accordance with the contract (§ 3932(a)), and "
+            "the 45 calendar days from receipt of the application written here apply only where the contract "
+            "has no term governing the time for payment (§ 3932(b)); where it has one, state the final date for "
+            "payment on the application. Enter the date the application was received as the application date. "
+            "The fifteen days recorded as the payment notice deadline are the agency's: it must tell the "
+            "contractor of a deficiency item within the period the contract sets or 15 calendar days of "
+            "receiving the application (§ 3934(b)); the section attaches no consequence for the sum to a late "
+            "notice, so the no-notice effect is none. Interest runs at the rate the Secretary of Revenue sets "
+            "for overdue taxes (§ 3932(c)), but where the contract has no grace period none is owed if payment "
+            "is made on or before the 15th calendar day after the payment date (§ 3932(d)), so the overdue "
+            "warning from the final date runs ahead of any interest actually due. Downstream, the contractor "
+            "must pay each subcontractor 14 days after receiving a progress payment (§ 3933(c)); that second "
+            "clock is not computed. Retainage may not exceed 10 percent until the contract is half complete, "
+            "when half of it is returned, and 5 percent after that (§ 3921(a)). The official page refused the "
+            "request, so the Legislative Reference Bureau text was read from the Internet Archive's capture of "
+            "12 February 2026."
+        ),
+    },
+    {
+        "code": "us_pa_private_caspa",
+        "jurisdiction": "Pennsylvania, United States (private)",
+        "country_code": "US",
+        "statute": "Pennsylvania Contractor and Subcontractor Payment Act, Act of 17 February 1994, P.L. 73, No. 7",
+        "statute_reference": (
+            "sections 3(a), 5(c)-(d), 6(b), 7(c) and 9(a) of Act 1994-7 as amended by Act 2018-27; "
+            "https://www.legis.state.pa.us/WU01/LI/LI/US/PDF/1994/0/0007..PDF"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 14,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 20,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "Contractor and Subcontractor Payment Act, section 5(d)",
+        "notes": (
+            "The clock for private construction in Pennsylvania; the Act does not apply to a project of six or "
+            "fewer residential units under construction at the same time (§ 3(a)) and may not be waived by "
+            "contract except where it says so (§ 3(c)). Except as the parties otherwise agree, an interim or "
+            "final invoice is due from the owner 20 days after the end of the billing period or 20 days after "
+            "delivery of the invoice, whichever is later (§ 5(c)), so enter the later of the two as the "
+            "application date and state the final date for payment on the application where the contract "
+            "sets its own. The fourteen days recorded as the payment notice deadline are the owner's window "
+            "to give a written explanation of a deficiency it withholds for, counted in calendar days from "
+            "receipt of the invoice (§ 6(b)(1)); failing to do so waives the basis to withhold and requires "
+            "payment of the invoice in full (§ 6(b)(2)), which is why the no-notice effect is that the applied "
+            "sum becomes payable. Interest is 1 percent a month, but only from the eighth day where the payment "
+            "is not made within seven days of the due date (§ 5(d)), so the overdue warning from the final date "
+            "runs a week ahead of the interest; it is written here as the 12 percent a year it comes to. A "
+            "separate penalty of 1 percent a month on an amount wrongfully withheld (§ 12) is not computed. "
+            "Downstream, the contractor must pay its subcontractor 14 days after receiving each progress or "
+            "final payment or 14 days after receiving the subcontractor's invoice, whichever is later "
+            "(§ 7(c)); that second clock is not computed. Retainage has no percentage cap in the Act and must "
+            "be paid within 30 days after final acceptance of the work (§ 9(a)). The official page refused the "
+            "request, so the Legislative Reference Bureau's compiled text was read from the Internet Archive's "
+            "capture of 19 February 2024, which shows the amendments of 12 June 2018 (P.L. 131, No. 27); an "
+            "amendment after that capture has not been checked."
+        ),
+    },
+    # Massachusetts writes both public periods into the same sentence - fifteen
+    # days, thirty in the case of the commonwealth - so a local awarding
+    # authority and the commonwealth get one row each, the same split the
+    # Chinese regulation's two payers take.
+    {
+        "code": "us_ma_public_local_39k",
+        "jurisdiction": "Massachusetts, United States (public, local)",
+        "country_code": "US",
+        "statute": "Massachusetts General Laws chapter 30 §§ 39K and 39G (periodic payments on public construction)",
+        "statute_reference": (
+            "M.G.L. c. 30 §§ 39F(1)(a), 39G and 39K; "
+            "https://malegislature.gov/Laws/GeneralLaws/PartI/TitleIII/Chapter30/Section39K and "
+            "https://malegislature.gov/Laws/GeneralLaws/PartI/TitleIII/Chapter30/Section39G"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 15,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Federal Reserve Bank of Boston rediscount rate",
+        "interest_margin_percent": Decimal("3.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "M.G.L. c. 30 § 39K and § 39G",
+        "notes": (
+            "The clock for a periodic payment owed by a Massachusetts county, city, town, district, board, "
+            "commission or other local public body: on a public building contract over two thousand dollars "
+            "under § 39K, and on public ways, bridges, sewers, water mains, airports and other public works "
+            "under § 39G, which sets the same period. The awarding authority must pay within fifteen days after "
+            "receiving the contractor's periodic estimate for the preceding month, so enter the date the "
+            "estimate was received at the place the authority designated as the application date; the "
+            "commonwealth has thirty days and has its own row. Neither section sets a deadline for disputing an "
+            "estimate - the authority deducts its own retention for claims against the contractor - so there is "
+            "no payment notice and silence has no consequence. Daily interest is added at three percentage "
+            "points above the rediscount rate charged by the Federal Reserve Bank of Boston from the first day "
+            "after the payment is due. The authority may keep a retention of no more than five percent of the "
+            "approved amount of a periodic payment, and under § 39K owes the final payment within sixty-five "
+            "days after completion. Downstream, § 39F makes the general contractor pay each subcontractor "
+            "forthwith after it is paid on a periodic estimate, which is not a number of days, so there is no "
+            "second clock to compute. The official pages refused the request, so the text was read from the "
+            "Internet Archive's captures of malegislature.gov (§ 39K of 30 March 2025, § 39G of 25 April 2025), "
+            "which print no amendment history."
+        ),
+    },
+    {
+        "code": "us_ma_public_state_39k",
+        "jurisdiction": "Massachusetts, United States (public, commonwealth)",
+        "country_code": "US",
+        "statute": "Massachusetts General Laws chapter 30 §§ 39K and 39G (periodic payments on public construction)",
+        "statute_reference": (
+            "M.G.L. c. 30 §§ 39F(1)(a), 39G and 39K; "
+            "https://malegislature.gov/Laws/GeneralLaws/PartI/TitleIII/Chapter30/Section39K and "
+            "https://malegislature.gov/Laws/GeneralLaws/PartI/TitleIII/Chapter30/Section39G"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "due_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Federal Reserve Bank of Boston rediscount rate",
+        "interest_margin_percent": Decimal("3.000"),
+        "interest_fixed_percent": None,
+        "interest_statute": "M.G.L. c. 30 § 39K and § 39G",
+        "notes": (
+            "The clock for a periodic payment owed by the Commonwealth of Massachusetts, which § 39K extends to "
+            "local housing authorities, on a public building contract over five thousand dollars, or on public "
+            "ways, bridges, sewers, water mains, airports and other public works under § 39G. The awarding "
+            "authority must pay within thirty days after receiving the contractor's periodic estimate for the "
+            "preceding month, against fifteen for a local body, so enter the date the estimate was received as "
+            "the application date. Everything else is as for us_ma_public_local_39k: no deadline for disputing "
+            "an estimate and so no payment notice, daily interest at three percentage points above the Federal "
+            "Reserve Bank of Boston rediscount rate from the first day after the payment is due, a retention of "
+            "no more than five percent of each approved periodic payment, and a subcontractor paid forthwith "
+            "under § 39F rather than within a number of days. Read from the same Internet Archive captures of "
+            "malegislature.gov."
+        ),
+    },
+    {
+        "code": "us_ma_private_29e",
+        "jurisdiction": "Massachusetts, United States (private)",
+        "country_code": "US",
+        "statute": "Massachusetts General Laws chapter 149 § 29E (prompt payment on private construction)",
+        "statute_reference": (
+            "M.G.L. c. 149 § 29E(a), (c) and (e); "
+            "https://malegislature.gov/Laws/GeneralLaws/PartI/TitleXXI/Chapter149/Section29E"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 15,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 60,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The clock for a private project in Massachusetts on which a lien may be established under chapter "
+            "254 and the prime contract's original price is $3,000,000 or more; projects of one to four "
+            "dwelling units are excluded (§ 29E(a)). The section does not set the periods directly: it makes "
+            "every such contract provide reasonable ones and caps them at 15 days after submission to approve "
+            "or reject a periodic progress payment application and 45 days after approval to pay it (§ 29E(c)). "
+            "Enter the date the application was submitted as the application date; the sixty days written here "
+            "are the two caps end to end, and where the contract sets shorter periods or the owner approved "
+            "sooner, state the final date for payment on the application. The fifteen-day approval window is "
+            "recorded as the payment notice deadline; a rejection must be in writing, give the factual and "
+            "contractual basis and be certified as made in good faith. An application neither approved nor "
+            "rejected in time is deemed approved unless it is rejected before the date payment is due, so a "
+            "rejection stays possible after the fifteen days and silence does not settle the sum; the no-notice "
+            "effect is therefore none. Each tier below the owner may take 7 more days to approve than the tier "
+            "above it, and a clause making payment conditional on the payer being paid is unenforceable except "
+            "in the cases § 29E(e) lists. The section names no interest rate, so the contract rate applies. "
+            "The official page refused the request, so the text was read from the Internet Archive's capture "
+            "of malegislature.gov of 15 May 2026, word for word the same as its capture of June 2024."
+        ),
+    },
+    {
+        "code": "us_az_public_34221",
+        "jurisdiction": "Arizona, United States (public)",
+        "country_code": "US",
+        "statute": "Arizona public works progress payments, A.R.S. § 34-221 and § 41-2577",
+        "statute_reference": (
+            "A.R.S. § 34-221(C), (G) and (J) and § 41-2577(A), (B) and (E); "
+            "https://www.azleg.gov/ars/34/00221.htm and https://www.azleg.gov/ars/41/02577.htm"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 7,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 21,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("12.000"),
+        "interest_statute": "A.R.S. § 34-221(J) and § 41-2577(E)",
+        "notes": (
+            "The clock for a progress payment on Arizona public work: § 34-221 binds counties, cities, towns "
+            "and the districts § 34-101 lists, and § 41-2577 the state under its procurement code, in the same "
+            "terms. An estimate of the work is deemed approved and certified for payment seven days after it "
+            "is submitted unless the owner first issues a specific written finding of the items it does not "
+            "approve, and a certified estimate must be paid within fourteen days, so enter the date the "
+            "estimate was submitted to the person the owner designated as the application date. That written "
+            "finding is recorded as the payment notice, and because an estimate nobody answered in time is "
+            "deemed certified, the no-notice effect is that the applied sum becomes payable. The twenty-one "
+            "days written here are the two periods end to end, the latest date the sections allow; where the "
+            "estimate was certified sooner, payment falls due fourteen days after that, so state the final date "
+            "for payment on the application. Interest is one percent a month or fraction of a month on the "
+            "unpaid balance, written here as the 12 percent a year it comes to. Downstream, the contractor must "
+            "pay each subcontractor within seven days after receiving a progress payment unless they agreed "
+            "otherwise in writing, with interest at one percent a month from the eighth day (§ 34-221(G) and "
+            "(K), § 41-2577(B) and (F)); that second clock is not computed. The owner retains ten percent of "
+            "each estimate, and once the contract is half complete no more than five percent of later payments "
+            "while progress is satisfactory (§ 34-221(C), § 41-2576). School districts are not in the § 34-101 "
+            "list and were not researched. Read on azleg.gov."
+        ),
+    },
+    {
+        "code": "us_az_private_1182",
+        "jurisdiction": "Arizona, United States (private)",
+        "country_code": "US",
+        "statute": "Arizona prompt payment on private construction, A.R.S. §§ 32-1181 to 32-1188",
+        "statute_reference": (
+            "A.R.S. §§ 32-1182(A), (D) and (Q), 32-1183(B) and 32-1187; "
+            "https://www.azleg.gov/ars/32/01182.htm and https://www.azleg.gov/ars/32/01183.htm"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 14,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 21,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "fixed_rate",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": Decimal("18.000"),
+        "interest_statute": "A.R.S. § 32-1182(Q)",
+        "notes": (
+            "The clock for private construction in Arizona; the payment sections do not apply to the state or "
+            "its political subdivisions (§ 32-1187). A billing or estimate is deemed certified and approved "
+            "fourteen days after the owner receives it unless the owner first issues a written statement of its "
+            "reasons for not certifying all or part of it, and the owner must pay within seven days after the "
+            "certification (§ 32-1182(A) and (D)), so enter the date the owner received the billing as the "
+            "application date. That written statement is recorded as the payment notice, and because a billing "
+            "nobody answered in time is deemed certified, the no-notice effect is that the applied sum becomes "
+            "payable. The twenty-one days written here are the two periods end to end, the latest date the "
+            "section allows; where the billing was certified sooner, payment falls due seven days after that. "
+            "An owner may lengthen either period only through a clear and conspicuous contract term matched by a "
+            "notice legend on every page of the plans (§ 32-1182(C) and (F)), and an owner-occupied dwelling is "
+            "excluded unless the billing carries the legend § 32-1188 sets, so state the final date for payment "
+            "on the application in either case. Interest is one and "
+            "one-half percent a month or fraction of a month on the unpaid balance, or a higher agreed rate "
+            "(§ 32-1182(Q)), written here as the 18 percent a year it comes to. Downstream, the contractor must "
+            "pay each subcontractor within seven days of receiving each progress payment, retention release or "
+            "final payment (§ 32-1183(B)), with interest at the same rate from the eighth day; that second "
+            "clock is not computed. The section allows only a reasonable amount for retention and sets no "
+            "percentage. Read on azleg.gov."
+        ),
+    },
+    # Virginia's Public Procurement Act gives state agencies thirty days and
+    # local governments forty-five in the same definition, with different notice
+    # and interest rules, so the public side is two rows.
+    {
+        "code": "us_va_public_state_4347",
+        "jurisdiction": "Virginia, United States (public, state agencies)",
+        "country_code": "US",
+        "statute": "Virginia Public Procurement Act, Article 4 (prompt payment by state agencies)",
+        "statute_reference": (
+            "Code of Virginia §§ 2.2-4347, 2.2-4350, 2.2-4351, 2.2-4354 and 2.2-4355; "
+            "https://law.lis.virginia.gov/vacode/title2.2/chapter43/section2.2-4347/ and "
+            "https://law.lis.virginia.gov/vacode/title2.2/chapter43/section2.2-4355/"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 15,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 30,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the statute as the Wall Street Journal prime rate (the lower of a split rate), capped under § 58.1-1812"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "Code of Virginia § 2.2-4355",
+        "notes": (
+            "The clock for a payment owed by a Virginia state agency, construction included. The payment date "
+            "is the one the contract sets or, where it sets none, 30 days after the agency receives a proper "
+            "invoice or the goods or services, whichever is later (§ 2.2-4347), so enter the later of the two "
+            "as the application date and state the final date for payment on the application where the "
+            "contract fixes one. The fifteen days recorded as the payment notice deadline are the agency's: it "
+            "must notify the contractor of any defect or impropriety that would prevent payment within fifteen "
+            "days after receiving the invoice or the work (§ 2.2-4351), and the section attaches no consequence "
+            "for the sum to a late notice. Interest accrues only on amounts still unpaid seven days after the "
+            "payment date (§ 2.2-4355(A)), so the overdue warning from the final date runs a week ahead of it; "
+            "the rate is the prime rate The Wall Street Journal reports, the lower one where a split rate is "
+            "published, and never more than the rate set under § 58.1-1812, a cap that was not read and is not "
+            "encoded. A contract may provide a different rate, and no interest runs on the part of a payment "
+            "held up by a genuine disagreement. Downstream, within seven days of being paid the contractor "
+            "must either pay the subcontractor its share or notify the agency and the subcontractor in writing "
+            "of what it withholds and why, with interest at one percent a month on late amounts, and it must "
+            "pay a subcontractor within 60 days of a proper invoice even if it has not been paid itself, giving "
+            "notice by the 50th day of anything it withholds (§ 2.2-4354); that second clock is not computed. "
+            "Read on law.lis.virginia.gov; §§ 2.2-4347 and 2.2-4354 were last amended in 2023 (chapters 675 "
+            "and 676)."
+        ),
+    },
+    {
+        "code": "us_va_public_local_4352",
+        "jurisdiction": "Virginia, United States (public, local government)",
+        "country_code": "US",
+        "statute": "Virginia Public Procurement Act, Article 4 (prompt payment by local governments)",
+        "statute_reference": (
+            "Code of Virginia §§ 2.2-4347, 2.2-4352 and 2.2-4354; "
+            "https://law.lis.virginia.gov/vacode/title2.2/chapter43/section2.2-4352/"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 20,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 45,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "Code of Virginia § 2.2-4352",
+        "notes": (
+            "The clock for a payment owed by a Virginia local government, construction included. The payment "
+            "date is the one the contract sets or, where it sets none, not more than forty-five days after the "
+            "goods or services are received or after the invoice is rendered, whichever is later (§ 2.2-4352; "
+            "§ 2.2-4347 says 45 days after the local government receives the invoice), so enter the later of "
+            "the two as the application date. The twenty days recorded as the payment notice deadline are the "
+            "local government's: within twenty days after receiving the invoice or the work it must notify the "
+            "contractor of any defect or impropriety that would prevent payment by the payment date, and the "
+            "section attaches no consequence for the sum to a late notice. The section sets no interest rate of "
+            "its own: a local government that pays late must pay the finance charges the contractor assesses, "
+            "unless the contract provides otherwise, and those charges may not exceed one percent a month. That "
+            "is a ceiling on the contractor's own charge rather than a statutory rate, so the interest basis "
+            "is contract. Downstream, the contractor-to-subcontractor rules of § 2.2-4354 are the same as for a "
+            "state agency (see us_va_public_state_4347) and are not computed. Read on law.lis.virginia.gov."
+        ),
+    },
+    {
+        "code": "us_va_private_1146",
+        "jurisdiction": "Virginia, United States (private)",
+        "country_code": "US",
+        "statute": "Code of Virginia § 11-4.6 (required payment provisions in private construction contracts)",
+        "statute_reference": (
+            "Code of Virginia § 11-4.6(A) and (B)(1)-(2); "
+            "https://law.lis.virginia.gov/vacode/title11/chapter1/section11-4.6/"
+        ),
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 45,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 60,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "prescribed_rate",
+        "interest_reference_rate": (
+            "the statute as the Wall Street Journal prime rate (the lower of a split rate), capped under § 58.1-1812"
+        ),
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "Code of Virginia § 11-4.6(B)(1), applying § 2.2-4355",
+        "notes": (
+            "The clock for private construction in Virginia, where the owner is anyone other than a public "
+            "body. A construction contract between an owner and a general contractor must include a provision "
+            "requiring the owner to pay within 60 days of receiving an invoice following satisfactory "
+            "completion of the work invoiced (§ 11-4.6(B)(1)), so enter the date the owner received that "
+            "invoice as the application date. The forty-five days recorded as the payment notice deadline are "
+            "the owner's: to withhold any of it, the owner must notify the general contractor in writing within "
+            "45 days of receiving the invoice, naming the contractual noncompliance and the amount withheld. "
+            "The section attaches no consequence for the sum to a missed notice, so the no-notice effect is "
+            "none. Where the owner and general contractor leave the provision out, subdivision (B)(1) does not "
+            "say whether it applies anyway, while (B)(2) deems its own terms included in the contract. Late "
+            "payment carries interest penalties consistent with § 2.2-4355, the prime-rate rule of the "
+            "state-agency row, whose cap under § 58.1-1812 was not read and is not encoded. Downstream, the "
+            "general contractor must pay a subcontractor within the earlier of 60 days of the subcontractor's "
+            "invoice and seven days after receiving the owner's payment for that work, must give notice by the "
+            "50th day of anything it withholds, and may not make the owner's payment a condition of paying the "
+            "subcontractor unless the owner is insolvent (§ 11-4.6(B)(2)); on projects over $500,000 other than "
+            "single-family work the same terms must flow down every tier. That second clock is not computed. "
+            "The section does not affect retainage provisions. Read on law.lis.virginia.gov; its history runs "
+            "from 2020 (chapter 1038) to 2026 (chapter 1040), and the 2026 chapter added subsection C on "
+            "subcontractor wage liability for contracts entered into on or after 1 July 2026 without changing "
+            "any payment period."
         ),
     },
     {
@@ -794,6 +1752,133 @@ PAYMENT_REGIMES: tuple[dict[str, Any], ...] = (
             "written here as contract, the nearest of the four, but that undersells the fact that a real "
             "statutory number applies when the contract says nothing; there is no fifth basis to name it "
             "precisely without widening the vocabulary."
+        ),
+    },
+    # The four Canadian regimes below are split by jurisdiction because each
+    # province and the federal government enacted its own prompt payment or
+    # lien statute with its own clock. Ontario's Construction Act was the
+    # first to bring a statutory payment period; the federal act followed in
+    # 2019, Alberta in 2020, and British Columbia's Builders Lien Act has its
+    # own certificate-based period. A regime in this table is one clock, which
+    # is why each jurisdiction is a separate entry rather than a single
+    # "Canada" row with footnotes a calculation cannot read.
+    {
+        "code": "ca_fed_prompt_payment",
+        "jurisdiction": "Canada (federal)",
+        "country_code": "CA",
+        "statute": "Federal Prompt Payment for Construction Work Act, S.C. 2019, c. 29, s. 387",
+        "statute_reference": "sections 4, 6 and 10",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 28,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "reference_rate_plus_margin",
+        "interest_reference_rate": "Bank of Canada overnight rate",
+        "interest_margin_percent": Decimal("1.500"),
+        "interest_fixed_percent": None,
+        "interest_statute": "Federal Prompt Payment for Construction Work Act, section 10",
+        "notes": (
+            "The clock for a payment owed by the Crown on federal construction work. The Act requires "
+            "payment of a proper invoice within 28 calendar days of receipt, so enter the date the Crown "
+            "received the proper invoice as the application date; following the convention used for the "
+            "other single-date regimes, the application date is taken as the due date and the 28-day limit "
+            "as the final date for payment. A proper invoice is defined in section 4 and must meet the "
+            "requirements the contract specifies, including being in a form acceptable to the contracting "
+            "authority. There is no statutory payment notice or pay-less notice in the Act, so silence has "
+            "no preclusive effect. Interest on late payment runs at the Bank of Canada overnight rate plus "
+            "one and a half percent, which is the reference_rate_plus_margin shape. The Act also creates "
+            "a downstream clock: a contractor paid by the Crown must pay its subcontractor within 28 days "
+            "of the subcontractor's proper invoice, and the same pass-through applies down the chain; this "
+            "regime does not compute those downstream clocks. The Act applies to contracts entered into on "
+            "or after the day the prompt payment provisions came into force, and only to federal real "
+            "property and federal immovables as defined in the Federal Real Property and Federal "
+            "Immovables Act."
+        ),
+    },
+    {
+        "code": "ca_ab_prompt_payment",
+        "jurisdiction": "Alberta, Canada",
+        "country_code": "CA",
+        "statute": "Prompt Payment and Construction Lien Improvement Act, S.A. 2020, c. P-26.4",
+        "statute_reference": "sections 32.1, 32.2 and 32.3 of the Builders' Lien Act as amended",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": 14,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 28,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "applied_sum_becomes_notified_sum",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The clock for a payment on construction work in Alberta, introduced by the Prompt Payment "
+            "and Construction Lien Improvement Act 2020, which amended the Builders' Lien Act to add a "
+            "prompt payment Part. The owner must pay a proper invoice within 28 calendar days of receipt, "
+            "so enter the date the owner received the proper invoice as the application date. A notice of "
+            "non-payment, stating the amount disputed and the reasons, must be served within 14 days; "
+            "missing that window and the invoiced amount must be paid in full, which is why the no-notice "
+            "effect is applied_sum_becomes_notified_sum, the same shape as Ontario's Construction Act. The "
+            "contractor must then pay each subcontractor within 7 days of receiving payment from the owner, "
+            "a downstream clock this regime does not compute. The Act does not prescribe a statutory "
+            "interest rate for late payment on its own terms, so the interest basis is contract; where the "
+            "contract is silent the common-law rules on pre-judgment interest apply. These provisions apply "
+            "to contracts entered into on or after the date the prompt payment provisions came into force."
+        ),
+    },
+    {
+        "code": "ca_bc_builders_lien",
+        "jurisdiction": "British Columbia, Canada",
+        "country_code": "CA",
+        "statute": "Builders Lien Act, S.B.C. 1997, c. 45",
+        "statute_reference": "sections 5 and 9",
+        "due_date_basis": "application_date",
+        "due_date_days": 0,
+        "due_date_day_basis": "calendar",
+        "payment_notice_basis": "application_date",
+        "payment_notice_days": None,
+        "payment_notice_day_basis": "calendar",
+        "final_date_basis": "application_date",
+        "final_date_days": 55,
+        "final_date_day_basis": "calendar",
+        "pay_less_days": None,
+        "pay_less_day_basis": "calendar",
+        "no_notice_effect": "none",
+        "interest_basis": "contract",
+        "interest_reference_rate": "",
+        "interest_margin_percent": None,
+        "interest_fixed_percent": None,
+        "interest_statute": "",
+        "notes": (
+            "The clock derived from the lien period in British Columbia's Builders Lien Act. Unlike "
+            "Ontario and Alberta, British Columbia does not have a standalone prompt payment statute with "
+            "a fixed invoice-to-payment period; the relevant statutory deadline is the 55-day window from "
+            "the issuance of a certificate of completion within which a subcontractor or supplier must "
+            "file a lien, and which also serves as the outer boundary for payment. Enter the date the "
+            "certificate of completion was issued as the application date; the 55 calendar days is written "
+            "here as the final date for payment, following the convention used for the other single-date "
+            "regimes. There is no statutory payment notice or pay-less notice in the Act, so silence has "
+            "no preclusive effect. The Act does not prescribe a statutory interest rate for late payment, "
+            "so the interest basis is contract; where the contract is silent the Court Order Interest Act "
+            "pre-judgment rate applies. British Columbia has had discussions about introducing prompt "
+            "payment legislation closer to the Ontario model, but as of the date this entry was written "
+            "no such statute is in force, and this lien-period-based clock is the nearest statutory "
+            "deadline the province provides."
         ),
     },
     {

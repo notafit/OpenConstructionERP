@@ -117,6 +117,203 @@ PACK_CONFIG: dict[str, Any] = {
             "balance_to_finish",
         ],
     },
+    # ── Progress billing ─────────────────────────────────────────────────────
+    # Read through ``app.core.regional_packs.resolve_progress_billing``, keyed by
+    # ISO country so a figure can only ever answer for the country it names.
+    # Every number sits under a dict that says where it came from: a
+    # ``statute_reference`` where a clause states it, ``source`` where it is
+    # practice or our own convention, and ``effective_date`` always present
+    # (``None`` = commencement not established, as in the state packs).
+    # Contract-form clauses are cited by document and clause; the form numbers
+    # of the payment and close-out forms stay out (see payment_application).
+    "progress_billing": {
+        "US": {
+            "retention_policy": {
+                "tiers": [
+                    {"from_percent_complete": "0", "rate": "10"},
+                    {"from_percent_complete": "50", "rate": "5"},
+                ],
+                "tier_mode": "prospective",
+                "stored_materials_rate": None,
+                "cap": None,
+                "source": "industry_practice",
+                "statute_reference": "AIA A101-2017 § 5.1.7.1 and § 5.1.7.2",
+                "effective_date": None,
+                "note": (
+                    "The standard agreement leaves both the retainage figure and any reduction blank for the "
+                    "parties to fill in, and says the amount may be limited by governing law. Ten percent "
+                    "stepping down to five at half complete is the common pattern, not a national rule; some "
+                    "states write the same split into statute for private work. Prospective mode keeps the "
+                    "new rate for work done after the threshold, and a contract may choose recompute instead. "
+                    "No separate stored-materials rate or national cap is suggested: the agreement takes one "
+                    "retainage figure from each application, and caps are state law carried by the state packs."
+                ),
+            },
+            "release_events": {
+                "events": [
+                    {
+                        "event": "substantial_completion",
+                        "release_percent_of_held": "100",
+                        "open_items_withholding": {
+                            "multiplier": "1.5",
+                            "source": "industry_practice",
+                            "effective_date": None,
+                            "note": (
+                                "The general conditions only say the payment is adjusted for incomplete work. "
+                                "Holding back one and a half times the estimated cost of the open items is the "
+                                "common measure and appears in several state prompt payment statutes; other "
+                                "contracts write a different multiple."
+                            ),
+                        },
+                        "required_documents": ["certificate_substantial_completion"],
+                        "required_documents_when_bonded": ["consent_of_surety"],
+                        "statute_reference": "AIA A201-2017 § 9.8.5",
+                        "effective_date": "2017",
+                    },
+                    {
+                        "event": "final_completion",
+                        "release_percent_of_held": "100",
+                        "required_documents": ["affidavit_payment_of_debts"],
+                        "required_documents_when_bonded": ["consent_of_surety"],
+                        "documents_owner_may_require": ["affidavit_release_of_liens", "final_lien_waiver"],
+                        "statute_reference": "AIA A201-2017 § 9.10.2",
+                        "effective_date": "2017",
+                        "note": (
+                            "The affidavit that payrolls, material bills and other indebtedness are paid and "
+                            "the surety's consent to final payment are conditions of the remaining retainage. "
+                            "Releases and waivers of liens are a condition only where the owner requires them, "
+                            "which most owners do."
+                        ),
+                    },
+                    {
+                        "event": "rate_step_down",
+                        "release_percent_of_held": None,
+                        "required_documents": [],
+                        "required_documents_when_bonded": ["consent_of_surety"],
+                        "statute_reference": "AIA A101-2017 § 5.1.7.2 and its published instructions",
+                        "effective_date": "2017",
+                        "note": (
+                            "A reduction of retainage before substantial completion needs the surety's consent "
+                            "where the contractor furnished a bond. The amount released is whatever the "
+                            "recompute leaves above the new rate, so no percentage is set here."
+                        ),
+                    },
+                ],
+            },
+            "stored_materials": {
+                "billable": True,
+                "requirements_by_location_kind": {
+                    "on_site": {
+                        "any_of": [["delivery_ticket", "invoice"]],
+                        "source": "industry_practice",
+                        "statute_reference": "AIA A201-2017 § 9.3.2",
+                        "effective_date": "2017",
+                        "note": (
+                            "Materials delivered and suitably stored at the site are billable, conditioned on "
+                            "procedures satisfactory to the owner to establish its title or otherwise protect "
+                            "its interest; a delivery ticket and the invoice are the usual proof."
+                        ),
+                    },
+                    "off_site": {
+                        "any_of": [["owner_approved_offsite", "bill_of_sale", "insurance"]],
+                        "statute_reference": "AIA A201-2017 § 9.3.2",
+                        "effective_date": "2017",
+                        "note": (
+                            "Off-site storage is billable only if the owner approved it in advance, at a "
+                            "location agreed in writing, with the owner's title established and the goods "
+                            "insured."
+                        ),
+                    },
+                    "bonded_warehouse": {
+                        "any_of": [["owner_approved_offsite", "bill_of_sale", "insurance"]],
+                        "statute_reference": "AIA A201-2017 § 9.3.2",
+                        "effective_date": "2017",
+                    },
+                    "supplier_premises": {
+                        "any_of": [["owner_approved_offsite", "bill_of_sale", "insurance"]],
+                        "statute_reference": "AIA A201-2017 § 9.3.2",
+                        "effective_date": "2017",
+                    },
+                },
+                "statute_reference": "AIA A201-2017 § 9.3.2",
+                "effective_date": "2017",
+            },
+            "sub_payment_requirements": {
+                # Summary the subcontractor rollup reads; ``requirements`` below
+                # is the detail, and a test holds the two to the same names.
+                "certificate_types": ["insurance", "license"],
+                "lien_waiver_required": True,
+                "source": "industry_practice",
+                "statute_reference": "AIA A201-2017 § 9.3.1",
+                "effective_date": "2017",
+                "requirements": [
+                    {
+                        "code": "insurance_certificate",
+                        "evidence": "certificate",
+                        "cert_type": "insurance",
+                        "valid_at": "period_end",
+                        "effect_if_missing": "hold_payment",
+                        "source": "industry_practice",
+                        "effective_date": None,
+                    },
+                    {
+                        "code": "contractor_license",
+                        "evidence": "certificate",
+                        "cert_type": "license",
+                        "valid_at": "period_end",
+                        "effect_if_missing": "hold_payment",
+                        "source": "state_law",
+                        "effective_date": None,
+                        "note": "Licensing is set state by state; the state packs carry the licensing duties.",
+                    },
+                    {
+                        "code": "lien_waiver",
+                        "evidence": "lien_waiver",
+                        "waiver_types": {
+                            "current_period": "conditional_partial",
+                            "prior_paid_periods": "unconditional_partial",
+                            "final": ["conditional_final", "unconditional_final"],
+                        },
+                        "effect_if_missing": "hold_payment",
+                        "source": "industry_practice",
+                        "statute_reference": "AIA A201-2017 § 9.3.1",
+                        "effective_date": "2017",
+                        "note": (
+                            "The general conditions let the owner ask for releases and waivers of liens from "
+                            "subcontractors and suppliers as support for each application. A conditional "
+                            "waiver covers the payment now applied for and an unconditional one covers "
+                            "payments already received; several states prescribe the wording."
+                        ),
+                    },
+                ],
+            },
+            "billing_cycle": {
+                "frequency": "monthly",
+                "period_end": "month_end",
+                "statute_reference": "AIA A101-2017 § 5.1.2",
+                "effective_date": "2017",
+                "note": "One calendar month ending on the last day of the month, unless the parties write another period.",
+                "application_timing": {
+                    "submit_days_before_payment_date": "10",
+                    "architect_certifies_within_days": "7",
+                    "statute_reference": "AIA A201-2017 § 9.3.1 and § 9.4.1",
+                    "effective_date": "2017",
+                },
+                "payment_clock_regimes": {},
+                "payment_clock_note": (
+                    "No national payment period: the agreement leaves the payment date to the parties, and "
+                    "statutory prompt payment periods are state law seeded by the state packs."
+                ),
+            },
+            "change_line_code_format": {
+                "format": "{source_code}",
+                "placeholders": ["source_code"],
+                "source": "platform_convention",
+                "effective_date": None,
+                "note": "A change-order line carries the change order's own code, for example CO-005.",
+            },
+        },
+    },
     # ── Tax rules ────────────────────────────────────────────────────────────
     "tax_rules": [
         {

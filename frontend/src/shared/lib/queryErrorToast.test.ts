@@ -86,10 +86,17 @@ describe('notifyQueryError', () => {
   it('speaks again once the throttle window has passed', () => {
     notifyQueryError(new ApiError(500, 'Internal Server Error', undefined), EMPTY);
     skipThrottle();
+    // Flush the dismiss timer so the first toast leaves the store. Without
+    // this the store deduplicates on type+title and merges the second toast
+    // into the still-visible first one, which is the right behaviour for a
+    // burst but hides the throttle reopening.
+    vi.advanceTimersByTime(60_000);
     notifyQueryError(new ApiError(500, 'Internal Server Error', undefined), EMPTY);
 
     // The throttle has to coalesce a burst, not mute the handler for good.
-    expect(toasts()).toHaveLength(2);
+    expect(toasts()).toHaveLength(1);
+    // And the history records both: one toast is not the same as one failure.
+    expect(useToastStore.getState().history).toHaveLength(2);
   });
 
   it('stays quiet when the query already has data on screen', () => {

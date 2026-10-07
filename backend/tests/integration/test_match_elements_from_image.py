@@ -230,8 +230,14 @@ async def test_from_image__jpeg_success(http_client, owner):
 async def test_from_image__file_too_large_returns_413(http_client, owner):
     project_id = await _seed_project(owner_id=owner["user_id"])
 
-    # Valid PNG header then padding to push past the 10 MB cap.
-    oversized = _PNG_BYTES + b"\x00" * (10 * 1024 * 1024 + 1)
+    # Valid PNG header, then padding to land exactly one byte over the cap the
+    # router actually enforces. Read the limit from the router instead of
+    # writing a number here: this test spelled its own "10 MB cap" and the
+    # endpoint has shipped 50 MB since the day it was written, so it uploaded a
+    # legal file and got the 201 it deserved.
+    from app.modules.match_elements.router import _MAX_IMAGE_BYTES
+
+    oversized = _PNG_BYTES + b"\x00" * (_MAX_IMAGE_BYTES + 1 - len(_PNG_BYTES))
     resp = await http_client.post(
         "/api/v1/match_elements/sessions/from-image",
         data={"project_id": str(project_id)},

@@ -28,6 +28,7 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import {
   CheckCircle2,
   XCircle,
@@ -172,6 +173,7 @@ export function ApprovalInstanceCard({
     queryFn: () => listInstances({ targetKind, targetId }),
     enabled: Boolean(targetKind && targetId),
     staleTime: 10_000,
+    refetchOnWindowFocus: true,
   });
 
   const instances = instancesQuery.data ?? [];
@@ -202,6 +204,21 @@ export function ApprovalInstanceCard({
     enabled: Boolean(targetKind && wantsRoutes),
     staleTime: 60_000,
   });
+
+  // OC-15: resolve user UUIDs to readable names. The same query key
+  // is shared with RouteEditor and RFIDetailPage, so the request fires
+  // once per page and comes from cache afterwards.
+  const canListUsers = useHasPermission('users.list');
+  const { data: userList = [] } = useQuery<{ id: string; email: string; full_name: string }[]>({
+    queryKey: ['users-search'],
+    queryFn: () => apiGet('/v1/users/?limit=100&is_active=true'),
+    staleTime: 60_000,
+    enabled: canListUsers,
+  });
+  const userMap = useMemo(
+    () => new Map(userList.map((u) => [u.id, u.full_name || u.email])),
+    [userList],
+  );
 
   const startMut = useMutation({
     mutationFn: (routeId: string) =>
@@ -438,6 +455,7 @@ export function ApprovalInstanceCard({
                 index={idx}
                 total={ladder.length}
                 currentUserId={currentUserId}
+                userMap={userMap}
                 comment={comments[rung.step.id] ?? ''}
                 onCommentChange={(value) =>
                   setComments((p) => ({ ...p, [rung.step.id]: value }))
@@ -506,6 +524,7 @@ export interface StepRowProps {
   index: number;
   total: number;
   currentUserId: string | null;
+  userMap: Map<string, string>;
   comment: string;
   onCommentChange: (value: string) => void;
   onDecide: (decision: StepDecision) => void;
@@ -517,6 +536,7 @@ export function StepRow({
   index,
   total,
   currentUserId,
+  userMap,
   comment,
   onCommentChange,
   onDecide,
@@ -550,7 +570,8 @@ export function StepRow({
 
   const approverLabel =
     step.approver_role ||
-    step.approver_user_id ||
+    (step.approver_user_id && userMap.get(step.approver_user_id)) ||
+    (step.approver_user_id ? step.approver_user_id.slice(0, 8) + '...' : null) ||
     t('approvalRoutes.approver_unassigned', { defaultValue: 'Unassigned' });
 
   return (

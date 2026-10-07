@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -46,8 +47,10 @@ from app.modules.boq.importers.excel import (
     SUPPORTED_HEADER_LANGUAGES,
     ExcelImporter,
     _build_column_aliases,
+    _label_key,
     _languages_missing_mandatory_columns,
     _match_column,
+    normalise_label,
 )
 from app.modules.boq.roundtrip import ID_COLUMN_ALIASES
 
@@ -175,8 +178,112 @@ _LANGUAGES_BEFORE_THE_SPLIT = frozenset({"en", "de", "es", "fr", "it", "pl", "ru
 # Polish named a description, a unit and a quantity column but no rate one,
 # so a Polish bill imported with every rate at zero; the completeness rule
 # below is what forced the gap shut.
+#
+# The rest came in when the router's own English and German header list was
+# folded into this table (the legacy and smart import paths used to read only
+# that list, so a bill headed in any other language was refused there), plus
+# the total column French and Italian never named and the "Sl. No." ordinal
+# of South Asian bills.
 _DELIBERATE_ADDITIONS_TO_THE_ORIGINAL_SEVEN: dict[str, frozenset[str]] = {
-    "unit_rate": frozenset({"cena jednostkowa", "cena jedn.", "cena"}),
+    "ordinal": frozenset({"#", "sl. no.", "s. no.", "sr. no.", "oz", "pos.-nr.", "lv-pos."}),
+    "description": frozenset(
+        {"item description", "description of item", "description of work", "bezeichnung", "kurztext"}
+    ),
+    "unit": frozenset({"uom", "unit of measure"}),
+    "quantity": frozenset({"qty."}),
+    "unit_rate": frozenset({"cena jednostkowa", "cena jedn.", "cena", "unit price", "unit cost", "price"}),
+    "total": frozenset(
+        {
+            "sum",
+            "total price",
+            "gp",
+            "montant",
+            "prix total",
+            "montant ht",
+            "total ht",
+            "importo",
+            "totale",
+            "importo totale",
+        }
+    ),
+    "classification": frozenset({"cost code", "cost group", "class"}),
+}
+
+# The second widening, when each market's bills were held to the header they
+# are really printed with: the Spanish presupuesto, the French DPGF, the
+# Italian computo metrico, the Polish kosztorys, the Russian smeta and the
+# English-language bill an Indian contractor prices against the DSR. Most
+# of all it names their code column, which the national code rules read and
+# which was dropped as an unknown column before.
+_MARKET_HEADER_ADDITIONS_TO_THE_ORIGINAL_SEVEN: dict[str, frozenset[str]] = {
+    "ordinal": frozenset(
+        {"n°", "n.", "n. ord.", "num. ord.", "n.ord.", "lp", "lp.", "№ п/п", "п/п", "№ пп"},
+    ),
+    "description": frozenset(
+        {
+            "resumen",
+            "concepto",
+            "designazione dei lavori",
+            "descrizione dei lavori",
+            "opis robót",
+            "opis robot",
+            "nazwa",
+            "наименование работ",
+            "наименование работ и затрат",
+        }
+    ),
+    "unit": frozenset(
+        {
+            "unidad de medida",
+            "u.m.",
+            "unità di misura",
+            "unita di misura",
+            "j.m.",
+            "jednostka miary",
+            "ед. изм.",
+            "единица измерения",
+        }
+    ),
+    "quantity": frozenset({"medición", "medicion", "qté", "qte", "q.tà", "q.ta", "qta", "кол."}),
+    "unit_rate": frozenset(
+        {
+            "precio unitario",
+            "precio unit.",
+            "p. unitario",
+            "prix unitaire",
+            "prix unitaire ht",
+            "pu",
+            "p.u.",
+            "pu ht",
+            "p.u. ht",
+            "prezzo unitario",
+            "prezzo unit.",
+        }
+    ),
+    "total": frozenset({"importe total", "wartość", "wartosc", "всего", "сметная стоимость"}),
+    "classification": frozenset(
+        {
+            "código",
+            "codigo",
+            "clave",
+            "tariffa",
+            "codice",
+            "codice tariffa",
+            "articolo",
+            "podstawa",
+            "podstawa wyceny",
+            "knr",
+            "обоснование",
+            "шифр",
+            "шифр расценки",
+            "код",
+            "item code",
+            "dsr code",
+            "dsr no.",
+            "dsr item no.",
+            "sor code",
+        }
+    ),
 }
 
 
@@ -199,7 +306,7 @@ def test_every_header_read_before_the_split_still_matches_through_the_matcher() 
             assert _match_column(f"  {header.upper()}  ") == canonical
 
 
-def test_the_original_seven_languages_gained_only_the_polish_rate_headers() -> None:
+def test_the_original_seven_languages_gained_only_the_named_headers() -> None:
     # A subset check alone would not notice a string quietly added to, say,
     # German. Rebuild the union of just the seven the table started with and
     # account for every difference.
@@ -211,7 +318,9 @@ def test_the_original_seven_languages_gained_only_the_polish_rate_headers() -> N
         }
     )
     for canonical, headers in _HEADERS_BEFORE_THE_SPLIT.items():
-        allowed = _DELIBERATE_ADDITIONS_TO_THE_ORIGINAL_SEVEN.get(canonical, frozenset())
+        allowed = _DELIBERATE_ADDITIONS_TO_THE_ORIGINAL_SEVEN.get(
+            canonical, frozenset()
+        ) | _MARKET_HEADER_ADDITIONS_TO_THE_ORIGINAL_SEVEN.get(canonical, frozenset())
         assert original[canonical] - headers == allowed
         assert headers - original[canonical] == frozenset()
 
@@ -312,20 +421,29 @@ def test_supported_header_languages_is_the_tables_own_key_set() -> None:
     assert sorted(SUPPORTED_HEADER_LANGUAGES) == [
         "ar",
         "bg",
+        "bn",
         "cs",
         "da",
         "de",
         "el",
         "en",
         "es",
+        "et",
+        "fa",
         "fi",
+        "fil",
         "fr",
         "he",
+        "hi",
+        "hr",
         "hu",
         "id",
         "it",
         "ja",
+        "kk",
         "ko",
+        "ky",
+        "mn",
         "nl",
         "no",
         "pl",
@@ -333,9 +451,14 @@ def test_supported_header_languages_is_the_tables_own_key_set() -> None:
         "ro",
         "ru",
         "sk",
+        "sl",
+        "sr",
         "sv",
+        "th",
         "tr",
         "uk",
+        "ur",
+        "uz",
         "vi",
         "zh",
     ]
@@ -567,19 +690,115 @@ def test_an_unknown_column_beside_known_ones_is_ignored_and_the_rest_imports() -
     assert sorted(imported.metadata["column_mapping"]) == ["0", "1", "2", "3"]
 
 
-def test_a_sheet_headed_entirely_in_an_unknown_language_degrades_to_a_named_refusal() -> None:
-    # Nothing maps, so no row carries a canonical key and the parser has
-    # nothing to return. It has to say so as ``ImporterParseError``, which the
-    # dispatcher turns into a 400 naming the reason and, when it is the
-    # dispatcher's own detection that found no importer at all, into the smart
-    # import path. An untyped exception would be logged as a failure of ours
-    # instead of reported as a file we cannot read.
+def test_a_sheet_headed_entirely_in_an_unknown_language_reports_the_headings_it_could_not_read() -> None:
+    # Nothing maps, so no row carries a canonical key and there is nothing to
+    # import. That used to be an ``ImporterParseError`` reading "No data rows
+    # found", an English 400 that named neither the headings nor what was
+    # missing. It is now a coded error the import dialog words in the reader's
+    # language, carrying the headings as written, so the user can see which
+    # one to rename.
     content = _workbook(
         _UNKNOWN_MARKET_HEADERS,
         [["1", "Ukuta wa zege", "m3", 9.0, 410.0, 3690.0]],
     )
 
+    imported = _parse(content)
+
+    assert imported.positions == []
+    [error] = imported.errors
+    assert error["code"] == "header_not_recognised"
+    assert error["missing"] == ["description", "quantity_or_rate"]
+    assert error["unrecognised"] == _UNKNOWN_MARKET_HEADERS
+
+
+def test_a_known_header_over_no_rows_is_still_refused() -> None:
+    content = _workbook(["Description", "Unit", "Quantity", "Rate"], [])
+
     with pytest.raises(ImporterParseError) as excinfo:
         _parse(content)
 
     assert "No data rows found" in str(excinfo.value)
+
+
+# ── Normalised matching ─────────────────────────────────────────────────────
+#
+# The matcher compares headers on a key that ignores case, accents,
+# punctuation, spacing and a bracketed or trailing currency, so the collision
+# rule has to hold on that key too: two strings that differ as written can
+# meet once normalised, and then the column they reach is an accident.
+
+
+def test_no_two_columns_share_a_normalised_header_key() -> None:
+    owners: dict[str, set[str]] = {}
+    for canonical, headers in _COLUMN_ALIASES.items():
+        for header in headers:
+            key = _label_key(header)
+            if key:
+                owners.setdefault(key, set()).add(canonical)
+    ambiguous = {key: sorted(columns) for key, columns in owners.items() if len(columns) > 1}
+    assert ambiguous == {}
+
+
+@pytest.mark.parametrize(
+    ("header", "canonical"),
+    [
+        # The Croatian troskovnik header row the video team's file carries.
+        ("R.br.", "ordinal"),
+        ("Opis stavke", "description"),
+        ("Jed. mj.", "unit"),
+        ("Količina", "quantity"),
+        ("Jed. cijena (EUR)", "unit_rate"),
+        ("Ukupno (EUR)", "total"),
+        # The same with the accents, dots and spacing an export drops.
+        ("RBR", "ordinal"),
+        ("JED MJ", "unit"),
+        ("KOLICINA", "quantity"),
+        ("Jedinicna cijena", "unit_rate"),
+        ("Iznos EUR", "total"),
+        # Letters NFKD does not decompose.
+        ("Ilosc", "quantity"),
+        ("MÆNGDE", "quantity"),
+        ("Belop", "total"),
+        ("SIRA NO", "ordinal"),
+        # Punctuation-only differences in languages already in the table.
+        ("Pos", "ordinal"),
+        ("Unit Rate (EUR/m2)", "unit_rate"),
+        ("Einheitspreis [€]", "unit_rate"),
+        ("Menge", "quantity"),
+    ],
+)
+def test_a_header_matches_whatever_its_accents_punctuation_and_currency(header: str, canonical: str) -> None:
+    assert _match_column(header) == canonical
+
+
+@pytest.mark.parametrize("header", ["", "   ", "(EUR)", "—", "[m2]", "€"])
+def test_a_header_that_normalises_to_nothing_matches_nothing(header: str) -> None:
+    # An empty key would make every blank header cell a column.
+    assert _match_column(header) is None
+
+
+def test_normalising_keeps_marks_that_change_a_word_outside_latin_greek_and_cyrillic() -> None:
+    # Thai tone marks and Devanagari vowel signs are combining characters, but
+    # dropping them would turn different words into one.
+    assert normalise_label("ราคาต่อหน่วย") != normalise_label("ราคาตอหนวย")
+    assert normalise_label("मात्रा") != normalise_label("मतर")
+    assert normalise_label("Količina (EUR)") == "kolicina"
+    assert normalise_label("Iznos EUR") == "iznos"
+
+
+# ── Every language we ship a locale for can head a bill ─────────────────────
+
+_LOCALES_DIR = Path(__file__).resolve().parents[3] / "frontend" / "src" / "app" / "locales"
+
+
+def _shipped_locale_languages() -> set[str]:
+    return {path.stem.split("-")[0] for path in _LOCALES_DIR.glob("*.ts")}
+
+
+@pytest.mark.skipif(not _LOCALES_DIR.is_dir(), reason="frontend locales not beside the backend")
+def test_every_shipped_locale_language_has_a_header_row_the_importer_reads() -> None:
+    # A Croatian bill was refused with "No data rows found" while the app
+    # offered Croatian: the locale existed, the header words did not. Adding a
+    # locale now fails here until its bill headers are in the table.
+    missing = sorted(_shipped_locale_languages() - SUPPORTED_HEADER_LANGUAGES)
+    assert missing == []

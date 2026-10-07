@@ -25,7 +25,7 @@
 // the column count, the preview count and the type scale all have to come from
 // the same number. They do, in GALLERY_BY_SPAN below.
 
-import { useMemo } from 'react';
+import { Suspense, lazy, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
@@ -52,6 +52,16 @@ import { iconFor } from '@/features/cases/icons';
 import { CaseArt } from '@/features/cases/CaseArt';
 import { useDashboardLayoutStore } from '@/stores/useDashboardLayoutStore';
 import { DASHBOARD_WIDGET_BY_ID } from './widgetRegistry';
+
+// The video half of the card. Lazy, so the video catalogue arrives with this
+// card and not with the dashboard's own chunk.
+const DashboardVideosStrip = lazy(() => import('@/features/videos/DashboardVideosStrip'));
+
+/** How many video thumbnails each width shows: one row, Start here first.
+ *  One more than a comfortable fit from a third of the page up, so each
+ *  thumbnail is about a fifth smaller and the row reads as a quiet index
+ *  rather than a second gallery. */
+const VIDEOS_BY_SPAN: Record<SpanStep, number> = { 2: 2, 3: 4, 4: 5, 6: 5 };
 
 /** This card's id in the dashboard widget registry. Its width and its
  *  visibility are both stored against it, so the id is the whole link between
@@ -346,8 +356,13 @@ export function DashboardCasesCard() {
       {/* Quick-launch: jump straight into a case */}
       {picks.length > 0 && (
         <div className="mt-3">
-          {/* Adaptive eyebrow: resume / role-tuned / popular starting points. */}
+          {/* Which half this is, then the adaptive eyebrow: resume /
+              role-tuned / popular starting points. */}
           <div className="mb-1.5 flex items-center gap-1 text-2xs font-medium text-content-tertiary">
+            <span className="font-semibold uppercase tracking-wide text-content-secondary">
+              {t('nav.cases', { defaultValue: 'Use cases' })}
+            </span>
+            <span aria-hidden="true">·</span>
             {anyInProgress ? (
               <PlayCircle size={11} className="text-oe-blue" aria-hidden="true" />
             ) : (
@@ -480,6 +495,15 @@ export function DashboardCasesCard() {
           </div>
         </div>
       )}
+
+      {/* Video guides: Start here, then picks for the reader's role and
+          country. AFTER the cases, not above them: the cases are what this
+          card is for, and a row of bright thumbnails at its top pulled the eye
+          away from them. The fallback holds the row's height so nothing
+          jumps. */}
+      <Suspense fallback={<div className="mt-3 h-24" aria-hidden="true" />}>
+        <DashboardVideosStrip count={VIDEOS_BY_SPAN[span]} />
+      </Suspense>
     </div>
   );
 }

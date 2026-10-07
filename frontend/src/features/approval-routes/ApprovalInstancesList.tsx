@@ -109,6 +109,7 @@ export function ApprovalInstancesList({
       }),
     staleTime: 15_000,
     refetchInterval: wantsAutoRefresh ? 30_000 : false,
+    refetchOnWindowFocus: true,
   });
 
   // Resolve route templates so each row can show the human route name

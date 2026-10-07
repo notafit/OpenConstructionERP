@@ -87,10 +87,10 @@ async def _on_rfi_deleted(event: Event) -> None:
     await _delete_rfi_vector(event)
 
 
-event_bus.subscribe("rfi.created", _on_rfi_created)
-event_bus.subscribe("rfi.updated", _on_rfi_updated)
-event_bus.subscribe("rfi.deleted", _on_rfi_deleted)
+event_bus.subscribe_once("rfi.created", _on_rfi_created)
+event_bus.subscribe_once("rfi.updated", _on_rfi_updated)
+event_bus.subscribe_once("rfi.deleted", _on_rfi_deleted)
 # RFI lifecycle transitions (respond / close) also change the embedded
 # text (official_response, status), so reindex on those too.
-event_bus.subscribe("rfi.responded", _on_rfi_updated)
-event_bus.subscribe("rfi.closed", _on_rfi_updated)
+event_bus.subscribe_once("rfi.responded", _on_rfi_updated)
+event_bus.subscribe_once("rfi.closed", _on_rfi_updated)

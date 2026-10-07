@@ -73,7 +73,9 @@ LOCALE_GLOB = "frontend/src/app/locales/*.ts"
 _KEY_EXCEPTIONS: dict[str, str] = {}
 
 
-def _scan(paths: list[str]) -> tuple[list[tuple[str, int, str]], list[tuple[str, int, str]]]:
+def _scan(
+    paths: list[str],
+) -> tuple[list[tuple[str, int, str]], list[tuple[str, int, str]]]:
     """Return (unexcepted_hits, excepted_hits), both as (path, lineno, key)."""
     unexcepted: list[tuple[str, int, str]] = []
     excepted: list[tuple[str, int, str]] = []
@@ -97,7 +99,10 @@ def main() -> int:
 
     unexcepted, excepted = _scan(paths)
     if unexcepted:
-        print(f"ERROR: doubled escape found in {len(unexcepted)} place(s):", file=sys.stderr)
+        print(
+            f"ERROR: doubled escape found in {len(unexcepted)} place(s):",
+            file=sys.stderr,
+        )
         for path, lineno, key in unexcepted:
             print(f"  {path}:{lineno}: {key}", file=sys.stderr)
         print(

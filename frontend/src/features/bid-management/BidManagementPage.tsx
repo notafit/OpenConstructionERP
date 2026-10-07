@@ -1,7 +1,7 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import { useState, useMemo, useEffect, Fragment } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useState, useMemo, useEffect, useCallback, Fragment } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import clsx from 'clsx';
@@ -25,6 +25,8 @@ import {
   Users,
   Check,
   Network,
+  Gavel,
+  ShoppingCart,
 } from 'lucide-react';
 import {
   Button,
@@ -46,10 +48,15 @@ import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { apiGet, getErrorMessage } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useToastStore } from '@/stores/useToastStore';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { useTabKeyboardNav } from '@/shared/hooks/useTabKeyboardNav';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
+import { useAwardOutcome } from '@/shared/hooks/useAwardOutcome';
+import { RelatedRecordLink, RelatedRecordStrip } from '@/shared/ui/RelatedRecordLink';
+import { contractDeepLink } from '@/shared/lib/changeChainLinks';
+import { PROCUREMENT_LINK, RFQ_LINK, tenderPackageDeepLink } from '@/shared/lib/awardChainLinks';
 import {
   listPackages,
   getPackage,
@@ -90,6 +97,8 @@ import {
   type PrequalStatus,
 } from '@/features/subcontractors/api';
 import { bidManagementGuide } from './bidManagementGuide';
+import { bidderPayload, linkStillHolds, type PickedSubcontractor } from './inviteBidder';
+import { AddFromBoqModal } from './AddFromBoqModal';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildBidManagementInsights } from './bidManagementInsights';
 import { fmtList, fmtFixed } from '@/shared/lib/formatters';
@@ -200,7 +209,7 @@ function listProjectsLite(): Promise<ProjectStub[]> {
   // list that did not load look exactly like an account with no projects, and
   // the page then told the user to go and create one they may well already
   // have.
-  return apiGet<ProjectStub[]>('/v1/projects/?limit=200');
+  return fetchProjectList<ProjectStub[]>();
 }
 
 function listInvitationsForPackage(packageId: string): Promise<BidInvitation[]> {
@@ -512,6 +521,10 @@ function HowBidManagementWorks() {
           </span>{' '}
           <ModLink to="/tendering">
             {t('bid_management.mod_tendering', { defaultValue: 'Tendering' })}
+          </ModLink>{' '}
+          ·{' '}
+          <ModLink to={RFQ_LINK}>
+            {t('bid_management.mod_rfq', { defaultValue: 'RFQ Bidding' })}
           </ModLink>
         </span>
       </div>
@@ -553,6 +566,30 @@ export function BidManagementPage() {
   });
   const [selectedPackageId, setSelectedPackageId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+
+  // /bid-management?highlight=<packageId> opens that package's drawer (the
+  // house deep-link convention, used by the tender and contract screens to
+  // land here on the record). The param stays while the drawer is open so a
+  // refresh or a shared link reopens it, and is dropped on close so a later
+  // remount does not reopen what the reader just closed.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const highlightPackageId = searchParams.get('highlight');
+  useEffect(() => {
+    if (highlightPackageId) setSelectedPackageId(highlightPackageId);
+  }, [highlightPackageId]);
+  const closeDrawer = useCallback(() => {
+    setSelectedPackageId(null);
+    if (searchParams.has('highlight')) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete('highlight');
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [searchParams, setSearchParams]);
 
   const packagesQ = useQuery({
     queryKey: ['bid-management', 'packages', projectId, statusFilter],
@@ -693,6 +730,10 @@ export function BidManagementPage() {
             label: t('nav.tendering', { defaultValue: 'Tendering' }),
             onClick: () => navigate('/tendering'),
           },
+          {
+            label: t('nav.rfq_bidding', { defaultValue: 'RFQ Bidding' }),
+            onClick: () => navigate(RFQ_LINK),
+          },
         ]}
       >
         {t('bid_management.intro_body', {
@@ -826,7 +867,7 @@ export function BidManagementPage() {
       {selectedPackageId && (
         <PackageDrawer
           packageId={selectedPackageId}
-          onClose={() => setSelectedPackageId(null)}
+          onClose={closeDrawer}
           currency={currentProject?.currency || undefined}
         />
       )}
@@ -1861,6 +1902,7 @@ function PackageDrawer({
   // submission, so leveling/award were inert for real packages. This holds the
   // invitation a manager is recording a bid against.
   const [recordFor, setRecordFor] = useState<BidInvitation | null>(null);
+  const [boqPickerOpen, setBoqPickerOpen] = useState(false);
 
   const pkgQ = useQuery({
     queryKey: ['bid-management', 'package', packageId],
@@ -1945,6 +1987,17 @@ function PackageDrawer({
   });
 
   const pkg = pkgQ.data;
+
+  // What the award drafted. The award subscriber stamps this package's id
+  // (and its tender package's id, when linked) on the contract and the
+  // purchase order it creates; the lookup reads the stamp back.
+  const awardOutcome = useAwardOutcome(
+    pkg?.project_id,
+    { tender_package_id: pkg?.tender_id ?? null, bid_package_ids: [packageId] },
+    pkg?.status === 'awarded',
+  );
+  const awardContract = awardOutcome.contract.state === 'found' ? awardOutcome.contract.record : null;
+  const awardOrder = awardOutcome.order.state === 'found' ? awardOutcome.order.record : null;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -2037,6 +2090,51 @@ function PackageDrawer({
                 />
               </div>
 
+              <RelatedRecordStrip
+                label={t('bid_management.related', { defaultValue: 'Related:' })}
+                data-testid="bid-package-related"
+              >
+                {pkg.tender_id && (
+                  <RelatedRecordLink
+                    to={tenderPackageDeepLink(pkg.tender_id)}
+                    icon={<Gavel size={12} />}
+                    title={t('bid_management.tender_package_hint', {
+                      defaultValue: 'Open the tender package this bid package belongs to',
+                    })}
+                  >
+                    {t('bid_management.tender_package', { defaultValue: 'Tender package' })}
+                  </RelatedRecordLink>
+                )}
+                {awardContract && (
+                  <RelatedRecordLink
+                    to={contractDeepLink(awardContract.id)}
+                    icon={<FileText size={12} />}
+                    title={t('bid_management.award_contract_hint', {
+                      defaultValue: 'Open the contract drafted from this award',
+                    })}
+                  >
+                    {t('bid_management.award_contract_named', {
+                      defaultValue: 'Contract {{code}}',
+                      code: awardContract.code,
+                    })}
+                  </RelatedRecordLink>
+                )}
+                {awardOrder && (
+                  <RelatedRecordLink
+                    to={PROCUREMENT_LINK}
+                    icon={<ShoppingCart size={12} />}
+                    title={t('bid_management.award_po_hint', {
+                      defaultValue: 'Open Procurement, where the purchase order drafted from this award is listed',
+                    })}
+                  >
+                    {t('bid_management.award_po_named', {
+                      defaultValue: 'Purchase order {{number}}',
+                      number: awardOrder.po_number,
+                    })}
+                  </RelatedRecordLink>
+                )}
+              </RelatedRecordStrip>
+
               {/* missing_help fix (audit #8): explain the required FSM sequence
                   so a user knows why leveling/award stay empty until they walk
                   publish → open bids → record submissions → level → award. */}
@@ -2110,11 +2208,16 @@ function PackageDrawer({
                   {t('bid_management.run_leveling', { defaultValue: 'Compute Leveling' })}
                 </Button>
                 {pkg.status === 'awarded' && (
-                  <Link to="/contracts">
+                  <Link to={awardContract ? contractDeepLink(awardContract.id) : '/contracts'}>
                     <Button variant="primary" icon={<ArrowRight size={14} />}>
-                      {t('bid_management.create_contract', {
-                        defaultValue: 'Formalise as Contract',
-                      })}
+                      {awardContract
+                        ? t('bid_management.open_award_contract', {
+                            defaultValue: 'Open contract {{code}}',
+                            code: awardContract.code,
+                          })
+                        : t('bid_management.create_contract', {
+                            defaultValue: 'Formalise as Contract',
+                          })}
                     </Button>
                   </Link>
                 )}
@@ -2173,6 +2276,26 @@ function PackageDrawer({
                   packageId={packageId}
                   nextOrderIndex={(linesQ.data ?? []).length}
                 />
+                <div className="mt-2 flex justify-end">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    icon={<ListPlus size={14} />}
+                    onClick={() => setBoqPickerOpen(true)}
+                  >
+                    {t('bid_management.add_from_boq', { defaultValue: 'Add from BOQ' })}
+                  </Button>
+                </div>
+                {boqPickerOpen && (
+                  <AddFromBoqModal
+                    packageId={packageId}
+                    projectId={pkg.project_id}
+                    linkedPositionIds={(linesQ.data ?? [])
+                      .map((li) => li.boq_position_id)
+                      .filter((id): id is string => !!id)}
+                    onClose={() => setBoqPickerOpen(false)}
+                  />
+                )}
               </Card>
 
               <Card padding="sm">
@@ -2193,14 +2316,16 @@ function PackageDrawer({
                       // An invitation that already produced a submission cannot
                       // be recorded again (the backend enforces one submission
                       // per invitation with a UNIQUE constraint → 409).
+                      // A bid is taken only inside the tender window, the
+                      // same two states the backend accepts: not on a draft
+                      // that has not gone out, not once the package is closed.
                       const hasSubmission = (subsQ.data ?? []).some(
                         (s) => s.invitation_id === inv.id,
                       );
                       const canRecord =
                         !hasSubmission &&
                         !!inv.bidder_ref_id &&
-                        pkg.status !== 'awarded' &&
-                        pkg.status !== 'cancelled';
+                        (pkg.status === 'published' || pkg.status === 'open');
                       return (
                         <li
                           key={inv.id}
@@ -2615,13 +2740,13 @@ function InlineInviteForm({ packageId }: { packageId: string }) {
   // CONN-39: invite straight from the Subcontractor Directory instead of
   // retyping a firm by hand, prefilling the company and its primary contact.
   const [pickerOpen, setPickerOpen] = useState(false);
+  // The directory entry the award will name as the contract counterparty.
+  // It holds only while the company field still reads the picked name.
+  const [picked, setPicked] = useState<PickedSubcontractor | null>(null);
+  const link = linkStillHolds(picked, company);
   const inviteMut = useMutation({
     mutationFn: async () => {
-      const bidder = await createBidder({
-        package_id: packageId,
-        company_name: company.trim() || email.trim(),
-        contact_email: email.trim(),
-      });
+      const bidder = await createBidder(bidderPayload(packageId, company, email, picked));
       return createInvitation({
         package_id: packageId,
         bidder_ref_id: bidder.id,
@@ -2633,6 +2758,7 @@ function InlineInviteForm({ packageId }: { packageId: string }) {
       qc.invalidateQueries({ queryKey: ['bid-management'] });
       setEmail('');
       setCompany('');
+      setPicked(null);
       // quick_win clarity (audit #9): the invite is recorded and marked "sent",
       // but actual email delivery depends on SMTP being configured. Say so
       // instead of implying mail definitely went out.
@@ -2671,6 +2797,14 @@ function InlineInviteForm({ packageId }: { packageId: string }) {
           placeholder={t('bid_management.company', { defaultValue: 'Company' })}
           className={inputCls}
         />
+        {link && (
+          <p className="text-[11px] text-content-tertiary">
+            {t('bid_management.linked_to_directory', {
+              defaultValue: 'Linked to {{name}} in the Subcontractor Directory. The contract from an award names this firm.',
+              name: link.name,
+            })}
+          </p>
+        )}
         <input
           type="email"
           value={email}
@@ -2692,6 +2826,7 @@ function InlineInviteForm({ packageId }: { packageId: string }) {
         <SubcontractorPickerModal
           onPick={(sub, resolvedEmail) => {
             setCompany(sub.legal_name);
+            setPicked({ id: sub.id, name: sub.legal_name });
             if (resolvedEmail) setEmail(resolvedEmail);
             if (!resolvedEmail) {
               addToast({

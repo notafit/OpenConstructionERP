@@ -1,0 +1,47 @@
+# Switzerland Construction Pack - first-login onboarding wizard.
+# Streamed by /api/v1/partner-pack/onboarding-script and rendered by
+# the OnboardingWizard React component in place of the default steps.
+#
+# Trilingual: DE/FR/IT with English parallel.
+
+version: 2
+pack: switzerland-ch
+locale: de
+title: "Willkommen bei OpenConstructionERP - Schweiz"
+title_en: "Welcome to OpenConstructionERP - Switzerland Edition"
+title_fr: "Bienvenue sur OpenConstructionERP - Edition Suisse"
+title_it: "Benvenuto su OpenConstructionERP - Edizione Svizzera"
+subtitle: "Drei Schritte, um Ihren Arbeitsbereich auf Schweizer Kalkulationspraxis auszurichten (SIA 451, BKP, SIA 118). Three quick steps to align your workspace with Swiss estimating practice."
+
+steps:
+  - id: company_profile
+    title: "Unternehmensprofil / Company profile"
+    body: "Bitte hinterlegen Sie die Stammdaten Ihres Unternehmens. Sie erscheinen in Berichten, Offerten und Submissionsunterlagen. Enter your company details so reports, tenders and invoices are correctly attributed."
+    fields:
+      - { key: company_name, label: "Firmenname / Company name", type: text, required: true }
+      - { key: uid_nr, label: "UID-Nummer (Unternehmens-Identifikationsnummer) / Enterprise ID", type: text, required: false, placeholder: "CHE-123.456.789", help: "Ihre Unternehmens-Identifikationsnummer gem. UIDG. Your enterprise identification number per UIDG." }
+      - { key: legal_form, label: "Rechtsform / Legal form", type: select, options: ["AG (Aktiengesellschaft)", "GmbH (Gesellschaft mit beschraenkter Haftung)", "Einzelunternehmen / Entreprise individuelle", "Kollektivgesellschaft / Societe en nom collectif", "Genossenschaft / Societe cooperative", "Verein / Association", "Sonstige / Other"], default: "AG (Aktiengesellschaft)", required: true }
+      - { key: head_office_kanton, label: "Kanton des Hauptsitzes / Canton of head office", type: select, options: ["Zuerich", "Bern", "Luzern", "Uri", "Schwyz", "Obwalden", "Nidwalden", "Glarus", "Zug", "Fribourg", "Solothurn", "Basel-Stadt", "Basel-Landschaft", "Schaffhausen", "Appenzell A.Rh.", "Appenzell I.Rh.", "St. Gallen", "Graubuenden", "Aargau", "Thurgau", "Ticino", "Vaud", "Valais", "Neuchatel", "Geneve", "Jura"], required: true }
+      - { key: language_region, label: "Sprachregion / Language region", type: radio, options: ["Deutschschweiz (German-speaking)", "Suisse romande (French-speaking)", "Svizzera italiana (Italian-speaking)"], default: "Deutschschweiz (German-speaking)", required: true }
+
+  - id: standards_classification
+    title: "Normen und Klassifikation / Standards and classification"
+    body: "Legen Sie fest, welche Schweizer Normen fuer Ihre Projekte gelten. Die Validierung des Leistungsverzeichnisses wird darauf ausgerichtet. Confirm which Swiss standards apply to your projects."
+    fields:
+      - { key: classification_standard, label: "Kostenklassifikation / Cost classification", type: radio, options: ["BKP Baukostenplan (standard, CRB)", "eBKP Elementbasierter Baukostenplan (element-based, SN 506 511)"], default: "BKP Baukostenplan (standard, CRB)", required: true }
+      - { key: sia_contract_edition, label: "SIA 118 Ausgabe / SIA 118 edition", type: radio, options: ["SIA 118:2013 (aktuell / current)", "SIA 118:2001"], default: "SIA 118:2013 (aktuell / current)", required: true }
+      - { key: default_sia_phase, label: "Standard SIA-Phase / Default SIA phase", type: select, options: ["SIA 112 Phase 31 - Vorprojekt (preliminary project)", "SIA 112 Phase 32 - Bauprojekt (building project)", "SIA 112 Phase 41 - Ausschreibung (tendering)", "SIA 112 Phase 51 - Ausfuehrung (execution)"], default: "SIA 112 Phase 32 - Bauprojekt (building project)", required: true }
+      - { key: enable_crb_benchmarks, label: "CRB-Baukostenbenchmarks aktivieren / Enable CRB cost benchmarks", type: checkbox, default: true, help: "Prueft Kostenansaetze gegen CRB-Referenzwerte nach Gebaeudetyp und Region. Checks cost estimates against CRB reference values." }
+
+  - id: review
+    title: "Ueberpruefen und Abschliessen / Review and finish"
+    body: "Wir richten Ihren Arbeitsbereich mit SIA 451, BKP, SIA 118 und den gewaehlten Einstellungen ein. Alles kann spaeter unter Einstellungen geaendert werden. We will create your workspace with SIA 451, BKP, SIA 118 and your chosen settings."
+    action:
+      label: "Arbeitsbereich anlegen / Create my workspace"
+      apply:
+        - set_default_currency: CHF
+        - set_tax_template: ch_mwst_8_1
+        - enable_rule_packs:
+            - sia_451
+            - bkp_classification
+            - sia_118

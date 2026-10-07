@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "ccdc_14",
+  "name": "CCDC 14 — Design-Build Stipulated Price Contract (2013)",
+  "name_fr-CA": "CCDC 14 — Contrat conception-construction à prix forfaitaire (2013)",
+  "standard": "CCDC 14-2013",
+  "jurisdiction": "CA",
+  "regulator": "Canadian Construction Documents Committee",
+  "publication_year": 2013,
+  "applies_to": [
+    "projects",
+    "tendering",
+    "validation"
+  ],
+  "description": "Reference document for the design-build stipulated-price structure under CCDC 14-2013. What the form requires a project to settle: Owner's Statement of Requirements present, Design-Builder's Proposal documented, single-point responsibility for design and construction asserted, schedule for design milestones present, performance bond and labour-and-material bond set. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la structure conception-construction à prix forfaitaire selon CCDC 14-2013. Ce que la formule exige : Énoncé des besoins du Maître présent, Proposition du Concepteur-Constructeur documentée, responsabilité unique conception/construction affirmée, échéancier des jalons de conception présent, cautionnement de bonne exécution et cautionnement de paiement de main-d'œuvre et matériaux fournis. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. A design-build form moves design responsibility to the contractor, which is a question about the contract rather than about the bill the engine reads. Nothing registered checks it, and a document that named a rule for it would be describing a check that does not run.",
+  "enables_rule_ids": []
+}

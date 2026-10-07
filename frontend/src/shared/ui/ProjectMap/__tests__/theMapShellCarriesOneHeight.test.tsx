@@ -140,6 +140,6 @@ describe('the map shell carries exactly one height', () => {
   it('gives the card variant its own single height', () => {
     const { container } = render(<ProjectMap variant="card" lat={SITE.lat} lng={SITE.lng} label="Berlin" />);
 
-    expect(heightUtilities(shellOf(container))).toEqual(['h-28']);
+    expect(heightUtilities(shellOf(container))).toEqual(['h-24']);
   });
 });

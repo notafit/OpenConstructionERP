@@ -6,9 +6,9 @@
 // NlRuleBuilderPanel page.
 //
 // i18n: every key carries its inline English default and is read via
-// t(key, { defaultValue }). These keys are NOT added to en.ts or any locale
-// file; the inline defaults are the single source of truth, and translators
-// pick the keys up later.
+// t(key, { defaultValue }). The keys are not in en.ts, the inline defaults
+// are the English source; their translations live in the other locale files,
+// so a changed default needs its translations redone too.
 //
 // Spotlight selectors reuse the panel's stable data-testid hooks so each
 // highlight survives styling churn and button reorders.

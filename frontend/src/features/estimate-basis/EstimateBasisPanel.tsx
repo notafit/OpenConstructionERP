@@ -26,6 +26,7 @@ import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   AlertTriangle,
+  CheckSquare,
   ChevronDown,
   ChevronRight,
   ClipboardList,
@@ -38,11 +39,13 @@ import {
   Save,
   Send,
   ShieldCheck,
+  Square,
   Trash2,
 } from 'lucide-react';
 import { Badge, Button, Card, CardContent, CardHeader, EmptyState, ErrorState } from '@/shared/ui';
 import { getErrorMessage, triggerDownload } from '@/shared/lib/api';
 import { formatCurrency } from '@/shared/lib/money';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import { BasisHeadline } from './BasisHeadline';
 import { BasisProvenance } from './BasisProvenance';
 import {
@@ -84,8 +87,8 @@ interface Draft {
   inclusions: QualificationItem[];
   exclusions: QualificationItem[];
   assumptions: QualificationItem[];
-  /** The AACE class the estimator has stated. `null` = nobody has stated one. */
-  estimateClass: number | null;
+  /** The estimate class the estimator has stated. `null` = nobody has stated one. */
+  estimateClass: number | string | null;
   accuracyLowPct: string;
   accuracyHighPct: string;
   marketConditions: string;
@@ -150,6 +153,18 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [dirty, setDirty] = useState(false);
+  /** OC-09: timestamp of last successful save, drives the "Saved" indicator. */
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  const canGenerate = useHasPermission('estimate_basis.generate');
+  const canWrite = useHasPermission('estimate_basis.write');
+
+  // OC-09: warn on page close/refresh with unsaved changes.
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
 
   const listQuery = useQuery({
     queryKey: ['estimate-basis', 'list', projectId],
@@ -227,6 +242,7 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
       queryClient.invalidateQueries({ queryKey: ['estimate-basis', 'list', projectId] });
       setDraft(draftFromDoc(updated));
       setDirty(false);
+      setSavedAt(Date.now());
     },
   });
 
@@ -250,6 +266,15 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
     patchItems(
       key,
       draft[key].map((it) => (it.id === id ? { ...it, enabled: !it.enabled } : it)),
+    );
+  }
+
+  /** OC-08: bulk toggle all auto-generated (template) items in a section. */
+  function toggleAllAuto(key: CategoryKey, enabled: boolean) {
+    if (!draft) return;
+    patchItems(
+      key,
+      draft[key].map((it) => (it.source === 'auto' ? { ...it, enabled } : it)),
     );
   }
 
@@ -294,11 +319,11 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
    * server seeds the same band on its side; doing it here as well is what makes
    * the decision one click rather than three.
    */
-  function setEstimateClass(next: number) {
+  function setEstimateClass(next: number | string) {
     const option = classesQuery.data?.items.find((o) => o.estimate_class === next);
     setDraft((prev) => {
       if (!prev) return prev;
-      if (next <= 0) {
+      if (next === 0 || next === '') {
         return { ...prev, estimateClass: null, accuracyLowPct: '', accuracyHighPct: '' };
       }
       return {
@@ -363,6 +388,13 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
   }
 
   const generating = generateMutation.isPending;
+  // Drafting and saving are editor work (estimate_basis.generate / .write).
+  // A viewer still reads and exports the document; the two writes stay
+  // visible but disabled, with the reason on hover, instead of a 403 toast.
+  const forbiddenHint = t('errors.forbidden', {
+    defaultValue: "You don't have permission to perform this action.",
+  });
+  const generateHint = canGenerate ? undefined : forbiddenHint;
   const hasDocuments = (listQuery.data?.items.length ?? 0) > 0;
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -392,7 +424,11 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
             'Draft the inclusions, exclusions and assumptions automatically from the estimate contents.',
         })}
         action={
-          <Button onClick={() => generateMutation.mutate()} disabled={generating}>
+          <Button
+            onClick={() => generateMutation.mutate()}
+            disabled={generating || !canGenerate}
+            title={generateHint}
+          >
             {t('estimateBasis.generate', { defaultValue: 'Draft basis of estimate' })}
           </Button>
         }
@@ -420,7 +456,8 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
           <Button
             variant="secondary"
             onClick={() => generateMutation.mutate()}
-            disabled={generating}
+            disabled={generating || !canGenerate}
+            title={generateHint}
             icon={
               generating ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
@@ -450,7 +487,8 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
           </Button>
           <Button
             onClick={() => saveMutation.mutate()}
-            disabled={!dirty || saveMutation.isPending}
+            disabled={!dirty || saveMutation.isPending || !canWrite}
+            title={canWrite ? undefined : forbiddenHint}
             icon={
               saveMutation.isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
@@ -461,6 +499,13 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
           >
             {t('estimateBasis.save', { defaultValue: 'Save' })}
           </Button>
+          {/* OC-09: brief "Saved" confirmation after a successful save. */}
+          {savedAt && !dirty && !saveMutation.isPending && (
+            <span className="flex items-center gap-1 text-xs text-semantic-success transition-opacity duration-300">
+              <ShieldCheck className="h-3.5 w-3.5" aria-hidden />
+              {t('estimateBasis.saved', { defaultValue: 'Saved' })}
+            </span>
+          )}
         </div>
       </div>
 
@@ -568,6 +613,7 @@ export function EstimateBasisPanel({ projectId, boqId, currency, baseDate }: Est
               onText={(id, text) => updateItemText(key, id, text)}
               onRemove={(id) => removeItem(key, id)}
               onAdd={() => addItem(key)}
+              onToggleAllAuto={(enabled) => toggleAllAuto(key, enabled)}
               addLabel={t('estimateBasis.addLine', { defaultValue: 'Add line' })}
               emptyLabel={t('estimateBasis.sectionEmpty', { defaultValue: 'No lines yet.' })}
             />
@@ -863,6 +909,8 @@ interface SectionProps {
   onText: (id: string, text: string) => void;
   onRemove: (id: string) => void;
   onAdd: () => void;
+  /** OC-08: bulk enable/disable all auto-generated items. */
+  onToggleAllAuto: (enabled: boolean) => void;
   addLabel: string;
   emptyLabel: string;
 }
@@ -874,6 +922,7 @@ function Section({
   onText,
   onRemove,
   onAdd,
+  onToggleAllAuto,
   addLabel,
   emptyLabel,
 }: SectionProps) {
@@ -884,6 +933,10 @@ function Section({
   // not so the page can look tidy on arrival.
   const [open, setOpen] = useState(true);
   const enabledCount = items.filter((it) => it.enabled).length;
+  const autoItems = items.filter((it) => it.source === 'auto');
+  const autoEnabledCount = autoItems.filter((it) => it.enabled).length;
+  const hasAuto = autoItems.length > 0;
+  const allAutoEnabled = autoEnabledCount === autoItems.length;
 
   return (
     <Card>
@@ -913,9 +966,26 @@ function Section({
           </button>
         }
         action={
-          <Button variant="ghost" size="sm" onClick={onAdd} icon={<Plus className="h-4 w-4" aria-hidden />}>
-            {addLabel}
-          </Button>
+          <div className="flex items-center gap-1">
+            {hasAuto && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onToggleAllAuto(!allAutoEnabled)}
+                icon={allAutoEnabled
+                  ? <CheckSquare className="h-4 w-4" aria-hidden />
+                  : <Square className="h-4 w-4" aria-hidden />
+                }
+              >
+                {allAutoEnabled
+                  ? t('estimateBasis.uncheckTemplate', { defaultValue: 'Uncheck template' })
+                  : t('estimateBasis.checkTemplate', { defaultValue: 'Check template' })}
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={onAdd} icon={<Plus className="h-4 w-4" aria-hidden />}>
+              {addLabel}
+            </Button>
+          </div>
         }
       />
       <CardContent className={`space-y-2 ${open ? '' : 'hidden'}`}>

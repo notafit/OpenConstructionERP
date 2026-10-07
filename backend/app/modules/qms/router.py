@@ -8,6 +8,7 @@ Per-project access is enforced via :func:`verify_project_access`.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -133,19 +134,15 @@ def _conflict(detail: str) -> HTTPException:
 
 
 def _client_ip(request: Request) -> str | None:
-    """Best-effort client IP, honouring a single trusted proxy hop.
+    """Best-effort client IP for non-repudiation context, never for authorisation.
 
-    ``X-Forwarded-For`` is attacker-spoofable but is the only signal behind
-    a reverse proxy; we take the first hop and fall back to the socket peer.
-    Stored purely as non-repudiation context, never used for authorisation.
+    ``X-Forwarded-For`` is believed only from a configured trusted proxy; any
+    other caller is recorded by its socket peer (``app.core.rate_limiter.client_ip``).
     """
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first[:64]
-    client = request.client
-    return client.host[:64] if client and client.host else None
+    from app.core.rate_limiter import client_ip
+
+    ip = client_ip(request)
+    return ip[:64] if ip else None
 
 
 # ── ITP Plans ─────────────────────────────────────────────────────────────
@@ -856,7 +853,9 @@ async def plan_compliance_export(
     except ValueError as exc:
         raise _bad(str(exc)) from exc
     if fmt == "csv":
-        body = _compliance_csv(export["records"])
+        # Writing the file walks every inspection of the plan and is pure CPU,
+        # so it runs in a worker thread; the records are already plain dicts.
+        body = await asyncio.to_thread(_compliance_csv, export["records"])
         return StreamingResponse(
             iter([body]),
             media_type="text/csv",

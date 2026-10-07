@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from fastapi import HTTPException, status
 
@@ -282,9 +282,11 @@ async def _safe_audit(
 # Re-exported under its own name so ``from app.modules.boq.service import
 # DEFAULT_MARKUP_TEMPLATES`` keeps resolving for the readers that predate the
 # move. The table itself lives in a module the methodology catalogue can import.
-from app.modules.boq.base_date import ACCEPTED_SHAPES, price_base_day
+from app.modules.boq.activity_text import activity_description
+from app.modules.boq.base_date import ACCEPTED_SHAPES, price_base_day, tax_point
 from app.modules.boq.markup_templates import (
     CONSTRUCTION_TIER_COUNTRIES,
+    CONSTRUCTION_TIER_TAX_CODE,
     region_key_for_country,
     resolve_region_lines,
 )
@@ -297,6 +299,7 @@ from app.modules.boq.models import (
     Position,
     QuantityLink,
 )
+from app.modules.boq.price_list_carry import PRICE_LIST_KEY, carry_from_link, linked_cost_item_id
 from app.modules.boq.repository import (
     ActivityLogRepository,
     BOQRepository,
@@ -352,7 +355,8 @@ from app.modules.boq.schemas import (
 from app.modules.boq.templates import TEMPLATES
 from app.modules.costs.repository import CostItemRepository
 from app.modules.i18n_foundation.repository import TaxConfigRepository
-from app.modules.i18n_foundation.tax_rules import TaxRuleError
+from app.modules.i18n_foundation.tax_rules import TaxRateRow, TaxRuleError, active_rows
+from app.modules.i18n_foundation.tax_rules import format_rate as format_tax_rate
 from app.modules.i18n_foundation.tax_rules import resolve as resolve_tax
 from app.modules.i18n_foundation.tax_rules import row_from_orm as tax_row_from_orm
 
@@ -524,6 +528,14 @@ def _str_to_float(value: str | None) -> float:
 SECTION_UNITS: tuple[str, ...] = ("", "section")
 
 
+def _is_zero(value: object) -> bool:
+    """Whether a stored money string (or number) is zero; blank reads as zero."""
+    try:
+        return Decimal(str(value if value not in (None, "") else "0")) == 0
+    except (InvalidOperation, ValueError):
+        return False
+
+
 def _is_section(position: Position) -> bool:
     """Determine whether a position is a section/sub-section header.
 
@@ -664,25 +676,10 @@ def _resource_total_in_base(
     fx_rates_map: dict[str, str] | None,
     base_currency: str,
 ) -> Decimal:
-    """Sum resource subtotals in the project's BASE currency.
+    """Sum convertible resource subtotals in base currency.
 
-    Issue #88 - each resource dict may carry an optional ``currency``. When
-    present and different from ``base_currency``, the row's contribution is
-    converted via ``fx_rates_map[currency]`` (units of base per 1 unit of
-    foreign). Missing currency → treated as base. Missing rate for a
-    foreign currency → resource is summed in its own units anyway, but
-    the caller is expected to surface a "missing FX rate" warning at UI
-    time (this function silently skips the conversion to keep the rollup
-    deterministic and never zero out a row).
-
-    The rollup is accumulated with ``Decimal`` (qty, rate and fx are coerced
-    via ``_to_decimal``) so summing many lines never drifts in binary float
-    before the caller's ``_quantize_money_str`` snaps to 4dp. Returns a
-    ``Decimal``; callers already wrap it via ``_quantize_money_str`` /
-    ``_to_decimal(str(...))``.
-
-    Pure function - no DB I/O - so it's cheap to call from update_position
-    and reusable from snapshot/export paths.
+    Missing or unusable foreign FX excludes that amount from the base total.
+    The resource-summary response reports excluded amounts by source currency.
     """
     if not resources:
         return Decimal("0")
@@ -695,12 +692,7 @@ def _resource_total_in_base(
         rate = _to_decimal(r.get("unit_rate"))
         sub = qty * rate
         code = str(r.get("currency") or "").strip().upper()
-        if code and code != base and fx_rates_map:
-            fx = fx_rates_map.get(code)
-            if fx:
-                fx_dec = _to_decimal(fx)
-                if fx_dec.is_finite() and fx_dec != 0:
-                    sub = sub * fx_dec
+        sub = _position_total_in_base(str(sub), code, fx_rates_map, base)
         total += sub
     return total
 
@@ -710,29 +702,14 @@ def _detect_resource_fx_warnings(
     fx_rates_map: dict[str, str] | None,
     base_currency: str,
 ) -> list[str]:
-    """Issue #157 (skolodi): collect resource currency codes that have no FX
-    rate in the project's ``fx_rates`` table.
+    """Collect foreign resource currencies with missing or unusable FX.
 
-    The rollup at ``_resource_total_in_base`` silently no-ops the conversion
-    when a foreign-currency resource has no rate (preserves the value in its
-    own units to keep the rollup deterministic and never zero a row). The
-    side effect is the bug skolodi recorded on video: changing a resource's
-    currency from EUR to USD with no USD rate produces an identical sum
-    (`sub = qty * rate * 1` == `sub = qty * rate * <missing>` because the
-    multiplication is skipped) - so the section total appears unchanged
-    even though the user just touched the row. ARS has a rate in his
-    project, hence "ARS updates but USD doesn't."
-
-    Returning the list of missing codes lets the API surface a per-position
-    warning so the UI can prompt "Add USD to Project Settings" instead of
-    silently producing a math-correct-but-user-confusing no-op.
-
-    Pure function - no DB I/O - safe to call from any write path.
+    The base rollup excludes these amounts; callers surface the codes so the
+    user can add or repair rates in Project Settings. Pure function, no DB I/O.
     """
     if not isinstance(resources, list) or not resources:
         return []
     base = (base_currency or "").strip().upper()
-    have = {k.upper() for k in (fx_rates_map or {}).keys()}
     missing: list[str] = []
     seen: set[str] = set()
     for r in resources:
@@ -749,7 +726,7 @@ def _detect_resource_fx_warnings(
         code = raw.strip().upper()
         if not code or code == base:
             continue
-        if code in have:
+        if resource_fx_factor(code, base, fx_rates_map) is not None:
             continue
         if code in seen:
             continue
@@ -865,26 +842,18 @@ def _position_total_in_base(
     CSV / Excel / PDF exports and was summing foreign-currency ``total``
     strings straight into the base-currency Direct Cost / Grand Total.
 
-    Semantics match ``_resource_total_in_base``: a position priced in a
-    non-base currency contributes ``total * fx_rates_map[currency]`` (units
-    of base per 1 unit of foreign). Missing currency → treated as base.
-    Missing rate for a foreign currency → summed in its own units anyway
-    (never zeroed) so the rollup stays deterministic and a forgotten FX
-    rate degrades visibly rather than silently dropping money.
+    Missing currency is treated as base. A foreign amount with no usable
+    positive rate is excluded from the base total and reported separately by
+    the resource summary. Negative amounts remain valid credits.
     """
     amount = _to_decimal(total)
     base = (base_currency or "").strip().upper()
     code = (currency_code or "").strip().upper()
-    if code and code != base and fx_rates_map:
-        fx = fx_rates_map.get(code)
-        if fx:
-            # Default 0 (not 1) so a present-but-unparseable rate
-            # ("n/a", "1,5", ...) fails the > 0 guard below and the amount
-            # stays in its own units instead of silently converting at 1:1.
-            # Matches _resource_total_in_base's bad-rate handling.
-            converted = _to_decimal(fx)
-            if converted > 0:
-                amount = amount * converted
+    factor = resource_fx_factor(code, base, fx_rates_map)
+    if factor is None:
+        return Decimal("0")
+    if code and base and code != base:
+        amount *= _to_decimal((fx_rates_map or {}).get(code))
     return amount
 
 
@@ -1178,6 +1147,67 @@ _AACE_CLASSES: dict[int, dict[str, str | int]] = {
     },
 }
 
+# ── Canadian CCA estimate classification ─────────────────────────────────────
+# Based on the Canadian Construction Association / Treasury Board practice.
+# Classes use letters (D least defined through A most defined) rather than
+# AACE's reverse-numbered 5-to-1 scale.
+
+_CA_CCA_CLASSES: dict[str, dict[str, str | int]] = {
+    "D": {
+        "label": "Order of Magnitude",
+        "accuracy_low": "-30%",
+        "accuracy_high": "+50%",
+        "definition_low": 0,
+        "definition_high": 5,
+        "methodology": (
+            "High-level estimate based on gross floor area or capacity, used for initial project screening. "
+            "Comparable to AACE Class 5/4."
+        ),
+    },
+    "C": {
+        "label": "Substantive Estimate",
+        "accuracy_low": "-15%",
+        "accuracy_high": "+30%",
+        "definition_low": 5,
+        "definition_high": 30,
+        "methodology": (
+            "Based on schematic design with elemental unit rates and outline specification. Comparable to AACE Class 3."
+        ),
+    },
+    "B": {
+        "label": "Detailed Estimate",
+        "accuracy_low": "-10%",
+        "accuracy_high": "+15%",
+        "definition_low": 30,
+        "definition_high": 70,
+        "methodology": (
+            "Based on developed design with detailed quantity takeoff and trade-level pricing. "
+            "Comparable to AACE Class 2."
+        ),
+    },
+    "A": {
+        "label": "Pre-tender Estimate",
+        "accuracy_low": "-5%",
+        "accuracy_high": "+10%",
+        "definition_low": 65,
+        "definition_high": 100,
+        "methodology": (
+            "Based on complete or near-complete tender documentation with firm subcontractor and supplier pricing. "
+            "Comparable to AACE Class 1."
+        ),
+    },
+}
+
+# ── Classification system registry ───────────────────────────────────────────
+# Maps a system key to (classes_dict, determiner_function). Country packs
+# register their own system here so the service resolves the right table
+# at runtime from the project's country_code.
+
+_ClassesTable = dict[int, dict[str, str | int]] | dict[str, dict[str, str | int]]
+_Determiner = Callable[..., int | str]
+
+ESTIMATE_CLASSIFICATION_SYSTEMS: dict[str, tuple[_ClassesTable, _Determiner]] = {}
+
 
 def _determine_aace_class(
     total_positions: int,
@@ -1204,22 +1234,61 @@ def _determine_aace_class(
     return 1
 
 
+def _determine_ca_class(
+    total_positions: int,
+    rate_pct: float,
+    resource_pct: float,
+) -> str:
+    """Determine Canadian CCA estimate class (D/C/B/A) from completeness.
+
+    Mirrors the AACE thresholds mapped onto the four-letter Canadian scale.
+    """
+    if total_positions < 10 or rate_pct < 30:
+        return "D"
+    if total_positions < 50 or rate_pct < 70:
+        return "C"
+    if total_positions < 100 or resource_pct < 85:
+        return "B"
+    return "A"
+
+
+# Register both systems after the functions are defined.
+ESTIMATE_CLASSIFICATION_SYSTEMS["aace"] = (_AACE_CLASSES, _determine_aace_class)
+ESTIMATE_CLASSIFICATION_SYSTEMS["ca_cca"] = (_CA_CCA_CLASSES, _determine_ca_class)
+
+# Country code to classification system. Extend this mapping when a new
+# jurisdiction ships its own estimate class taxonomy.
+_COUNTRY_CLASSIFICATION_SYSTEM: dict[str, str] = {
+    "CA": "ca_cca",
+}
+
+
+def _resolve_classification_system(country_code: str | None) -> str:
+    """Return the classification system key for a country, defaulting to AACE."""
+    if country_code:
+        return _COUNTRY_CLASSIFICATION_SYSTEM.get(country_code.strip().upper(), "aace")
+    return "aace"
+
+
 def _build_classification(
     total_positions: int,
     positions_with_rates: int,
     positions_with_resources: int,
     positions_with_classification: int,
+    system: str = "aace",
 ) -> EstimateClassificationResponse:
     """Build an EstimateClassificationResponse from raw metric counts."""
     rate_pct = (positions_with_rates / total_positions * 100) if total_positions > 0 else 0.0
     resource_pct = (positions_with_resources / total_positions * 100) if total_positions > 0 else 0.0
     classification_pct = (positions_with_classification / total_positions * 100) if total_positions > 0 else 0.0
 
-    est_class = _determine_aace_class(total_positions, rate_pct, resource_pct)
-    class_info = _AACE_CLASSES[est_class]
+    classes_table, determiner = ESTIMATE_CLASSIFICATION_SYSTEMS.get(system, ESTIMATE_CLASSIFICATION_SYSTEMS["aace"])
+    est_class = determiner(total_positions, rate_pct, resource_pct)
+    class_info = classes_table[est_class]  # type: ignore[index]
 
     return EstimateClassificationResponse(
         estimate_class=est_class,
+        classification_system=system,
         class_label=str(class_info["label"]),
         accuracy_low=str(class_info["accuracy_low"]),
         accuracy_high=str(class_info["accuracy_high"]),
@@ -1935,6 +2004,27 @@ _RESOURCE_DEFINITION_FIELDS: tuple[str, ...] = (
     "currency",
 )
 
+
+def _same_resource_value(field: str, old: Any, new: Any) -> bool:
+    """Whether a resource definition field kept its value across an edit.
+
+    ``unit_rate`` compares by amount. The editor coerces every resource rate
+    it reads to a number, so a rate stored as ``"12.3400"`` comes back as
+    ``12.34`` on the next resource edit of that position, and a textual
+    comparison read every untouched rate beside the edited one as a new master
+    definition. Any other field, and a rate that is not a number on both sides,
+    compares as stored.
+    """
+    if old == new:
+        return True
+    if field != "unit_rate":
+        return False
+    try:
+        return Decimal(str(old)) == Decimal(str(new))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
 # ── Issue #136: multi-level section / partida hierarchy ──────────────────
 #
 # Historically a BOQ had exactly 3 fixed tiers: Section → Partida → Resource.
@@ -1950,6 +2040,14 @@ _RESOURCE_DEFINITION_FIELDS: tuple[str, ...] = (
 # bulk_add_positions / create_section) and the parent_id-move path of
 # update_position so a deep tree can never be assembled by either route.
 MAX_NESTING_DEPTH = 8
+
+
+class BulkCreateNotApplicable(Exception):
+    """The rows passed to :meth:`BOQService.add_positions_in_document_order` need the per-row path.
+
+    Raised before anything is written; the argument names the first row that
+    could not go in the batch.
+    """
 
 
 def _generate_internal_reference_code() -> str:
@@ -1989,6 +2087,132 @@ def _copy_definition_metadata(master_meta: dict[str, Any] | None) -> dict[str, A
     return out
 
 
+class _LockedSkips:
+    """Linked lines one definition edit left alone because their bill is locked.
+
+    A shared code reaches every bill of the project, but a locked bill keeps
+    its approved figures until someone unlocks or revises it. The #127, #132
+    and #133 passes of one edit each report the lines they skipped here, and
+    ``update_position`` puts the total on the response so the editor can say
+    which bills still carry the old definition. A line is counted once even
+    when two passes would both have rewritten it.
+    """
+
+    def __init__(self) -> None:
+        self._lines: set[uuid.UUID] = set()
+        self._bills: dict[uuid.UUID, str] = {}
+
+    def add(self, position_id: uuid.UUID, boq_id: uuid.UUID, name: str) -> None:
+        self._lines.add(position_id)
+        self._bills[boq_id] = name
+
+    def as_info(self) -> dict[str, Any]:
+        """``locked_skipped`` and ``locked_boqs`` (sorted by name), or nothing."""
+        if not self._lines:
+            return {}
+        ordered = sorted(self._bills.items(), key=lambda kv: (kv[1], str(kv[0])))
+        return {
+            "locked_skipped": len(self._lines),
+            "locked_boqs": [{"id": str(boq_id), "name": name} for boq_id, name in ordered],
+        }
+
+
+class _SeededVat(NamedTuple):
+    """What the tax seed answered for a bill.
+
+    Attributes:
+        rate: The rate as a decimal-string percentage, or ``None`` when the
+            region's own line has to stand.
+        unanswered_on: Set only when the country HAS rates on file and none of
+            them answers the day the bill is priced on, to that day. ``None``
+            when there was an answer, and also when the country simply has no
+            rows, which is the ordinary state and is not reported.
+    """
+
+    rate: str | None
+    unanswered_on: str | None = None
+
+
+_NO_SEEDED_VAT: Final = _SeededVat(None)
+
+#: Resolver statuses that mean "nothing on file is in force on that day", as
+#: opposed to a country that needs a subdivision or whose rows contradict each
+#: other. Only these are a gap in the dated history.
+_DATE_GAP_STATUSES: Final = frozenset({"no_configuration", "default_rate_not_in_force"})
+
+
+def _report_unanswered_day(boq_id: uuid.UUID, country_code: str, day: str, rows_on_file: int) -> str:
+    """Log that a bill's own date has no rate although the country has rates, and return the day."""
+    logger.warning(
+        "BOQ %s is priced on %s, and none of the %d %s tax rate(s) on file is in force that day; the "
+        "region's own VAT line stands in, which is today's rate or a neighbour's, not the rate of %s",
+        boq_id,
+        day,
+        rows_on_file,
+        country_code.upper(),
+        day,
+    )
+    return day
+
+
+def _construction_tier_rate(
+    rows: Sequence[TaxRateRow], country: str, tax_code: str, on_date: str, boq_id: uuid.UUID
+) -> str | None:
+    """The construction tier a country's bill is charged on ``on_date``, or ``None``.
+
+    Read straight off the tier's own row rather than through ``resolve``,
+    because ``resolve`` answers which rate is the STANDARD one and a tier is
+    by definition not. The window rule is still not written twice: the rows
+    in force come from :func:`active_rows`, the same comparison the resolver
+    and the repository use.
+
+    Args:
+        rows: The country's rows as the resolver reads them.
+        country: ISO 3166-1 alpha-2, upper case.
+        tax_code: The tier row's ``tax_code``, from ``CONSTRUCTION_TIER_TAX_CODE``.
+        on_date: The bill's own price-base day as an ISO date.
+        boq_id: The bill, so a broken row is reported against it.
+
+    Returns:
+        The rate as a decimal-string percentage. ``None`` when the tier is not
+        on file for that date, which is the ordinary state of an unseeded
+        install and leaves the region's own line standing, and ``None`` with a
+        warning when the rows on file cannot be read as one rate.
+    """
+    in_force = [
+        row
+        for row in active_rows(rows, country, on_date)
+        if row.tax_code == tax_code and row.combination in ("national", "federal")
+    ]
+    if not in_force:
+        return None
+    if len(in_force) > 1:
+        logger.warning(
+            "BOQ %s: %s has %d %s rows in force on %s, so which construction rate applies cannot be "
+            "told; the region's own VAT line stands",
+            boq_id,
+            country,
+            len(in_force),
+            tax_code,
+            on_date,
+        )
+        return None
+    try:
+        rate = Decimal(in_force[0].rate_pct)
+    except (InvalidOperation, TypeError):
+        rate = None
+    if rate is None or not rate.is_finite() or rate < 0:
+        logger.warning(
+            "BOQ %s: the %s %s row carries rate_pct %r, which is not a rate; the region's own VAT line stands",
+            boq_id,
+            country,
+            tax_code,
+            in_force[0].rate_pct,
+        )
+        return None
+    return format_tax_rate(rate)
+
+
 class BOQService:
     """Business logic for BOQ, Position, and Markup operations."""
 
@@ -2007,6 +2231,23 @@ class BOQService:
         should call this before proceeding.  Read-only methods do not
         need the guard.
 
+        Deliberately unguarded: the writers that build a NEW bill
+        (``create_boq``, ``duplicate_boq``, ``create_scenario``,
+        ``create_boq_from_template``), ``update_boq`` for header fields (it
+        refuses a status change on a locked bill, since status and lock move
+        together through the lock and unlock endpoints),
+        ``refresh_quantity_links`` (records drift, applies nothing), and the
+        writers of snapshots, quantity links and activity rows. ``delete_boq``
+        is guarded: it would remove a locked bill with all its positions and
+        markups. The linked-master and resource-code propagation reached from
+        ``update_position`` writes into OTHER bills of the project; it does not
+        refuse the edit but skips every line in a locked bill and reports the
+        skip on the response (:meth:`_locked_bills_among`, ``_LockedSkips``).
+        The link bookkeeping that also reaches other bills never writes into a
+        locked one either: a master leaving its group hands over to a line in
+        an open bill (:meth:`_hand_over_link_group`), and a new link that would
+        promote an owner in a locked bill is refused.
+
         Returns:
             The loaded BOQ (so callers can reuse it instead of fetching twice).
 
@@ -2018,9 +2259,72 @@ class BOQService:
         if boq.is_locked:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="BOQ is locked and cannot be modified. Create a revision to make changes.",
+                detail=translate("errors.boq_locked", locale=get_locale()),
             )
         return boq
+
+    async def _ensure_boq_writable(self, boq_id: uuid.UUID) -> None:
+        """Raise exactly as :meth:`_ensure_not_locked` does, reading one column.
+
+        ``_ensure_not_locked`` hands back the BOQ, and loading a BOQ loads every
+        position and markup it has (both collections are ``selectin``). A
+        caller that only needs the guard pays for the whole bill: on a 2,000
+        line BOQ that was seconds of every single-position price edit. This
+        asks for ``is_locked`` alone.
+
+        Raises:
+            HTTPException 404: BOQ not found.
+            HTTPException 409: BOQ is locked and cannot be modified.
+        """
+        row = (await self.session.execute(select(BOQ.is_locked).where(BOQ.id == boq_id))).first()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="BOQ not found",
+            )
+        if row[0]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=translate("errors.boq_locked", locale=get_locale()),
+            )
+
+    async def _locked_bills_among(self, boq_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, str]:
+        """The locked bills among ``boq_ids``, as ``{id: name}``, in one query.
+
+        For the writers that reach into OTHER bills of the project (linked
+        definition propagation, link bookkeeping) and must leave a locked one
+        alone. An empty input asks nothing of the database.
+        """
+        ids = {boq_id for boq_id in boq_ids if boq_id is not None}
+        if not ids:
+            return {}
+        rows = await self.session.execute(select(BOQ.id, BOQ.name).where(BOQ.id.in_(ids), BOQ.is_locked.is_(True)))
+        return {boq_id: name or "" for boq_id, name in rows.all()}
+
+    async def _hand_over_link_group(self, survivors: Sequence[Position]) -> uuid.UUID | None:
+        """Give a link group whose master is leaving a new master, sparing locked bills.
+
+        ``survivors`` are the members that stay, oldest first. The oldest one in
+        a bill that is NOT locked becomes the master, or, when it is the only
+        member left, a plain line with no group. A line in a locked bill is
+        never written: a lone survivor there keeps its role and group, and a
+        group whose every survivor is locked is left without a master, so a new
+        link to that code is refused until the bill is unlocked.
+
+        Returns:
+            The id of the line that was rewritten, or None when none was.
+        """
+        if not survivors:
+            return None
+        locked = await self._locked_bills_among({p.boq_id for p in survivors})
+        heir = next((p for p in survivors if p.boq_id not in locked), None)
+        if heir is None:
+            return None
+        if len(survivors) == 1:
+            await self.position_repo.update_fields(heir.id, link_role=None, link_group_id=None)
+        else:
+            await self.position_repo.update_fields(heir.id, link_role="master")
+        return heir.id
 
     async def _validate_parent_id(
         self,
@@ -2063,7 +2367,7 @@ class BOQService:
         # parent-validation failures.
         if position_id is not None and new_parent_id == position_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Position cannot be its own parent (self-referencing parent_id).",
             )
 
@@ -2072,12 +2376,12 @@ class BOQService:
         parent = await self.position_repo.get_by_id(new_parent_id)
         if parent is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Parent position {new_parent_id} does not exist.",
             )
         if parent.boq_id != boq_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"Parent position belongs to a different BOQ ({parent.boq_id}); cross-BOQ parents are not allowed."
                 ),
@@ -2184,7 +2488,7 @@ class BOQService:
         deepest_tier = base_tier + extra
         if deepest_tier > MAX_NESTING_DEPTH:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"Maximum nesting depth of {MAX_NESTING_DEPTH} tiers "
                     f"reached - cannot place this item {deepest_tier} "
@@ -2458,6 +2762,7 @@ class BOQService:
             status="draft",
             estimate_type=data.estimate_type,
             base_date=data.base_date,
+            tax_date=data.tax_date,
             metadata_={"display_columns": default_display_columns},
         )
         boq = await self.boq_repo.create(boq)
@@ -2601,6 +2906,48 @@ class BOQService:
                 fx_map[code] = rate
         return base, fx_map
 
+    async def _resolve_project_fx_for_projects(
+        self,
+        project_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, tuple[str, dict[str, str]]]:
+        """Resolve ``(base_currency, {code: rate})`` for a set of projects in one query.
+
+        Batched sibling of :meth:`_resolve_project_fx_by_project`, for a rollup
+        that spans several projects at once (the bill register of many
+        projects), which would otherwise pay one lookup per project. Same
+        best-effort contract: a project that is missing, or every project when
+        the lookup fails, is absent from the mapping, and callers default an
+        absent project to ``("", {})``.
+        """
+        wanted = list(dict.fromkeys(project_ids))
+        if not wanted:
+            return {}
+        try:
+            from app.modules.projects.models import Project
+
+            rows = (
+                await self.session.execute(
+                    select(Project.id, Project.currency, Project.fx_rates).where(Project.id.in_(wanted)),
+                )
+            ).all()
+        except Exception:  # noqa: BLE001 - never break a widget on this lookup
+            logger.debug("Project FX lookup failed for projects %s", wanted, exc_info=True)
+            return {}
+        resolved: dict[uuid.UUID, tuple[str, dict[str, str]]] = {}
+        for project_id, currency, fx_rates in rows:
+            base = str(currency).strip()[:3].upper() if currency else ""
+            raw = fx_rates if isinstance(fx_rates, list) else []
+            fx_map: dict[str, str] = {}
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                code = str(entry.get("code") or "").strip().upper()
+                rate = str(entry.get("rate") or "").strip()
+                if code and rate:
+                    fx_map[code] = rate
+            resolved[project_id] = (base, fx_map)
+        return resolved
+
     async def _find_content_duplicate(
         self,
         boq_id: uuid.UUID,
@@ -2621,14 +2968,18 @@ class BOQService:
         the first colliding ordinal, or ``None``. Never raises - duplicate
         detection is advisory and must not break a write.
         """
-        # PERF: v4.2.2 Round 2 Wave C audit - already single-query
-        # (one ``list_all_for_boq`` then in-memory fingerprint scan;
-        # ``_content_fingerprint`` reads scalar columns only). Replacing
-        # the python scan with a DB-side hash filter would need a
-        # ``content_hash`` column + backfill - deferred (model refactor).
+        # PERF: single query, then an in-memory fingerprint scan. It reads the
+        # four compared columns plus id and ordinal, not whole positions:
+        # ``list_all_for_boq`` built an ORM object and decoded the metadata of
+        # every row in the bill on every price edit. The comparison itself
+        # stays in Python, because it case-folds and collapses whitespace in
+        # the description and quantises legacy numeric strings, and no SQL
+        # expression agrees with that on every database locale. A DB-side
+        # filter would need a ``content_hash`` column + backfill - deferred
+        # (model refactor).
         try:
             target = _content_fingerprint(description, unit, quantity, unit_rate)
-            for pos in await self.position_repo.list_all_for_boq(boq_id):
+            for pos in await self.position_repo.list_content_keys_for_boq(boq_id):
                 if exclude_id is not None and pos.id == exclude_id:
                     continue
                 if (
@@ -2654,6 +3005,21 @@ class BOQService:
     ) -> tuple[list[BOQ], int]:
         """List BOQs for a given project with pagination."""
         return await self.boq_repo.list_for_project(project_id, offset=offset, limit=limit)
+
+    async def list_boqs_for_projects(
+        self,
+        project_ids: list[uuid.UUID],
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[uuid.UUID, list[BOQ]]:
+        """List the BOQs of several projects, paginated per project, in one query.
+
+        Each project's page is the one :meth:`list_boqs_for_project` returns for
+        the same ``offset`` and ``limit``. A project with no BOQ on its page is
+        absent from the mapping.
+        """
+        return await self.boq_repo.list_for_projects(project_ids, offset=offset, limit=limit)
 
     async def count_line_items(self, boq_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
         """Count the priced line items of each BOQ, excluding section headers.
@@ -2720,6 +3086,8 @@ class BOQService:
     async def compute_boq_totals(
         self,
         boq_ids: list[uuid.UUID],
+        *,
+        positions_by_boq: dict[uuid.UUID, list[Position]] | None = None,
     ) -> dict[uuid.UUID, dict[str, Any]]:
         """Currency-aware money breakdown per BOQ for list / detail endpoints.
 
@@ -2740,7 +3108,11 @@ class BOQService:
         Returns ``{boq_id: {direct_cost, markups_total, grand_total,
         base_currency, currencies, is_mixed_currency, has_unresolved_escalation}}``.
         The three money keys keep their historical ``float`` type and meaning;
-        the trailing keys are additive metadata the callers may surface. Both
+        the trailing keys are additive metadata the callers may surface.
+
+        ``positions_by_boq`` lets a caller that has just read every position of
+        a bill (``list_all_for_boq`` order and contract) hand them over instead
+        of having them read a second time; bills it does not cover are read. Both
         flags mean the same kind of thing, that the total below is not safe to
         read as final: one because it blends currencies, the other because an
         escalation line named an index nobody could resolve and was therefore
@@ -2766,17 +3138,20 @@ class BOQService:
         #  * Every position for the whole set in one ``boq_id IN (...)`` query,
         #    grouped by BOQ (same no-limit / no-eager-load rollup contract as
         #    ``list_all_for_boq``).
-        #  * The owning project id per BOQ in one query, then the project FX
-        #    table resolved ONCE per distinct project (every BOQ on a list page
-        #    shares the same project - Issue #111 conversion is unchanged, it
-        #    only stops re-running the identical FX lookup per BOQ).
+        #  * The owning project id per BOQ in one query, then the FX tables of
+        #    every distinct project in one more (Issue #111 conversion is
+        #    unchanged, it only stops re-running the identical FX lookup per
+        #    BOQ, and per project when the bills span several projects, as the
+        #    many-project bill register does).
         markups_by_boq = await self.boq_repo.active_markups_for_boqs(boq_ids)
-        positions_by_boq = await self.position_repo.list_all_for_boqs(boq_ids)
+        # A bill the caller did not hand over is read here, so a partial dict
+        # can never report a bill as empty.
+        handed = positions_by_boq or {}
+        missing = [b for b in boq_ids if b not in handed]
+        positions_by_boq = {**handed, **(await self.position_repo.list_all_for_boqs(missing) if missing else {})}
         project_by_boq = await self.position_repo.project_ids_for_boqs(boq_ids)
 
-        fx_by_project: dict[uuid.UUID, tuple[str, dict[str, str]]] = {}
-        for project_id in set(project_by_boq.values()):
-            fx_by_project[project_id] = await self._resolve_project_fx_by_project(project_id)
+        fx_by_project = await self._resolve_project_fx_for_projects(list(set(project_by_boq.values())))
 
         for boq_id in boq_ids:
             project_id = project_by_boq.get(boq_id)
@@ -2855,10 +3230,21 @@ class BOQService:
 
         Raises:
             HTTPException 404 if BOQ not found.
+            HTTPException 409 if the BOQ is locked and the status would change.
         """
         boq = await self.get_boq(boq_id)
 
         fields = data.model_dump(exclude_unset=True)
+        # Status and lock move together, and only through the lock and unlock
+        # endpoints: locking approves the bill and sets it ``final``, unlocking
+        # (admin or manager only) puts it back to ``draft``. Moving a LOCKED
+        # bill's status here would make it read as a draft or an archive while
+        # every writer still refuses it, and would skip the unlock endpoint's
+        # role check. An echo of the current status is not a change and passes,
+        # and so do the other header fields. On an unlocked bill the editor's
+        # review flow (draft to final and back) is untouched.
+        if "status" in fields and fields["status"] != boq.status:
+            await self._ensure_boq_writable(boq_id)
         # Map 'metadata' key to the model's 'metadata_' column.
         # MERGE the incoming metadata into the row's existing JSON instead of
         # replacing the whole column - a PATCH that carries only a couple of
@@ -2887,9 +3273,15 @@ class BOQService:
     async def delete_boq(self, boq_id: uuid.UUID) -> None:
         """Delete a BOQ and all its positions.
 
-        Raises HTTPException 404 if not found.
+        A locked bill is refused like every other write to it: deleting it
+        would remove its approved figures in one step. Unlock it first.
+
+        Raises:
+            HTTPException 404: BOQ not found.
+            HTTPException 409: BOQ is locked and cannot be modified.
         """
         boq = await self.get_boq(boq_id)
+        await self._ensure_boq_writable(boq_id)
         project_uuid = boq.project_id
         project_id = str(project_uuid)
 
@@ -2913,6 +3305,7 @@ class BOQService:
                 deleted_position_ids,
                 project_id=project_uuid,
             )
+        await self._release_generated_budgets(boq_id, project_uuid, deleted_position_ids)
 
         await self.boq_repo.delete(boq_id)
 
@@ -2924,6 +3317,80 @@ class BOQService:
         )
 
         logger.info("BOQ deleted: %s", boq_id)
+
+    async def _release_generated_budgets(
+        self,
+        boq_id: uuid.UUID,
+        project_id: uuid.UUID,
+        position_ids: Sequence[str],
+    ) -> None:
+        """Remove or detach the budgets "Create budget" generated from this bill.
+
+        That endpoint writes finance budgets stamped with ``boq_id`` in their
+        metadata and one cost model budget line per position. Neither has a
+        foreign key to the bill, so deleting the bill left both behind as budget
+        that no bill stands behind. A generated row nobody has worked on goes
+        with the bill. A row with money recorded against it since (committed,
+        actual, earned, or a revised finance budget) is a record in its own
+        right and is kept, detached from the bill: the finance row notes which
+        bill it came from, the budget line drops its position link.
+        """
+        from app.modules.finance.models import ProjectBudget
+
+        budgets = (
+            (await self.session.execute(select(ProjectBudget).where(ProjectBudget.project_id == project_id)))
+            .scalars()
+            .all()
+        )
+        for budget in budgets:
+            meta = budget.metadata_ if isinstance(budget.metadata_, dict) else {}
+            if meta.get("boq_id") != str(boq_id):
+                continue
+            untouched = (
+                _is_zero(budget.committed)
+                and _is_zero(budget.actual)
+                and Decimal(str(budget.revised_budget or 0)) == Decimal(str(budget.original_budget or 0))
+            )
+            if untouched:
+                await self.session.delete(budget)
+            else:
+                detached = {k: v for k, v in meta.items() if k != "boq_id"}
+                detached["deleted_boq_id"] = str(boq_id)
+                budget.metadata_ = detached
+
+        await self._release_position_budget_lines(position_ids)
+        await self.session.flush()
+
+    async def _release_position_budget_lines(self, position_ids: Sequence[str]) -> None:
+        """Remove or detach the cost model budget lines of deleted positions.
+
+        One line per position is generated by "Create budget", linked by
+        ``boq_position_id`` with no foreign key behind it. A line with no money
+        recorded goes with its position; a line with committed, actual or earned
+        money is kept and drops the link, so the record survives the position.
+        Shared by ``delete_boq`` and ``delete_position``.
+        """
+        if not position_ids:
+            return
+        from app.modules.costmodel.models import BudgetLine
+
+        lines = (
+            (
+                await self.session.execute(
+                    select(BudgetLine).where(
+                        BudgetLine.boq_position_id.in_([uuid.UUID(pid) for pid in position_ids]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for line in lines:
+            untouched = _is_zero(line.committed_amount) and _is_zero(line.actual_amount) and line.earned_amount is None
+            if untouched:
+                await self.session.delete(line)
+            else:
+                line.boq_position_id = None
 
     # ── Position operations ───────────────────────────────────────────────
 
@@ -2959,8 +3426,13 @@ class BOQService:
         link_mode = getattr(data, "link_mode", None)
         project_id = await self.position_repo.project_id_for_boq(data.boq_id)
         if supplied_code and link_mode != "standalone":
+            # Cross-BOQ lookup only when the user explicitly requested
+            # linked reuse ("link" or "copy").  Default (link_mode is None)
+            # restricts to the SAME BOQ so a matching reference_code in a
+            # sibling BOQ cannot silently donate its description/resources.
+            scope_boq_id = data.boq_id if link_mode not in ("link", "copy") else None
             master = (
-                await self.position_repo.find_master_by_reference_code(project_id, supplied_code)
+                await self.position_repo.find_master_by_reference_code(project_id, supplied_code, boq_id=scope_boq_id)
                 if project_id is not None
                 else None
             )
@@ -3004,12 +3476,12 @@ class BOQService:
             except Exception as exc:  # noqa: BLE001 - surface any DB failure as 422
                 logger.exception("add_position cost_item lookup failed for %s", data.cost_item_id)
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(f"cost_item_id does not reference an active CostItem ({type(exc).__name__})"),
                 ) from exc
             if cost_item is None or not getattr(cost_item, "is_active", False):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="cost_item_id does not reference an active CostItem",
                 )
             merged_metadata["cost_item_id"] = str(data.cost_item_id)
@@ -3023,6 +3495,12 @@ class BOQService:
             )
         else:
             _cost_compat_warned = False
+        # A line made from a regional price list keeps the list's region,
+        # edition and shares. The editor's add-from-database modal names its
+        # item inside the metadata rather than at the top level.
+        await carry_from_link(
+            self.session, merged_metadata, cost_item=cost_item if data.cost_item_id is not None else None
+        )
 
         # Stamp the CWICR variant snapshot so the position's unit_rate is
         # immutable from the cost-database side: a later re-import or rate
@@ -3188,6 +3666,175 @@ class BOQService:
         logger.info("Position added: %s to BOQ %s", data.ordinal, data.boq_id)
         return position
 
+    async def add_positions_in_document_order(
+        self,
+        boq_id: uuid.UUID,
+        items: Sequence[tuple[uuid.UUID, PositionCreate]],
+        *,
+        chunk_size: int = 500,
+    ) -> list[uuid.UUID]:
+        """Create an imported bill's rows in the order the file lists them, in one transaction.
+
+        The import path for a bill whose rows arrive in tree order: every
+        section before the rows filed under it, a section's own items before
+        its sub-sections. Each item carries the id it will be stored under, so
+        a row can name a section created in the same call as its parent.
+
+        It writes what :meth:`add_position` writes for the same payload (the
+        duplicate-content warning, the internal reference code, the variant
+        and resource stamps, the nesting cap), but with a fixed number of
+        queries instead of about a dozen per row: ``add_position`` re-reads
+        the parent's children, shifts the sort order of every later row and
+        rescans the bill for duplicates on each call, so a bill of a few
+        thousand rows did not finish inside a request. Rows are flushed in
+        chunks and leave the session's identity map once written, so the
+        session does not grow with the bill (the payloads passed in still
+        do). One ``boq.positions.bulk_created`` event names every created id,
+        for the search index.
+
+        Raises:
+            BulkCreateNotApplicable: The rows need what only the per-row path
+                does (a cost-item link, a reference code to reuse, an anchor
+                row), an ordinal is taken or repeated, a parent is not a
+                section created earlier in the same call, or a row would sit
+                deeper than the nesting cap. Nothing has been written; the
+                caller creates the rows one by one instead.
+        """
+        if not items:
+            return []
+        await self._ensure_not_locked(boq_id)
+
+        seen: set[str] = set()
+        tier: dict[uuid.UUID, int] = {}
+        for position_id, data in items:
+            if (
+                data.boq_id != boq_id
+                or data.cost_item_id is not None
+                or (getattr(data, "reference_code", None) or "").strip()
+                or getattr(data, "after_position_id", None) is not None
+                or data.ordinal in seen
+            ):
+                raise BulkCreateNotApplicable(data.ordinal)
+            seen.add(data.ordinal)
+            if data.parent_id is None:
+                tier[position_id] = 1
+            elif data.parent_id in tier:
+                tier[position_id] = tier[data.parent_id] + 1
+            else:
+                raise BulkCreateNotApplicable(data.ordinal)
+            if tier[position_id] > MAX_NESTING_DEPTH:
+                raise BulkCreateNotApplicable(data.ordinal)
+        if await self.position_repo.ordinals_taken(boq_id, seen):
+            raise BulkCreateNotApplicable("ordinal taken")
+
+        project_id = await self.position_repo.project_id_for_boq(boq_id)
+        max_order = await self.position_repo.get_max_sort_order(boq_id)
+        # First ordinal per content fingerprint, existing rows first: the row
+        # ``_find_content_duplicate`` would name, as the rows are added in order.
+        first_with: dict[tuple[str, str, str, str], str] = {}
+        for row in await self.position_repo.list_content_keys_for_boq(boq_id):
+            first_with.setdefault(
+                _content_fingerprint(row.description, row.unit, row.quantity, row.unit_rate), row.ordinal
+            )
+        codes = await self._fresh_reference_codes(project_id, len(items))
+
+        created: list[uuid.UUID] = []
+        pending: list[Position] = []
+        for offset, ((position_id, data), code) in enumerate(zip(items, codes, strict=True), start=1):
+            metadata: dict[str, Any] = dict(data.metadata) if isinstance(data.metadata, dict) else {}
+            currency_hint = metadata.get("currency")
+            _stamp_variant_snapshot(
+                metadata,
+                unit_rate=data.unit_rate,
+                currency=currency_hint if isinstance(currency_hint, str) else None,
+            )
+            _stamp_resource_variant_snapshots(
+                metadata,
+                position_currency=currency_hint if isinstance(currency_hint, str) else None,
+            )
+            _stamp_resource_breakdown(metadata)
+            fingerprint = _content_fingerprint(data.description, data.unit, data.quantity, data.unit_rate)
+            duplicate_of = first_with.setdefault(fingerprint, data.ordinal)
+            if duplicate_of != data.ordinal:
+                _apply_duplicate_warning(metadata, duplicate_of)
+            norm_id, norm_work_key = _norm_provenance_from_metadata(metadata)
+            pending.append(
+                Position(
+                    id=position_id,
+                    boq_id=boq_id,
+                    parent_id=data.parent_id,
+                    ordinal=data.ordinal,
+                    description=data.description,
+                    unit=data.unit,
+                    quantity=_quantize_money_str(data.quantity),
+                    unit_rate=_quantize_money_str(data.unit_rate),
+                    total=_compute_total(data.quantity, data.unit_rate),
+                    classification=data.classification,
+                    source=data.source,
+                    confidence=str(data.confidence) if data.confidence is not None else None,
+                    risk_dispersion=(str(data.risk_dispersion) if data.risk_dispersion is not None else None),
+                    price_basis=data.price_basis,
+                    cad_element_ids=data.cad_element_ids,
+                    metadata_=metadata,
+                    norm_id=norm_id,
+                    norm_work_key=norm_work_key,
+                    validation_status="warnings" if duplicate_of != data.ordinal else "pending",
+                    sort_order=max_order + offset,
+                    reference_code=code,
+                    link_group_id=None,
+                    link_role=None,
+                )
+            )
+            if len(pending) >= chunk_size:
+                created.extend(await self._flush_and_release(pending))
+                pending = []
+        created.extend(await self._flush_and_release(pending))
+
+        await _safe_publish(
+            "boq.positions.bulk_created",
+            {"boq_id": str(boq_id), "count": len(created), "position_ids": [str(pid) for pid in created]},
+            source_module="oe_boq",
+            session=self.session,
+        )
+        await _safe_audit(
+            self.session,
+            action="bulk_create",
+            entity_type="position",
+            entity_id=str(boq_id),
+            details={"count": len(created)},
+        )
+        logger.info("Imported %d positions into BOQ %s in document order", len(created), boq_id)
+        return created
+
+    async def _flush_and_release(self, positions: list[Position]) -> list[uuid.UUID]:
+        """Write ``positions`` and drop them from the identity map; their ids in order."""
+        if not positions:
+            return []
+        self.session.add_all(positions)
+        await self.session.flush()
+        ids = [position.id for position in positions]
+        for position in positions:
+            self.session.expunge(position)
+        return ids
+
+    async def _fresh_reference_codes(self, project_id: uuid.UUID | None, count: int) -> list[str]:
+        """``count`` internal reference codes no position of the project uses yet, in one query per round."""
+        codes: list[str] = []
+        for _ in range(8):
+            wanted = count - len(codes)
+            if wanted <= 0:
+                break
+            candidates = list(dict.fromkeys(_generate_internal_reference_code() for _ in range(wanted)))
+            candidates = [c for c in candidates if c not in codes]
+            if project_id is not None:
+                used = await self.position_repo.reference_codes_used_in_project(project_id, candidates)
+                candidates = [c for c in candidates if c not in used]
+            codes.extend(candidates)
+        while len(codes) < count:
+            # Astronomically unlikely: the same fallback as a single create.
+            codes.append(f"{_generate_internal_reference_code()}{uuid.uuid4().hex[:4].upper()}"[:64])
+        return codes[:count]
+
     async def _create_reused_position(
         self,
         *,
@@ -3221,6 +3868,26 @@ class BOQService:
         master_ordinal = master.ordinal
         master_link_group_id = master.link_group_id
         master_link_role = master.link_role
+        master_boq_id = master.boq_id
+
+        # The owner may sit in another bill of the project. Linking to a plain
+        # owner promotes it to master, and linking to a group member that lost
+        # its role gives the role back; both write into the owner's bill. A
+        # locked bill does not change at all, so that link is refused here,
+        # before anything is written. Joining a group whose owner is already
+        # the master writes nothing into its bill and goes ahead, as does a copy.
+        if not as_copy and (master_link_group_id is None or master_link_role != "master"):
+            locked = await self._locked_bills_among({master_boq_id})
+            if master_boq_id in locked:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=translate(
+                        "errors.boq_link_owner_locked",
+                        locale=get_locale(),
+                        code=reference_code,
+                        bill=locked[master_boq_id],
+                    ),
+                )
 
         # Resolve / create the link group (only for the linked path).
         link_group_id: uuid.UUID | None = None
@@ -3397,7 +4064,7 @@ class BOQService:
                 cost_item = await cost_repo.get_by_id(data.cost_item_id)
                 if cost_item is None or not getattr(cost_item, "is_active", False):
                     raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=(f"cost_item_id {data.cost_item_id} does not reference an active CostItem"),
                     )
                 merged_metadata["cost_item_id"] = str(data.cost_item_id)
@@ -3409,6 +4076,9 @@ class BOQService:
                 )
             else:
                 _bulk_cost_warned = False
+            await carry_from_link(
+                self.session, merged_metadata, cost_item=cost_item if data.cost_item_id is not None else None
+            )
 
             currency_hint = merged_metadata.get("currency") if isinstance(merged_metadata, dict) else None
             _stamp_variant_snapshot(
@@ -3452,7 +4122,7 @@ class BOQService:
 
         await _safe_publish(
             "boq.positions.bulk_created",
-            {"boq_id": str(boq_id), "count": len(inserted)},
+            {"boq_id": str(boq_id), "count": len(inserted), "position_ids": [str(p.id) for p in inserted]},
             source_module="oe_boq",
             session=self.session,
         )
@@ -3574,7 +4244,7 @@ class BOQService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=translate("errors.position_not_found", locale=get_locale()),
             )
-        await self._ensure_not_locked(position.boq_id)
+        await self._ensure_boq_writable(position.boq_id)
 
         # ── Issue #127: capture pre-update link state ────────────────────
         # Needed AFTER the write to decide master-propagation vs
@@ -3598,6 +4268,19 @@ class BOQService:
         if "metadata" in fields:
             _requested_def_fields.add("metadata_")
 
+        # ── Issue #133: which resources did the CLIENT send? ─────────────
+        # Snapshot them now, as sent, before the code below derives metadata
+        # of its own: OC-21 rescales every resource rate when only unit_rate
+        # is patched, and the duplicate, link-strip and cost-item steps write
+        # metadata the client never touched. None of that is a person editing
+        # a master resource definition, so none of it may fan out to the other
+        # positions sharing a code. ``None`` means the request carried no
+        # resource list, and then nothing propagates.
+        _res_requested: list[dict[str, Any]] | None = None
+        _req_meta = fields.get("metadata")
+        if isinstance(_req_meta, dict) and isinstance(_req_meta.get("resources"), list):
+            _res_requested = [dict(r) if isinstance(r, dict) else {} for r in _req_meta["resources"]]
+
         # ── Issue #79: cost_item_id linkage ─────────────────────────────
         # The client doesn't see ``metadata.cost_item_id`` directly - they
         # send a top-level ``cost_item_id`` field.  Pop it out, validate
@@ -3616,12 +4299,12 @@ class BOQService:
                     client_cost_item_id,
                 )
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(f"cost_item_id does not reference an active CostItem ({type(exc).__name__})"),
                 ) from exc
             if cost_item is None or not getattr(cost_item, "is_active", False):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="cost_item_id does not reference an active CostItem",
                 )
             # Merge into the metadata field that the rest of the function
@@ -3651,6 +4334,20 @@ class BOQService:
                 fields["validation_status"] = "warnings"
             fields["metadata"] = base_meta
 
+        # Linking a line to a cost item, or to another one, carries that
+        # item's price-list block and drops the one the previous item left.
+        if isinstance(fields.get("metadata"), dict):
+            _new_link = linked_cost_item_id(fields["metadata"])
+            _old_link = linked_cost_item_id(position.metadata_ if isinstance(position.metadata_, dict) else None)
+            if _new_link is not None and (_new_link != _old_link or PRICE_LIST_KEY not in fields["metadata"]):
+                fields["metadata"] = dict(fields["metadata"])
+                await carry_from_link(
+                    self.session,
+                    fields["metadata"],
+                    cost_item=cost_item if client_cost_item_id is not None else None,
+                    replace=_new_link != _old_link,
+                )
+
         # ── BUG-CONCURRENCY01: optimistic concurrency check ──────────────
         # Pop the client-supplied ``version`` so it never reaches the SQL
         # UPDATE.  We bump it ourselves below.
@@ -3679,12 +4376,13 @@ class BOQService:
 
         # ── Issue #133: snapshot resources BEFORE the write so a master
         # resource definition edit can be diffed + propagated afterwards.
+        # Always from the stored row, whatever the request carries: the diff
+        # below compares what was stored with what the client sent.
         _res_before: list[dict[str, Any]] | None = None
-        if "metadata" in fields:
-            _existing_meta = position.metadata_ if isinstance(position.metadata_, dict) else {}
-            _rb = _existing_meta.get("resources")
-            if isinstance(_rb, list):
-                _res_before = [dict(r) if isinstance(r, dict) else {} for r in _rb]
+        _existing_meta = position.metadata_ if isinstance(position.metadata_, dict) else {}
+        _rb = _existing_meta.get("resources")
+        if isinstance(_rb, list):
+            _res_before = [dict(r) if isinstance(r, dict) else {} for r in _rb]
 
         # If ordinal is being changed, check uniqueness within the BOQ
         if "ordinal" in fields and fields["ordinal"] != position.ordinal:
@@ -3865,6 +4563,36 @@ class BOQService:
                 # the FX-aware rollup agree.
                 new_unit_rate = _quantize_money_str(_resource_total_in_base(resources, _fx_map, _fx_base_ccy or ""))
                 fields["unit_rate"] = new_unit_rate
+
+        # OC-21: when the user directly patches unit_rate WITHOUT changing
+        # the resource list, proportionally scale each resource's unit_rate
+        # so the resource breakdown and the position total stay in sync.
+        # Without this, the cost breakdown reads stale resource subtotals
+        # that diverge from the position's new unit_rate (e.g. +5% on the
+        # position but unchanged resource rows).
+        if "unit_rate" in fields and not triggered_by_resources:
+            existing_meta = position.metadata_ if isinstance(position.metadata_, dict) else {}
+            existing_resources = existing_meta.get("resources")
+            if isinstance(existing_resources, list) and _has_contributing_resources(existing_resources):
+                old_rate = _to_decimal(position.unit_rate)
+                new_rate = _to_decimal(new_unit_rate)
+                if old_rate > 0 and new_rate > 0 and old_rate != new_rate:
+                    ratio = new_rate / old_rate
+                    scaled = []
+                    for r in existing_resources:
+                        if not isinstance(r, dict):
+                            scaled.append(r)
+                            continue
+                        r_copy = dict(r)
+                        r_rate = _to_decimal(r_copy.get("unit_rate"))
+                        r_copy["unit_rate"] = str(_quantize_money(r_rate * ratio))
+                        r_qty = _to_decimal(r_copy.get("quantity"))
+                        r_copy["total"] = str(_quantize_money(r_qty * _to_decimal(r_copy["unit_rate"])))
+                        scaled.append(r_copy)
+                    if "metadata_" not in fields or not isinstance(fields.get("metadata_"), dict):
+                        fields["metadata_"] = dict(existing_meta)
+                    fields["metadata_"]["resources"] = scaled
+                    _stamp_resource_breakdown(fields["metadata_"])
 
         # Recalculate total only when something pricing-related actually changed.
         # A pure metadata patch (e.g. setting a custom column value) leaves the
@@ -4122,7 +4850,7 @@ class BOQService:
                     {k: type(v).__name__ for k, v in fields.items()},
                 )
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(
                         "Position update could not be applied. The row may have "
                         "been deleted or modified concurrently - reload and retry. "
@@ -4139,7 +4867,14 @@ class BOQService:
         # never propagate). Each affected position + its BOQ totals are
         # recomputed, the position-changed event fires per instance, and
         # ONE audit entry records the fan-out.
+        #
+        # A line in a LOCKED bill is never rewritten here or in the two passes
+        # below: an approved bill keeps its figures until someone unlocks or
+        # revises it. The edit itself goes through (its own bill passed the lock
+        # guard); the skipped lines are collected and reported on the response.
         _propagated_count = 0
+        _locked_skips = _LockedSkips()
+        _editor_boq_id = position.boq_id
         if _link_role_before == "master" and _link_group_before is not None and not _did_unlink_instance and fields:
             # Resolve the definition fields whose persisted value changed.
             _changed_def_payload: dict[str, Any] = {}
@@ -4189,6 +4924,10 @@ class BOQService:
                     # ``_link_src`` anywhere; they keep the original
                     # group-flat behaviour so existing links never regress.
                     _group_has_src = any("_link_src" in s["meta"] for s in _grp_snap)
+                    # The editor's own bill passed the lock guard; ask about the others.
+                    _grp_locked = await self._locked_bills_among(
+                        {s["boq_id"] for s in _grp_snap if s["boq_id"] != _editor_boq_id}
+                    )
                     affected_boqs: set[uuid.UUID] = set()
                     for _snap in _grp_snap:
                         _inst_id = _snap["id"]
@@ -4209,6 +4948,9 @@ class BOQService:
                         # children (``_link_src`` = their own master child)
                         # are handled by the master-child pass below.
                         if _group_has_src and str(_inst_meta.get("_link_src")) != str(position_id):
+                            continue
+                        if _inst_boq_id in _grp_locked:
+                            _locked_skips.add(_inst_id, _inst_boq_id, _grp_locked[_inst_boq_id])
                             continue
                         inst_fields: dict[str, Any] = {}
                         for k, v in _changed_def_payload.items():
@@ -4260,8 +5002,9 @@ class BOQService:
                         try:
                             _proj_id: uuid.UUID | None = None
                             try:
-                                _b = await self.get_boq(position.boq_id)
-                                _proj_id = _b.project_id
+                                # The project id only: ``get_boq`` would load
+                                # every position and markup of the bill.
+                                _proj_id = await self.position_repo.project_id_for_boq(position.boq_id)
                             except Exception:  # noqa: BLE001
                                 _proj_id = None
                             await self.log_activity(
@@ -4365,6 +5108,9 @@ class BOQService:
                             }
                             for _c in _mc_group
                         ]
+                        _mc_locked = await self._locked_bills_among(
+                            {s["boq_id"] for s in _mc_snap if s["boq_id"] != _editor_boq_id}
+                        )
                         _mc_affected: set[uuid.UUID] = set()
                         for _cs in _mc_snap:
                             _ci_id = _cs["id"]
@@ -4382,6 +5128,9 @@ class BOQService:
                             # Per-node correspondence: only the instance
                             # children cloned from THIS master child.
                             if str(_ci_meta.get("_link_src")) != str(position_id):
+                                continue
+                            if _ci_boq_id in _mc_locked:
+                                _locked_skips.add(_ci_id, _ci_boq_id, _mc_locked[_ci_boq_id])
                                 continue
                             _ci_fields: dict[str, Any] = {}
                             for k, v in _mc_changed.items():
@@ -4425,8 +5174,7 @@ class BOQService:
                             try:
                                 _mc_proj: uuid.UUID | None = None
                                 try:
-                                    _mb = await self.get_boq(position.boq_id)
-                                    _mc_proj = _mb.project_id
+                                    _mc_proj = await self.position_repo.project_id_for_boq(position.boq_id)
                                 except Exception:  # noqa: BLE001
                                     _mc_proj = None
                                 await self.log_activity(
@@ -4511,8 +5259,9 @@ class BOQService:
             try:
                 project_id: uuid.UUID | None = None
                 try:
-                    boq = await self.get_boq(position.boq_id)
-                    project_id = boq.project_id
+                    # One column, not ``get_boq``: loading the BOQ loads every
+                    # position and markup it has, on every single edit.
+                    project_id = await self.position_repo.project_id_for_boq(position.boq_id)
                 except Exception:  # noqa: BLE001 - best-effort
                     project_id = None
                 await self.log_activity(
@@ -4534,15 +5283,16 @@ class BOQService:
         # definition for, fan the changed DEFINITION fields out to every
         # other position's resource sharing that code (never the quantity,
         # never a user-diverged instance). Mirrors the #127 contract.
+        #
+        # Only a change the CLIENT made counts. The diff is taken between the
+        # stored resources and the ones the request carried; a request with no
+        # resource list propagates nothing. The metadata this method derives
+        # itself does not count: OC-21 rescales every resource rate on a plain
+        # unit_rate edit, and treating that as a master edit re-priced every
+        # other position sharing a code whenever someone typed, pasted or
+        # bulk-factored a price on the oldest carrier of that code.
         _resource_propagated = 0
-        if (
-            # ``metadata`` is renamed to ``metadata_`` earlier in this
-            # method (the column writer expects the mapped attribute name),
-            # so accept either spelling here.
-            ("metadata" in fields or "metadata_" in fields)
-            and not _did_unlink_instance
-            and isinstance(position.metadata_, dict)
-        ):
+        if _res_requested is not None and not _did_unlink_instance and isinstance(position.metadata_, dict):
             _res_after_raw = position.metadata_.get("resources")
             if isinstance(_res_after_raw, list):
                 # Snapshot the after-state into a plain list NOW, before the
@@ -4550,12 +5300,24 @@ class BOQService:
                 # below compares the editor's own before/after without a reload
                 # that would raise MissingGreenlet.
                 _res_after = [dict(r) if isinstance(r, dict) else r for r in _res_after_raw]
-                _res_delta = self._resource_def_changed(_res_before, _res_after)
+                # What the client changed, carried at the value that was stored
+                # for it. A field the write path put back to its stored value
+                # drops out, and so does anything derived for fields the client
+                # left alone.
+                _res_delta: dict[str, dict[str, Any]] = {}
+                _requested_delta = self._resource_def_changed(_res_before, _res_requested)
+                if _requested_delta:
+                    _stored_delta = self._resource_def_changed(_res_before, _res_after)
+                    for _code, _req_fields in _requested_delta.items():
+                        _kept = {f: v for f, v in _stored_delta.get(_code, {}).items() if f in _req_fields}
+                        if _kept:
+                            _res_delta[_code] = _kept
                 if _res_delta:
                     _resource_propagated = await self._propagate_resource_definitions(
                         editor_position=position,
                         changed_by_code=_res_delta,
                         actor_id=actor_id,
+                        locked_skips=_locked_skips,
                     )
                     # The propagation rewrote sibling rows and may have rolled
                     # a value back onto this one; re-hydrate ``position`` so the
@@ -4576,13 +5338,17 @@ class BOQService:
         # Stashed on a NON-mapped attribute so the request-session commit
         # in ``get_session`` never persists it (mutating the mapped
         # ``metadata_`` column here would flush the transient key into the
-        # DB). The router merges it into the response metadata.
-        if _propagated_count or _did_unlink_instance or _resource_propagated:
+        # DB). The router merges it into the response metadata. A skip in a
+        # locked bill is reported even when nothing else was written, so the
+        # editor never reads silence as "every bill took the change".
+        _skip_info = _locked_skips.as_info()
+        if _propagated_count or _did_unlink_instance or _resource_propagated or _skip_info:
             try:
                 position._link_propagation_info = {  # type: ignore[attr-defined]
                     "propagated_to": _propagated_count,
                     "unlinked": _did_unlink_instance,
                     "resource_propagated_to": _resource_propagated,
+                    **_skip_info,
                 }
             except Exception:  # noqa: BLE001 - purely cosmetic
                 pass
@@ -4828,13 +5594,13 @@ class BOQService:
             )
         if source.target_id != position_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(f"Log entry {log_id} targets a different position ({source.target_id})"),
             )
         changes = source.changes if isinstance(source.changes, dict) else {}
         if field not in changes:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"Field '{field}' has no recorded change in log entry "
                     f"{log_id}. Available fields: {sorted(changes.keys())}"
@@ -4849,7 +5615,7 @@ class BOQService:
                 payload_kwargs[field] = None if value is None or value == "" else float(value)
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=f"Cannot coerce {field}={value!r} to float",
                 ) from exc
         elif field in {"classification", "metadata", "cad_element_ids"}:
@@ -4861,7 +5627,7 @@ class BOQService:
             update_data = PositionUpdate(**payload_kwargs)
         except Exception as exc:  # noqa: BLE001 - schema rejections → 422
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(f"Cannot restore field '{field}': {exc!s}"),
             ) from exc
 
@@ -4940,12 +5706,12 @@ class BOQService:
         resources_raw = existing_meta.get("resources")
         if not isinstance(resources_raw, list):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Position has no resources to re-pick a variant for",
             )
         if resource_idx < 0 or resource_idx >= len(resources_raw):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(f"resource_idx {resource_idx} is out of range (position has {len(resources_raw)} resource(s))"),
             )
 
@@ -4955,14 +5721,14 @@ class BOQService:
         target_resource = resources[resource_idx]
         if not isinstance(target_resource, dict):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Resource at index {resource_idx} is malformed",
             )
 
         available = target_resource.get("available_variants")
         if not isinstance(available, list) or not available:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "Resource has no cached variants to re-pick from. "
                     "Re-add the resource from the cost database to enable variant switching."
@@ -4979,7 +5745,7 @@ class BOQService:
                 break
         if chosen is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"variant_code '{variant_code}' not found in available_variants "
                     f"({len(available)} option(s) cached on this resource)"
@@ -4990,7 +5756,7 @@ class BOQService:
             new_price = float(chosen.get("price", 0) or 0)
         except (TypeError, ValueError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Selected variant has a malformed price",
             ) from exc
 
@@ -5078,7 +5844,7 @@ class BOQService:
                 resource_idx,
             )
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "Variant re-pick could not be applied. The position may have been "
                     f"modified concurrently - reload and retry. ({type(exc).__name__})"
@@ -5208,18 +5974,8 @@ class BOQService:
                 # Survivors = group members not in the delete set (cascade
                 # may have removed instances too).
                 survivors = [p for p in group if str(p.id) not in _deleted_ids_set]
-                if survivors:
-                    # list_link_group is ordered oldest-first → promote head.
-                    _promote_id = survivors[0].id
-                    await self.position_repo.update_fields(_promote_id, link_role="master")
-                    if len(survivors) == 1:
-                        # Only one left - collapse to a standalone owner so
-                        # we don't keep a one-member group around.
-                        await self.position_repo.update_fields(
-                            _promote_id,
-                            link_role=None,
-                            link_group_id=None,
-                        )
+                _promote_id = await self._hand_over_link_group(survivors)
+                if _promote_id is not None:
                     logger.info(
                         "Promoted position %s to master of group %s (old master %s deleted)",
                         _promote_id,
@@ -5239,6 +5995,7 @@ class BOQService:
         # module doesn't retain dead IDs in Activity.boq_position_ids JSON arrays.
         if deleted_position_ids:
             await self._scrub_activity_position_refs(_del_position_boq_id, deleted_position_ids)
+            await self._release_position_budget_lines(deleted_position_ids)
 
         for pid_str in deleted_position_ids:
             await _safe_publish(
@@ -5389,7 +6146,7 @@ class BOQService:
 
         if kind == "banded" and not _read_bands(meta):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "A banded markup needs metadata.bands, a list of "
                     '{"up_to": <ceiling or null>, "percentage": <rate>} tranches.'
@@ -5403,7 +6160,7 @@ class BOQService:
             target_period = str(config.get("target_period") or "").strip() if isinstance(config, dict) else ""
             if series_id is None or not base_period or not target_period:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(
                         "An escalation markup needs metadata.escalation with series_id, "
                         "base_period and target_period as YYYY-MM."
@@ -5568,7 +6325,7 @@ class BOQService:
         """
         if overrides_id is not None and scope_position_id is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="A markup can only override another line inside a scope; set scope_position_id as well.",
             )
 
@@ -5576,25 +6333,25 @@ class BOQService:
             position = await self.position_repo.get_by_id(scope_position_id)
             if position is None or position.boq_id != boq_id:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="scope_position_id must name a position on this BOQ.",
                 )
 
         if overrides_id is not None:
             if self_id is not None and overrides_id == self_id:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="A markup cannot override itself.",
                 )
             target = await self.markup_repo.get_by_id(overrides_id)
             if target is None or target.boq_id != boq_id:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="overrides_id must name a markup on this BOQ.",
                 )
             if target.scope_position_id is not None:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Only a bill-wide markup can be overridden; that line is itself scoped.",
                 )
 
@@ -5827,8 +6584,21 @@ class BOQService:
             logger.debug("project lookup failed for boq %s", boq_id, exc_info=True)
             return None
 
-    async def _seeded_vat_rate(self, country_code: str | None, base_date: str | None, boq_id: uuid.UUID) -> str | None:
-        """The country's own standard VAT rate from the shipped tax seed.
+    async def _seeded_vat_rate(
+        self,
+        country_code: str | None,
+        base_date: str | None,
+        boq_id: uuid.UUID,
+        *,
+        field: str = "base_date",
+    ) -> _SeededVat:
+        """The VAT rate a bill of quantities in this country is charged, from the tax seed.
+
+        That is the country's standard rate almost everywhere. In a country
+        named in ``CONSTRUCTION_TIER_COUNTRIES`` it is the construction tier
+        instead, read from the row ``CONSTRUCTION_TIER_TAX_CODE`` names and in
+        force on the bill's base date: China's 9 rather than its headline 13,
+        Ireland's 13.5 rather than its standard 23 or the UK stack's 20.
 
         The bill used to price a country with no project override off its
         region's stack, which is a neighbour's rate wherever a region serves
@@ -5845,9 +6615,14 @@ class BOQService:
 
         Args:
             country_code: The project's ISO 3166-1 alpha-2 code, or None.
-            base_date: The bill's own base date. A bill of quantities is taxed
-                at its own base date, so this is the date the rate is resolved
-                on - not today. The column is ``String(40)`` free text and a
+            base_date: The bill's own tax date, which is its ``tax_date`` when
+                it states one and its ``base_date`` otherwise; the caller picks
+                through :func:`app.modules.boq.base_date.tax_point` and passes
+                what it picked here. A bill of quantities is taxed at its own
+                date, so this is the date the rate is resolved on - not today.
+                The parameter keeps its old name because ``base_date`` is what
+                every bill without a tax date still passes. The column is
+                ``String(40)`` free text and a
                 price base is legitimately stated as a day, a month, a quarter
                 or a year, so it is read by
                 :func:`app.modules.boq.base_date.price_base_day`, which owns
@@ -5858,13 +6633,20 @@ class BOQService:
                 windows in opposite directions without failing.
             boq_id: The bill being priced, so that a base date nothing can read
                 names the bill it came from in the log rather than only itself.
+            field: Which column the date came from, ``base_date`` or
+                ``tax_date``, so that the log names the field to fix.
 
         Returns:
-            The rate as a decimal-string percentage, or None when the country
-            is unknown, has no row in force, or the table is empty - the last
-            being every database that has not been seeded yet. None means the
-            region's own line stands, which the caller records rather than
-            leaving indistinguishable from a rate that was resolved.
+            A :class:`_SeededVat`. Its ``rate`` is the rate as a decimal-string
+            percentage, or None when the country is unknown, has no row in
+            force, or the table is empty - the last being every database that
+            has not been seeded yet. None means the region's own line stands,
+            which the caller records rather than leaving indistinguishable
+            from a rate that was resolved. ``unanswered_on`` separates the one
+            case of those that is a gap rather than an absence: the country
+            has rates on file and none is in force on the bill's day, so the
+            line standing in is today's rate or a neighbour's. That case is
+            logged at warning, and the caller writes the day onto the line.
 
         Raises:
             Nothing. A rate that cannot be read is not a reason a bill cannot
@@ -5874,14 +6656,17 @@ class BOQService:
             a defect in somebody's data that nothing else would report.
         """
         if not country_code:
-            return None
+            return _NO_SEEDED_VAT
+        # The seed's standard answer is not what a bill of quantities asks where
+        # construction has a tier of its own, so those countries are asked for
+        # the tier row instead, further down. A tier country with no row named
+        # keeps the old behaviour, the regional stack's own line, rather than
+        # falling through to the standard rate it is listed here to avoid.
+        tier_code: str | None = None
         if country_code.upper() in CONSTRUCTION_TIER_COUNTRIES:
-            # The seed answers "what is this country's standard rate", which is
-            # not what a bill of quantities asks where construction has a tier
-            # of its own. China's headline rate is 13 and its construction rate
-            # is 9; the 9 is on the regional stack, so leaving it alone is the
-            # answer rather than a gap.
-            return None
+            tier_code = CONSTRUCTION_TIER_TAX_CODE.get(country_code.upper())
+            if tier_code is None:
+                return _NO_SEEDED_VAT
         stated = (base_date or "").strip()
         day = price_base_day(stated)
         on_date = day.isoformat() if day else None
@@ -5894,9 +6679,10 @@ class BOQService:
             # stop it - refusing to price a project is worse than pricing it at
             # today's rate - so the log is the only thing that reports it.
             logger.warning(
-                "BOQ %s states base date %r, which is not a date the platform reads (%s); "
+                "BOQ %s states %s %r, which is not a date the platform reads (%s); "
                 "the bill is taxed at today's rate instead of its own",
                 boq_id,
+                "tax date" if field == "tax_date" else "base date",
                 stated,
                 ", ".join(ACCEPTED_SHAPES),
             )
@@ -5911,7 +6697,16 @@ class BOQService:
             # ordinary state of the ten priced countries the seed says nothing
             # about.
             logger.debug("Tax table unreadable for %s; the region's own VAT line stands", country_code)
-            return None
+            return _NO_SEEDED_VAT
+        day_priced = on_date or datetime.now(tz=UTC).date().isoformat()
+        if tier_code is not None:
+            tier_rows = [tax_row_from_orm(c) for c in configs]
+            tier_rate = _construction_tier_rate(tier_rows, country_code.upper(), tier_code, day_priced, boq_id)
+            if tier_rate is not None:
+                return _SeededVat(tier_rate)
+            if any(row.tax_code == tier_code for row in tier_rows):
+                return _SeededVat(None, _report_unanswered_day(boq_id, country_code, day_priced, len(tier_rows)))
+            return _NO_SEEDED_VAT
         try:
             resolution = resolve_tax([tax_row_from_orm(c) for c in configs], country_code, on_date=on_date)
         except TaxRuleError as exc:
@@ -5931,12 +6726,25 @@ class BOQService:
                 exc.code,
                 exc.message,
             )
-            return None
+            return _NO_SEEDED_VAT
         if not resolution.resolved or resolution.combined_rate_pct is None:
-            return None
+            if configs and resolution.status in _DATE_GAP_STATUSES:
+                # Rates are on file for this country and none answers the day
+                # the bill is priced on: a base date before the earliest
+                # window the install holds. Not the same event as a country
+                # with no rows at all, which is the ordinary state of a dozen
+                # priced countries and of every unseeded install and stays
+                # silent. Here the region's line stands in for a rate the
+                # country did have, and that line is today's, or a
+                # neighbour's on a shared stack: a Swiss bill for 2017 is
+                # charged Germany's 19. Nothing can say what the right number
+                # was, so the bill still seeds; the log and the line's own
+                # metadata are what say a rate was missing.
+                return _SeededVat(None, _report_unanswered_day(boq_id, country_code, day_priced, len(configs)))
+            return _NO_SEEDED_VAT
         # Explicitly against None: "0" is Kuwait's and Qatar's real answer and
         # a truthiness test here would send both back to the Gulf region's 5.
-        return resolution.combined_rate_pct
+        return _SeededVat(resolution.combined_rate_pct)
 
     async def apply_default_markups(self, boq_id: uuid.UUID, region: str | None = None) -> list[BOQMarkup]:
         """Replace all markups on a BOQ with the default template for a region.
@@ -6013,8 +6821,14 @@ class BOQService:
         # so the region's line is the last resort, not the default.
         vat_rate = project_vat_override
         rate_source = "project"
+        unanswered_on: str | None = None
         if vat_rate is None:
-            vat_rate = await self._seeded_vat_rate(country_code, getattr(boq, "base_date", None), boq_id)
+            # The tax date, not the price base: a bill priced at 2025 rates
+            # for works in 2026 is taxed at 2026's rate. A bill that states no
+            # tax date is taxed on its base date, exactly as before the field.
+            tax_field, tax_day = tax_point(getattr(boq, "tax_date", None), getattr(boq, "base_date", None))
+            seeded = await self._seeded_vat_rate(country_code, tax_day, boq_id, field=tax_field)
+            vat_rate, unanswered_on = seeded.rate, seeded.unanswered_on
             rate_source = "country_seed"
         if vat_rate is None:
             rate_source = "region_template"
@@ -6027,7 +6841,7 @@ class BOQService:
         # out here, because the methodology catalogue reads the same table and a
         # rule written twice is a rule that will be true in one place.
         new_markups: list[BOQMarkup] = []
-        for entry in resolve_region_lines(region_key, vat_rate=vat_rate):
+        for entry in resolve_region_lines(region_key, vat_rate=vat_rate, country_code=country_code):
             # ``vat_override`` keeps its existing meaning: this line's rate was
             # replaced. ``vat_rate_source`` is added on tax lines only, and is
             # read off the line rather than off the decision above, because a
@@ -6038,6 +6852,12 @@ class BOQService:
                 metadata["vat_override"] = True
             if entry["category"] == "tax":
                 metadata["vat_rate_source"] = rate_source if entry["vat_override"] else "region_template"
+                if unanswered_on is not None and not entry["vat_override"]:
+                    # The region's line stood in for a day the country's own
+                    # rates do not reach. Said on the line, not only in the
+                    # log, so the bill itself records that its tax is a
+                    # stand-in rather than a rate of that date.
+                    metadata["vat_rate_unresolved_on"] = unanswered_on
             markup = BOQMarkup(
                 boq_id=boq_id,
                 name=str(entry["name"]),
@@ -6159,6 +6979,8 @@ class BOQService:
         source_project_id = source_boq.project_id
         source_name = source_boq.name
         source_description = source_boq.description
+        source_base_date = source_boq.base_date
+        source_tax_date = source_boq.tax_date
         source_metadata = dict(source_boq.metadata_) if source_boq.metadata_ else {}
         # Issue #435: a revision or scenario of a variation request's bill is
         # still that request's bill. Dropping the link here would quietly turn
@@ -6176,6 +6998,8 @@ class BOQService:
             project_id=source_project_id,
             name=f"{source_name} (Copy)",
             description=source_description,
+            base_date=source_base_date,
+            tax_date=source_tax_date,
             status="draft",
             variation_request_id=source_variation_request_id,
             metadata_=source_metadata,
@@ -6437,6 +7261,7 @@ class BOQService:
 
         Raises:
             HTTPException 404 if source position not found.
+            HTTPException 409 if the BOQ is locked.
         """
         source = await self.position_repo.get_by_id(position_id)
         if source is None:
@@ -6444,6 +7269,9 @@ class BOQService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=translate("errors.position_not_found", locale=get_locale()),
             )
+        # A duplicate adds a priced line (and its subtree) to the bill, so a
+        # locked bill refuses it like any other position write.
+        await self._ensure_boq_writable(source.boq_id)
 
         # Issue #127: a duplicate is a one-time clone - UNLINKED, with its
         # own fresh internal reference_code (no future propagation). It now
@@ -6521,7 +7349,7 @@ class BOQService:
         role = getattr(position, "link_role", None)
         if group_id is None or role is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Position is not part of a linked-code group.",
             )
 
@@ -6541,12 +7369,7 @@ class BOQService:
             try:
                 group = await self.position_repo.list_link_group(group_id)
                 survivors = [p for p in group if p.id != position_id]
-                if survivors:
-                    new_master = survivors[0]
-                    if len(survivors) == 1:
-                        await self.position_repo.update_fields(new_master.id, link_role=None, link_group_id=None)
-                    else:
-                        await self.position_repo.update_fields(new_master.id, link_role="master")
+                await self._hand_over_link_group(survivors)
             except Exception:  # noqa: BLE001 - never block the unlink
                 logger.exception(
                     "Survivor-promotion failed unlinking master %s",
@@ -6786,7 +7609,7 @@ class BOQService:
             for f in _RESOURCE_DEFINITION_FIELDS:
                 new_v = r.get(f)
                 old_v = prev.get(f) if isinstance(prev, dict) else None
-                if new_v != old_v:
+                if not _same_resource_value(f, old_v, new_v):
                     delta[f] = new_v
             if delta:
                 changed[code] = delta
@@ -6798,9 +7621,13 @@ class BOQService:
         editor_position: Position,
         changed_by_code: dict[str, dict[str, Any]],
         actor_id: uuid.UUID | None,
+        locked_skips: _LockedSkips | None = None,
     ) -> int:
         """Issue #133 - fan a master resource's definition edit out to the
         linked resource instances across the project.
+
+        A carrier in a LOCKED bill is left as it is and, when ``locked_skips``
+        is given, recorded there, so the edit's response can name it.
 
         ``editor_position`` is the just-saved position. For each changed
         resource ``code`` it only propagates when ``editor_position`` holds
@@ -6811,6 +7638,14 @@ class BOQService:
         (never the master's). A target resource the user explicitly
         diverged (``_code_overridden`` truthy) is left untouched and not
         re-linked silently (the architecture guide: AI-augmented, human-confirmed).
+
+        Only the positions that may carry one of the codes are read, as plain
+        rows; the rewritten ones are written by ``update_many`` (a plain UPDATE
+        per row, one flush, see its docstring for why not an executemany) and
+        announced by one ``boq.positions.resource_propagated`` event. It used to
+        be an ORM load of the whole project plus an UPDATE and an event per
+        rewritten row, and an event here is not cheap: every subscriber opens
+        a session of its own.
 
         Returns the number of resource instances updated. Best-effort -
         never raises (a propagation hiccup must not fail the user's PATCH).
@@ -6833,8 +7668,11 @@ class BOQService:
             # failure returns ("", {}) so the rollup degrades to a raw sum
             # rather than blending currencies into the stored rate.
             fx_base_ccy, fx_map = await self._resolve_project_fx_by_project(project_id)
-            # Oldest-first - the FIRST carrier of a code is its master.
-            positions = await self.position_repo.list_for_project(project_id)
+            # Oldest-first - the FIRST carrier of a code is its master. The
+            # rows are narrowed in SQL to those that may carry one of the codes;
+            # ``_has_code`` below still makes the exact match, so a row the
+            # narrowing keeps without cause changes nothing.
+            positions = await self.position_repo.list_resource_carrier_rows(project_id, changed_by_code)
 
             # ── Snapshot EVERY position into plain values BEFORE any write, so
             # the rollup below reads one consistent view of the project and
@@ -6847,7 +7685,7 @@ class BOQService:
                     "ordinal": p.ordinal,
                     "quantity": p.quantity,
                     "version": int(p.version or 0),
-                    "meta": (dict(p.metadata_) if isinstance(p.metadata_, dict) else {}),
+                    "meta": (dict(p.meta) if isinstance(p.meta, dict) else {}),
                 }
                 for p in positions
             ]
@@ -6873,9 +7711,20 @@ class BOQService:
             if not owned_codes:
                 return 0
             owned_cf = {c.casefold() for c in owned_codes}
+            # The locked bills among the other carriers of an owned code. The
+            # editor's own bill passed the lock guard before this was reached.
+            locked_bills = await self._locked_bills_among(
+                {
+                    s["boq_id"]
+                    for s in snap
+                    if s["boq_id"] != editor_boq_id and any(_has_code(s["meta"], c) for c in owned_codes)
+                }
+            )
 
             updated = 0
             affected_boqs: set[uuid.UUID] = set()
+            writes: list[dict[str, Any]] = []
+            positions_by_boq: dict[str, list[str]] = {}
             for s in snap:
                 if s["id"] == editor_id:
                     continue
@@ -6913,6 +7762,11 @@ class BOQService:
                     touched = True
                 if not touched:
                     continue
+                if s["boq_id"] in locked_bills:
+                    # Would have changed, but the bill is approved: leave it.
+                    if locked_skips is not None:
+                        locked_skips.add(s["id"], s["boq_id"], locked_bills[s["boq_id"]])
+                    continue
                 new_meta = dict(meta)
                 new_meta["resources"] = new_res
                 # Recompute the position's derived unit_rate from resources.
@@ -6923,30 +7777,46 @@ class BOQService:
                 res_dicts = [r for r in new_res if isinstance(r, dict)]
                 derived_rate = _quantize_money_str(_resource_total_in_base(res_dicts, fx_map, fx_base_ccy or ""))
                 new_total = _compute_total(s["quantity"], derived_rate)
-                await self.position_repo.update_fields(
-                    s["id"],
-                    metadata_=new_meta,
-                    unit_rate=derived_rate,
-                    total=new_total,
-                    version=s["version"] + 1,
+                writes.append(
+                    {
+                        "id": s["id"],
+                        "metadata_": new_meta,
+                        "unit_rate": derived_rate,
+                        "total": new_total,
+                        "version": s["version"] + 1,
+                    }
                 )
                 affected_boqs.add(s["boq_id"])
+                positions_by_boq.setdefault(str(s["boq_id"]), []).append(str(s["id"]))
                 updated += 1
+
+            if updated:
+                await self.position_repo.update_many(writes)
+                # One event for the whole fan-out, like ``bulk_created``. The
+                # per-row ``boq.position.updated`` it replaces re-embedded each
+                # row for search, but the embedding reads description, ordinal,
+                # unit and classification, none of which this rewrites. The
+                # activity log splits it back into one entry per bill touched
+                # (``positions_by_boq``), so each bill's feed still shows the
+                # lines that changed under it.
                 await _safe_publish(
-                    "boq.position.updated",
+                    "boq.positions.resource_propagated",
                     {
-                        "position_id": str(s["id"]),
-                        "boq_id": str(s["boq_id"]),
-                        "ordinal": s["ordinal"],
-                        "changes": {"resource_code_propagation": sorted(owned_codes)},
+                        "project_id": str(project_id),
+                        "boq_id": str(editor_boq_id),
+                        "propagated_from": str(editor_id),
+                        "count": updated,
+                        "changes": {
+                            "resource_code_propagation": sorted(owned_codes),
+                            "position_ids": [str(w["id"]) for w in writes],
+                            "boq_ids": sorted(str(b) for b in affected_boqs),
+                            "positions_by_boq": positions_by_boq,
+                        },
                         "kind": "linked_resource_propagation",
                     },
                     source_module="oe_boq",
                     session=self.session,
                 )
-
-            if updated:
-                await self.session.flush()
                 if actor_id is not None:
                     try:
                         await self.log_activity(
@@ -7002,7 +7872,14 @@ class BOQService:
         Raises:
             HTTPException 404 if BOQ not found.
         """
-        boq = await self.get_boq(boq_id)
+        # The header columns only: the BOQ entity would load every position and
+        # markup through its selectin relationships, and the positions are read
+        # below in sort order anyway. Together with handing those positions to
+        # compute_boq_totals, a full-BOQ read decodes the positions once instead
+        # of three times, which is most of its time on the event loop.
+        boq = await self.boq_repo.get_header(boq_id)
+        if boq is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOQ not found")
         positions = await self.position_repo.list_all_for_boq(boq_id)
 
         # Build position responses + count. Section headers carry no unit and
@@ -7021,21 +7898,29 @@ class BOQService:
         # endpoint (BUG-008) and foreign-currency positions are converted into
         # the project base before summing (Issue #111 sibling) instead of being
         # blended at face value as the old ``_str_to_float(pos.total)`` sum did.
-        totals = await self.compute_boq_totals([boq_id])
+        totals = await self.compute_boq_totals([boq_id], positions_by_boq={boq_id: positions})
         money = totals.get(boq_id, {"direct_cost": 0.0, "markups_total": 0.0, "grand_total": 0.0})
         direct_cost = Decimal(str(money["direct_cost"]))
         markups_total = Decimal(str(money["markups_total"]))
         grand_total_with_markups = Decimal(str(money["grand_total"]))
 
         return BOQWithPositions(
-            id=boq.id,
-            project_id=boq.project_id,
-            name=boq.name,
-            description=boq.description,
-            status=boq.status,
-            metadata_=boq.metadata_,
-            created_at=boq.created_at,
-            updated_at=boq.updated_at,
+            id=boq["id"],
+            project_id=boq["project_id"],
+            name=boq["name"],
+            description=boq["description"],
+            status=boq["status"],
+            metadata_=boq["metadata_"],
+            created_at=boq["created_at"],
+            updated_at=boq["updated_at"],
+            is_locked=boq["is_locked"],
+            approved_by=boq["approved_by"],
+            approved_at=boq["approved_at"],
+            base_date=boq["base_date"],
+            tax_date=boq["tax_date"],
+            estimate_type=boq["estimate_type"],
+            parent_estimate_id=boq["parent_estimate_id"],
+            variation_request_id=boq["variation_request_id"],
             positions=position_responses,
             # BUG-B-001 / BUG-B-012: cents-quantised (HALF_UP) so list and
             # detail return one canonical figure.
@@ -7220,6 +8105,14 @@ class BOQService:
             metadata_=boq.metadata_,
             created_at=boq.created_at,
             updated_at=boq.updated_at,
+            is_locked=boq.is_locked,
+            approved_by=boq.approved_by,
+            approved_at=boq.approved_at,
+            base_date=boq.base_date,
+            tax_date=boq.tax_date,
+            estimate_type=boq.estimate_type,
+            parent_estimate_id=boq.parent_estimate_id,
+            variation_request_id=boq.variation_request_id,
             sections=sections,
             positions=ungrouped_responses,
             # BUG-B-001 / BUG-B-012: snap aggregates to cents (HALF_UP) so
@@ -7288,7 +8181,14 @@ class BOQService:
         Raises:
             HTTPException 404 if BOQ not found.
         """
-        boq = await self.get_boq(boq_id)
+        # Only the bill's existence is needed here. ``get_boq`` proved it by
+        # loading every position and markup (both ``selectin``), and both are
+        # read again below, so the editor paid for them twice on every open.
+        if await self.boq_repo.get_header(boq_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="BOQ not found",
+            )
         all_positions = await self.position_repo.list_all_for_boq(boq_id)
 
         # Resolve the project's base currency + FX table so positions and
@@ -7299,100 +8199,99 @@ class BOQService:
         # behaviour) rather than failing the breakdown.
         base_currency, fx_map = await self._resolve_project_fx(boq_id)
 
-        # Accumulators
-        category_amounts: dict[str, float] = {}
+        # Every position contributes its canonical total, the figure the grid,
+        # the structured endpoint, the markup panel and the exports sum:
+        # ``quantity x unit_rate`` as stored, converted into the base currency
+        # (``_leaf_total_base_with_resources``). The resource rows only decide
+        # how that total is split between categories.
+        #
+        # This used to sum ``res.quantity x res.unit_rate`` scaled by the
+        # position quantity instead. That is the same number only while the
+        # resource rows add up to the position's rate to the cent, and they do
+        # not always: a catalogue component carries a separately rounded cost,
+        # a variant default lands at a different figure, and some writers
+        # store whole-position quantities on the rows. The Grand Total card,
+        # which reads this endpoint, then disagreed with the grid under the
+        # same label. Accumulated in Decimal so the direct cost here is the
+        # cent-exact sum the structured endpoint computes.
+        category_amounts: dict[str, Decimal] = {}
         category_counts: dict[str, int] = {}
-        resource_totals: dict[str, float] = {}  # name -> total cost
+        resource_totals: dict[str, Decimal] = {}  # name -> total cost
         resource_types: dict[str, str] = {}  # name -> type
         resource_positions: dict[str, set[uuid.UUID]] = {}  # name -> position ids
+        direct_cost_val = Decimal("0")
+
+        def _add(cat: str, name: str, amount: Decimal, pos_id: uuid.UUID) -> None:
+            category_amounts[cat] = category_amounts.get(cat, Decimal("0")) + amount
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+            resource_totals[name] = resource_totals.get(name, Decimal("0")) + amount
+            resource_types[name] = cat
+            resource_positions.setdefault(name, set()).add(pos_id)
+
         for pos in all_positions:
             if _is_section(pos):
                 continue
 
-            pos_qty = _str_to_float(pos.quantity)
-            pos_total = _str_to_float(pos.total)
+            pos_total_base = _leaf_total_base_with_resources(pos, fx_map, base_currency)
+            direct_cost_val += pos_total_base
             meta = pos.metadata_ or {}
             resources = meta.get("resources")
 
-            if isinstance(resources, list) and len(resources) > 0:
+            # Per-unit subtotal of each resource row in the base currency, used
+            # as the row's WEIGHT within the position, never as money.
+            shares: list[tuple[str, str, float]] = []
+            if isinstance(resources, list):
                 for res in resources:
                     if not isinstance(res, dict):
                         continue
-                    res_type = str(res.get("type", "other")).lower()
-                    res_name = str(res.get("name", "Unknown"))
-                    # Derive the per-unit subtotal from quantity * unit_rate when
-                    # both are present, so the breakdown self-heals after an
-                    # inline resource edit that updated qty/rate but left a stale
-                    # ``total`` behind. Fall back to the stored ``total`` only
-                    # when the factors are missing.
                     res_qty = res.get("quantity")
                     res_rate = res.get("unit_rate")
                     if res_qty is not None and res_rate is not None:
-                        res_total = (_str_to_float(res_qty)) * (_str_to_float(res_rate))
+                        weight = _str_to_float(res_qty) * _str_to_float(res_rate)
                     else:
-                        res_total = float(res.get("total", 0) or 0)
-                    if not math.isfinite(res_total):
-                        res_total = 0.0
-
-                    # Convert this resource's per-unit subtotal into the base
-                    # currency (mirrors _resource_total_in_base): a resource may
-                    # carry its own currency; a missing rate degrades to no
-                    # conversion rather than zeroing the row. Scaling by the
-                    # position quantity afterwards is currency-neutral.
+                        weight = _str_to_float(res.get("total"))
+                    if not math.isfinite(weight):
+                        weight = 0.0
                     res_currency = str(res.get("currency") or "").strip().upper()
-                    if res_currency and res_currency != base_currency and fx_map:
-                        fx = fx_map.get(res_currency)
-                        if fx:
-                            fx_f = _str_to_float(fx)
-                            if math.isfinite(fx_f) and fx_f > 0:
-                                res_total = res_total * fx_f
+                    factor = resource_fx_factor(res_currency, base_currency, fx_map)
+                    if factor is None:
+                        continue
+                    weight *= factor
+                    shares.append(
+                        (
+                            self._normalize_resource_category(str(res.get("type", "other")).lower()),
+                            str(res.get("name", "Unknown")),
+                            weight,
+                        )
+                    )
 
-                    cat = self._normalize_resource_category(res_type)
-
-                    # Scale the per-unit resource subtotal by the real
-                    # position quantity. ``res.total`` is the PER-UNIT
-                    # subtotal (r.quantity * r.unit_rate) and the position's
-                    # authoritative total is pos.quantity * Σ(res.total), so
-                    # scaling by ``pos_qty`` makes this branch sum to the same
-                    # canonical direct cost as the stored ``pos.total`` summed
-                    # everywhere else. Never substitute 1.0 for a legitimate
-                    # fractional or zero quantity (that over-stated 0.5 m3 as
-                    # 1.0 and reported a full subtotal for a 0-qty position).
-                    scaled_cost = res_total * pos_qty
-
-                    category_amounts[cat] = category_amounts.get(cat, 0.0) + scaled_cost
-                    category_counts[cat] = category_counts.get(cat, 0) + 1
-
-                    resource_totals[res_name] = resource_totals.get(res_name, 0.0) + scaled_cost
-                    resource_types[res_name] = cat
-                    resource_positions.setdefault(res_name, set()).add(pos.id)
+            weight_sum = sum(w for _, _, w in shares)
+            if shares and weight_sum != 0 and math.isfinite(weight_sum):
+                # Split the canonical total by each row's share. The last row
+                # takes the remainder so the parts add up to the total exactly.
+                allotted = Decimal("0")
+                for idx, (cat, name, weight) in enumerate(shares):
+                    if idx == len(shares) - 1:
+                        amount = pos_total_base - allotted
+                    else:
+                        amount = pos_total_base * Decimal(str(weight / weight_sum))
+                        allotted += amount
+                    _add(cat, name, amount, pos.id)
             else:
-                # Heuristic fallback - classify by description keywords (fast).
-                # Convert the position total into base currency first so a
-                # foreign-priced position is not aggregated at its face value
-                # (mirrors _position_total_in_base on the export rollup path).
+                # No usable resource split: classify the whole position by its
+                # description keywords (fast heuristic).
                 cat = self._classify_position_category(pos.description)
-                pos_total_base = float(
-                    _position_total_in_base(pos.total, _position_currency(pos), fx_map, base_currency)
-                )
-                category_amounts[cat] = category_amounts.get(cat, 0.0) + pos_total_base
-                category_counts[cat] = category_counts.get(cat, 0) + 1
-
                 short_name = pos.description[:60] if pos.description else "Position"
-                resource_totals[short_name] = resource_totals.get(short_name, 0.0) + pos_total_base
-                resource_types[short_name] = cat
-                resource_positions.setdefault(short_name, set()).add(pos.id)
-
-        direct_cost_val = sum(category_amounts.values())
+                _add(cat, short_name, pos_total_base, pos.id)
 
         # Build categories sorted by amount descending
         categories: list[CostBreakdownCategory] = []
         for cat, amount in sorted(category_amounts.items(), key=lambda x: x[1], reverse=True):
-            pct = (amount / direct_cost_val * 100.0) if direct_cost_val > 0 else 0.0
+            pct = float(amount / direct_cost_val * 100) if direct_cost_val > 0 else 0.0
             categories.append(
                 CostBreakdownCategory(
                     type=cat,
-                    amount=round(amount, 2),
+                    amount=_round_currency(amount),
                     percentage=round(pct, 1),
                     item_count=category_counts.get(cat, 0),
                 )
@@ -7413,13 +8312,11 @@ class BOQService:
         markup_total = Decimal("0")
 
         if markups_orm:
-            # ``direct_cost_val`` is a float sum built by the category loop
-            # above, and the scoped partition walks the same positions through
-            # the canonical resource-aware conversion. Where the two disagree
-            # by a rounding tail the difference lands in the bill-wide bucket,
-            # so this screen's total is the one it computed for itself.
+            # ``direct_cost_val`` is the same canonical per-position sum the
+            # scoped partition and ``get_boq_structured`` walk, so the markup
+            # amounts here are the ones the editor and the exports show.
             markup_results = _calculate_markup_amounts_scoped(
-                Decimal(str(direct_cost_val)),
+                direct_cost_val,
                 markups_orm,
                 all_positions,
                 lambda pos: _leaf_total_base_with_resources(pos, fx_map, base_currency),
@@ -7436,7 +8333,9 @@ class BOQService:
                     )
                     markup_total += amount
 
-        grand_total = float(Decimal(str(direct_cost_val)) + markup_total)
+        # OC-47: keep as str-serialised Decimal so openpyxl writes a clean
+        # number without binary-float tails like 30695.000000000004.
+        grand_total = direct_cost_val + markup_total
 
         # Top 10 resources by cost
         top_resources: list[CostBreakdownResource] = []
@@ -7445,16 +8344,10 @@ class BOQService:
                 CostBreakdownResource(
                     name=name,
                     type=resource_types.get(name, "other"),
-                    total_cost=round(total_cost, 2),
+                    total_cost=_round_currency(total_cost),
                     positions_count=len(resource_positions.get(name, set())),
                 )
             )
-
-        await _safe_publish(
-            "boq.cost_breakdown.computed",
-            {"boq_id": str(boq_id), "direct_cost": round(direct_cost_val, 2)},
-            session=self.session,
-        )
 
         return CostBreakdownResponse(
             boq_id=str(boq_id),
@@ -7539,7 +8432,7 @@ class BOQService:
             (await self._resolve_escalation_factors(markups_orm)).factors,
         )
         markup_total = sum(amount for _, amount in markup_results)
-        grand_total = float(direct_cost + markup_total)
+        grand_total = float(str(direct_cost + markup_total))
 
         return BOQStatisticsResponse(
             boq_id=str(boq_id),
@@ -7984,7 +8877,7 @@ class BOQService:
                 action=e.action,
                 target_type=e.target_type,
                 target_id=e.target_id,
-                description=e.description,
+                description=activity_description(e.action, e.description),
                 changes=e.changes,
                 metadata_=e.metadata_,
                 created_at=e.created_at,
@@ -8020,7 +8913,7 @@ class BOQService:
                 action=e.action,
                 target_type=e.target_type,
                 target_id=e.target_id,
-                description=e.description,
+                description=activity_description(e.action, e.description),
                 changes=e.changes,
                 metadata_=e.metadata_,
                 created_at=e.created_at,
@@ -8029,10 +8922,14 @@ class BOQService:
         ]
         return ActivityLogList(items=items, total=total, offset=offset, limit=limit)
 
-    # ── AACE Estimate Classification ─────────────────────────────────────
+    # ── Estimate Classification ─────────────────────────────────────────
 
     async def get_estimate_classification(self, boq_id: uuid.UUID) -> EstimateClassificationResponse:
-        """Determine AACE 18R-97 estimate class for a BOQ.
+        """Determine the estimate class for a BOQ.
+
+        The classification system is resolved from the project's country_code:
+        Canadian projects use the CCA letter classes (D/C/B/A), everything
+        else defaults to AACE 18R-97 (integer classes 5-1).
 
         Auto-detects class based on:
         - Number of line-item positions (excluding section headers)
@@ -8046,7 +8943,33 @@ class BOQService:
         Raises:
             HTTPException 404 if BOQ not found.
         """
-        await self.get_boq(boq_id)
+        # The bill's existence and its project's country, in one statement.
+        # This used to take nine: ``get_boq`` loaded the bill with every
+        # position and markup (both ``selectin``) only to prove it exists and
+        # dropped it, so ``project_for_boq`` loaded all of that again, then the
+        # project with its milestones and WBS, all to read one column. A bill
+        # whose project row is gone still classifies, with no country, as
+        # ``project_for_boq`` answered for it.
+        from app.modules.projects.models import Project  # noqa: PLC0415
+
+        row = (
+            await self.session.execute(
+                select(BOQ.id, Project.country_code)
+                .select_from(BOQ)
+                .outerjoin(Project, Project.id == BOQ.project_id)
+                .where(BOQ.id == boq_id)
+            )
+        ).first()
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="BOQ not found",
+            )
+
+        # Resolve classification system from the project's country.
+        country_code = row[1]
+        system = _resolve_classification_system(country_code)
+
         all_positions = await self.position_repo.list_all_for_boq(boq_id)
 
         # Filter out section headers - only count real line items
@@ -8054,7 +8977,7 @@ class BOQService:
         total_positions = len(items)
 
         if total_positions == 0:
-            return _build_classification(0, 0, 0, 0)
+            return _build_classification(0, 0, 0, 0, system=system)
 
         # Count positions with non-zero unit rates
         positions_with_rates = sum(1 for p in items if _str_to_float(p.unit_rate) > 0)
@@ -8074,6 +8997,7 @@ class BOQService:
             positions_with_rates,
             positions_with_resources,
             positions_with_classification,
+            system=system,
         )
 
     # ── Snapshot operations ────────────────────────────────────────────────
@@ -8314,9 +9238,19 @@ class BOQService:
         Deletes all current positions and markups, then recreates them from
         the snapshot - including hierarchical parent_id relationships and
         markup lines.
+
+        Raises:
+            HTTPException 404: BOQ or snapshot not found.
+            HTTPException 409: BOQ is locked and cannot be modified.
         """
         from sqlalchemy import delete as sa_delete
         from sqlalchemy import select
+
+        # Restore replaces every position and markup, so a locked bill refuses
+        # it. The one-column guard on purpose: ``_ensure_not_locked`` loads the
+        # BOQ with both selectin collections, which would sit in the identity
+        # map across the bulk DELETE below.
+        await self._ensure_boq_writable(boq_id)
 
         # Load snapshot
         stmt = select(BOQSnapshot).where(

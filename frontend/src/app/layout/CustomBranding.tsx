@@ -27,8 +27,9 @@
 // users (issue #272).
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Link } from 'react-router-dom';
 import clsx from 'clsx';
-import { Pencil, Upload, Trash2, X, Building2 } from 'lucide-react';
+import { Pencil, Upload, Trash2, X, Building2, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { Logo } from '@/shared/ui';
@@ -45,17 +46,30 @@ interface CustomBrandingProps {
 }
 
 const MAX_NAME_LEN = 60;
-const ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp'];
+/** Image types the app logo accepts. Also read by the Company & documents settings tab. */
+export const ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml', 'image/webp'];
 
-/** Read a File into a base64 data URL, with size + mime gating. */
-async function fileToDataUrl(file: File): Promise<string> {
-  if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+/**
+ * Read a File into a base64 data URL, with size + mime gating.
+ *
+ * The limits default to the app logo's. The document logo passes its own,
+ * which the server serves. The gate's messages are English, so a caller that
+ * shows them in its own words checks type and size itself first, and the gate
+ * here only ever fires on a file that caller already accepted.
+ */
+export async function fileToDataUrl(
+  file: File,
+  limits: { accept?: readonly string[]; maxBytes?: number } = {},
+): Promise<string> {
+  const accept = limits.accept ?? ACCEPTED_IMAGE_TYPES;
+  const maxBytes = limits.maxBytes ?? BRANDING_MAX_LOGO_BYTES;
+  if (!accept.includes(file.type)) {
     throw new Error('Unsupported image type. Use PNG, JPG, SVG, or WebP.');
   }
-  if (file.size > BRANDING_MAX_LOGO_BYTES) {
+  if (file.size > maxBytes) {
     throw new Error(
       `Logo too large (${Math.round(file.size / 1024)} KB). Max ${Math.round(
-        BRANDING_MAX_LOGO_BYTES / 1024,
+        maxBytes / 1024,
       )} KB.`,
     );
   }
@@ -226,7 +240,11 @@ export function CustomBranding({ iconified }: CustomBrandingProps) {
       </div>
 
       {editing && (
-        <BrandingEditorModal onClose={() => setEditing(false)} canPersist={isAdmin} />
+        <BrandingEditorModal
+          onClose={() => setEditing(false)}
+          canPersist={isAdmin}
+          showDocumentsLink
+        />
       )}
     </>
   );
@@ -242,6 +260,7 @@ export function CustomBranding({ iconified }: CustomBrandingProps) {
 export function BrandingEditorModal({
   onClose,
   canPersist = false,
+  showDocumentsLink = false,
 }: {
   onClose: () => void;
   /**
@@ -250,6 +269,13 @@ export function BrandingEditorModal({
    * screen) the change stays in this browser only, exactly as before.
    */
   canPersist?: boolean;
+  /**
+   * Point to the Company & documents settings tab, where the formal logo and
+   * the letterhead for printed documents live. Only the signed-in sidebar
+   * passes it: the login page has no settings to go to, and the onboarding
+   * wizard should not be left halfway.
+   */
+  showDocumentsLink?: boolean;
 }) {
   const { t } = useTranslation();
   const { mode, logoDataUrl, companyName, setLogo, setCompanyName, reset, persistToServer } =
@@ -272,6 +298,7 @@ export function BrandingEditorModal({
       logoDataUrl={logoDataUrl}
       companyName={companyName}
       onClose={onClose}
+      showDocumentsLink={showDocumentsLink}
       onApplyLogo={async (file) => {
         try {
           const url = await fileToDataUrl(file);
@@ -322,6 +349,7 @@ interface EditorProps {
   logoDataUrl: string | null;
   companyName: string;
   onClose: () => void;
+  showDocumentsLink: boolean;
   onApplyLogo: (file: File) => void | Promise<void>;
   onApplyName: (name: string) => void;
   onReset: () => void;
@@ -332,6 +360,7 @@ function BrandingEditor({
   logoDataUrl,
   companyName,
   onClose,
+  showDocumentsLink,
   onApplyLogo,
   onApplyName,
   onReset,
@@ -540,6 +569,19 @@ function BrandingEditor({
                 {t('branding.name_apply', { defaultValue: 'Save name' })}
               </button>
             </form>
+          )}
+          {showDocumentsLink && (
+            <Link
+              to="/settings?tab=company"
+              onClick={onClose}
+              className="mt-4 inline-flex items-center gap-1.5 text-xs text-oe-blue hover:underline"
+              data-testid="branding-documents-link"
+            >
+              <FileText size={13} />
+              {t('branding.documents_link', {
+                defaultValue: 'Logo and company details for documents',
+              })}
+            </Link>
           )}
         </div>
 

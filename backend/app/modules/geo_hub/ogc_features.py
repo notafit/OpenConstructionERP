@@ -47,7 +47,7 @@ rectangle intersects the requested one. That is the usual simple-server
 reading of the standard and it is a superset of true intersection, so
 nothing that should match is dropped.
 
-To keep a single request bounded on a 2 GB VPS the service reads at most
+To keep a single request bounded on a 3 GB server the service reads at most
 :data:`MAX_SCAN_ROWS` rows per collection before filtering. When a scan
 hits that ceiling the response omits ``numberMatched`` rather than
 reporting a number it cannot stand behind - the standard permits the

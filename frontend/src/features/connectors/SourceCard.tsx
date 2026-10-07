@@ -208,12 +208,11 @@ export function SourceCard({ source, onSync, syncing, syncError, syncResult }: S
             <div className="flex items-center gap-1.5 text-xs text-semantic-success" role="status">
               <CheckCircle2 className="h-3.5 w-3.5 shrink-0" aria-hidden />
               <span>
-                {syncResult.created === 1
-                  ? t('connectors.just_imported_one', { defaultValue: 'Imported 1 new document' })
-                  : t('connectors.just_imported_many', {
-                      defaultValue: 'Imported {{n}} new documents',
-                      n: syncResult.created,
-                    })}
+                {t('connectors.just_imported', {
+                  count: syncResult.created,
+                  defaultValue_one: 'Imported {{count}} new document',
+                  defaultValue_other: 'Imported {{count}} new documents',
+                })}
               </span>
             </div>
           ) : (

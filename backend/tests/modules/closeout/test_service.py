@@ -55,9 +55,16 @@ async def test_create_package_is_idempotent_per_project(session, project_id):
 async def test_completeness_and_gaps_initial(session, project_id):
     service, package = await _make_package(session, project_id, "commercial")
     gaps = await service.gaps(package)
-    # Document-backed required slots are gaps; generated artifacts are not.
+    # A document-backed slot is a gap until someone binds evidence to it.
     assert "As-built drawing set" in gaps
-    assert "COBie / asset register" not in gaps
+    # So is a generated artifact, until the package has been built. The COBie
+    # export does not exist before the build writes it and this package has
+    # never been built, so "generated artifacts are not gaps" is only true of
+    # the built view - the one the build itself reports from while assembling
+    # its own manifest. Both directions are asserted so neither reading can
+    # rot unnoticed.
+    assert "COBie / asset register" in gaps
+    assert "COBie / asset register" not in await service.gaps(package, treat_built=True)
     assert package.completeness_pct < 100
     assert package.status in ("draft", "in_progress")
 

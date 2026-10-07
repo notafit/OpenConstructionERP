@@ -322,7 +322,11 @@ def _is_router_decorator(decorator: ast.expr) -> dict[str, Any] | None:
         if kw.arg == "response_model":
             response_model = _unparse_annotation(kw.value)
 
-    return {"method": method.upper(), "path": path or "/", "response_model": response_model}
+    return {
+        "method": method.upper(),
+        "path": path or "/",
+        "response_model": response_model,
+    }
 
 
 def scan_routes(router_path: Path) -> list[dict[str, Any]]:
@@ -391,7 +395,13 @@ def scan_routes(router_path: Path) -> list[dict[str, Any]]:
 # 4. Pydantic schema extraction
 # ---------------------------------------------------------------------------
 
-_PYDANTIC_BASES = {"BaseModel", "BaseSchema", "BaseCreate", "BaseUpdate", "BaseResponse"}
+_PYDANTIC_BASES = {
+    "BaseModel",
+    "BaseSchema",
+    "BaseCreate",
+    "BaseUpdate",
+    "BaseResponse",
+}
 
 
 def scan_schemas(schemas_path: Path) -> list[dict[str, Any]]:
@@ -675,9 +685,33 @@ def generate_manifest(root: Path) -> dict[str, Any]:
         if normalized in backend_module_ids:
             frontend_mapping[feat["name"]] = normalized
         else:
-            # Try partial match
+            # Try partial match. Iterate SORTED, not over the set itself.
+            # Four features match more than one module today - auth matches
+            # authority_submission and review_authority, bim matches bim_hub,
+            # bim_requirements and bimlv, field matches field_diary, field_time
+            # and fieldreports, inbound matches inbound_capture and
+            # inbound_email - and this loop takes the first hit. Python
+            # randomises string hashing per process, so iterating the set
+            # handed those four a different answer on every run, from the same
+            # inputs. Both rolls are on record in this repository's own files,
+            # which is how the defect was caught rather than argued: the
+            # manifest committed in June carries field -> field_diary, and a
+            # regeneration run while this comment was being written produced
+            # field -> field_time. Same generator, same three candidate
+            # modules, different answer. Nothing between the two runs changed
+            # except the hash seed the interpreter chose at startup.
+            #
+            # The statistics are blind to it. frontend_backend_mapped counts
+            # how many features matched SOMETHING, and all four match either
+            # way, so the count sits at the same number while the values move
+            # underneath it. A check comparing only statistics would stay green
+            # over this forever.
+            #
+            # Alphabetically first is arbitrary but stable, which is the whole
+            # requirement here. Picking a BETTER match among the candidates is
+            # a separate question and not one this line should answer quietly.
             matched = None
-            for mid in backend_module_ids:
+            for mid in sorted(backend_module_ids):
                 if mid in normalized or normalized in mid:
                     matched = mid
                     break
@@ -706,6 +740,24 @@ def generate_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
+def render_manifest(manifest: dict[str, Any]) -> str:
+    """Serialise a manifest to the exact text the committed file carries.
+
+    Kept as a function rather than inlined at the one call site below, because
+    it is no longer the one call site: scripts/check_architecture_manifest.py
+    renders the tree and compares the result against the committed file, and
+    that comparison is only meaningful if both sides are serialised by the same
+    code. Two hand-maintained copies of these arguments would agree until one of
+    them changed, and then the guard would report drift that is nothing but its
+    own formatting.
+
+    Returns LF line endings regardless of platform, because the string is built
+    here rather than written through a text stream. The write below does pass it
+    through one, so the FILE gets CRLF on Windows; see the note there.
+    """
+    return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate architecture manifest for OpenConstructionERP.")
     parser.add_argument(
@@ -726,8 +778,15 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "architecture_manifest.json"
 
+    # No newline= argument, so on Windows this writes CRLF while the same run on
+    # Linux writes LF. That is survivable rather than tidy: .gitattributes has no
+    # rule for *.json and this repository's Windows clones run with
+    # core.autocrlf=true, which normalises the blob back to LF on commit, so the
+    # committed artifact is LF whoever generated it. The guard does not depend on
+    # that holding - it reads the committed file with universal newlines, so a
+    # clone configured the other way is compared correctly too.
     output_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        render_manifest(manifest),
         encoding="utf-8",
     )
 

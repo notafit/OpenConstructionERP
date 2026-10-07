@@ -15,6 +15,7 @@
  */
 import { useTranslation } from 'react-i18next';
 import type { InsightDataset, InsightDef } from '@/features/insights';
+import { parseDateUTC } from '@/shared/lib/dates';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -85,7 +86,7 @@ function isOverdue(r: TaskLite, done: boolean): boolean {
   if (done) return false;
   if (typeof r.is_overdue === 'boolean') return r.is_overdue;
   if (!r.due_date) return false;
-  const due = new Date(r.due_date).getTime();
+  const due = parseDateUTC(r.due_date).getTime();
   return !Number.isNaN(due) && due < Date.now();
 }
 

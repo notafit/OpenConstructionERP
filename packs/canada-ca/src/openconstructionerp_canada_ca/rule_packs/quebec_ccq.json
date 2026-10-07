@@ -1,0 +1,22 @@
+{
+  "rule_pack_id": "quebec_ccq",
+  "name": "Québec — CCQ & RBQ Licensing and Compliance",
+  "name_fr-CA": "Québec — Conformité CCQ et licences RBQ",
+  "standard": "Loi R-20 / Loi sur le bâtiment (Québec)",
+  "jurisdiction": "CA-QC",
+  "regulator": "Commission de la construction du Québec (CCQ) · Régie du bâtiment du Québec (RBQ)",
+  "publication_year": 2024,
+  "applies_to": [
+    "projects",
+    "subcontractors",
+    "validation"
+  ],
+  "description": "Reference document for Québec-specific construction compliance. What the regime requires a project to show: every subcontractor on the project has a valid RBQ licence number with allowed subcategories, every active worker is declared to the CCQ with a competency certificate (CCQ card / carte), prevailing collective-agreement wage rates apply, the contract is drafted in French per Charter of the French Language, and QST/GST registration numbers are populated on every invoice. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la conformité particulière au Québec. Ce que le régime exige du projet : chaque sous-traitant du projet possède un numéro de licence RBQ valide avec les sous-catégories autorisées, chaque travailleur actif est déclaré à la CCQ avec un certificat de compétence (carte CCQ), les taux de salaire de la convention collective applicable sont appliqués, le contrat est rédigé en français selon la Charte de la langue française et les numéros d'inscription TVQ/TPS sont renseignés sur chaque facture. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {
+    "quebec_ccq.rbq_licence_required": "ERROR",
+    "quebec_ccq.ccq_competency_card_required": "ERROR"
+  },
+  "why_no_rules": "This document ships as reference and enables no engine rules. The Quebec labour regime turns on trade certification, collective agreement rates and reporting to the board, none of which is registered as a rule. The platform's generic timesheet checks are not configured against this regime, so enabling one would misrepresent a generic limit as a CCQ requirement.",
+  "enables_rule_ids": []
+}

@@ -425,9 +425,9 @@ def register_subscribers() -> None:
     """Idempotently subscribe NCR cross-module handlers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("qms.audit.finding_raised", _on_qms_finding_raised)
-    event_bus.subscribe("clash.high_severity.detected", _on_clash_high_severity)
-    event_bus.subscribe("validation.results.errors_found", _on_validation_errors_found)
-    event_bus.subscribe("ncr.closed_with_cost_impact", _on_ncr_closed_with_cost_impact)
+    event_bus.subscribe_once("qms.audit.finding_raised", _on_qms_finding_raised)
+    event_bus.subscribe_once("clash.high_severity.detected", _on_clash_high_severity)
+    event_bus.subscribe_once("validation.results.errors_found", _on_validation_errors_found)
+    event_bus.subscribe_once("ncr.closed_with_cost_impact", _on_ncr_closed_with_cost_impact)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("NCR: 4 cross-module subscriber(s) registered")

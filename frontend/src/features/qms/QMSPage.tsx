@@ -4,6 +4,7 @@ import { Fragment, useState, useMemo, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import clsx from 'clsx';
 import {
   ClipboardCheck,
@@ -47,7 +48,8 @@ import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { SectionIntro } from '@/features/validation';
-import { apiGet, getAuthToken, getErrorMessage, triggerDownload } from '@/shared/lib/api';
+import { getAuthToken, getErrorMessage, triggerDownload } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useToastStore } from '@/stores/useToastStore';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import {
@@ -89,6 +91,7 @@ import {
   type PunchCategory,
   type Audit,
 } from './api';
+import { reworkNotes } from './copqRework';
 import { HoldPointDependencyTree } from './HoldPointDependencyTree';
 import { AttachmentEvidenceGallery } from './AttachmentEvidenceGallery';
 import { qmsGuide } from './qmsGuide';
@@ -285,6 +288,18 @@ export function QMSPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<PunchCategory | ''>('');
   const [createOpen, setCreateOpen] = useState(false);
+  // Each register is written under its own permission, and audits need a
+  // manager. A role that cannot create in the open tab sees the create button
+  // disabled with the reason, and the empty register offers no create action.
+  const canCreateByTab: Record<Tab, boolean> = {
+    itp: useHasPermission('qms.itp.write'),
+    inspections: useHasPermission('qms.inspection.write'),
+    ncrs: useHasPermission('qms.ncr.write'),
+    punch: useHasPermission('qms.punch.write'),
+    audits: useHasPermission('qms.audit.write'),
+  };
+  const canCreate = canCreateByTab[tab];
+  const openCreate = canCreate ? () => setCreateOpen(true) : undefined;
   const [selectedNcrId, setSelectedNcrId] = useState<string | null>(null);
   const [selectedInspectionId, setSelectedInspectionId] = useState<string | null>(null);
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
@@ -295,7 +310,7 @@ export function QMSPage() {
 
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<ProjectLite[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<ProjectLite[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -335,6 +350,8 @@ export function QMSPage() {
     queryFn: () => fetchCOPQ(projectId, ''),
     enabled: !!projectId && tab === 'ncrs',
   });
+  // What the rework figure leaves out, if anything.
+  const copqReworkNotes = copqQ.data ? reworkNotes(copqQ.data) : [];
 
   // Module Insights - the toggleable visualization panel for this module. The
   // per-tab list queries above are gated on the active tab, so the panel gets
@@ -429,7 +446,18 @@ export function QMSPage() {
                 panel. Leads the cluster so charts are one obvious click away. */}
             <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={qmsGuide} />
-            <Button variant="primary" size="sm" icon={<Plus size={14} />} onClick={() => setCreateOpen(true)} disabled={!projectId}>
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<Plus size={14} />}
+              onClick={() => setCreateOpen(true)}
+              disabled={!projectId || !canCreate}
+              title={
+                canCreate
+                  ? undefined
+                  : t('errors.forbidden', { defaultValue: "You don't have permission to perform this action." })
+              }
+            >
               {tabCreateLabel(tab, t)}
             </Button>
           </>
@@ -538,6 +566,17 @@ export function QMSPage() {
               />
             </div>
           </div>
+          {/* What the rework figure leaves out. The server folds only the
+              money already in this currency, so an empty figure can mean
+              nothing open, nothing priced, or nothing priced in this
+              currency, and those are three different sentences. */}
+          {copqReworkNotes.length > 0 && (
+            <p className="mt-3 text-xs text-content-tertiary" data-testid="qms-copq-rework-note">
+              {copqReworkNotes
+                .map((note) => t(note.key, { defaultValue: note.defaultValue, ...(note.params ?? {}) }))
+                .join(' ')}
+            </p>
+          )}
         </Card>
       )}
 
@@ -609,7 +648,7 @@ export function QMSPage() {
             rows={filteredItp}
             registerTotal={activeQuery.data?.total ?? 0}
             onClearFilters={filtersActive ? clearFilters : undefined}
-            onAction={() => setCreateOpen(true)}
+            onAction={openCreate}
             onSelect={(id) => setSelectedPlanId(id)}
           />
         ) : tab === 'inspections' ? (
@@ -618,7 +657,7 @@ export function QMSPage() {
             registerTotal={activeQuery.data?.total ?? 0}
             onClearFilters={filtersActive ? clearFilters : undefined}
             onSelect={(id) => setSelectedInspectionId(id)}
-            onAction={() => setCreateOpen(true)}
+            onAction={openCreate}
           />
         ) : tab === 'ncrs' ? (
           <NCRTable
@@ -626,21 +665,21 @@ export function QMSPage() {
             registerTotal={activeQuery.data?.total ?? 0}
             onClearFilters={filtersActive ? clearFilters : undefined}
             onSelect={(id) => setSelectedNcrId(id)}
-            onAction={() => setCreateOpen(true)}
+            onAction={openCreate}
           />
         ) : tab === 'punch' ? (
           <PunchTable
             rows={filteredPunch}
             registerTotal={activeQuery.data?.total ?? 0}
             onClearFilters={filtersActive ? clearFilters : undefined}
-            onAction={() => setCreateOpen(true)}
+            onAction={openCreate}
           />
         ) : (
           <AuditTable
             rows={filteredAudits}
             registerTotal={activeQuery.data?.total ?? 0}
             onClearFilters={filtersActive ? clearFilters : undefined}
-            onAction={() => setCreateOpen(true)}
+            onAction={openCreate}
           />
         )}
       </Card>
@@ -843,7 +882,7 @@ function ITPTable({
       Its presence is also the signal that `registerTotal` counts a filtered
       query rather than the register, so it cannot be read as a denial. */
   onClearFilters?: () => void;
-  onAction: () => void;
+  onAction?: () => void;
   onSelect: (id: string) => void;
 }) {
   const { t } = useTranslation();
@@ -885,7 +924,7 @@ function ITPTable({
         description={t('qms.empty_itp_desc', {
           defaultValue: 'Inspection & Test Plans define quality gates for each work package.',
         })}
-        action={{ label: t('qms.new_itp', { defaultValue: 'New ITP Plan' }), onClick: onAction }}
+        action={onAction ? { label: t('qms.new_itp', { defaultValue: 'New ITP Plan' }), onClick: onAction } : undefined}
       />
     );
   }
@@ -956,7 +995,7 @@ function InspectionTable({
       query rather than the register, so it cannot be read as a denial. */
   onClearFilters?: () => void;
   onSelect: (id: string) => void;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   const { t } = useTranslation();
   if (rows.length === 0) {
@@ -983,7 +1022,7 @@ function InspectionTable({
         description={t('qms.empty_inspections_desc', {
           defaultValue: 'Schedule an inspection against an ITP control point to record hold/witness sign-offs.',
         })}
-        action={{ label: t('qms.new_inspection', { defaultValue: 'Schedule Inspection' }), onClick: onAction }}
+        action={onAction ? { label: t('qms.new_inspection', { defaultValue: 'Schedule Inspection' }), onClick: onAction } : undefined}
       />
     );
   }
@@ -1042,7 +1081,7 @@ function NCRTable({
       query rather than the register, so it cannot be read as a denial. */
   onClearFilters?: () => void;
   onSelect: (id: string) => void;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   const { t } = useTranslation();
   if (rows.length === 0) {
@@ -1069,7 +1108,7 @@ function NCRTable({
         description={t('qms.empty_ncrs_desc', {
           defaultValue: 'NCRs capture defects with cost impact and feed the COPQ rollup.',
         })}
-        action={{ label: t('qms.new_ncr', { defaultValue: 'Raise NCR' }), onClick: onAction }}
+        action={onAction ? { label: t('qms.new_ncr', { defaultValue: 'Raise NCR' }), onClick: onAction } : undefined}
       />
     );
   }
@@ -1135,7 +1174,7 @@ function PunchTable({
       Its presence is also the signal that `registerTotal` counts a filtered
       query rather than the register, so it cannot be read as a denial. */
   onClearFilters?: () => void;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1172,7 +1211,7 @@ function PunchTable({
         description={t('qms.empty_punch_desc', {
           defaultValue: 'Snag items captured on walkthroughs land here for assignment and close-out.',
         })}
-        action={{ label: t('qms.new_punch', { defaultValue: 'Add Punch Item' }), onClick: onAction }}
+        action={onAction ? { label: t('qms.new_punch', { defaultValue: 'Add Punch Item' }), onClick: onAction } : undefined}
       />
     );
   }
@@ -1238,7 +1277,7 @@ function AuditTable({
       Its presence is also the signal that `registerTotal` counts a filtered
       query rather than the register, so it cannot be read as a denial. */
   onClearFilters?: () => void;
-  onAction: () => void;
+  onAction?: () => void;
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -1275,7 +1314,7 @@ function AuditTable({
         description={t('qms.empty_audits_desc', {
           defaultValue: 'ISO 9001 internal, external and supplier audits with finding registers.',
         })}
-        action={{ label: t('qms.new_audit', { defaultValue: 'Plan Audit' }), onClick: onAction }}
+        action={onAction ? { label: t('qms.new_audit', { defaultValue: 'Plan Audit' }), onClick: onAction } : undefined}
       />
     );
   }

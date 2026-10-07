@@ -33,7 +33,9 @@ Rules, all registered under the ``payment_clock`` rule set:
 * ``payment_clock.final_date_after_due_date``- ERROR.   The final date for
   payment must fall after the due date.
 * ``payment_clock.statutory_interest``       - WARNING. Past the final date and
-  unpaid, interest runs, at a rate the finding names.
+  unpaid, interest runs, at a rate the finding names, on the sum that actually
+  had to be paid rather than on the sum applied for. Which sum that is depends
+  on the notices: see :func:`_sum_due`.
 * ``payment_clock.notice_currency``          - WARNING. A notice in a currency
   other than the application's.
 
@@ -45,6 +47,7 @@ run against a fixture with no database at all.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -139,19 +142,23 @@ def _reference(context: ValidationContext) -> str:
     return _text(application.get("reference")) or _text(application.get("id")) or "this application"
 
 
-def _paid_in_full(application: dict[str, Any]) -> bool:
+def _paid_in_full(application: dict[str, Any], due: Decimal | None) -> bool:
     """Whether the row says the money actually arrived.
 
     A status of ``paid`` with no payment date is a workflow tick somebody
     clicked, not evidence of payment, so both are required. Where a part
     payment is recorded, the shortfall is still overdue.
+
+    ``due`` is the sum that had to be paid, not the sum applied for. A
+    payer who notified a lower sum in time and paid that sum has paid in full,
+    and this used to compare against the applied sum and call the difference
+    overdue - in exactly the situation the module exists for.
     """
     if _text(application.get("status")) in {"paid", "closed"} and parse_date(application.get("paid_at")):
         paid = parse_money(application.get("paid_amount"))
-        applied = parse_money(application.get("applied_amount"))
-        if paid is None or applied is None:
+        if paid is None or due is None:
             return True
-        return paid >= applied
+        return paid >= due
     return False
 
 
@@ -175,6 +182,170 @@ def _result(
         element_ref=element_ref,
         suggestion=suggestion,
         details=details or {},
+    )
+
+
+# ── The sum that has to be paid ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _SumDue:
+    """The figure the final date is measured against, and where it came from.
+
+    ``basis`` is one of ``payment_notice``, ``default_payment_notice``,
+    ``applied_sum_by_silence``, ``applied_sum`` or ``pay_less_notice``.
+    ``label`` names the figure in words, so a finding can say which sum it
+    used instead of leaving a reader to work it out from the number.
+    """
+
+    amount: Decimal | None
+    basis: str
+    label: str
+    reference: str = ""
+
+
+def _notice_amount(notice: dict[str, Any], currency: str) -> Decimal | None:
+    """The sum a notice states, where it can be compared with the application's.
+
+    A notice in another currency is not converted. Neither a rate nor a date
+    for one is in the snapshot, and a guessed rate would put a figure in a
+    finding that no source backs. ``payment_clock.notice_currency`` reports the
+    mismatch; the arithmetic here leaves that notice out.
+    """
+    stated = _text(notice.get("currency")).upper()
+    if stated and currency and stated != currency.upper():
+        return None
+    return parse_money(notice.get("notified_amount"))
+
+
+def _served_in_time(notice: dict[str, Any], deadline: date | None) -> bool:
+    """Whether a notice met its deadline. Where the regime sets none, nothing to miss."""
+    if deadline is None:
+        return True
+    issued_at = parse_date(notice.get("issued_at"))
+    return issued_at is not None and issued_at <= deadline
+
+
+def _latest(notices: list[dict[str, Any]]) -> dict[str, Any]:
+    """The last notice served, where more than one of a kind is recorded."""
+    return max(notices, key=lambda notice: parse_date(notice.get("issued_at")) or date.min)
+
+
+def _sum_due(context: ValidationContext) -> _SumDue:
+    """The sum that has to be paid by the final date, and the reason it is that sum.
+
+    Four sources, in the order the statutes put them:
+
+    * a payment notice served in time states the notified sum;
+    * failing that, a payee's default payment notice states it, where the
+      regime lets silence fix the sum at all;
+    * failing both, the sum applied for. Under a regime where silence concedes
+      the claim that is the statutory consequence and the label says so; under
+      every other regime it is simply the only figure anybody has stated;
+    * and a pay-less notice served in time, stating both a sum and the basis
+      for it, lowers whichever of those applies.
+
+    The pay-less notice is applied last and named separately because it reduces
+    what has to be *paid* without displacing the notified sum. Conflating the
+    two is the mistake that loses the adjudication, which is why
+    :func:`app.modules.payment_clock.service.notified_sum` refuses to look at
+    pay-less notices at all and this function, which answers a different
+    question, does.
+
+    A notice served late is left out entirely: it has no statutory effect, and
+    ``payment_clock.notice_in_time`` reports it on its own account.
+    """
+    application = _section(context, "application")
+    regime = _section(context, "regime")
+    schedule = _schedule(context)
+    currency = _text(application.get("currency"))
+    applied = parse_money(application.get("applied_amount"))
+    notices = _notices(context)
+    effect = _text(regime.get("no_notice_effect")) or "applied_sum_becomes_notified_sum"
+
+    def priced(notice_type: str, deadline: date | None) -> list[dict[str, Any]]:
+        return [
+            notice
+            for notice in notices
+            if _text(notice.get("notice_type")) == notice_type
+            and _served_in_time(notice, deadline)
+            and _notice_amount(notice, currency) is not None
+        ]
+
+    served_in_time = [
+        notice
+        for notice in notices
+        if _text(notice.get("notice_type")) == "payment_notice"
+        and _served_in_time(notice, schedule.payment_notice_deadline)
+    ]
+    payment_notices = priced("payment_notice", schedule.payment_notice_deadline)
+    default_notices = priced("default_payment_notice", None)
+    silence_fixes_the_sum = effect == "applied_sum_becomes_notified_sum"
+    window_closed = schedule.payment_notice_deadline is not None and _as_of(context) > schedule.payment_notice_deadline
+
+    if payment_notices:
+        notice = _latest(payment_notices)
+        amount = _notice_amount(notice, currency)
+        base = _SumDue(
+            amount,
+            "payment_notice",
+            (
+                f"the notified sum of {format_money(amount, currency)}, stated in the payment notice "
+                f"served on {_text(notice.get('issued_at'))}"
+            ),
+            _text(notice.get("reference")),
+        )
+    elif default_notices and silence_fixes_the_sum:
+        notice = _latest(default_notices)
+        amount = _notice_amount(notice, currency)
+        base = _SumDue(
+            amount,
+            "default_payment_notice",
+            (
+                f"the notified sum of {format_money(amount, currency)}, stated in the payee's default "
+                f"payment notice of {_text(notice.get('issued_at'))}"
+            ),
+            _text(notice.get("reference")),
+        )
+    elif silence_fixes_the_sum and window_closed and not served_in_time:
+        # Silence only, and only where the statute makes silence count. A
+        # notice that was served but states no comparable figure - no sum at
+        # all, or a sum in another currency - is not silence, so the applied
+        # sum stands as the only figure stated rather than as a concession.
+        base = _SumDue(
+            applied,
+            "applied_sum_by_silence",
+            (
+                f"the sum applied for, {format_money(applied, currency)}, which became the notified sum "
+                "when no payment notice was served in time"
+            ),
+        )
+    else:
+        base = _SumDue(applied, "applied_sum", f"the sum applied for, {format_money(applied, currency)}")
+
+    # A pay-less notice without a stated sum or without the basis of its
+    # calculation is invalid under ``payment_clock.pay_less_basis``, and the sum
+    # it tried to withhold stays payable, so it is not allowed to lower
+    # anything here either.
+    reductions: list[tuple[Decimal, dict[str, Any]]] = []
+    for notice in priced("pay_less_notice", schedule.pay_less_deadline):
+        amount = _notice_amount(notice, currency)
+        if amount is not None and _text(notice.get("basis_of_calculation")):
+            reductions.append((amount, notice))
+    if not reductions or base.amount is None:
+        return base
+
+    lowest, notice = min(reductions, key=lambda pair: pair[0])
+    if lowest >= base.amount:
+        return base
+    return _SumDue(
+        lowest,
+        "pay_less_notice",
+        (
+            f"{format_money(lowest, currency)}, the sum a pay-less notice served on "
+            f"{_text(notice.get('issued_at'))} states as due against {base.label}"
+        ),
+        _text(notice.get("reference")),
     )
 
 
@@ -485,23 +656,49 @@ class PaymentClockStatutoryInterest(ValidationRule):
         if final_date is None:
             return []
         as_of = _as_of(context)
-        if as_of <= final_date or _paid_in_full(application):
-            return [_result(self, True, "OK", details={"final_date": final_date.isoformat()})]
+        sum_due = _sum_due(context)
+        sum_due_details = {
+            "sum_due_basis": sum_due.basis,
+            "sum_due_amount": format(sum_due.amount, "f") if sum_due.amount is not None else None,
+            "sum_due_reference": sum_due.reference,
+        }
+        if as_of <= final_date or _paid_in_full(application, sum_due.amount):
+            return [_result(self, True, "OK", details={"final_date": final_date.isoformat(), **sum_due_details})]
+
+        paid = parse_money(application.get("paid_amount")) or Decimal("0")
+        outstanding = sum_due.amount - paid if sum_due.amount is not None else None
+        currency = _text(application.get("currency"))
+        if outstanding is not None and outstanding <= 0:
+            # The sum that had to be paid has been paid, whatever the status
+            # column says. Interest runs on what was owed, and what was owed is
+            # the notified sum, not the sum asked for before the payer notified
+            # a lower figure in time.
+            return [
+                _result(
+                    self,
+                    True,
+                    "OK",
+                    details={
+                        "final_date": final_date.isoformat(),
+                        "paid_amount": format(paid, "f"),
+                        **sum_due_details,
+                    },
+                )
+            ]
 
         overdue_days = days_between(final_date, as_of)
-        applied = parse_money(application.get("applied_amount"))
-        paid = parse_money(application.get("paid_amount")) or Decimal("0")
-        outstanding = applied - paid if applied is not None else None
-        currency = _text(application.get("currency"))
         rate = interest_description(regime)
         return [
             _result(
                 self,
                 False,
                 (
+                    # The figure is named in its own clause. Which sum the
+                    # interest runs on is the thing being argued about, and a
+                    # reader should not have to open the notices to see it.
                     f"{format_money(outstanding, currency)} has been outstanding for {overdue_days} day(s) "
-                    f"past the final date for payment of {final_date.isoformat()}. Statutory interest runs "
-                    f"at {rate}."
+                    f"past the final date for payment of {final_date.isoformat()}, measured against "
+                    f"{sum_due.label}. Statutory interest runs at {rate}."
                 ),
                 element_ref=_reference(context),
                 suggestion=(
@@ -516,6 +713,7 @@ class PaymentClockStatutoryInterest(ValidationRule):
                     "currency": currency,
                     "interest_basis": _text(regime.get("interest_basis")),
                     "interest_rate": rate,
+                    **sum_due_details,
                 },
             )
         ]

@@ -35,6 +35,12 @@ import socket
 import sys
 import webbrowser
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 # ── Console encoding hardening ────────────────────────────────────────────
 # On Windows + Anaconda Python the default console encoding is cp1252,
@@ -1255,6 +1261,18 @@ def _run_fatal_preflight(data_dir: Path, host: str, port: int) -> None:
     if not any(c.status == "error" for c in fatal_checks):
         return
 
+    # Emit a STAGE marker so the desktop launcher shows a specific failure on
+    # its checklist instead of timing out with no diagnosis. The pre-flight
+    # runs before the full boot machinery, so emit_stage is called directly.
+    errors = [c for c in fatal_checks if c.status == "error"]
+    stage_detail = "; ".join(c.name for c in errors[:3])
+    try:
+        from app.core.embedded_pg import emit_stage as _emit  # noqa: PLC0415
+
+        _emit("preflight", "fail", f"Pre-flight check failed: {stage_detail}")
+    except Exception:  # noqa: BLE001
+        pass
+
     print(
         _red(
             _bold(
@@ -1409,6 +1427,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
     try:
         import uvicorn
 
+        from app.core.server_loop import uvicorn_loop_option
+
         uvicorn.run(
             "app.main:create_app",
             factory=True,
@@ -1416,6 +1436,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
             port=args.port,
             log_level="warning" if args.quiet else "info",
             access_log=False,
+            # On Windows, a proactor loop that re-posts a failed accept: the stock
+            # one closes the listening socket for good when one client resets while
+            # waiting to be accepted, and the app then looks frozen. See
+            # app/core/server_loop.py.
+            loop=uvicorn_loop_option(),
         )
     except KeyboardInterrupt:
         print()
@@ -1988,6 +2013,206 @@ def cmd_seed(args: argparse.Namespace) -> None:
         print("Seed complete.")
 
     asyncio.run(_run_seed())
+
+
+# ── Admin recovery (promote-admin) ──────────────────────────────────────────
+# Public registration hands out admin only on a fresh install, so an install
+# whose last administrator was deactivated (or whose operator never registered
+# before other people did) has no way back in through the web UI. This command
+# is that way back: run on the server, it makes an existing account an active
+# admin.
+
+
+async def _promote_user_to_admin(session: AsyncSession, email: str) -> str:
+    """Make the account at ``email`` an active admin and return a status line.
+
+    Raises:
+        LookupError: No usable account exists at that address (missing or
+            already erased), so there is nothing to promote.
+    """
+    from sqlalchemy import func, select
+
+    from app.modules.users.models import User
+
+    user = (
+        await session.execute(select(User).where(func.lower(User.email) == email.strip().lower()))
+    ).scalar_one_or_none()
+    if user is None or user.deleted_at is not None:
+        raise LookupError(f"No user with e-mail {email!r}.")
+    if user.role == "admin" and user.is_active:
+        return f"{user.email} is already an active admin."
+    user.role = "admin"
+    user.is_active = True
+    await session.flush()
+    return f"{user.email} is now an active admin."
+
+
+def cmd_promote_admin(args: argparse.Namespace) -> None:
+    """Promote an existing user to an active admin (operator recovery)."""
+    if not (args.email or "").strip():
+        print(_red("Give the e-mail of the account to promote: openconstructionerp promote-admin <email>"))
+        sys.exit(2)
+    data_dir = _data_dir_from_args(args)
+    _setup_env(data_dir, DEFAULT_HOST, DEFAULT_PORT)
+
+    import asyncio
+
+    async def _run() -> str:
+        from app.database import async_session_factory
+
+        _register_all_module_models()
+        async with async_session_factory() as session:
+            message = await _promote_user_to_admin(session, args.email)
+            await session.commit()
+            return message
+
+    try:
+        message = asyncio.run(_run())
+    except LookupError as exc:
+        print(_red(str(exc)))
+        sys.exit(1)
+    print(_green(message))
+
+
+async def run_demo_cleanup(apply: bool, write: Callable[[str], None] = print) -> Any:
+    """The demo-cleanup pass itself: find, print and with ``apply`` remove and commit.
+
+    Opens its session from ``app.database`` at call time, so whatever database
+    the process is pointed at is the one cleaned.
+    """
+    from app.core.demo_cleanup import clean_leaked_demo_rows
+    from app.database import async_session_factory
+
+    async with async_session_factory() as session:
+        report = await clean_leaked_demo_rows(session, apply=apply)
+        if apply:
+            await session.commit()
+        else:
+            await session.rollback()
+
+    write(f"Real projects checked: {report.real_projects}")
+    if report.found:
+        write("Demo rows proven to be the seed's, by its mark or by content matching the seed exactly:")
+    for project, rows in report.by_project().items():
+        write(f"  {project or 'Company-wide (no project)'}")
+        for row in rows:
+            write(f"    {row.module} / {row.table}  {row.id}  {row.title}")
+    if report.kept:
+        write("Kept, although they came from the seed:")
+        for row in report.kept:
+            where = row.project_name or "company-wide"
+            write(f"    {row.module} / {row.table}  {row.id}  {row.title}  ({where}; {row.reason})")
+    if report.ppe_kept_reason:
+        write(f"  Company-wide seed rows kept: {report.ppe_kept_reason}")
+
+    if apply:
+        write(_green(f"Removed {report.total} demo row(s)."))
+    elif report.total:
+        write(_yellow("Dry run, nothing changed. Run again with --apply to remove the rows listed above."))
+    elif report.kept or report.ppe_kept_reason:
+        write(_yellow("Nothing to remove. The rows listed as kept stay; see the reason next to each."))
+    else:
+        write(_green("No demo rows found in real projects."))
+    return report
+
+
+def cmd_demo_cleanup(args: argparse.Namespace) -> None:
+    """Report, and with --apply remove, demo rows the old boot seeding left in real projects."""
+    data_dir = _data_dir_from_args(args)
+    _setup_env(data_dir, DEFAULT_HOST, DEFAULT_PORT)
+
+    import asyncio
+
+    _register_all_module_models()
+    asyncio.run(run_demo_cleanup(bool(args.apply)))
+
+
+# ── Reference data update ───────────────────────────────────────────────────
+# The seeder fills countries, work calendars and tax rates only while each table
+# is empty, so an install set up on an older release keeps the copy it started
+# with. This prints what the shipped files would add or change and, with
+# --apply, writes the changes marked ready. The rule for what may be written is
+# in app/modules/i18n_foundation/reference_data_update.py.
+
+
+def _format_reference_value(value: Any) -> str:
+    import json
+
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return text if len(text) <= 60 else text[:57] + "..."
+    return "-" if value is None else str(value)
+
+
+async def run_reference_data_update(apply: bool, write: Callable[[str], None] = print) -> Any:
+    """Preview, and with ``apply`` write, the shipped reference data this database lacks.
+
+    Opens its session from ``app.database`` at call time, so whatever database
+    the process is pointed at is the one compared. Commits only on ``apply``.
+    """
+    from app.database import async_session_factory
+    from app.modules.i18n_foundation.reference_data_update import apply_reference_update, compute_reference_diff
+
+    async with async_session_factory() as session:
+        if apply:
+            result = await apply_reference_update(session, None)
+            await session.commit()
+            diff = result.after
+        else:
+            result = None
+            diff = await compute_reference_diff(session)
+            await session.rollback()
+
+    if result is not None:
+        write(
+            _green(
+                f"Applied {len(result.applied)} change(s): {result.rows_added} row(s) added, "
+                f"{result.rows_updated} row(s) updated."
+            )
+        )
+        for key in result.applied:
+            write(f"  {key}")
+
+    headings = {
+        "ready": "Ready to apply:",
+        "kept": "Kept as they are (this database's version stays):",
+        "review": "Needs a person to decide, never applied by this command:",
+    }
+    for status, heading in headings.items():
+        entries = [change for change in diff.changes if change.status == status]
+        if not entries:
+            continue
+        write(heading)
+        for change in entries:
+            extra = f", {change.rows_added} row(s) to add" if change.rows_added and status == "ready" else ""
+            write(f"  {change.key}  {change.label}  ({change.reason}{extra})")
+            for item in change.fields:
+                write(
+                    f"      {item.field}: {_format_reference_value(item.before)} -> "
+                    f"{_format_reference_value(item.after)}"
+                )
+            if change.detail:
+                write(f"      {change.detail}")
+
+    ready = diff.count("ready")
+    if apply:
+        return diff
+    if ready:
+        write(_yellow(f"Dry run, nothing changed. Run again with --apply to write the {ready} ready change(s)."))
+    else:
+        write(_green("Reference data already matches this release. Nothing to apply."))
+    return diff
+
+
+def cmd_update_reference_data(args: argparse.Namespace) -> None:
+    """Show, and with --apply write, the shipped countries, calendars and tax rates this install lacks."""
+    data_dir = _data_dir_from_args(args)
+    _setup_env(data_dir, DEFAULT_HOST, DEFAULT_PORT)
+
+    import asyncio
+
+    _register_all_module_models()
+    asyncio.run(run_reference_data_update(bool(args.apply)))
 
 
 # ── Module management (install / list / uninstall) ─────────────────────────
@@ -2613,6 +2838,46 @@ def _build_parser() -> argparse.ArgumentParser:
     seed_p.add_argument("--demo", action="store_true", help="Install demo project with sample data")
     _add_data_dir_arg(seed_p)
 
+    # promote-admin - operator recovery when no administrator is left
+    promote_p = subparsers.add_parser(
+        "promote-admin",
+        help="Make an existing user an active admin (recovery when no admin is left)",
+    )
+    # Optional at parse time so ``promote-admin --data-dir X`` parses like every
+    # other data-dir command; cmd_promote_admin refuses a missing e-mail.
+    promote_p.add_argument("email", nargs="?", help="E-mail of the existing account to promote")
+    _add_data_dir_arg(promote_p)
+
+    # demo-cleanup - remove demo rows the old boot seeding wrote into real projects
+    demo_cleanup_p = subparsers.add_parser(
+        "demo-cleanup",
+        help="List demo rows the old boot seeding left in real projects; --apply removes them",
+    )
+    demo_cleanup_p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the marked rows. Without it nothing is changed.",
+    )
+    _add_data_dir_arg(demo_cleanup_p)
+
+    # update-reference-data - shipped countries, calendars and tax rates an older install lacks
+    refdata_p = subparsers.add_parser(
+        "update-reference-data",
+        help="Show the shipped countries, work calendars and tax rates this install lacks; --apply writes them",
+    )
+    refdata_mode = refdata_p.add_mutually_exclusive_group()
+    refdata_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only print what would change (the default).",
+    )
+    refdata_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the changes marked ready. Rows you created or edited are never changed.",
+    )
+    _add_data_dir_arg(refdata_p)
+
     # module - install / list / uninstall business modules
     module_p = subparsers.add_parser(
         "module",
@@ -2717,6 +2982,12 @@ def main() -> None:
         cmd_upgrade(args)
     elif args.command == "seed":
         cmd_seed(args)
+    elif args.command == "promote-admin":
+        cmd_promote_admin(args)
+    elif args.command == "demo-cleanup":
+        cmd_demo_cleanup(args)
+    elif args.command == "update-reference-data":
+        cmd_update_reference_data(args)
     elif args.command == "module":
         cmd_module(args)
     elif args.command == "pack":

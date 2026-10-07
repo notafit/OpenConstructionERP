@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "bsab_classification",
+  "name": "BSAB — Byggandets Samordning Classification",
+  "standard": "BSAB 96",
+  "jurisdiction": "SE",
+  "regulator": "Svensk Byggtjanst / BK (Byggandets Kontaktkrets)",
+  "publication_year": 1996,
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for BSAB, the Swedish classification a priced bill is structured against, in the edition named above. The classification asks that every priced line carries a code, that the code has the shape the system defines, that the element hierarchy is consistent and that functional elements and production results are assigned correctly. None of that is implemented as a rule. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swedish quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared five ids under the bsab prefix (classification_code_required, valid_code_format, hierarchy_consistent, element_type_valid, no_orphan_positions), and the engine defines none of them and registers no rule set by that name. The classification rules the engine does implement are written for DIN 276, GAEB and MasterFormat and read those code shapes, so enabling one of them against BSAB codes would report a correctly coded Swedish bill as wrong. The universal BOQ hygiene checks run on every project regardless of this document and are not claimed here.",
+  "enables_rule_ids": []
+}

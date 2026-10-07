@@ -25,11 +25,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const apiGet = vi.fn(async (..._args: unknown[]) => ({}) as unknown);
 const apiPost = vi.fn(async (..._args: unknown[]) => ({}) as unknown);
 const apiPatch = vi.fn(async (..._args: unknown[]) => ({}) as unknown);
+const downloadWithAuth = vi.fn(async (..._args: unknown[]) => undefined);
+let uiLanguage: string | null = 'en';
 
 vi.mock('@/shared/lib/api', () => ({
+  API_BASE: '/api',
+  activeLanguageTag: () => uiLanguage,
   apiGet: (...args: unknown[]) => apiGet(...args),
   apiPost: (...args: unknown[]) => apiPost(...args),
   apiPatch: (...args: unknown[]) => apiPatch(...args),
+  downloadWithAuth: (...args: unknown[]) => downloadWithAuth(...args),
 }));
 
 import {
@@ -41,12 +46,15 @@ import {
   respondToRFI,
   closeRFI,
   createVariationFromRFI,
+  downloadRFIPdf,
 } from '../api';
 
 beforeEach(() => {
   apiGet.mockClear();
   apiPost.mockClear();
   apiPatch.mockClear();
+  downloadWithAuth.mockClear();
+  uiLanguage = 'en';
 });
 
 // Read the Nth positional arg of a mock's Mth call. `vi.fn` infers an
@@ -83,6 +91,25 @@ describe('updateRFI', () => {
     await updateRFI('abc-123', { status: 'open' });
     expect(nthArg(apiPatch, 0, 0)).toBe('/v1/rfi/abc-123');
     expect(nthArg(apiPatch, 0, 1)).toEqual({ status: 'open' });
+  });
+});
+
+describe('downloadRFIPdf', () => {
+  it('GETs the trailing-slash PDF route in the UI language', async () => {
+    // The download bypasses apiGet and its Accept-Language header, so the
+    // query parameter is the only thing that carries the reader's language.
+    uiLanguage = 'de';
+    await downloadRFIPdf('abc-123', 'RFI-007');
+    expect(downloadWithAuth).toHaveBeenCalledTimes(1);
+    expect(nthArg(downloadWithAuth, 0, 0)).toBe('/api/v1/rfi/abc-123/export/pdf/?locale=de');
+    expect(nthArg(downloadWithAuth, 0, 1)).toBe('RFI-007.pdf');
+  });
+
+  it('leaves the language to the server when the UI has none yet', async () => {
+    uiLanguage = null;
+    await downloadRFIPdf('abc-123', '');
+    expect(nthArg(downloadWithAuth, 0, 0)).toBe('/api/v1/rfi/abc-123/export/pdf/');
+    expect(nthArg(downloadWithAuth, 0, 1)).toBe('rfi.pdf');
   });
 });
 

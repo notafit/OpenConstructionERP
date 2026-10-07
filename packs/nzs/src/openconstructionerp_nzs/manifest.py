@@ -21,9 +21,10 @@ MANIFEST = PartnerPackManifest(
         "en-NZ": "locales/en-NZ.json",
     },
     cwicr_regions=[
+        # Only published bases are declared: a slug that resolves to nothing
+        # was listed on the activation dialog and then skipped at install.
+        # Wellington and Christchurch follow when their bases are.
         "cwicr-eng-auckland",
-        "cwicr-eng-wellington",
-        "cwicr-eng-christchurch",
     ],
     default_currency="NZD",
     default_tax_template="nz_gst_15",
@@ -42,6 +43,13 @@ MANIFEST = PartnerPackManifest(
         "nzs_3910_2023_contracts",
         "rawlinsons_nz_benchmarks",
     ],
+    # The documents above are reference text the engine never executes. This
+    # is the list that switches rules on. New Zealand quantity surveying sits in
+    # the Commonwealth measurement tradition, and NRM is what the classification
+    # registry and the NZ country row already give a New Zealand project, so a
+    # project created under the pack runs the same national checks as one
+    # created without it.
+    validation_rule_sets=["nrm"],
     default_modules=[],
     hidden_modules=[],
     branding=PartnerBranding(

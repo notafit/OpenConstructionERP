@@ -1,0 +1,22 @@
+{
+  "rule_pack_id": "uni_standards",
+  "name": "UNI Construction Standards",
+  "standard": "UNI EN / UNI standards series",
+  "jurisdiction": "IT",
+  "description": "Validates specifications and BOQ items against key UNI (Ente Italiano di Normazione) construction standards. Covers UNI EN 1990-1999 Eurocodes (structural), UNI 10349 (climatic data for energy), UNI 11337 (BIM and construction information management), and material testing references. Checks that specification clauses cite the applicable UNI standard and version.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "uni.standard_reference_present",
+    "uni.standard_version_current",
+    "uni.en_1990_eurocode_basis_referenced",
+    "uni.en_1992_concrete_referenced_if_applicable",
+    "uni.en_1993_steel_referenced_if_applicable",
+    "uni.en_1998_seismic_referenced_if_applicable",
+    "uni.uni_10349_climatic_data_referenced",
+    "uni.uni_11337_bim_referenced_if_applicable",
+    "uni.material_test_standard_cited",
+    "uni.cam_criteri_ambientali_minimi_referenced"
+  ],
+  "regulator": "UNI (Ente Italiano di Normazione)",
+  "publication_year": 2024
+}

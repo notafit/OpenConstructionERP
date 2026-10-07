@@ -51,6 +51,7 @@ vi.mock('../api', () => ({
     logo_align: 'left',
     footer_text: '',
     show_page_numbers: true,
+    show_letterhead: true,
   }),
   getDocumentAppearanceOptions: vi.fn().mockResolvedValue({
     page_sizes: ['A4', 'LETTER', 'LEGAL'],
@@ -69,6 +70,7 @@ vi.mock('../api', () => ({
       logo_align: 'left',
       footer_text: '',
       show_page_numbers: true,
+      show_letterhead: true,
     },
   }),
   saveDocumentAppearance: vi.fn(),

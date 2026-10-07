@@ -6,14 +6,20 @@ import App from './app/App';
 import { useToastStore } from '@/stores/useToastStore';
 import { notifyQueryError } from '@/shared/lib/queryErrorToast';
 import { initialLocaleReady } from './app/i18n';
+import { applyStoredUiScale } from '@/shared/lib/uiScale';
+import { retireStaleCaches } from './pwa/retireStaleCaches';
 import './index.css';
+
+// Desktop only: put the saved text size back on the webview as early as
+// possible. The mount at the bottom of this file waits for it.
+const uiScaleReady = applyStoredUiScale();
 
 (window as unknown as { CESIUM_BASE_URL: string }).CESIUM_BASE_URL = '/cesium/';
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      staleTime: 30_000, // 30s — data considered fresh for 30s, then refetch on focus/mount
+      staleTime: 120_000, // 2min — data considered fresh, reduces redundant refetches on tab switch
       gcTime: 5 * 60_000, // 5min — keep in cache for 5 min after unmount
       // Offline-first: try the cache before spinning a 300s AbortController.
       // `api.ts` falls back to IndexedDB via offlineStore on network errors,
@@ -35,7 +41,7 @@ const queryClient = new QueryClient({
         }
         return count < 1;
       },
-      refetchOnWindowFocus: true, // refetch when user tabs back
+      refetchOnWindowFocus: false, // opt-in per query; global refetch caused unnecessary re-renders on tab switch
     },
     mutations: {
       // Mutations while offline are queued by offlineStore and replayed on
@@ -104,6 +110,12 @@ window.addEventListener('vite:preloadError', () => {
   }
 });
 
+// Earlier builds let the service worker cache cross-origin images, failures
+// included, for 30 days (see pwa/staticAssetRoute.ts). The lane now has a new
+// name; dropping the old cache lets those visitors see the real images
+// without a hard reload. Fire and forget, it never throws.
+void retireStaleCaches();
+
 // The public demo is served under /demo (Caddy strips the prefix before it
 // reaches the backend, but the browser URL keeps it), so react-router needs a
 // matching basename there. Desktop and localhost serve at the root, where the
@@ -151,16 +163,40 @@ const renderApp = () => {
 // empty. Production ships the locale as a ~50 KB gzip chunk rather than a 4 MB
 // dev module, so the window is far narrower there — narrower, not absent.
 const LOCALE_MOUNT_CAP_MS = 2000;
-if (initialLocaleReady) {
-  let mounted = false;
-  const mountOnce = () => {
-    if (!mounted) {
-      mounted = true;
-      renderApp();
+const mountWhenLocaleReady = () => {
+  if (initialLocaleReady) {
+    let mounted = false;
+    const mountOnce = () => {
+      if (!mounted) {
+        mounted = true;
+        renderApp();
+      }
+    };
+    void initialLocaleReady.then(mountOnce);
+    window.setTimeout(mountOnce, LOCALE_MOUNT_CAP_MS);
+  } else {
+    renderApp();
+  }
+};
+
+// The same reasoning for the saved text size in the desktop app, which is a
+// native webview zoom set over IPC (see `uiScale.ts`). The call went out at the
+// top of this file; mounting after it answers means the first app frame is
+// painted at the chosen size instead of at 100% and then jumping. A local IPC
+// round trip is a few milliseconds, so the cap only matters if the shell does
+// not answer at all. `uiScaleReady` is null in the browser and at the default
+// size, which keeps those boots exactly as they were.
+const UI_SCALE_MOUNT_CAP_MS = 300;
+if (uiScaleReady) {
+  let started = false;
+  const startOnce = () => {
+    if (!started) {
+      started = true;
+      mountWhenLocaleReady();
     }
   };
-  void initialLocaleReady.then(mountOnce);
-  window.setTimeout(mountOnce, LOCALE_MOUNT_CAP_MS);
+  void uiScaleReady.then(startOnce, startOnce);
+  window.setTimeout(startOnce, UI_SCALE_MOUNT_CAP_MS);
 } else {
-  renderApp();
+  mountWhenLocaleReady();
 }

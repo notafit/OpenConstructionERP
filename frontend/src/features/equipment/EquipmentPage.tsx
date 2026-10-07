@@ -26,6 +26,7 @@ import {
   Users,
   Network,
   ArrowRight,
+  Banknote,
 } from 'lucide-react';
 import {
   Button,
@@ -51,6 +52,7 @@ import {
   listEquipment,
   getEquipment,
   getEquipmentDashboard,
+  getEquipmentCostSummary,
   createEquipment,
   updateEquipment,
   deleteEquipment,
@@ -63,6 +65,8 @@ import {
   deleteInspection,
   listDamageReports,
   deleteDamageReport,
+  DAMAGE_SEVERITY_LABELS,
+  DAMAGE_STATUS_LABELS,
   listTypes,
   deleteType,
   type Equipment,
@@ -75,6 +79,7 @@ import {
   type MaintenanceWorkOrder as ApiWorkOrder,
   type Inspection as ApiInspection,
   type DamageReport as ApiDamage,
+  type EquipmentCostSummary,
   type EquipmentType as ApiEquipmentType,
 } from './api';
 import { WorkOrderFormModal } from './modals/WorkOrderFormModal';
@@ -109,6 +114,7 @@ const EQUIPMENT_STATUS_LABELS: Record<string, string> = {
 
 type DrawerTab =
   | 'utilization'
+  | 'costs'
   | 'health'
   | 'maintenance'
   | 'certifications'
@@ -836,6 +842,12 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
     enabled: !!id && tab === 'damage',
   });
 
+  const costQ = useQuery({
+    queryKey: ['equipment', 'costSummary', id],
+    queryFn: () => getEquipmentCostSummary(id),
+    enabled: !!id && tab === 'costs',
+  });
+
   return (
     <div
       className="fixed inset-0 z-50 flex justify-end"
@@ -987,7 +999,7 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
             {dashQ.data?.blocked && (
               <div
                 role="alert"
-                className="mx-5 mt-3 flex items-start gap-2 rounded-lg border border-status-error/30 bg-status-error/10 px-3 py-2 text-xs text-status-error"
+                className="mx-5 mt-3 flex items-start gap-2 rounded-lg border border-semantic-error/30 bg-semantic-error/10 px-3 py-2 text-xs text-semantic-error"
               >
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
                 <span>
@@ -1018,6 +1030,13 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                         defaultValue: 'Utilization',
                       }),
                       icon: Activity,
+                    },
+                    {
+                      id: 'costs',
+                      label: t('equipment.tab_costs', {
+                        defaultValue: 'Costs',
+                      }),
+                      icon: Banknote,
                     },
                     {
                       id: 'health',
@@ -1077,6 +1096,12 @@ function DetailDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                   telemetry={telemetryQ.data ?? []}
                   loading={telemetryQ.isLoading}
                   dashboard={dashQ.data ?? null}
+                />
+              )}
+              {tab === 'costs' && (
+                <CostSummaryTab
+                  data={costQ.data ?? null}
+                  loading={costQ.isLoading}
                 />
               )}
               {tab === 'health' && (
@@ -1603,6 +1628,98 @@ function MeterReadingModal({
   );
 }
 
+function CostSummaryTab({
+  data,
+  loading,
+}: {
+  data: EquipmentCostSummary | null;
+  loading: boolean;
+}) {
+  const { t } = useTranslation();
+
+  if (loading) return <SkeletonTable rows={6} columns={2} />;
+  if (!data) {
+    return (
+      <EmptyState
+        icon={<Banknote size={20} />}
+        title={t('equipment.costs_empty', { defaultValue: 'No cost data yet' })}
+        description={t('equipment.costs_empty_desc', {
+          defaultValue: 'Costs are tracked through rentals, fuel logs, work orders and parts.',
+        })}
+      />
+    );
+  }
+
+  const rows: { label: string; value: string; sub?: string }[] = [
+    {
+      label: t('equipment.cost_rental', { defaultValue: 'Rental' }),
+      value: fmtFixed(parseFloat(data.rental_cost), 2),
+      sub: t('equipment.cost_rental_days', { defaultValue: '{{count}} days', count: data.rental_days }),
+    },
+    {
+      label: t('equipment.cost_fuel', { defaultValue: 'Fuel' }),
+      value: fmtFixed(parseFloat(data.fuel_cost), 2),
+      sub: `${fmtFixed(parseFloat(data.fuel_litres), 1)} L`,
+    },
+    {
+      label: t('equipment.cost_maintenance', { defaultValue: 'Maintenance' }),
+      value: fmtFixed(parseFloat(data.maintenance_cost), 2),
+      sub: t('equipment.cost_work_orders', { defaultValue: '{{count}} work orders', count: data.maintenance_orders }),
+    },
+    {
+      label: t('equipment.cost_parts', { defaultValue: 'Parts' }),
+      value: fmtFixed(parseFloat(data.parts_cost), 2),
+    },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg border border-border-light bg-surface-primary p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-content-primary">
+            {t('equipment.cost_breakdown', { defaultValue: 'Cost breakdown' })}
+          </h3>
+          <span className="text-lg font-bold tabular-nums text-content-primary">
+            {fmtFixed(parseFloat(data.total_cost), 2)}
+          </span>
+        </div>
+        <div className="space-y-2">
+          {rows.map((r) => (
+            <div key={r.label} className="flex items-center justify-between text-sm">
+              <div>
+                <span className="text-content-secondary">{r.label}</span>
+                {r.sub && (
+                  <span className="ml-2 text-xs text-content-tertiary">{r.sub}</span>
+                )}
+              </div>
+              <span className="tabular-nums font-medium">{r.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="rounded-lg border border-border-light bg-surface-primary p-3 text-center">
+          <div className="text-xs text-content-tertiary mb-1">
+            {t('equipment.cost_plant_hours', { defaultValue: 'Plant hours' })}
+          </div>
+          <div className="text-lg font-semibold tabular-nums">
+            {fmtFixed(parseFloat(data.plant_hours), 1)} h
+          </div>
+        </div>
+        <div className="rounded-lg border border-border-light bg-surface-primary p-3 text-center">
+          <div className="text-xs text-content-tertiary mb-1">
+            {t('equipment.cost_per_hour', { defaultValue: 'Cost / hour' })}
+          </div>
+          <div className="text-lg font-semibold tabular-nums">
+            {data.cost_per_hour ? fmtFixed(parseFloat(data.cost_per_hour), 2) : '—'}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MaintenanceTab({
   equipmentId,
   rows,
@@ -1914,7 +2031,7 @@ function CertificationsTab({
                       className={clsx(
                         'px-3 py-2',
                         expired
-                          ? 'text-status-error font-medium'
+                          ? 'text-semantic-error font-medium'
                           : 'text-content-secondary',
                       )}
                     >
@@ -2057,9 +2174,15 @@ function DamageTab({
               </div>
               <div className="flex flex-col items-end gap-1">
                 <Badge variant={DAMAGE_VARIANT[r.severity]} dot>
-                  {r.severity}
+                  {t(`equipment.damage.severity_${r.severity}`, {
+                    defaultValue: DAMAGE_SEVERITY_LABELS[r.severity] ?? r.severity,
+                  })}
                 </Badge>
-                <Badge variant="neutral">{r.status}</Badge>
+                <Badge variant="neutral">
+                  {t(`equipment.damage.status_${r.status}`, {
+                    defaultValue: DAMAGE_STATUS_LABELS[r.status] ?? r.status,
+                  })}
+                </Badge>
               </div>
             </div>
             <div className="mt-2 flex items-center justify-between gap-2">

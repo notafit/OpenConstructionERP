@@ -96,7 +96,7 @@ def _shipped_packs() -> list[object]:
 #: is the population collapsing, because both registries swallow a load failure
 #: and carry on with fewer entries.
 MIN_DEMO_TEMPLATES = 40
-MIN_SHIPPED_PACKS = 18
+MIN_SHIPPED_PACKS = 30
 
 
 # ── Gate 1: no rule set is declared and then left unreachable ───────────────
@@ -231,16 +231,25 @@ def test_no_pack_claims_a_jurisdiction_while_carrying_only_the_baseline() -> Non
 NO_NATIONAL_RULES_REGISTERED: dict[str, str] = {
     "AE": "No Emirati rule set is registered; the Abu Dhabi demo measures to MasterFormat.",
     "AU": "No Australian rule set is registered; the AS/NZS packs declare NRM.",
+    "BE": "No Belgian rule set is registered; nothing reads a Belgian building code.",
+    "CZ": "No Czech rule set is registered; nothing reads a Czech classification code.",
+    "DK": "No Danish rule set is registered; nothing reads a CCS or V&S code.",
     "EU": "Not a country. Two cross-region demos carry it as their region tag.",
-    "IT": "No Italian rule set is registered. Nothing in the engine reads a DEI or computo metrico code.",
+    "HR": "No Croatian rule set is registered; the Croatian demos measure to DIN 276.",
+    "ID": "No Indonesian rule set is registered; nothing reads an SNI code.",
+    "IE": "No Irish rule set is registered; the pack declares NRM.",
     "KR": "No Korean rule set is registered.",
     "Middle East": "Not a country. The built-in Dubai demo carries it as free text.",
+    "NG": "No Nigerian rule set is registered; nothing reads a BMPIU or FMW code.",
     "NL": "No Dutch rule set is registered; nothing reads an NL-SfB or STABU code.",
+    "NO": "No Norwegian rule set is registered; nothing reads an NS 3420 code.",
     "NZ": "No New Zealand rule set is registered; the NZS pack declares NRM.",
-    "PL": "No Polish rule set is registered; nothing reads a KNR code.",
+    "PT": "No Portuguese rule set is registered; nothing reads a ProNIC code.",
     "SA": "No Saudi rule set is registered; the Vision 2030 pack declares MasterFormat.",
+    "SE": "No Swedish rule set is registered; nothing reads an AMA or BSAB code.",
+    "SG": "No Singaporean rule set is registered; nothing reads a CONQUAS code.",
     "XX": "Not a country. The cross-region trade packs use it to mean 'no country'.",
-    "ZA": "No South African rule set is registered; the pack declares MasterFormat.",
+    "ZA": "No South African rule set is registered; the country pack declares NRM.",
 }
 
 
@@ -339,12 +348,17 @@ NATIONAL_RULE_SET_BY_COUNTRY: dict[str, str] = {
     "ES": "bc3",
     "FR": "dpgf",
     "GB": "nrm",
+    "GR": "greece",
     "HU": "hungary",
     "IN": "cpwd",
+    "IT": "italy",
     "JP": "sekisan",
     "MX": "mexico",
+    "PL": "poland",
+    "RO": "romania",
     "RU": "gesn",
     "TR": "birimfiyat",
+    "UA": "ukraine",
     "US": "masterformat",
 }
 
@@ -531,12 +545,14 @@ def test_no_national_rule_set_is_inert_on_the_payload_the_gate_builds() -> None:
     )
 
 
-#: The three packs whose lines this file writes out in full, with a compliant
-#: and a malformed code apiece. Three and not fifteen on purpose: a compliant
-#: line has to be written against the standard itself, and inventing eleven
-#: more from the rule sources would be asserting what the regex says rather
-#: than what the standard says. The test above covers all fifteen for the
-#: weaker property, that none of them is inert.
+#: The packs whose lines this file writes out in full, with a compliant and a
+#: malformed code apiece. Seven and not nineteen on purpose: a compliant line has
+#: to be written against the standard itself, and inventing the rest from the
+#: rule sources would be asserting what the regex says rather than what the
+#: standard says. Italy's compliant code is a voce of the Toscana 2025 list as
+#: published. Romania, Greece and Ukraine are here because their lines were
+#: written from the sources their packs cite. The test above covers every
+#: national set for the weaker property, that none of them is inert.
 _DISCRIMINATION_CASES: dict[str, dict[str, list[ContractLine]]] = {
     "AT": {
         "bare": [_sov_line("1", "Excavation", "m3")],
@@ -552,6 +568,38 @@ _DISCRIMINATION_CASES: dict[str, dict[str, list[ContractLine]]] = {
         "bare": [_sov_line("1", "Excavation", "m3")],
         "compliant": [_sov_line("1.1", "Excavation", "m3", {"birimfiyat": "15.140"})],
         "malformed": [_sov_line("1.1", "Excavation", "m3", {"birimfiyat": "NOT-A-POZ"})],
+    },
+    # The deviz general chapter a Romanian line is budgeted under (HG 907/2016).
+    "RO": {
+        "bare": [_sov_line("1", "Excavation", "m3")],
+        "compliant": [_sov_line("1.1", "Excavation", "m3", {"deviz": "4.1"})],
+        "malformed": [_sov_line("1.1", "Excavation", "m3", {"deviz": "7.2"})],
+    },
+    # The unified price list article a Greek line is priced from.
+    "GR": {
+        "bare": [_sov_line("1", "Excavation", "m3")],
+        "compliant": [_sov_line("1.1", "Excavation", "m3", {"net": "ΟΙΚ 20.05.01"})],
+        "malformed": [_sov_line("1.1", "Excavation", "m3", {"net": "ΟΙΚ 99.05.01"})],
+    },
+    # The prezzario voce a line is priced from (region, edition year, item
+    # path), with the safety costs on a line of their own as the code of
+    # public contracts asks (D.Lgs. 36/2023 art. 41).
+    "IT": {
+        "bare": [_sov_line("1", "Excavation", "m3")],
+        "compliant": [
+            _sov_line("1.1", "Demolizione totale di edifici", "m3", {"voci": "TOS25_01.A03.001.001"}),
+            _sov_line("1.2", "Oneri della sicurezza non soggetti a ribasso", "pcs", {"voci": "NP.01"}),
+        ],
+        "malformed": [
+            _sov_line("1.1", "Demolizione totale di edifici", "m3", {"voci": "see specification"}),
+            _sov_line("1.2", "Oneri della sicurezza non soggetti a ribasso", "pcs", {"voci": "NP.01"}),
+        ],
+    },
+    # The chapter of the Ukrainian summary estimate, one to twelve.
+    "UA": {
+        "bare": [_sov_line("1", "Excavation", "m3")],
+        "compliant": [_sov_line("1.1", "Excavation", "m3", {"zkr": "2"})],
+        "malformed": [_sov_line("1.1", "Excavation", "m3", {"zkr": "13"})],
     },
 }
 

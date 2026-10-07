@@ -429,9 +429,9 @@ def register_punchlist_event_subscribers() -> None:
     """Wire cross-module subscribers. Idempotent."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("property_dev.snag.created", _on_snag_created)
-    event_bus.subscribe("clash.high_severity.detected", _on_clash_high_severity)
-    event_bus.subscribe("inspection.completed.failed", _on_inspection_completed_failed)
+    event_bus.subscribe_once("property_dev.snag.created", _on_snag_created)
+    event_bus.subscribe_once("clash.high_severity.detected", _on_clash_high_severity)
+    event_bus.subscribe_once("inspection.completed.failed", _on_inspection_completed_failed)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("punchlist cross-module subscribers registered")
 

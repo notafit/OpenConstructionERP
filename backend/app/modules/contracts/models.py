@@ -20,6 +20,10 @@ Tables:
     oe_contracts_milestone                 - milestones / payment schedule
     oe_contracts_template                  - authored, versioned clause templates
     oe_contracts_template_clause           - the clauses one template version holds
+    oe_contracts_sov_adjustment            - one change order's movement of one SoV line
+    oe_contracts_retention_release         - retention released at an event, billed on a claim
+    oe_contracts_stored_material           - materials delivered but not yet installed
+    oe_contracts_stored_material_movement  - deliveries, installs and removals of a stored material
 
 Notes:
     * counterparty_id is a plain UUID column (no SQLAlchemy ForeignKey) since
@@ -37,10 +41,11 @@ Notes:
 """
 
 import uuid
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import JSON, Boolean, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import JSON, Boolean, Date, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import GUID, Base
 
@@ -105,7 +110,7 @@ class Contract(Base):
     retention_release_event: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        default="practical_completion",
+        default="substantial_completion",
     )
     status: Mapped[str] = mapped_column(
         String(40),
@@ -189,6 +194,25 @@ class ContractLine(Base):
     # against, so contracted value and claimed-to-date roll up by cost line.
     cost_line_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # ── Where the line came from (v42) ───────────────────────────────────
+    # original, change_order or variation. Every line that existed before
+    # change orders could add lines was part of the contract as signed, so the
+    # scalar default is the true value for those rows too, which is why the
+    # boot heal may add this NOT NULL.
+    origin: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="original",
+        server_default="original",
+    )
+    # The idempotency key of the change order that created this line, in the
+    # same "change_order:<uuid>" shape the contract's posted sources use.
+    source_key: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    # The line value frozen when the contract left draft, next to
+    # Contract.original_contract_value. Nullable rather than zero: a line on a
+    # contract activated before this column existed has no recorded baseline,
+    # and zero would read as "added later from nothing".
+    original_value: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
     metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         "metadata",
         JSON,
@@ -409,7 +433,44 @@ class ProgressClaim(Base):
     # Optional link to the payment milestone this claim bills against. Plain
     # UUID - may point at an oe_contracts_milestone row OR a milestone owned by
     # the planning / schedule modules, so it is resolved at the service layer.
-    milestone_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    # Indexed: the payment plan looks up the claim behind each instalment.
+    milestone_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    # ── The period as dates (v42) ────────────────────────────────────────
+    # The parsed form of period_start, period_end and claim_date, which stay
+    # the API contract. Written by the service on every create and update and
+    # backfilled by the ``contracts_claim_period_dates`` boot repair, because a
+    # String column cannot be retyped on an upgraded install. NULL means the
+    # string was empty or unreadable, never "today": the period rules report it.
+    period_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Indexed because claim order and "claims in this month" both read it.
+    period_to: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+    application_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # ── Certificate snapshot (v42) ───────────────────────────────────────
+    # Total completed and stored to date, and retention held to date, as this
+    # application certified them (payment application lines 4 and 5). The next
+    # claim's "less previous certificates" is this claim's line 4 minus line 5,
+    # read from here rather than recomputed, because a later rate change or
+    # change order must not restate what was already certified. Nullable on
+    # purpose: a claim certified before the snapshot existed has none, and a
+    # zero would be a false certificate. Readers fall back to a reconstruction
+    # and say so.
+    completed_stored_to_date: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    retention_held_to_date: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # ── What the gross is made of (v45) ──────────────────────────────────
+    # ``"cost"`` for a claim billed off recorded cost of work, which carries a
+    # gross with no schedule of values behind it, and ``"lines"`` for a claim
+    # whose gross is the sum of its own period values. It decides one thing:
+    # whether a later line write may re-read the gross from the lines. For a
+    # cost claim it may not, or fifty thousand of recorded cost becomes the
+    # value of whatever single line somebody typed in.
+    #
+    # NULL means not recorded, not "lines". Every claim written before this
+    # column existed carries NULL and keeps exactly the behaviour it had, and
+    # the basis cannot be reconstructed for them: by the time anyone looks, a
+    # cost claim that was overwritten from its lines is indistinguishable from
+    # a line claim that always said that. Readers must treat NULL as "do what
+    # we did before" rather than guessing.
+    gross_basis: Mapped[str | None] = mapped_column(String(10), nullable=True)
     metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         "metadata",
         JSON,
@@ -458,6 +519,45 @@ class ProgressClaimLine(Base):
         nullable=False,
         default=Decimal("0"),
     )
+    # Three-stage QS quantities: submitted -> assessed -> certified
+    assessed_qty: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    certified_qty: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    # ── Payment application columns (v42) ────────────────────────────────
+    # Work completed on this SoV line by the claims strictly before this one
+    # (column D). ``aia.build_g703_line`` has read this attribute since it was
+    # written and falls back to cumulative minus period when it is None. That
+    # fallback is correct for every line written before v42, so the column is
+    # nullable: a server default of 0 would land on those rows through the
+    # boot heal and silently zero column D on every legacy application.
+    prior_completed_value: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # Materials presently stored and not yet in the work, as a period-end
+    # balance (column F). Zero is the true value for every legacy row, because
+    # nothing could record stored materials before this column, so it may be
+    # NOT NULL with a scalar default.
+    materials_stored_value: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    # Retention accrued to date on this line, on completed work and on stored
+    # materials, and the rate the engine applied. Nullable for the same reason
+    # as prior_completed_value: NULL says the retention engine never ran for
+    # this line, and readers keep using the contract's flat rate, which is what
+    # the line was billed at. A zero would claim no retention was ever held.
+    retention_to_date: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    retention_stored_to_date: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    retention_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
 
 
 class FinalAccount(Base):
@@ -808,6 +908,30 @@ class ContractMilestone(Base):
         server_default="pending",
         index=True,
     )
+    # ── Payment plan (v54) ────────────────────────────────────────────────
+    # The schedule milestone this instalment waits for. Plain UUIDs, like
+    # ``ProgressClaim.milestone_id``: the activity lives in another module.
+    # ``schedule_id`` is copied from the activity so a reschedule finds every
+    # instalment it moves with one indexed lookup.
+    activity_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    schedule_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    # deposit | progress | final. Stated by a person, never guessed from the
+    # dates: the statutory deposit ceilings read it.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="progress", server_default="progress")
+    # Calendar days from the milestone to the claim, and from the claim to
+    # payment. ``payment_terms_days`` NULL falls back to the contract's terms.
+    lag_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    payment_terms_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Forecast refreshed whenever the linked activity moves (ISO dates).
+    forecast_reached_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    forecast_due_date: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    forecast_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # When the milestone was reached, and by whom (NULL for the schedule).
+    reached_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    reached_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # Shown in the client portal only once a person says so, like a
+    # schedule milestone or a progress report.
+    client_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         "metadata",
         JSON,
@@ -872,7 +996,7 @@ class ContractTemplate(Base):
     retention_release_event: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        default="practical_completion",
+        default="substantial_completion",
     )
     # draft | published | archived.
     status: Mapped[str] = mapped_column(
@@ -953,3 +1077,309 @@ class ContractTemplateClause(Base):
 
     def __repr__(self) -> str:
         return f"<ContractTemplateClause {self.number} {self.title[:40]!r}>"
+
+
+#: Where a schedule of values line came from. Declared beside the column so the
+#: schemas and the change order poster agree on one list.
+CONTRACT_LINE_ORIGINS: frozenset[str] = frozenset({"original", "change_order", "variation"})
+
+
+class SovAdjustment(Base):
+    """One change order's movement of one schedule of values line.
+
+    A change order used to move ``Contract.total_value`` and nothing else, so
+    the payment application's contract sum to date and the sum of its scheduled
+    values drifted apart with every approval. Each row here records the part of
+    one change order that landed on one line. The invariant it makes checkable:
+    a line's scheduled value equals its value at activation plus the sum of its
+    adjustments, and the lines together equal the contract sum to date.
+
+    ``source_key`` is the same idempotency key the contract's posted sources
+    use (``_contract_source_key``), and the unique constraint on the pair is
+    what stops a change order and its mirrored variation from posting twice.
+    """
+
+    __tablename__ = "oe_contracts_sov_adjustment"
+    __table_args__ = (
+        UniqueConstraint(
+            "contract_line_id",
+            "source_key",
+            name="uq_oe_contracts_sov_adjustment_line_source",
+        ),
+    )
+
+    contract_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_contract.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    contract_line_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_contract_line.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    # change_order or variation_order.
+    source_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default="")
+    # Plain UUID to the change order or variation row (another module).
+    source_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    # The human code of the source, for example "CO-004", shown as a badge.
+    source_code: Mapped[str] = mapped_column(String(80), nullable=False, default="", server_default="")
+    delta_value: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    delta_quantity: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    # True when this adjustment created the line rather than moving an
+    # existing one.
+    created_line: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    # The day the change order was approved. Splits the change order summary
+    # into previous and this period against the claim's period. NULL counts as
+    # previous: an adjustment of unknown date was certainly approved before now.
+    approved_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="", server_default="")
+    metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
+    def __repr__(self) -> str:
+        return f"<SovAdjustment {self.source_key} {self.delta_value}>"
+
+
+#: Lifecycle of a retention release. A release is proposed, approved once the
+#: documents the event requires are in, billed on a progress claim, or voided.
+RETENTION_RELEASE_STATUSES: frozenset[str] = frozenset({"proposed", "approved", "billed", "void"})
+
+
+class RetentionRelease(Base):
+    """Retention released at an event and billed on a progress claim.
+
+    Accrual and release are two ledgers. Accrual lives on the claims
+    (``ProgressClaim.retention_amount`` per period, and the per-line
+    retention-to-date snapshot); release lives here, one row per event. The
+    retention a payment application shows as held is accrued to date less the
+    releases billed on that claim or earlier.
+
+    Before this table a release was an entry appended to
+    ``Contract.metadata['retention_releases']``, which cannot be queried by
+    period and is read-only from v42 on.
+    """
+
+    __tablename__ = "oe_contracts_retention_release"
+
+    contract_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_contract.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # A canonical event: substantial_completion, final_completion,
+    # defects_period_end, or rate_step_down for a recompute-mode reduction.
+    event: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="proposed",
+        server_default="proposed",
+        index=True,
+    )
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    # Kept back from the release against open items (for example a punch list
+    # valued at a multiple of its cost), so the reader sees why the release is
+    # smaller than what was held.
+    withheld_for_open_items: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    released_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # The claim that bills this release. A plain UUID rather than a foreign
+    # key: deleting a draft claim must not delete the release it would have
+    # billed, it only makes the release billable again.
+    progress_claim_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    # ContractDocument ids that evidence the event (certificates, affidavits,
+    # consent of surety). Checked against what the release rule requires.
+    document_ids: Mapped[list] = mapped_column(  # type: ignore[assignment]
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
+    def __repr__(self) -> str:
+        return f"<RetentionRelease {self.event} {self.status} {self.amount}>"
+
+
+#: Where a stored material sits. Off-site and bonded storage need more evidence
+#: before most owners will pay for them.
+STORED_MATERIAL_LOCATIONS: frozenset[str] = frozenset({"on_site", "off_site", "bonded_warehouse", "supplier_premises"})
+STORED_MATERIAL_STATUSES: frozenset[str] = frozenset({"recorded", "billable", "installed", "rejected"})
+STORED_MATERIAL_MOVEMENT_KINDS: frozenset[str] = frozenset({"delivered", "installed", "removed", "adjusted"})
+
+
+class StoredMaterial(Base):
+    """Materials delivered for a schedule of values line and not yet installed.
+
+    What a payment application bills as "materials presently stored" is a
+    period-end balance, delivered less installed less removed, not a delta, so
+    the quantities live in :class:`StoredMaterialMovement` rows and the balance
+    is computed as of a date. This row holds what does not move: the line it
+    belongs to, where it is, what it cost, and the evidence an owner asks for
+    before paying for material that is not yet in the work.
+    """
+
+    __tablename__ = "oe_contracts_stored_material"
+
+    contract_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_contract.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    contract_line_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_contract_line.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    unit: Mapped[str] = mapped_column(String(20), nullable=False, default="", server_default="")
+    quantity: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    unit_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="", server_default="")
+    location_kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="on_site",
+        server_default="on_site",
+    )
+    location_text: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="")
+    received_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    vendor: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    # Evidence, as plain UUIDs into the documents module.
+    delivery_ticket_document_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    invoice_document_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    bill_of_sale_document_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    insurance_document_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    photo_document_ids: Mapped[list] = mapped_column(  # type: ignore[assignment]
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    title_transferred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    # Plain UUID to a ContractSecurity given in exchange for payment, the other
+    # way several jurisdictions let stored materials be billed.
+    security_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True)
+    owner_approved_offsite: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="recorded",
+        server_default="recorded",
+        index=True,
+    )
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    metadata_: Mapped[dict] = mapped_column(  # type: ignore[assignment]
+        "metadata",
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+
+    # The movements are the material's quantities, so every read wants them.
+    movements: Mapped[list["StoredMaterialMovement"]] = relationship(
+        back_populates="material",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="StoredMaterialMovement.moved_on",
+    )
+
+    def __repr__(self) -> str:
+        return f"<StoredMaterial {self.description[:40]!r} {self.status}>"
+
+
+class StoredMaterialMovement(Base):
+    """One delivery, install, removal or adjustment of a stored material."""
+
+    __tablename__ = "oe_contracts_stored_material_movement"
+
+    stored_material_id: Mapped[uuid.UUID] = mapped_column(
+        GUID(),
+        ForeignKey("oe_contracts_stored_material.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    value: Mapped[Decimal] = mapped_column(
+        Numeric(18, 4),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+    moved_on: Mapped[date] = mapped_column(Date, nullable=False)
+    # The claim an install was billed on, when there is one. Plain UUID for the
+    # same reason as RetentionRelease.progress_claim_id.
+    progress_claim_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+
+    # Walking up is by id; the collection is loaded from the parent.
+    material: Mapped[StoredMaterial] = relationship(back_populates="movements", lazy="raise_on_sql")
+
+    def __repr__(self) -> str:
+        return f"<StoredMaterialMovement {self.kind} {self.quantity} on {self.moved_on}>"

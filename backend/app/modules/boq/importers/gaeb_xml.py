@@ -41,6 +41,7 @@ formatting on export.
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar
@@ -49,6 +50,7 @@ from app.modules.boq.importers._base import (
     ImportedBOQ,
     ImportedPosition,
     ImporterParseError,
+    xml_error_position,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,10 @@ _DP_TO_KIND: dict[str, str] = {
     "85": "x85",
     "86": "x86",
 }
+
+# Extract the trailing two-digit DP number from prefixed forms like "dp84",
+# "da84", "phase84". Compiled once at import time.
+_DP_TRAILING_DIGITS = re.compile(r"(\d{2})$")
 
 
 def _local(tag: str) -> str:
@@ -301,14 +307,27 @@ def _detect_da_kind(root: ET.Element) -> str:
     (``.../GAEB_DA_XML/DA84/3.3``). The old probe matched ``DPNo`` / ``DP``
     interchangeably and only mapped four phases, so DP80 files came back as
     ``"x"`` (FA-GAEB-005).
+
+    Some authoring tools write the DP value with a prefix (``DP84``, ``DA84``,
+    ``X84``) instead of the bare two-digit number the standard intends. We
+    strip those prefixes so the lookup succeeds regardless of the spelling.
     """
     for el in root.iter():
         tag = _local(el.tag)
         if tag in ("DP", "DPType"):
-            text = (el.text or "").strip().lower().lstrip("x")
-            kind = _DP_TO_KIND.get(text)
+            text = (el.text or "").strip().lower()
+            # Try bare lookup after stripping a leading "x".
+            bare = text.lstrip("x")
+            kind = _DP_TO_KIND.get(bare)
             if kind:
                 return kind
+            # Handle prefixed forms: "dp84", "da84", "x84", "phase84", etc.
+            # Extract the trailing two digits.
+            m = _DP_TRAILING_DIGITS.search(bare)
+            if m:
+                kind = _DP_TO_KIND.get(m.group(1))
+                if kind:
+                    return kind
     # Namespace fallback: DA<nn> in the root tag's namespace URI.
     ns = root.tag.split("}", 1)[0].lstrip("{") if "}" in root.tag else ""
     marker = "/DA"
@@ -319,6 +338,27 @@ def _detect_da_kind(root: ET.Element) -> str:
         if kind:
             return kind
     return "x"
+
+
+def _site_phase(root: ET.Element) -> str:
+    """Return ``"31"`` or ``"89"`` for a measurement or invoice file, else ``""``.
+
+    Those two phases share the BoQ tree with the tender phases but are not
+    bills: an X31 holds measured quantities for existing positions and an X89
+    an invoice against them. Read as a bill, an X31 yields empty sections and
+    an X89 yields its invoiced lines as new positions. Recognised by the
+    ``DA31`` / ``DA89`` namespace, or by the container directly under the
+    root (``QtyDeterm`` and ``Invoice`` exist in no other phase).
+    """
+    ns = root.tag.split("}", 1)[0].lstrip("{") if "}" in root.tag else ""
+    for phase in ("31", "89"):
+        if f"/DA{phase}/" in ns + "/":
+            return phase
+    if _find_child(root, "QtyDeterm") is not None:
+        return "31"
+    if _find_child(root, "Invoice") is not None:
+        return "89"
+    return ""
 
 
 def _ozmask_separators(root: ET.Element) -> tuple[list[str], str]:
@@ -380,7 +420,10 @@ class GAEBXMLImporter:
         if not head_bytes:
             return False
         name = filename.lower()
-        if any(name.endswith(ext) for ext in (".x81", ".x83", ".x84", ".x86")):
+        # X31 and X89 are claimed too, only so that ``parse`` can refuse them
+        # by name. Left unclaimed they would fall through to the model-assisted
+        # import, which would happily turn an invoice into new positions.
+        if any(name.endswith(ext) for ext in (".x81", ".x83", ".x84", ".x86", ".x31", ".x89")):
             return True
         if not name.endswith(".xml"):
             return False
@@ -396,14 +439,32 @@ class GAEBXMLImporter:
         from defusedxml.ElementTree import fromstring as _safe_fromstring
 
         if not content:
-            raise ImporterParseError("GAEB XML upload is empty")
+            raise ImporterParseError("GAEB XML upload is empty", code="gaeb_empty_file")
 
         try:
             root = _safe_fromstring(content)
         except ET.ParseError as exc:
-            raise ImporterParseError(f"Failed to parse GAEB XML: {exc}") from exc
+            raise ImporterParseError(
+                f"Failed to parse GAEB XML: {exc}", code="gaeb_not_well_formed", params=xml_error_position(exc)
+            ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise ImporterParseError(f"GAEB XML rejected by security parser: {exc}") from exc
+            raise ImporterParseError(f"GAEB XML rejected by security parser: {exc}", code="gaeb_refused") from exc
+
+        site_phase = _site_phase(root)
+        if site_phase == "31":
+            raise ImporterParseError(
+                "This is a GAEB X31 quantity determination (Mengenermittlung), not a bill of quantities. "
+                "It carries measured quantities for positions that already exist: open the bill and use "
+                "the GAEB X31 / X89 dialog to import them.",
+                code="gaeb_x31_not_a_bill",
+            )
+        if site_phase == "89":
+            raise ImporterParseError(
+                "This is a GAEB X89 invoice (Rechnung), not a bill of quantities. Importing it would add "
+                "the invoiced lines as new positions: open the bill and use the GAEB X31 / X89 dialog to "
+                "check it instead.",
+                code="gaeb_x89_not_a_bill",
+            )
 
         da_kind = _detect_da_kind(root)
         priced_phase = da_kind in ("x84", "x86")
@@ -420,7 +481,9 @@ class GAEBXMLImporter:
                 if top_body is not None:
                     break
         if top_body is None:
-            raise ImporterParseError("No <BoQBody> element found. Is this a valid GAEB DA XML?")
+            raise ImporterParseError(
+                "No <BoQBody> element found. Is this a valid GAEB DA XML?", code="gaeb_no_bill_body"
+            )
 
         # Currency from <Award><Cur> with <AwardInfo><Cur> fallback (3.3
         # nests it under AwardInfo).
@@ -517,6 +580,13 @@ class GAEBXMLImporter:
                 quantity = 1.0
                 unit_rate_dec = it_dec
                 derived_qty += 1
+            elif up_dec is not None and up_dec != 0 and priced_phase:
+                # X84 item with UP but no Qty and no IT: the position carries a
+                # unit price only. Infer Qty=1 so the item is not lost; the
+                # total equals the unit price (IT = UP * 1).
+                quantity = 1.0
+                unit_rate_dec = up_dec
+                derived_qty += 1
             else:
                 quantity = float(qty_dec) if qty_dec is not None else 0.0
                 unit_rate_dec = up_dec if up_dec is not None else Decimal("0")
@@ -525,8 +595,10 @@ class GAEBXMLImporter:
 
             unit = _normalize_unit(unit_raw) or ("lsum" if (qty_dec is None and it_dec is not None) else "pcs")
 
-            if not description and qty_dec is None and it_dec is None and up_dec is None:
-                # Nothing usable at all - skip but count it.
+            has_money = it_dec is not None or up_dec is not None
+            if not description and qty_dec is None and not has_money:
+                # Nothing usable at all - no text, no quantity, no pricing.
+                # Skip but count it.
                 result.skipped += 1
                 return
 

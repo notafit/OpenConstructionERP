@@ -230,9 +230,27 @@ export interface COPQReport {
   project_id: string;
   ncr_cost_total: number | string;
   open_punch_count: number;
+  /**
+   * Punch rework money already denominated in `currency`. Never a blend: the
+   * server folds one currency bucket and describes the rest in the fields
+   * below, so a zero here can be read as "nothing to add" only together with
+   * `rework_cost_basis`.
+   */
   rework_cost_estimate: number | string;
   copq_total: number | string;
   currency: string;
+  /**
+   * Which case produced the rework figure: recorded, none_priced,
+   * currency_mismatch, currency_unknown, no_open_punch_items,
+   * source_unavailable, or override when a cost per item was passed in.
+   */
+  rework_cost_basis?: string;
+  rework_priced_count?: number;
+  rework_unpriced_count?: number;
+  rework_unreadable_count?: number;
+  /** Every currency open punch items are priced in, including this one. */
+  rework_by_currency?: Record<string, number | string>;
+  rework_currency_mixed?: boolean;
 }
 
 export interface FirstPassYieldReport {

@@ -122,6 +122,25 @@ class TestWildcardHandlerRegistration:
 # ---------------------------------------------------------------------------
 
 
+def _index_session(position_ids: list[uuid.UUID]) -> AsyncMock:
+    """A session whose reads find *position_ids* in one bill of one project.
+
+    The index worker reads the rows and then their bills' projects; one result
+    object answers both reads.
+    """
+    boq_id, project_id = uuid.uuid4(), uuid.uuid4()
+    rows = [MagicMock(id=pid, boq_id=boq_id) for pid in position_ids]
+    fake_session = AsyncMock()
+    fake_session.expunge_all = MagicMock()
+    fake_session.execute = AsyncMock(
+        return_value=MagicMock(
+            scalars=MagicMock(return_value=rows),
+            all=MagicMock(return_value=[(boq_id, project_id)]),
+        )
+    )
+    return fake_session
+
+
 class TestVectorIndexFailureLogging:
     @pytest.mark.asyncio
     async def test_single_failure_logs_at_warning(self, caplog):
@@ -136,17 +155,18 @@ class TestVectorIndexFailureLogging:
                 "vector_index_one",
                 AsyncMock(side_effect=ConnectionError("embeddings-down")),
             ),
+            patch.object(
+                mod,
+                "vector_index_many",
+                AsyncMock(side_effect=ConnectionError("embeddings-down")),
+            ),
             patch.object(mod, "async_session_factory") as session_factory,
         ):
-            fake_row = MagicMock(boq=MagicMock(project_id=uuid.uuid4()))
-            fake_session = AsyncMock()
-            fake_session.execute = AsyncMock(
-                return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=fake_row))
-            )
+            pid = uuid.uuid4()
+            fake_session = _index_session([pid])
             session_factory.return_value.__aenter__ = AsyncMock(return_value=fake_session)
             session_factory.return_value.__aexit__ = AsyncMock(return_value=None)
 
-            pid = uuid.uuid4()
             evt = Event(name="boq.position.created", data={"position_id": str(pid)})
             await mod._on_position_created(evt)
 
@@ -175,20 +195,22 @@ class TestVectorIndexFailureLogging:
                 "vector_index_one",
                 AsyncMock(side_effect=ConnectionError("embeddings-down")),
             ),
+            patch.object(
+                mod,
+                "vector_index_many",
+                AsyncMock(side_effect=ConnectionError("embeddings-down")),
+            ),
             patch.object(mod, "async_session_factory") as session_factory,
         ):
-            fake_row = MagicMock(boq=MagicMock(project_id=uuid.uuid4()))
-            fake_session = AsyncMock()
-            fake_session.execute = AsyncMock(
-                return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=fake_row))
-            )
+            pids = [uuid.uuid4() for _ in range(5)]
+            fake_session = _index_session(pids)
             session_factory.return_value.__aenter__ = AsyncMock(return_value=fake_session)
             session_factory.return_value.__aexit__ = AsyncMock(return_value=None)
 
-            for _ in range(5):
+            for pid in pids:
                 evt = Event(
                     name="boq.position.created",
-                    data={"position_id": str(uuid.uuid4())},
+                    data={"position_id": str(pid)},
                 )
                 await mod._on_position_created(evt)
 
@@ -364,6 +386,49 @@ class TestActivityLogScopeColumns:
         assert retried.action == "position.updated"
         assert any("no longer exists" in rec.getMessage() for rec in caplog.records)
 
+    @pytest.mark.asyncio
+    async def test_a_propagation_is_logged_in_every_bill_it_repriced(self):
+        """One fan-out event, one entry per bill whose lines it changed.
+
+        The event's ``boq_id`` is the bill of the edited line. Logged once, a
+        second bill whose lines were re-priced from the first would show nothing
+        in its own feed, which filters by ``boq_id``. Each entry names that
+        bill's lines and counts them.
+        """
+        import app.modules.boq.events as mod  # noqa: I001
+
+        editor_boq, other_boq, project_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        edited, near, far_1, far_2 = (str(uuid.uuid4()) for _ in range(4))
+        factory = _FactoryStub()
+        with patch.object(mod, "async_session_factory", factory):
+            await mod._log_boq_activity(
+                Event(
+                    name="boq.positions.resource_propagated",
+                    data={
+                        "project_id": str(project_id),
+                        "boq_id": str(editor_boq),
+                        "propagated_from": edited,
+                        "count": 3,
+                        "changes": {
+                            "resource_code_propagation": ["SHR-100"],
+                            "position_ids": [near, far_1, far_2],
+                            "boq_ids": sorted([str(editor_boq), str(other_boq)]),
+                            "positions_by_boq": {str(editor_boq): [near], str(other_boq): [far_1, far_2]},
+                        },
+                    },
+                    source_module="oe_boq",
+                )
+            )
+
+        by_boq = {row.boq_id: row for row in factory.rows}
+        assert set(by_boq) == {editor_boq, other_boq}
+        assert by_boq[other_boq].changes["position_ids"] == [far_1, far_2]
+        assert by_boq[other_boq].description == "Propagated a resource definition to 2 position(s)"
+        assert by_boq[editor_boq].changes["position_ids"] == [near]
+        assert by_boq[editor_boq].changes["propagated_from"] == edited
+        assert all(row.project_id == project_id for row in factory.rows)
+        assert all(row.action == "positions.resource_propagated" for row in factory.rows)
+
 
 # ---------------------------------------------------------------------------
 # Cleanup — restore module to its natural (settings-driven) state
@@ -388,3 +453,31 @@ def _reset_after_module():
         importlib.reload(boq_events_mod)
     finally:
         _restore_bus(snapshot)
+
+
+class TestActivityText:
+    """No event name reaches the feed as text, mapped or not."""
+
+    def test_an_event_without_a_sentence_is_humanized(self):
+        from app.modules.boq.events import _build_description
+
+        assert _build_description("boq.some_new.thing_happened", {}) == "Some new thing happened"
+
+    def test_every_published_boq_event_has_a_sentence(self):
+        from app.modules.boq.events import _EVENT_DESCRIPTIONS
+
+        for name in (
+            "boq.positions.bulk_created",
+            "boq.quantity_link.created",
+            "boq.quantity_link.applied",
+        ):
+            assert name in _EVENT_DESCRIPTIONS, name
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_event_writes_no_row(self):
+        events_mod = importlib.import_module("app.modules.boq.events")
+        with patch.object(events_mod, "async_session_factory") as factory:
+            await events_mod._log_boq_activity(
+                Event(name="boq.cost_breakdown.computed", data={"boq_id": str(uuid.uuid4())})
+            )
+        factory.assert_not_called()

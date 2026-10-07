@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "jass",
+  "name": "JASS — Japanese Architectural Standard Specification",
+  "standard": "JASS (AIJ)",
+  "jurisdiction": "JP",
+  "description": "Validates specifications and BOQ items against the Japanese Architectural Standard Specification (JASS) series published by the Architectural Institute of Japan (AIJ). Covers JASS 5 (reinforced concrete), JASS 6 (steel), JASS 8 (waterproofing), JASS 12 (interior finishing), JASS 15 (plastering / tiling), JASS 18 (painting), and JASS 19 (ceramic tiling). Checks that workmanship and quality requirements reference the applicable JASS section.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "jass.jass_reference_present_per_trade",
+    "jass.jass_version_current",
+    "jass.jass5_rc_concrete_workmanship_referenced",
+    "jass.jass5_concrete_strength_management",
+    "jass.jass6_steel_fabrication_referenced",
+    "jass.jass6_welding_qualification_noted",
+    "jass.jass8_waterproofing_method_specified",
+    "jass.jass12_interior_finishing_referenced",
+    "jass.jass15_plastering_tiling_referenced",
+    "jass.jass18_painting_referenced",
+    "jass.jass19_ceramic_tiling_referenced",
+    "jass.quality_control_provisions_present"
+  ],
+  "regulator": "AIJ (Architectural Institute of Japan)",
+  "publication_year": 2022
+}

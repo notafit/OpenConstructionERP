@@ -41,9 +41,13 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.platypus import CondPageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.core.app_branding import read_branding
+from app.core.company_profile import read_company_profile
 from app.core.money import minor_units, money_quantum
+from app.core.pdf_branding import branded_doc_metadata, branded_header_logo, branded_letterhead
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
@@ -55,6 +59,24 @@ from app.core.pdf_fonts import (
 register_pdf_fonts()
 
 PLACEHOLDER = "-"
+
+_SIDE_MARGIN = 14 * mm
+
+#: The largest amount a continuation sheet column must hold on one line: a
+#: contract sum just under a hundred million, which is where the grand total
+#: row puts it.
+_G703_WIDEST_AMOUNT = "99999999.99"
+#: The continuation sheet's cell font size. The cell styles and the width
+#: measurement both read it, so the two cannot disagree.
+_G703_FONT_SIZE = 7
+#: Horizontal cell padding on the continuation sheet, in points. Half
+#: reportlab's default, which across ten columns is 21mm the figures can use.
+_G703_CELL_PAD = 3.0
+
+#: The padding SimpleDocTemplate's frame keeps on every side, in points. The
+#: letterhead is laid out to the width inside it and the fit check measures the
+#: height inside it.
+_FRAME_PADDING = 6.0
 
 
 def _amount(value: Any, currency: str = "") -> str:
@@ -77,6 +99,15 @@ def _amount(value: Any, currency: str = "") -> str:
     return f"{d.quantize(money_quantum(code), rounding=ROUND_HALF_UP):,.{minor_units(code)}f}"
 
 
+def _dec_amount(value: Any) -> Decimal:
+    """Coerce a row's money value to Decimal so a column can be added up."""
+    try:
+        d = Decimal(str(value)) if value not in (None, "") else Decimal("0")
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+    return d if d.is_finite() else Decimal("0")
+
+
 def _money(value: Any, currency: str = "") -> str:
     """The same figure with its currency code in front, for the G702 face."""
     body = _amount(value, currency)
@@ -89,6 +120,22 @@ def _pct(value: Any) -> str:
     except (InvalidOperation, ValueError, TypeError):
         d = Decimal("0")
     return f"{d.quantize(Decimal('0.01'))}%"
+
+
+def _amount_or_blank(value: Any, currency: str = "") -> str:
+    """A continuation sheet amount that may have no answer: None prints nothing.
+
+    Only for column C and column H, which are None on the row carrying money no
+    schedule line carries. An empty cell says there is no answer; a zero says
+    the answer is zero. :func:`_amount` keeps reading None as zero, which is
+    right for every other figure on the form.
+    """
+    return "" if value is None else _amount(value, currency)
+
+
+def _pct_or_blank(value: Any) -> str:
+    """The percent column, empty on a row with no scheduled value to measure it against."""
+    return "" if value is None else _pct(value)
 
 
 def _txt(value: Any) -> str:
@@ -121,27 +168,78 @@ def _safe_para(text: Any, style: ParagraphStyle) -> Paragraph:
     return Paragraph(html.escape(raw), pdf_style_for_text(style, raw))
 
 
+def _g703_column_widths(frame_width: float, currency: str = "") -> list[float]:
+    """Continuation sheet column widths, summing to ``frame_width``.
+
+    The widths used to be fixed at 278mm on a sheet with 247mm inside its
+    margins, so the table ran to within a millimetre of both paper edges and a
+    printer clipped the item numbers and the retainage. Scaling them down
+    evenly is not enough on its own: the materials stored column then drops
+    below 9,999,999.99, and reportlab breaks a word too long for its column in
+    two, which on this form means a figure printed across two lines.
+
+    So every money column is as wide as the widest realistic amount, measured
+    in the totals row's bold in this currency's own digits, plus its padding.
+    Item and percent keep the widths the form always gave them and the
+    description takes what is left, which on Letter is slightly more than it
+    had before.
+    """
+    widest = stringWidth(_amount(_G703_WIDEST_AMOUNT, currency), BOLD_FONT, _G703_FONT_SIZE)
+    money = widest + 2 * _G703_CELL_PAD
+    item = percent = 16 * mm
+    description = frame_width - item - percent - 7 * money
+    return [item, description, money, money, money, money, money, percent, money, money]
+
+
+def _logo_configured() -> bool:
+    """Whether the header band will carry a logo: the document logo, else the app logo."""
+    return bool(read_company_profile().get("document_logo_data_url") or read_branding().get("logo_data_url"))
+
+
+def _stacked_height(flowables: list[Any], width: float) -> float:
+    """The height the flowables take stacked in one frame, spacing included.
+
+    Spacing is summed rather than collapsed the way a frame collapses it, so
+    this errs towards "does not fit", which is the safe side for a form that
+    must stay on one sheet.
+    """
+    total = 0.0
+    for flowable in flowables:
+        _, height = flowable.wrap(width, 1e6)
+        total += height + flowable.getSpaceBefore() + flowable.getSpaceAfter()
+    return total
+
+
 def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
     """Render the AIA G702 + G703 application dict to PDF bytes.
 
     ``app`` is the structure returned by ``ContractsService.build_aia_application``.
     """
+    page_width, _ = landscape(letter)
+    frame_width = page_width - 2 * _SIDE_MARGIN - 2 * _FRAME_PADDING
+    letterhead = branded_letterhead(frame_width, doc_type="pay_application")
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
         pagesize=landscape(letter),
-        leftMargin=14 * mm,
-        rightMargin=14 * mm,
-        topMargin=14 * mm,
+        leftMargin=_SIDE_MARGIN,
+        rightMargin=_SIDE_MARGIN,
+        # The header logo hangs down to about 16mm from the top edge, so a
+        # branded form starts its body at 18mm or the G703 header row repeated
+        # on every continuation page is drawn against it. A workspace with no
+        # logo and no letterhead keeps the 14mm the form always had, and with
+        # it every coordinate of the applications it has already issued.
+        topMargin=18 * mm if letterhead is not None or _logo_configured() else 14 * mm,
         bottomMargin=14 * mm,
         title="AIA G702/G703 Application for Payment",
+        **branded_doc_metadata(),
     )
 
     base = getSampleStyleSheet()
     h1 = ParagraphStyle("AIAH1", parent=base["Heading1"], fontName=BOLD_FONT, fontSize=14, alignment=TA_CENTER)
     h2 = ParagraphStyle("AIAH2", parent=base["Heading2"], fontName=BOLD_FONT, fontSize=10)
     body = ParagraphStyle("AIABody", parent=base["Normal"], fontName=BODY_FONT, fontSize=8)
-    cell = ParagraphStyle("AIACell", parent=body, fontSize=7, leading=9)
+    cell = ParagraphStyle("AIACell", parent=body, fontSize=_G703_FONT_SIZE, leading=9)
     cell_r = ParagraphStyle("AIACellR", parent=cell, alignment=TA_RIGHT)
     cell_l = ParagraphStyle("AIACellL", parent=cell, alignment=TA_LEFT)
     # The continuation sheet's header row sits on a near black fill, so its
@@ -167,9 +265,13 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
 
         return choose
 
+    # Line 8, current payment due, which the form prints in bold. Its row
+    # follows the two retainage sub-lines 5a and 5b.
+    payment_due_row = 9
+
     def _summary_face(row_index: int, col_index: int):
-        """Row 7 is the payment due line, which the form prints in bold."""
-        if row_index == 7:
+        """The payment due line is bold; every other money cell is a plain value."""
+        if row_index == payment_due_row:
             return money_total if col_index == 1 else label
         return money if col_index == 1 else None
 
@@ -217,6 +319,8 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
         ["3. Contract sum to date (1 + 2)", _money(summary.get("contract_sum_to_date"), currency)],
         ["4. Total completed and stored to date", _money(summary.get("total_completed_stored"), currency)],
         ["5. Retainage", _money(summary.get("retainage"), currency)],
+        ["   a. of completed work", _money(summary.get("retainage_completed_work"), currency)],
+        ["   b. of stored material", _money(summary.get("retainage_stored_materials"), currency)],
         ["6. Total earned less retainage (4 - 5)", _money(summary.get("total_earned_less_retainage"), currency)],
         ["7. Less previous certificates for payment", _money(summary.get("previous_certificates_total"), currency)],
         ["8. Current payment due", _money(summary.get("current_payment_due"), currency)],
@@ -233,7 +337,7 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
             [
                 ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-                ("BACKGROUND", (0, 7), (-1, 7), colors.whitesmoke),
+                ("BACKGROUND", (0, payment_due_row), (-1, payment_due_row), colors.whitesmoke),
                 ("TOPPADDING", (0, 0), (-1, -1), 2),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
             ]
@@ -267,7 +371,28 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
     story.append(cert_tbl)
     story.append(Spacer(1, 8 * mm))
 
+    # ── Letterhead ─────────────────────────────────────────────────────
+    # The G702 face is the sheet the owner and the architect sign, so it has
+    # to stay on one page. The firm's letterhead goes above it only when the
+    # two fit together, measured rather than assumed because certifier names
+    # and a three line address both vary. When they do not fit, the legal name
+    # takes one line instead and the logo moves to the header band, where it
+    # costs the form no height at all.
+    if letterhead is not None:
+        if _stacked_height([letterhead, *story], frame_width) <= doc.height - 2 * _FRAME_PADDING:
+            story.insert(0, letterhead)
+        else:
+            letterhead = None
+            legal_name = read_company_profile().get("legal_name", "")
+            if legal_name:
+                story.insert(0, _safe_para(legal_name, label))
+
     # ── G703 continuation sheet ────────────────────────────────────────
+    # With a letterhead above the face, the space left under the certification
+    # held the continuation heading and not one row, which printed the heading
+    # alone at the foot of the page. Room for the heading, the column header
+    # and a couple of rows, or the continuation sheet starts on a page of its own.
+    story.append(CondPageBreak(30 * mm))
     story.append(Paragraph("Continuation Sheet - AIA Document G703 (functional equivalent)", h2))
     story.append(Spacer(1, 2 * mm))
 
@@ -289,45 +414,51 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
             [
                 _safe_para(ln.get("item_number"), cell_l),
                 _safe_para(ln.get("description"), cell_l),
-                Paragraph(_amount(ln.get("scheduled_value"), currency), cell_r),
+                Paragraph(_amount_or_blank(ln.get("scheduled_value"), currency), cell_r),
                 Paragraph(_amount(ln.get("previous_value"), currency), cell_r),
                 Paragraph(_amount(ln.get("this_period_value"), currency), cell_r),
                 Paragraph(_amount(ln.get("materials_stored"), currency), cell_r),
                 Paragraph(_amount(ln.get("total_completed_stored"), currency), cell_r),
-                Paragraph(_pct(ln.get("percent_complete")), cell_r),
-                Paragraph(_amount(ln.get("balance_to_finish"), currency), cell_r),
+                Paragraph(_pct_or_blank(ln.get("percent_complete")), cell_r),
+                Paragraph(_amount_or_blank(ln.get("balance_to_finish"), currency), cell_r),
                 Paragraph(_amount(ln.get("retainage"), currency), cell_r),
             ]
         )
 
-    # Totals row from the summary.
+    # Totals row: each figure is the total of the column it sits under, added
+    # up from the rows above it. It used to take C from line 3 and H from line
+    # 9, two figures of the face that are not those columns: line 3 is the
+    # contract sum, which is the column C total only while the sheet lists
+    # every SoV line, and line 9 carries the retainage that column H leaves
+    # out, so the sheet printed a balance to finish 6,000 above its own rows.
+    #
+    # A cell with no answer is left out of its column's total on purpose, not
+    # read as a zero that happens to add nothing. Only C and H have such cells,
+    # on the row for money no schedule line carries. The C total is therefore
+    # the schedule's, as it was when that row printed a zero. The H total is the
+    # balance left on the schedule lines, higher than the placeholder's by that
+    # row's G, and it no longer equals the C total less the G total on a sheet
+    # carrying the row: the gap is that row's G, which has no balance to finish.
+    def _column_total(key: str) -> str:
+        answered = (_dec_amount(ln.get(key)) for ln in lines if ln.get(key) is not None)
+        return _amount(sum(answered, Decimal("0")), currency)
+
     data.append(
         [
             Paragraph("", foot_l),
             _safe_para("Grand total", foot_l),
-            Paragraph(_amount(summary.get("contract_sum_to_date"), currency), foot_r),
+            Paragraph(_column_total("scheduled_value"), foot_r),
             Paragraph("", foot_r),
             Paragraph("", foot_r),
             Paragraph("", foot_r),
-            Paragraph(_amount(summary.get("total_completed_stored"), currency), foot_r),
+            Paragraph(_column_total("total_completed_stored"), foot_r),
             Paragraph("", foot_r),
-            Paragraph(_amount(summary.get("balance_to_finish"), currency), foot_r),
-            Paragraph(_amount(summary.get("retainage"), currency), foot_r),
+            Paragraph(_column_total("balance_to_finish"), foot_r),
+            Paragraph(_column_total("retainage"), foot_r),
         ]
     )
 
-    col_widths = [
-        16 * mm,
-        58 * mm,
-        28 * mm,
-        28 * mm,
-        26 * mm,
-        22 * mm,
-        30 * mm,
-        16 * mm,
-        28 * mm,
-        26 * mm,
-    ]
+    col_widths = _g703_column_widths(frame_width, currency)
     # Every cell here is already a Paragraph, so the shaping and font command
     # helpers this table used to call had nothing to act on and were removed.
     # The TEXTCOLOR and FONTNAME commands that used to sit here had nothing to
@@ -347,12 +478,19 @@ def render_aia_application_pdf(app: dict[str, Any]) -> bytes:
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("TOPPADDING", (0, 0), (-1, -1), 2),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("LEFTPADDING", (0, 0), (-1, -1), _G703_CELL_PAD),
+                ("RIGHTPADDING", (0, 0), (-1, -1), _G703_CELL_PAD),
             ]
         )
     )
     story.append(g703_tbl)
 
-    doc.build(story)
+    def _first_page(canvas: Any, page_doc: Any) -> None:
+        # A letterhead already carries the logo; the header copy would print it twice.
+        if letterhead is None:
+            branded_header_logo(canvas, page_doc)
+
+    doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
     return buf.getvalue()
 
 

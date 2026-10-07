@@ -26,7 +26,7 @@ IBAN-shaped typo saves a payment, and refusing a nine-digit routing number
 locks a company out of the only screen that can record how it gets paid.
 
 No dependency: this is the whole of the algorithm, and a package for it would
-cost more than it saves on an instance running in two gigabytes.
+cost more than it saves on an instance running in three gigabytes.
 """
 
 from __future__ import annotations

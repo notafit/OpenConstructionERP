@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "La actuación comenzó el {start}, antes de presentar la solicitud el {filed}; la mayoría de los programas no financian nada una vez iniciada la actuación",
+      "unevidenced": "La actuación comenzó antes de tiempo, el {start}, y el expediente dice que el organismo lo autorizó, pero no indica ninguna autorización escrita",
+      "evidence": "Registre la referencia de la autorización escrita de inicio anticipado, para que el expediente se sostenga por sí solo",
+      "suggestion": "Revise las bases del programa antes de seguir gastando. Si el inicio anticipado se autorizó por escrito, regístrelo; si no, consulte al organismo antes de que la solicitud siga adelante"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "El desembolso {draw} incluye costes anteriores al {period_start}, inicio del período de ejecución",
+      "after": "El desembolso {draw} incluye costes posteriores al {period_end}, fin del período de ejecución",
+      "spans": "El desembolso {draw} se sale del período de ejecución por ambos extremos, del {period_start} al {period_end}",
+      "suggestion": "Pase los costes que quedan fuera del período de ejecución a un desembolso aparte y plantéelos al organismo, en lugar de mezclar ambos en un mismo desembolso"
+    },
+    "own_share_is_covered": {
+      "fail": "El programa exige una aportación propia del {rate} por ciento, es decir {required}, pero la solicitud registra {recorded}",
+      "suggestion": "Indique de dónde sale el resto de la aportación propia antes de presentar la solicitud: el programa la calcula sobre la base elegible, no sobre el total del proyecto"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Las {count} solicitudes de este proyecto suman el {intensity} por ciento de los costes elegibles y superan el límite de intensidad de la ayuda del {cap} por ciento que fija el más estricto de sus programas",
+      "suggestion": "Las ayudas públicas se acumulan entre programas y entre niveles de administración. Reduzca el importe de una solicitud o estudie si las actuaciones pueden separarse con costes propios cada una"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "El período de ejecución terminó el {period_end} y no se ha iniciado la justificación final",
+      "late": "La justificación final vencía el {due} y se presentó el {submitted}",
+      "overdue": "La justificación final vencía el {due} y no se ha presentado",
+      "suggestion": "Presente lo que ya existe en vez de esperar a tenerlo completo. Casi todos los organismos amplían un plazo si se pide, y ninguno amplía uno ya vencido"
+    },
+    "errors": {
+      "application_not_found": "Solicitud no encontrada",
+      "programme_code_taken": "Ya existe un programa con esta referencia en este país",
+      "programme_not_found": "Programa no encontrado",
+      "programme_has_applications": "Este programa tiene solicitudes y no se puede eliminar. Ciérrelo en lugar de eliminarlo.",
+      "application_code_taken": "Ya existe una solicitud con esta referencia en este proyecto",
+      "approved_application_not_deletable": "Una solicitud concedida no se puede eliminar. En su lugar, cambie su estado a Retirada o Cerrada.",
+      "approval_needs_period_end": "Una concesión necesita la fecha de fin del período de ejecución, porque todos los plazos posteriores se cuentan a partir de ella",
+      "draw_needs_approval": "Solo se pueden desembolsar fondos con cargo a una solicitud concedida",
+      "draw_not_found": "Desembolso no encontrado",
+      "paid_draw_not_deletable": "Un desembolso ya pagado no se puede eliminar",
+      "proof_not_found": "Justificación de uso no encontrada",
+      "obligation_not_found": "Plazo no encontrado",
+      "eligible_exceeds_amount": "La parte elegible no puede superar el importe",
+      "allocation_not_found": "Partida de coste no encontrada"
+    }
+  }
+}

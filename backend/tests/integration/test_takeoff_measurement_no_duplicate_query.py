@@ -107,33 +107,61 @@ async def test_delete_measurement_with_existing_row_skips_lookup() -> None:
 @pytest.mark.asyncio
 async def test_link_measurement_to_boq_with_existing_row_skips_lookup() -> None:
     """link_measurement_to_boq must accept ``existing`` and skip the re-fetch."""
+    import uuid as _uuid
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock, patch
 
+    from app.modules.boq.repository import PositionRepository
+    from app.modules.boq.service import BOQService
     from app.modules.takeoff.models import TakeoffMeasurement
     from app.modules.takeoff.service import TakeoffService
 
     fake_session = AsyncMock()
     service = TakeoffService(fake_session)
 
-    row = TakeoffMeasurement()
+    project_id = _uuid.uuid4()
+    row = TakeoffMeasurement(project_id=project_id)
+
+    # ``boq_position_id`` arrives as a plain string - ``LinkToBoqRequest``
+    # types it ``str`` and the column is ``String(255)`` - so the service
+    # parses it into a UUID before it may touch the BOQ repository, and
+    # answers 422 on anything that is not one. Hand it a real UUID: with a
+    # placeholder the call stops at that format guard and never reaches the
+    # lookup this test is about.
+    position_id = _uuid.uuid4()
+    position = SimpleNamespace(id=position_id, boq_id=_uuid.uuid4())
+    # Same project as the measurement, so the IDOR guard passes for the right
+    # reason rather than because it was stubbed out.
+    boq = SimpleNamespace(project_id=project_id)
 
     with (
+        # ``return_value=row`` keeps the re-fetch path fully working, so the
+        # await count below is the ONLY thing separating a service that uses
+        # ``existing`` from one that queries again.
         patch.object(
             service.measurement_repo,
             "get_by_id",
-            new=AsyncMock(),
+            new=AsyncMock(return_value=row),
         ) as get_mock,
         patch.object(
             service.measurement_repo,
             "update_fields",
             new=AsyncMock(),
         ),
+        patch.object(
+            PositionRepository,
+            "get_by_id",
+            new=AsyncMock(return_value=position),
+        ),
+        patch.object(
+            BOQService,
+            "get_boq",
+            new=AsyncMock(return_value=boq),
+        ),
     ):
-        import uuid as _uuid
-
         await service.link_measurement_to_boq(
             measurement_id=_uuid.uuid4(),
-            boq_position_id="pos-1",
+            boq_position_id=str(position_id),
             existing=row,
         )
         assert get_mock.await_count == 0, (

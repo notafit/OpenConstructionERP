@@ -34,11 +34,13 @@ replay quirk that broke ``StreamingResponse``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
 import logging
 import os
+import shutil
 import tempfile
 import uuid
 import zipfile
@@ -99,6 +101,11 @@ _SPOOL_THRESHOLD_BYTES = 16 * 1024 * 1024
 
 # Chunk size when streaming the finished archive to the response.
 _STREAM_CHUNK_BYTES = 64 * 1024
+
+# A member written through ``ZipFile.open(..., "w")`` has no size up front, so
+# one that may pass the 2 GiB zip32 limit has to ask for zip64 headers before
+# the first byte. Same margin ``zipfile`` itself applies to a known size.
+_ZIP64_MEMBER_BYTES = int(zipfile.ZIP64_LIMIT / 1.05)
 
 # Hard ceiling on the decompressed size of any single backup entry. A crafted
 # "zip bomb" declares a tiny compressed size but inflates to gigabytes; every
@@ -475,11 +482,16 @@ async def build_backup(
                         rows = []
                     else:
                         rows = (await session.execute(select(model_cls).where(clause))).scalars().all()
+                    # Reading the loaded rows stays here, next to the session
+                    # that owns them. Encoding and deflating them is pure CPU
+                    # that grows with the account, so it runs in a worker
+                    # thread: on the loop it froze every other request on this
+                    # worker for seconds at a time. The zip is only ever
+                    # touched by one call at a time, each awaited in turn.
                     serialised = [
                         {k: v for k, v in serialize_row(r).items() if not _is_sensitive_field(k)} for r in rows
                     ]
-                    payload = json.dumps(serialised, indent=2, ensure_ascii=False, default=str)
-                    zf.writestr(f"{backup_key}.json", payload)
+                    await asyncio.to_thread(_write_json_member, zf, f"{backup_key}.json", serialised)
                     record_counts[backup_key] = len(serialised)
 
                     if include_files:
@@ -520,39 +532,80 @@ async def build_backup(
                 json.dumps(manifest, indent=2, ensure_ascii=False),
             )
 
-    # Re-open zip read-only to compute checksum and rewrite manifest with it.
+    # Hashing and re-deflating the whole archive touches no database, so it
+    # runs off the event loop in one piece.
+    size = await asyncio.to_thread(_finalize_archive, spool, manifest, compression, compression_level)
+    return spool, manifest, size
+
+
+def _write_json_member(zf: zipfile.ZipFile, name: str, rows: list[dict[str, Any]]) -> None:
+    """Encode ``rows`` and write them into ``zf`` as ``name``.
+
+    Synchronous on purpose: :func:`build_backup` runs it in a worker thread.
+    """
+    zf.writestr(name, json.dumps(rows, indent=2, ensure_ascii=False, default=str))
+
+
+def _finalize_archive(
+    spool: tempfile.SpooledTemporaryFile,
+    manifest: dict[str, Any],
+    compression: int,
+    compression_level: int,
+) -> int:
+    """Stamp the archive checksum into ``manifest`` and rewrite the archive with it.
+
+    Returns the archive size and leaves ``spool`` rewound. Synchronous on
+    purpose: :func:`build_backup` runs it in a worker thread, since it reads,
+    hashes and re-deflates every member of the archive.
+    """
+    # Hash the archive in chunks rather than reading it whole. The spool
+    # spills to disk past its threshold so a large backup never has to be in
+    # memory, and reading it back in one piece here undid that: the whole
+    # archive in RAM, then a second copy for the reader over it.
     spool.seek(0)
-    raw = spool.read()
-    checksum = hashlib.sha256(raw).hexdigest()
-    manifest["checksum"] = checksum
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: spool.read(_STREAM_CHUNK_BYTES), b""):
+        digest.update(chunk)
+    manifest["checksum"] = digest.hexdigest()
 
     # Rewrite the archive with the checksum-augmented manifest. Cheaper
     # than seeking/patching inside the existing ZIP and keeps the ZIP
-    # central directory consistent.
-    spool.seek(0)
-    spool.truncate(0)
-    with (
-        zipfile.ZipFile(
-            spool,
-            mode="w",
-            compression=compression,
-            compresslevel=compression_level if compression == zipfile.ZIP_DEFLATED else None,
-        ) as zf2,
-        zipfile.ZipFile(io.BytesIO(raw), mode="r") as zf_old,
-    ):
-        for name in zf_old.namelist():
-            if name == "manifest.json":
-                zf2.writestr(
-                    "manifest.json",
-                    json.dumps(manifest, indent=2, ensure_ascii=False),
-                )
-            else:
-                zf2.writestr(name, zf_old.read(name))
+    # central directory consistent. Written to a second spool, member by
+    # member through a stream, then copied back, so neither the archive nor
+    # any one member (a model, a drawing) is ever held whole.
+    with tempfile.SpooledTemporaryFile(max_size=_SPOOL_THRESHOLD_BYTES, mode="w+b", suffix=".zip") as rewritten:
+        spool.seek(0)
+        with (
+            zipfile.ZipFile(
+                rewritten,
+                mode="w",
+                compression=compression,
+                compresslevel=compression_level if compression == zipfile.ZIP_DEFLATED else None,
+            ) as zf2,
+            zipfile.ZipFile(spool, mode="r") as zf_old,
+        ):
+            for info in zf_old.infolist():
+                if info.filename == "manifest.json":
+                    zf2.writestr(
+                        "manifest.json",
+                        json.dumps(manifest, indent=2, ensure_ascii=False),
+                    )
+                    continue
+                with (
+                    zf_old.open(info) as src,
+                    zf2.open(info.filename, mode="w", force_zip64=info.file_size > _ZIP64_MEMBER_BYTES) as dst,
+                ):
+                    shutil.copyfileobj(src, dst, _STREAM_CHUNK_BYTES)
+
+        rewritten.seek(0)
+        spool.seek(0)
+        spool.truncate(0)
+        shutil.copyfileobj(rewritten, spool, _STREAM_CHUNK_BYTES)
 
     spool.flush()
     size = spool.tell()
     spool.seek(0)
-    return spool, manifest, size
+    return size
 
 
 async def _embed_module_files(zf: zipfile.ZipFile, backup_key: str, rows: list[Any]) -> tuple[int, list[str]]:
@@ -583,7 +636,9 @@ async def _embed_module_files(zf: zipfile.ZipFile, backup_key: str, rows: list[A
             except Exception as exc:
                 warnings.append(f"{backup_key}: failed to read {key}: {str(exc)[:200]}")
                 break
-            zf.writestr(f"files/{backup_key}/{key.lstrip('/')}", payload)
+            # A blob can be a drawing or a model; deflating it is CPU work the
+            # event loop must not carry. Reads above stay awaited here.
+            await asyncio.to_thread(zf.writestr, f"files/{backup_key}/{key.lstrip('/')}", payload)
             embedded += 1
             break
     return embedded, warnings

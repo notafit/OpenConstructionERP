@@ -5,7 +5,7 @@
 Core does not talk to a tax authority. Every platform in the registry has its
 own transport, its own certificate handling and its own SOAP or REST dialect,
 and shipping eight of those would put eight client stacks and their transitive
-dependencies inside a core that has to run on a 2 GB VPS. So the boundary is an
+dependencies inside a core that has to run on a 3 GB server. So the boundary is an
 interface: this module owns the state, the validation and the trail, and an
 adapter owns the wire.
 

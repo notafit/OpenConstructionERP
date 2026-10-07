@@ -12,17 +12,46 @@ the same on every dialect.
 A migration that declares ``postgresql.UUID`` therefore describes a column
 shape that ``create_all`` never produces. Nothing breaks today, because the
 canonical install runs ``create_all`` and stamps the head without walking the
-chain, so those declarations are not executed. They are only reachable by
-walking the chain from base, and that walk currently fails: a revision creates
-a child with ``document_id uuid`` referencing a parent whose ``id`` is
-``varchar(36)``, and PostgreSQL refuses the foreign key with
-``DatatypeMismatch``.
+chain, so those declarations are not executed.
+
+They are reachable two ways, and this file was written knowing only the first.
+One is a walk of the whole chain from base, which fails on a child declared
+``document_id uuid`` whose parent ``id`` a String(36) revision built as
+``varchar(36)``. The other is a one-step downgrade of a merge node: alembic
+un-applies everything reachable only through the parent it is not going to and
+re-applies all of it on the way back up, against tables ``create_all`` left
+standing. That one is executed - ``tests/integration/test_migrations_roundtrip.py``
+runs it on every revision in its window - and it is the reason twenty-six
+entries have left the list below.
 
 The decision recorded here is that the divergence is frozen rather than
-repaired. Reconciling it would mean rewriting the revisions that already
-declare these columns, which is a multi-day project gated on questions nobody
+repaired. Reconciling all of it would mean rewriting every revision that
+declares these columns, which is a multi-day project gated on questions nobody
 has answered. This guard does the affordable half: it stops the gap growing.
 The allowlist below is closed. A new entry is not the fix.
+
+Frozen is not the same as untouchable, and the two rules are not in tension.
+The list is closed to growth; it is expected to shrink, and
+``test_allowlist_has_no_stale_entries`` makes a repair that does not shrink it
+a failure. Twenty-six entries have left that way: every revision that sits
+inside some merge node's one-step downgrade span, where the divergence is not
+dormant but fatal, and where no follow-up revision can help because the walk
+dies inside the offending ``upgrade()`` at the CREATE TABLE carrying the
+foreign key.
+
+Sixteen of the twenty-six were found by running the one walk the round trip
+exercises, one error at a time. The other ten were found by measuring the graph
+instead, and nothing has ever executed them: they sit in spans no test walks.
+Five of the ten hang a foreign key off a uuid column - three of those behind an
+interpolated target string, which is the shape a probe demanding a literal
+reports clean - and five declare uuid identity columns that a revision later in
+the same span can point a ``varchar(36)`` foreign key at, failing in the other
+direction. That is why the line is drawn at the span rather than at the foreign
+key: a span with no native uuid in it cannot produce either mismatch, and no
+name has to be resolved to say so.
+
+The twenty-four that remain sit outside every merge span, whichever parent a
+downgrade names. No walk reaches them and they stay frozen.
 
 The revisions are read with ``ast`` rather than imported, for the same reasons
 as ``test_alembic_single_head``: importing them drags in ``app.database`` and a
@@ -72,6 +101,17 @@ VERSIONS = Path(__file__).resolve().parents[2] / "alembic" / "versions"
 # it. Use the same type the models use - ``sa.String(36)``, or the ``GUID`` type
 # from ``app.database`` - so the column matches what ``create_all`` builds.
 #
+# It started at fifty and is now twenty-four. The twenty-six that left all sat
+# inside some merge node's one-step downgrade span, and they were repaired
+# rather than permitted because a follow-up revision cannot help there: the walk
+# dies inside the offending ``upgrade()`` itself, at the CREATE TABLE that hangs
+# the foreign key, so nothing later ever runs. The rule that allowed it is the
+# one below - the list may shrink, never grow, and
+# ``test_allowlist_has_no_stale_entries`` requires a repaired revision to leave.
+# What is left is outside every merge span, which
+# ``test_no_revision_inside_a_merge_span_declares_a_native_uuid`` in
+# ``tests/integration/test_migrations_roundtrip.py`` measures and enforces.
+#
 # Derived by scanning with ``_uuid_columns`` below, not written by hand.
 UUID_COLUMN_ALLOWLIST = frozenset(
     {
@@ -98,36 +138,7 @@ UUID_COLUMN_ALLOWLIST = frozenset(
         "v3024_qms.py",
         "v3025_supplier_catalogs.py",
         "v3026_bi_dashboards.py",
-        "v3029_qms_calibration_template_hse_extras.py",
-        "v3030_module4_extras.py",
-        "v3091_service_sla_recurring.py",
-        "v3093_subs_prequal_insurance.py",
-        "v3094_requirement_deliverables.py",
         "v3096_regional_indices_certainty.py",
-        "v3104_propdev_broker_escrow_pricematrix_hierarchy.py",
-        "v3106_geo_hub_init.py",
-        "v3110_propdev_snag_buyer_cost_photos.py",
-        "v3113_propdev_warranty_enrich.py",
-        "v3120_accommodation_init.py",
-        "v3125_propdev_pricing_engine.py",
-        "v3126_propdev_portal_tokens.py",
-        "v3200_resource_depth.py",
-        "v3214_project_status_history.py",
-        "v3217_contracts_depth.py",
-        "v3218_carbon_element_link.py",
-        "v3219_carbon_whole_life.py",
-        "v3220_field_time_timesheets.py",
-        "v3221_cost_explorer_reverse_index.py",
-        "v3231_prefab_unit_cost_link.py",
-        "v3235_design_options.py",
-        "v40_ai_agents.py",
-        "v40_assembly_templates.py",
-        "v40_bim_federations.py",
-        "v40_cpm_weekly.py",
-        "v41_clash_ai_triage.py",
-        "v41_clash_signature_smart_issues.py",
-        "v41_coordination_thresholds.py",
-        "v41_smart_views.py",
     }
 )
 

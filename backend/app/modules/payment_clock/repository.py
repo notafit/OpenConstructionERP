@@ -54,6 +54,11 @@ async def count_regimes(session: AsyncSession) -> int:
     return await session.scalar(select(func.count()).select_from(PaymentRegime)) or 0
 
 
+async def regime_codes(session: AsyncSession) -> set[str]:
+    """The codes of every regime in the table, shipped or locally added."""
+    return set((await session.execute(select(PaymentRegime.code))).scalars().all())
+
+
 # ── Applications ─────────────────────────────────────────────────────────────
 
 
@@ -230,6 +235,7 @@ __all__ = [
     "list_events_for_application",
     "list_notices",
     "list_regimes",
+    "regime_codes",
     "remove_application",
     "remove_notice",
 ]

@@ -57,6 +57,7 @@ import {
   type TemplateClause,
   type TemplateStatus,
 } from './api';
+import { retentionEventLabel } from './RetentionReleasePanel';
 
 const inputCls =
   'w-full rounded-lg border border-border-light bg-surface-primary px-3 py-2 text-sm text-content-primary placeholder:text-content-quaternary focus:border-oe-blue focus:outline-none focus:ring-1 focus:ring-oe-blue';
@@ -76,10 +77,12 @@ const STATUS_VARIANT: Record<TemplateStatus, 'neutral' | 'success' | 'warning'> 
   archived: 'neutral',
 };
 
+// The canonical events the server stores. It reads the older names
+// (practical completion, final account, handover) and answers with these.
 const RETENTION_EVENTS: RetentionReleaseEvent[] = [
-  'practical_completion',
-  'final_account',
-  'handover',
+  'substantial_completion',
+  'final_completion',
+  'defects_period_end',
 ];
 
 /** The catalogue query is shared with the empty-state chips on the register. */
@@ -737,7 +740,7 @@ function NewTemplateModal({
     name: '',
     family: '',
     description: '',
-    retention_release_event: 'practical_completion' as RetentionReleaseEvent,
+    retention_release_event: 'substantial_completion' as RetentionReleaseEvent,
   });
   const [busy, setBusy] = useState(false);
 
@@ -844,9 +847,7 @@ function NewTemplateModal({
           >
             {RETENTION_EVENTS.map((event) => (
               <option key={event} value={event}>
-                {t(`contracts.retention_${event}`, {
-                  defaultValue: event.replace(/_/g, ' '),
-                })}
+                {retentionEventLabel(t, event)}
               </option>
             ))}
           </select>

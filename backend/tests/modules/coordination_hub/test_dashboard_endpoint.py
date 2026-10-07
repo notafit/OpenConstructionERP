@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -93,6 +94,11 @@ async def project_id(client: AsyncClient, auth: dict[str, str]) -> str:
         json={
             "name": "Coordination Hub Endpoints",
             "description": "endpoints",
+            # The dashboard reports the project's own currency and does not
+            # fall back to EUR, so the project has to carry one. Without this
+            # the first test reads "" and the later "restore it to EUR" step
+            # was restoring a value the project never had.
+            "currency": "EUR",
         },
         headers=auth,
     )
@@ -193,8 +199,17 @@ async def test_dashboard_returns_200_with_zero_when_empty(client: AsyncClient, a
     assert body["federations"]["count"] == 0
     assert body["clashes"]["open_count"] == 0
     assert body["clashes"]["resolved_count"] == 0
-    # v3 §10 — money is Decimal-as-string on the JSON wire.
-    assert body["open_cost_impact_total"] == "0"
+    # v3 §10 — money is Decimal-as-string on the JSON wire. Assert the type and
+    # the value, not the scale: the KPI is summed by the clash_cost_impact
+    # kernel, which rounds to 2 dp and hands back a float, so the number of
+    # trailing digits in the string is whatever that float's repr carried - "0"
+    # for a Decimal zero, "0.0" for a float one. The sibling assertion in
+    # tests/unit/test_coordination_hub.py reads it with float() for the same
+    # reason. Pinning "0" pinned the repr, and it went red the moment the
+    # project had a currency and the empty-dashboard path was reached at all.
+    raw_total = body["open_cost_impact_total"]
+    assert isinstance(raw_total, str), f"money must cross the wire as a string, got {type(raw_total)}"
+    assert Decimal(raw_total) == 0
 
 
 @pytest.mark.asyncio

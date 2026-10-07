@@ -132,7 +132,7 @@ class PipelineNodeState(Base):
     re-runs and Phase-2 approval gates). ``inputs`` captures the node's
     params + which upstream nodes fed it; ``output`` is a SMALL envelope
     (counts, samples, IDs) - the full payload always stays in its owning
-    table, which is what keeps the SQLite / 2 GB-RAM target healthy.
+    table, which is what keeps the 3 GB-RAM target healthy.
     """
 
     __tablename__ = "oe_pipeline_node_state"

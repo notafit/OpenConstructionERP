@@ -23,6 +23,7 @@ import { Button, Card, Badge, EmptyState, Skeleton, Breadcrumb, DismissibleInfo,
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { validationGuide } from './validationGuide';
 import { apiGet, apiPost, triggerDownload } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -352,13 +353,18 @@ function getScoreRingColor(pct: number): string {
  * on its own next to "Passed 4721 of 4975" that looks like two numbers
  * contradicting each other, so when the cap is what produced the number, say so.
  */
-function ScoreCircle({ score, errors }: { score: number; errors: number }) {
+function ScoreCircle({ score, errors, warnings }: { score: number; errors: number; warnings: number }) {
   const { t } = useTranslation();
   const pct = Math.round(score * 100);
   const capped = errors > 0;
+  const hasWarnings = warnings > 0 && errors === 0;
   const radius = 54;
   const circumference = 2 * Math.PI * radius;
   const dashOffset = circumference - (pct / 100) * circumference;
+
+  const label = hasWarnings ? t('validation.score_warnings', 'Warnings') : getScoreLabel(pct, t);
+  const color = hasWarnings ? 'text-semantic-warning' : getScoreColor(pct);
+  const ringColor = hasWarnings ? 'stroke-semantic-warning' : getScoreRingColor(pct);
 
   return (
     <div className="flex flex-col items-center gap-2">
@@ -380,7 +386,7 @@ function ScoreCircle({ score, errors }: { score: number; errors: number }) {
             fill="none"
             strokeWidth="8"
             strokeLinecap="round"
-            className={`${getScoreRingColor(pct)} transition-all duration-700 ease-out`}
+            className={`${ringColor} transition-all duration-700 ease-out`}
             style={{
               strokeDasharray: circumference,
               strokeDashoffset: dashOffset,
@@ -388,19 +394,27 @@ function ScoreCircle({ score, errors }: { score: number; errors: number }) {
           />
         </svg>
         <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <span className={`text-3xl font-bold tabular-nums ${getScoreColor(pct)}`}>
+          <span className={`text-3xl font-bold tabular-nums ${color}`}>
             {pct}
           </span>
-          <span className={`text-sm font-medium ${getScoreColor(pct)}`}>%</span>
+          <span className={`text-sm font-medium ${color}`}>%</span>
         </div>
       </div>
-      <span className={`text-sm font-semibold ${getScoreColor(pct)}`}>
-        {getScoreLabel(pct, t)}
+      <span className={`text-sm font-semibold ${color}`}>
+        {label}
       </span>
       {capped && (
         <span className="max-w-40 text-center text-xs text-content-secondary">
           {t('validation.score_capped', {
             defaultValue: 'Capped by blocking errors, not a pass rate',
+          })}
+        </span>
+      )}
+      {hasWarnings && (
+        <span className="max-w-40 text-center text-xs text-semantic-warning">
+          {t('validation.score_has_warnings', {
+            defaultValue: '{{count}} warning(s)',
+            count: warnings,
           })}
         </span>
       )}
@@ -805,7 +819,7 @@ export function ValidationPage() {
   // Fetch projects
   const { data: projects, isLoading: projectsLoading } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1337,7 +1351,7 @@ export function ValidationPage() {
           <div className="grid gap-6 md:grid-cols-[200px_1fr]">
             {/* Score circle card */}
             <Card className="flex items-center justify-center">
-              <ScoreCircle score={report.score} errors={report.counts.errors} />
+              <ScoreCircle score={report.score} errors={report.counts.errors} warnings={report.counts.warnings} />
             </Card>
 
             {/* Summary card */}

@@ -3,7 +3,7 @@
 """Streaming-upload helper.
 
 UploadFile.read() loads the entire request body into memory.  On the
-2 GB-RAM VPS this is a trivial DoS vector once we removed the per-route
+3 GB-RAM server this is a trivial DoS vector once we removed the per-route
 size caps (a single 1 GB upload pushes the process into swap; a few
 concurrent uploads OOM the box).
 

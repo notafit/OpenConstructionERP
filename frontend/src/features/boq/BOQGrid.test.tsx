@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { evaluateFormula } from './grid/cellEditors';
 import { getColumnDefs } from './grid/columnDefs';
 import { parseClipboardNumber } from './BOQGrid';
+import { isResourceDrivenRate } from './boqHelpers';
 
 describe('evaluateFormula', () => {
   it('should evaluate simple addition', () => {
@@ -180,5 +181,35 @@ describe('parseClipboardNumber', () => {
 
   it('should handle large numbers with both separators', () => {
     expect(parseClipboardNumber('1,234,567.89')).toBeCloseTo(1234567.89);
+  });
+});
+
+describe('bulk writers skip the rates the Unit Rate cell locks', () => {
+  const mockT = (key: string, opts?: Record<string, string>) => opts?.defaultValue || key;
+  const context = { currencySymbol: '€', fmt: new Intl.NumberFormat('en'), t: mockT };
+  const rows = [
+    { id: 'manual', metadata: {} },
+    { id: 'no-list', metadata: { resources: [] } },
+    { id: 'blank-rows', metadata: { resources: [{ name: 'x', quantity: 0, unit_rate: 5 }] } },
+    { id: 'driven', metadata: { resources: [{ name: 'Concrete', quantity: 0.2, unit_rate: 120 }] } },
+    { id: 'driven-text-qty', metadata: { resources: [{ name: 'Labour', quantity: '1.5', unit_rate: 40 }] } },
+    { id: 'no-metadata' },
+  ];
+
+  it('agrees with the column editable predicate on every row shape', () => {
+    const rateCol = getColumnDefs(context).find((c) => c.field === 'unit_rate');
+    for (const data of rows) {
+      const editable = rateCol.editable({ data });
+      expect(isResourceDrivenRate('unit_rate', data), data.id).toBe(!editable);
+    }
+  });
+
+  it('only ever concerns the Unit Rate', () => {
+    const driven = rows[3];
+    expect(isResourceDrivenRate('unit_rate', driven)).toBe(true);
+    for (const field of ['quantity', 'description', 'unit', 'classification']) {
+      expect(isResourceDrivenRate(field, driven)).toBe(false);
+    }
+    expect(isResourceDrivenRate('unit_rate', null)).toBe(false);
   });
 });

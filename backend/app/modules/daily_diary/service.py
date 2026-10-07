@@ -17,6 +17,7 @@ Events emitted:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -518,13 +519,13 @@ class DailyDiaryService:
             entry_day = datetime.strptime(data.diary_date, "%Y-%m-%d").date()
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Invalid diary_date: {exc}",
             ) from exc
         max_allowed = datetime.now(UTC).date() + timedelta(days=1)
         if entry_day > max_allowed:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"diary_date {data.diary_date} is in the future; a daily "
                     "site diary is a contemporaneous record and cannot be "
@@ -1212,7 +1213,7 @@ class DailyDiaryService:
             new_hi = fields.get("elevation_max_m", survey.elevation_max_m)  # type: ignore[attr-defined]
             if new_lo is not None and new_hi is not None and new_lo > new_hi:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(
                         "elevation_min_m must be less than or equal to "
                         "elevation_max_m (would conflict with stored value)"
@@ -1341,7 +1342,10 @@ class DailyDiaryService:
         project_name = await self._project_name(diary.project_id)
         supervisor_name = await self._user_display_name(diary.site_supervisor_id)
 
-        pdf_bytes = render_diary_pdf(
+        # ReportLab layout of every entry runs off the event loop. The rows are
+        # already loaded and the renderer only reads plain attributes.
+        pdf_bytes = await asyncio.to_thread(
+            render_diary_pdf,
             diary,
             project_name=project_name,
             entries=list(entries),

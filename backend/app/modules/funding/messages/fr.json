@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Les travaux de cette opération ont commencé le {start}, avant le dépôt de la demande le {filed} ; la plupart des programmes ne financent plus rien une fois l'opération commencée",
+      "unevidenced": "Les travaux ont commencé de manière anticipée, le {start}, et le dossier indique que l'autorité l'a autorisé, mais ne mentionne aucune autorisation écrite",
+      "evidence": "Consignez la référence de l'autorisation écrite de démarrage anticipé, afin que le dossier se suffise à lui-même en cas de contrôle",
+      "suggestion": "Vérifiez les conditions du programme avant d'engager d'autres dépenses. Si le démarrage anticipé a été autorisé par écrit, consignez-le ; sinon, interrogez l'autorité avant de poursuivre la demande"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "La demande de versement {draw} porte sur des coûts antérieurs au {period_start}, date d'ouverture de la période de subvention",
+      "after": "La demande de versement {draw} porte sur des coûts postérieurs au {period_end}, date de clôture de la période de subvention",
+      "spans": "La demande de versement {draw} déborde de la période de subvention aux deux extrémités, du {period_start} au {period_end}",
+      "suggestion": "Placez les coûts situés hors de la période dans une demande de versement distincte et examinez-les avec l'autorité, plutôt que de mêler les deux dans une seule demande"
+    },
+    "own_share_is_covered": {
+      "fail": "Le programme exige un autofinancement de {rate} %, soit {required}, mais la demande indique {recorded}",
+      "suggestion": "Précisez l'origine du reste de l'autofinancement avant le dépôt, car le programme le calcule sur la base de coût éligible et non sur le coût total du projet"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Les {count} demandes de ce projet atteignent ensemble {intensity} % des coûts éligibles, au-delà du plafond d'intensité de l'aide de {cap} % fixé par le plus strict de leurs programmes",
+      "suggestion": "Les aides publiques se cumulent entre programmes et entre niveaux d'administration. Réduisez l'une des demandes, ou vérifiez si les opérations peuvent être séparées afin que chacune porte ses propres coûts"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "La période de subvention a pris fin le {period_end} et aucun justificatif final d'utilisation n'a encore été commencé",
+      "late": "Le justificatif final d'utilisation était dû le {due} et a été remis le {submitted}",
+      "overdue": "Le justificatif final d'utilisation était dû le {due} et n'a pas été remis",
+      "suggestion": "Remettez ce qui existe plutôt que d'attendre un dossier complet. La plupart des autorités prolongent un délai sur demande, aucune ne prolonge un délai déjà expiré"
+    },
+    "errors": {
+      "application_not_found": "Demande introuvable",
+      "programme_code_taken": "Un programme avec cette référence existe déjà dans ce pays",
+      "programme_not_found": "Programme introuvable",
+      "programme_has_applications": "Ce programme a des demandes et ne peut pas être supprimé. Clôturez-le plutôt.",
+      "application_code_taken": "Une demande avec cette référence existe déjà dans ce projet",
+      "approved_application_not_deletable": "Une demande accordée ne peut pas être supprimée. Passez plutôt son statut à Retiré ou Clos.",
+      "approval_needs_period_end": "Un octroi exige la date de fin de la période de subvention, car toutes les échéances suivantes sont calculées à partir de celle-ci",
+      "draw_needs_approval": "Un versement n'est possible qu'au titre d'une demande accordée",
+      "draw_not_found": "Versement introuvable",
+      "paid_draw_not_deletable": "Un versement déjà payé ne peut pas être supprimé",
+      "proof_not_found": "Justificatif d'utilisation introuvable",
+      "obligation_not_found": "Échéance introuvable",
+      "eligible_exceeds_amount": "La part éligible ne peut pas dépasser le montant",
+      "allocation_not_found": "Poste de coût introuvable"
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Bu tadbir boʻyicha ishlar {start} sanasida, yaʼni ariza {filed} sanasida topshirilishidan oldin boshlangan. Tadbir boshlangach, aksariyat dasturlar hech narsani moliyalashtirmaydi",
+      "unevidenced": "Ishlar muddatidan oldin, {start} sanasida boshlangan. Arizada idora bunga ruxsat bergani qayd etilgan, lekin yozma ruxsat koʻrsatilmagan",
+      "evidence": "Ishni muddatidan oldin boshlashga berilgan yozma ruxsatning raqamini qayd eting, shunda tekshiruvda arizaning oʻzi dalil boʻladi",
+      "suggestion": "Yana mablagʻ sarflashdan oldin dastur shartlarini tekshiring. Muddatidan oldin boshlashga yozma ruxsat berilgan boʻlsa, uni qayd eting; berilmagan boʻlsa, ariza keyingi bosqichga oʻtishidan oldin idoraga murojaat qiling"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Mablagʻ olish {draw} moliyalashtirish davri boshlanadigan {period_start} sanasidan oldingi xarajatlarni oʻz ichiga oladi",
+      "after": "Mablagʻ olish {draw} moliyalashtirish davri tugaydigan {period_end} sanasidan keyingi xarajatlarni oʻz ichiga oladi",
+      "spans": "Mablagʻ olish {draw} moliyalashtirish davridan ({period_start} dan {period_end} gacha) ikkala tomondan ham chiqib ketadi",
+      "suggestion": "Davrdan tashqaridagi xarajatlarni alohida mablagʻ olishga oʻtkazing va ularni idora bilan kelishib oling, bitta soʻrovga ikkalasini yuklamang"
+    },
+    "own_share_is_covered": {
+      "fail": "Dastur {rate} foiz, yaʼni {required} miqdorida oʻz hissasini talab qiladi, arizada esa {recorded} koʻrsatilgan",
+      "suggestion": "Topshirishdan oldin oʻz hissasining qolgan qismi qayerdan kelishini koʻrsating, chunki dastur uni loyihaning umumiy qiymatidan emas, hisobga olinadigan xarajat bazasidan hisoblaydi"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Bu loyihadagi {count} ta ariza birgalikda hisobga olinadigan xarajatlarning {intensity} foizini tashkil qiladi, bu ularning dasturlari ichida eng qatʼiysi belgilagan {cap} foizlik chegaradan yuqori",
+      "suggestion": "Davlat moliyalashtiruvi dasturlar va hokimiyat darajalari boʻylab jamlanadi. Soʻralgan summalardan birini kamaytiring yoki tadbirlarni har biri oʻz xarajatlariga ega boʻladigan qilib ajratish mumkinligini soʻrang"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Moliyalashtirish davri {period_end} sanasida tugagan, ammo yakuniy sarflanish hisoboti hali boshlanmagan",
+      "late": "Yakuniy sarflanish hisoboti {due} sanasigacha topshirilishi kerak edi, u {submitted} sanasida topshirilgan",
+      "overdue": "Yakuniy sarflanish hisoboti {due} sanasigacha topshirilishi kerak edi, lekin hali topshirilmagan",
+      "suggestion": "Hammasi toʻliq boʻlishini kutmasdan, bor narsani topshiring. Aksariyat idoralar soʻrov boʻyicha muddatni uzaytiradi, oʻtib ketgan muddatni esa hech biri uzaytirmaydi"
+    },
+    "errors": {
+      "application_not_found": "Ariza topilmadi",
+      "programme_code_taken": "Bu mamlakatda shu havolaga ega dastur allaqachon mavjud",
+      "programme_not_found": "Dastur topilmadi",
+      "programme_has_applications": "Bu dasturda arizalar bor, shuning uchun uni oʻchirib boʻlmaydi. Uning oʻrniga dasturni yoping.",
+      "application_code_taken": "Bu loyihada shu havolaga ega ariza allaqachon mavjud",
+      "approved_application_not_deletable": "Tasdiqlangan arizani oʻchirib boʻlmaydi. Uning oʻrniga holatini “Qaytarib olingan” yoki “Yopiq” deb oʻzgartiring.",
+      "approval_needs_period_end": "Tasdiqlash uchun moliyalashtirish davrining tugash sanasi kerak, chunki keyingi barcha muddatlar shu sanadan hisoblanadi",
+      "draw_needs_approval": "Mablagʻni faqat tasdiqlangan ariza boʻyicha olish mumkin",
+      "draw_not_found": "Mablagʻ olish soʻrovi topilmadi",
+      "paid_draw_not_deletable": "Toʻlangan mablagʻ olish soʻrovini oʻchirib boʻlmaydi",
+      "proof_not_found": "Sarflanish hisoboti topilmadi",
+      "obligation_not_found": "Majburiyat topilmadi",
+      "eligible_exceeds_amount": "Hisobga olinadigan summa umumiy summadan oshmasligi kerak",
+      "allocation_not_found": "Xarajat taqsimoti topilmadi"
+    }
+  }
+}

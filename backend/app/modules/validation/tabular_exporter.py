@@ -247,6 +247,13 @@ def report_to_xlsx(report: Any) -> bytes:
     for c_idx, head in enumerate(headers, start=1):
         ws.column_dimensions[get_column_letter(c_idx)].width = widths.get(head, 18)
     ws.freeze_panes = ws.cell(row=header_row + 1, column=1).coordinate
+    # Company letterhead above the title block; a no-op without a company
+    # profile. No title of its own: the sheet already opens with one.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(ws)
 
     buffer = io.BytesIO()
     wb.save(buffer)

@@ -89,11 +89,11 @@ async def _on_submittal_deleted(event: Event) -> None:
     await _delete_submittal_vector(event)
 
 
-event_bus.subscribe("submittal.created", _on_submittal_created)
-event_bus.subscribe("submittal.updated", _on_submittal_updated)
-event_bus.subscribe("submittal.deleted", _on_submittal_deleted)
+event_bus.subscribe_once("submittal.created", _on_submittal_created)
+event_bus.subscribe_once("submittal.updated", _on_submittal_updated)
+event_bus.subscribe_once("submittal.deleted", _on_submittal_deleted)
 # Workflow transitions (submit / review / approve) change the embedded
 # status, so reindex on those too.
-event_bus.subscribe("submittal.submitted", _on_submittal_updated)
-event_bus.subscribe("submittal.reviewed", _on_submittal_updated)
-event_bus.subscribe("submittal.approved", _on_submittal_updated)
+event_bus.subscribe_once("submittal.submitted", _on_submittal_updated)
+event_bus.subscribe_once("submittal.reviewed", _on_submittal_updated)
+event_bus.subscribe_once("submittal.approved", _on_submittal_updated)

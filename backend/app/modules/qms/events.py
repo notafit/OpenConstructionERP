@@ -315,17 +315,17 @@ def register_subscribers() -> None:
     """Idempotently subscribe QMS handlers to upstream events."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("hse.capa.completed", _on_hse_capa_completed)
-    event_bus.subscribe(
+    event_bus.subscribe_once("hse.capa.completed", _on_hse_capa_completed)
+    event_bus.subscribe_once(
         "hse.capa.root_cause_recorded",
         _on_hse_incident_root_cause,
     )
-    event_bus.subscribe("qms.ncr.raised", _on_ncr_raised_fanout)
-    event_bus.subscribe(
+    event_bus.subscribe_once("qms.ncr.raised", _on_ncr_raised_fanout)
+    event_bus.subscribe_once(
         "qms.inspection.hold_point_failed",
         _on_hold_point_failed,
     )
-    event_bus.subscribe(
+    event_bus.subscribe_once(
         "qms.inspection.approval_requested",
         _on_inspection_approval_requested,
     )

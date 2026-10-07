@@ -56,6 +56,7 @@ import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
+import { usePreferencesStore } from '@/stores/usePreferencesStore';
 import { todayLocalISO } from '@/shared/lib/dates';
 import { useWeekStartsOn, type WeekStartsOn } from '@/shared/lib/weekStart';
 import {
@@ -99,7 +100,7 @@ import { SignaturePad } from './SignaturePad';
 import { fieldreportsGuide } from './fieldreportsGuide';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildFieldReportsInsights } from './fieldReportsInsights';
-import { fmtList, getIntlLocale } from '@/shared/lib/formatters';
+import { fmtFixed, fmtList, getIntlLocale } from '@/shared/lib/formatters';
 
 declare global {
   interface Window {
@@ -216,6 +217,7 @@ export function FieldReportsPage() {
   const addToast = useToastStore((s) => s.addToast);
   const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
   const activeProjectName = useProjectContextStore((s) => s.activeProjectName);
+  const isImperialPage = usePreferencesStore((s) => s.measurementSystem) === 'imperial';
 
   const projectId = activeProjectId ?? '';
   const { confirm, ...confirmProps } = useConfirm();
@@ -900,7 +902,7 @@ export function FieldReportsPage() {
                             })}
                             {report.temperature_c != null && (
                               <span className="text-content-tertiary">
-                                {report.temperature_c}&deg;C
+                                {isImperialPage ? Math.round(report.temperature_c * 9 / 5 + 32) : report.temperature_c}&deg;{isImperialPage ? 'F' : 'C'}
                               </span>
                             )}
                           </span>
@@ -1414,6 +1416,8 @@ function ReportModal({
 }) {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
+  const measurementSystem = usePreferencesStore((s) => s.measurementSystem);
+  const isImperial = measurementSystem === 'imperial';
 
   // A report created mid-session purely so attachments can be added before
   // the user's first explicit Save (the attachments API needs a report id).
@@ -1436,7 +1440,18 @@ function ReportModal({
   const [weatherCondition, setWeatherCondition] = useState<WeatherCondition>(
     seed.weatherCondition,
   );
-  const [temperatureC, setTemperatureC] = useState<string>(seed.temperatureC);
+  // Temperature is stored as Celsius in the backend. For imperial users
+  // we convert the display value to Fahrenheit and convert back on save.
+  const cToF = (c: number) => Math.round(c * 9 / 5 + 32);
+  const fToC = (f: number) => Math.round((f - 32) * 5 / 9);
+  const seedTempDisplay = seed.temperatureC && isImperial
+    ? String(cToF(parseFloat(seed.temperatureC)))
+    : seed.temperatureC;
+  const [temperatureDisplay, setTemperatureDisplay] = useState<string>(seedTempDisplay);
+  // Derived Celsius value for saving — always convert back from display.
+  const temperatureC = isImperial && temperatureDisplay
+    ? String(fToC(parseFloat(temperatureDisplay)))
+    : temperatureDisplay;
   const [windSpeed, setWindSpeed] = useState(seed.windSpeed);
   const [precipitation, setPrecipitation] = useState(seed.precipitation);
   const [humidity, setHumidity] = useState<string>(seed.humidity);
@@ -1544,14 +1559,27 @@ function ReportModal({
             return;
           }
           setWeatherCondition(weatherConditionFromDescription(wx.description, wx.icon));
-          if (wx.temperature_c != null) setTemperatureC(String(Math.round(wx.temperature_c)));
+          if (wx.temperature_c != null) {
+            const displayTemp = isImperial ? cToF(wx.temperature_c) : Math.round(wx.temperature_c);
+            setTemperatureDisplay(String(displayTemp));
+          }
           if (wx.humidity_pct != null) setHumidity(String(Math.round(wx.humidity_pct)));
           if (wx.wind_speed_ms != null) {
-            const kmh = Math.round(wx.wind_speed_ms * 3.6);
-            setWindSpeed(`${kmh} km/h${wx.wind_direction ? ` ${wx.wind_direction}` : ''}`);
+            if (isImperial) {
+              const mph = Math.round(wx.wind_speed_ms * 2.237);
+              setWindSpeed(`${mph} mph${wx.wind_direction ? ` ${wx.wind_direction}` : ''}`);
+            } else {
+              const kmh = Math.round(wx.wind_speed_ms * 3.6);
+              setWindSpeed(`${kmh} km/h${wx.wind_direction ? ` ${wx.wind_direction}` : ''}`);
+            }
           }
           if (wx.precipitation_mm != null && wx.precipitation_mm > 0) {
-            setPrecipitation(`${wx.precipitation_mm} mm`);
+            if (isImperial) {
+              const inches = fmtFixed(wx.precipitation_mm / 25.4, 2);
+              setPrecipitation(`${inches} in`);
+            } else {
+              setPrecipitation(`${wx.precipitation_mm} mm`);
+            }
           }
           addToast({
             type: 'success',
@@ -1973,11 +2001,11 @@ function ReportModal({
             ))}
           </select>
         </WideModalField>
-        <WideModalField label={t('fieldreports.temperature', { defaultValue: 'Temp (\u00B0C)' })}>
+        <WideModalField label={t(isImperial ? 'fieldreports.temperature_f' : 'fieldreports.temperature', { defaultValue: isImperial ? 'Temp (\u00B0F)' : 'Temp (\u00B0C)' })}>
           <input
             type="number"
-            value={temperatureC}
-            onChange={(e) => setTemperatureC(e.target.value)}
+            value={temperatureDisplay}
+            onChange={(e) => setTemperatureDisplay(e.target.value)}
             placeholder="--"
             className={inputCls}
           />

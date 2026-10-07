@@ -30,8 +30,12 @@ MANIFEST = PartnerPackManifest(
     default_currency="EUR",
     default_tax_template="nl_btw_21",
     default_methodology="netherlands",
-    validation_rule_packs=[],
-    # No Dutch-specific engine rule set implemented yet.
+    validation_rule_packs=[
+        "bouwbesluit_2012",
+        "nen_standards",
+        "raw_systematiek",
+        "stabu",
+    ],
     validation_rule_sets=[],
     default_modules=[],  # empty = show all
     hidden_modules=[],

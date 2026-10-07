@@ -28,6 +28,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from app.core.pdf_branding import branded_doc_metadata, branded_header_logo, branded_letterhead
 from app.core.pdf_fonts import BODY_FONT, BOLD_FONT, pdf_style_for_text, register_pdf_fonts
 
 # Register the bundled Unicode (DejaVu) faces so Cyrillic / Greek / accented
@@ -74,6 +75,9 @@ def _styles() -> dict[str, ParagraphStyle]:
             parent=base["Normal"],
             fontName=BOLD_FONT,
             fontSize=20,
+            # Normal's 12pt leading under a 20pt face drew the project name
+            # through the lower half of the title.
+            leading=24,
             textColor=colors.HexColor("#0f172a"),
             spaceAfter=4,
         ),
@@ -166,6 +170,7 @@ def render_cover_pdf(summary: dict[str, Any]) -> bytes:
         topMargin=18 * mm,
         bottomMargin=18 * mm,
         title="Closeout package",
+        **branded_doc_metadata(),
     )
 
     pct = int(summary.get("completeness_pct", 0) or 0)
@@ -257,5 +262,15 @@ def render_cover_pdf(summary: dict[str, Any]) -> bytes:
         for gap in gaps:
             story.append(_safe_para(f"- {gap}", styles["gap"]))
 
-    doc.build(story)
+    # The frame pads 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(doc.width - 12, doc_type="closeout_cover")
+    if letterhead is not None:
+        story.insert(0, letterhead)
+
+    def _first_page(canvas: Any, page_doc: Any) -> None:
+        # A letterhead already carries the logo; the header copy would print it twice.
+        if letterhead is None:
+            branded_header_logo(canvas, page_doc)
+
+    doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
     return buf.getvalue()

@@ -7,11 +7,11 @@ Defines create, update, and response schemas for documents.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.validation.schemas import ValidationResultItem
 
@@ -255,6 +255,40 @@ class SheetUpdate(BaseModel):
     scale: str | None = Field(default=None, max_length=50)
     is_current: bool | None = None
     metadata: dict[str, Any] | None = None
+
+    @field_validator("sheet_number", "sheet_title", "discipline", "revision", "scale", mode="after")
+    @classmethod
+    def _blank_is_unset(cls, value: str | None) -> str | None:
+        """A field cleared in the edit form is stored as unset, not as "".
+
+        An empty sheet number would otherwise be a value two sheets could stack
+        on, and an empty revision one the order comparison would have to rank.
+        """
+        return value or None
+
+    @field_validator("revision_date", mode="after")
+    @classmethod
+    def _date_is_utc(cls, value: datetime | None) -> datetime | None:
+        """A bare date from the edit form ("2025-03-12") is that day at midnight UTC."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+
+
+class SheetRereadSummary(BaseModel):
+    """What re-reading a project's title blocks from the stored drawings changed."""
+
+    sheets_checked: int = Field(description="Sheets of the project that were considered.")
+    sheets_updated: int = Field(description="Sheets with at least one field changed by the re-read.")
+    fields_updated: int = Field(description="Fields changed across all sheets, discipline included.")
+    files_missing: int = Field(description="Sheets left as they were because their PDF could not be read.")
+    current_conflicts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of sheets made current or superseded by hand whose corrected revisions say otherwise. "
+            "The hand setting was kept; the sheet needs a look."
+        ),
+    )
 
 
 class SheetResponse(BaseModel):
@@ -621,3 +655,89 @@ class FolderPermissionResponse(BaseModel):
     # Pre-joined for the modal so it doesn't have to make N member lookups.
     user_email: str | None = None
     user_full_name: str | None = None
+
+
+class DocumentReferenceItem(BaseModel):
+    """One module's remaining hold on a document, with how many rows hold it."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    key: str
+    module: str
+    model: str
+    #: ``strands`` (NOT NULL, the row cannot record the loss), ``unlinks``
+    #: (nullable or a JSON array element, the row survives without it) or
+    #: ``retains`` (audit and preserved copies, meant to outlive the document).
+    impact: str
+    count: int
+
+
+class DocumentReferencesResponse(BaseModel):
+    """What still points at a document, for the delete confirmation.
+
+    Purely informational. The delete endpoint does not consult this and is
+    not blocked by it: several of these links are documented as deliberately
+    severable, so the decision belongs to the person confirming.
+    """
+
+    document_id: UUID
+    total: int = 0
+    strands: int = 0
+    unlinks: int = 0
+    retains: int = 0
+    references: list[DocumentReferenceItem] = Field(default_factory=list)
+
+
+#: Same ceiling as :class:`app.core.bulk_ops.BulkDeleteRequest`, so anything
+#: the batch delete accepts can be checked first in one call.
+_BATCH_MAX_IDS = 2000
+
+
+class DocumentBatchReferencesRequest(BaseModel):
+    """Documents a bulk delete is about to remove."""
+
+    ids: list[UUID] = Field(..., min_length=1, max_length=_BATCH_MAX_IDS)
+
+
+class DocumentBatchReferencesResponse(BaseModel):
+    """What still points at any document in a batch, for the bulk delete prompt.
+
+    The totals and ``references`` cover the whole batch so the prompt can say
+    what the whole delete costs in one panel. They count rows, each once: a
+    meeting holding two of the selected documents is one record, counted under
+    one reference key (the heaviest impact that reaches it), so ``references``
+    adds up to ``total``. ``documents`` keeps the per-document answer (only
+    documents something points at), which counts links exactly as the single
+    endpoint does, so a caller can name the files responsible. ``checked`` is how many of the requested ids
+    the caller may read and were looked at; ids outside it are neither counted
+    nor named, so the answer never says more than reading those documents
+    would.
+    """
+
+    checked: int = 0
+    referenced_documents: int = 0
+    total: int = 0
+    strands: int = 0
+    unlinks: int = 0
+    retains: int = 0
+    references: list[DocumentReferenceItem] = Field(default_factory=list)
+    documents: list[DocumentReferencesResponse] = Field(default_factory=list)
+
+    @property
+    def severs(self) -> int:
+        """Rows the delete would strand or unlink, the ones that lose something."""
+        return self.strands + self.unlinks
+
+
+class DocumentBatchDeleteRequest(BaseModel):
+    """IDs to delete, plus the caller's word that the references were seen.
+
+    ``acknowledge_references`` defaults to false. A batch where any document is
+    still pointed at by a row that would be stranded or unlinked is refused
+    with 409 and the references report until the caller sends it as true,
+    the server-side form of the confirmation the single-document prompt asks
+    of the person.
+    """
+
+    ids: list[UUID] = Field(..., min_length=1, max_length=_BATCH_MAX_IDS)
+    acknowledge_references: bool = False

@@ -187,6 +187,7 @@ _AUTHENTICATION_ENDPOINTS = (
 #: Reads that post a body because the query does not fit in a URL. Refusing
 #: these would put a refusal dialog behind the Search button.
 _READ_ONLY_ENDPOINTS = (
+    "app.modules.boq.router:list_boqs_by_projects",
     "app.modules.boq.router:search_cost_items",
     "app.modules.boq.router:suggest_rate",
     "app.modules.boq.router:suggest_prerequisites",
@@ -212,10 +213,12 @@ _READ_ONLY_ENDPOINTS = (
 #: uses - an HTTPException is not a thing a WebSocket close can express - so a
 #: refused socket reaches the browser as close code 1008 and a short reason,
 #: and our own screen never gets the chance to explain itself. Measured on the
-#: two clients we ship, neither of which reconnects: the notifications hook has
-#: no close handler at all and degrades quietly to React Query polling, and the
-#: presence hook sets its status to closed while the indicator renders an empty
-#: roster, which a visitor cannot tell apart from nobody else being here. So a
+#: three clients we ship, none of which reconnects: the notifications hook has
+#: no close handler at all and degrades quietly to React Query polling, the
+#: collaboration-lock presence hook sets its status to closed while the
+#: indicator renders an empty roster, and the global-presence hook degrades
+#: the same way. A visitor cannot tell any of them apart from nobody else
+#: being here. So a
 #: socket left out of this list does not fail loudly anywhere a user or an
 #: operator is looking. It just stops working on the demo and stays green
 #: everywhere else.
@@ -227,6 +230,7 @@ _READ_ONLY_ENDPOINTS = (
 _READ_ONLY_SOCKET_ENDPOINTS = (
     "app.modules.notifications.router:notifications_ws",
     "app.modules.collaboration_locks.router:presence_ws",
+    "app.modules.global_presence.router:global_presence_ws",
 )
 
 #: The resolved allowlist. Public so a test can assert against it and so the
@@ -328,7 +332,7 @@ async def demo_read_only_guard(connection: HTTPConnection) -> AsyncGenerator[Non
     WebSocket handshakes are refused here too, and they are default-deny like
     everything else: a socket carries no method, so there is nothing to key a
     safe-versus-unsafe decision on, and the only honest reading of "no method"
-    is "not known to be safe". The two sockets a visitor needs are named in
+    is "not known to be safe". The three sockets a visitor needs are named in
     :data:`_READ_ONLY_SOCKET_ENDPOINTS` and everything else is closed with 1008.
 
     This is what keeps sockets at the same depth as the rest of the module.

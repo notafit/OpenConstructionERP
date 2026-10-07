@@ -11,8 +11,28 @@ import { normalizePackLocale } from '../i18n';
 describe('normalizePackLocale', () => {
   it('strips the region subtag when the UI does not ship that region', () => {
     expect(normalizePackLocale('fr-CA')).toBe('fr'); // batimatech-ca
-    expect(normalizePackLocale('en-AU')).toBe('en'); // aus
-    expect(normalizePackLocale('en-NZ')).toBe('en'); // nzs
+  });
+
+  it('gives English of a day-first region the British entry, not the month-first one', () => {
+    // The unqualified entry prints 3/14/2026. An Australian, Irish or Indian
+    // pack stripped to it read 3/4/2026 as the fourth of March.
+    expect(normalizePackLocale('en-AU')).toBe('en-GB'); // aus
+    expect(normalizePackLocale('en-NZ')).toBe('en-GB'); // nzs
+    expect(normalizePackLocale('en-IE')).toBe('en-GB'); // ireland-ie
+    expect(normalizePackLocale('en-IN')).toBe('en-GB'); // india-cpwd
+    expect(normalizePackLocale('en-CA')).toBe('en'); // canada-ca: not day-first
+  });
+
+  it('prints the day first for a day-first pack, which the unqualified entry does not', () => {
+    const fourteenthOfMarch = new Date(2026, 2, 14);
+    const format = (tag: string) =>
+      new Intl.DateTimeFormat(normalizePackLocale(tag), { year: 'numeric', month: '2-digit', day: '2-digit' }).format(
+        fourteenthOfMarch,
+      );
+    expect(format('en-AU')).toBe('14/03/2026');
+    expect(format('en-IE')).toBe('14/03/2026');
+    // The control: what the Australian pack printed before.
+    expect(format('en')).toBe('03/14/2026');
   });
 
   it('keeps the region when the UI ships it, because the pack asked for it', () => {
@@ -34,9 +54,13 @@ describe('normalizePackLocale', () => {
 
   it('passes through base codes the UI ships', () => {
     expect(normalizePackLocale('de')).toBe('de'); // bimhessen-de, doker-formwork
-    expect(normalizePackLocale('pt')).toBe('pt'); // Portugal, no pack of its own
+    expect(normalizePackLocale('pt')).toBe('pt'); // portugal-pt
     expect(normalizePackLocale('ar')).toBe('ar'); // saudi-vision2030 (RTL)
-    expect(normalizePackLocale('en')).toBe('en'); // india-cpwd, modular-prefab
+    expect(normalizePackLocale('en')).toBe('en'); // modular-prefab
+    // hungary-hu. The pack declared English while no Hungarian interface
+    // shipped; it declares hu now, and hu has to answer with itself or the
+    // pack is back to promising a language it cannot deliver.
+    expect(normalizePackLocale('hu')).toBe('hu');
   });
 
   it('is case-insensitive and trims', () => {

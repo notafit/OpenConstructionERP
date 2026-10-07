@@ -3,8 +3,9 @@
 //
 // "How it works" guide content for the Project Files module. Co-located
 // with the FileManagerPage. Every key carries an inline English default
-// and is consumed via t(key, { defaultValue }). These keys are NOT added
-// to en.ts or any locale file by design (inline defaults only).
+// and is consumed via t(key, { defaultValue }). The keys are not in en.ts,
+// the inline defaults are the English source; their translations live in the
+// other locale files, so a changed default needs its translations redone too.
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

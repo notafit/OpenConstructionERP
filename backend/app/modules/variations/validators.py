@@ -48,6 +48,12 @@ from app.core.validation.engine import (
 )
 from app.core.validation.messages import translate
 
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, so two findings on one screen cannot disagree
+# about what an amount looks like. Importing it registers nothing.
+from app.core.validation.rules import _fmt_money
+
 logger = logging.getLogger(__name__)
 
 #: Rule set name callers pass to ``ValidationEngine.validate``.
@@ -161,6 +167,11 @@ class VariationBOQTotalMatchesEstimate(ValidationRule):
             return []
         headline = _decimal(data.get("estimated_cost_impact"))
         priced = _decimal(data.get("grand_total"))
+        # The bill's own currency, and only because the mixed-currency guard
+        # above has already returned: with one bill in two currencies there is
+        # no single code that is true of both figures, and writing either would
+        # state something the data does not say.
+        currency = str(data.get("base_currency") or "").strip()
         passed = abs(headline - priced) < _MONEY_EPSILON
         return [
             RuleResult(
@@ -175,8 +186,8 @@ class VariationBOQTotalMatchesEstimate(ValidationRule):
                     else translate(
                         "variations.boq_total_matches_estimate.fail",
                         locale=locale,
-                        estimate=format(headline, "f"),
-                        priced=format(priced, "f"),
+                        estimate=_fmt_money(headline, currency),
+                        priced=_fmt_money(priced, currency),
                     )
                 ),
                 element_ref=str(data.get("variation_request_id") or ""),

@@ -19,6 +19,7 @@ Module-bridge endpoints (see app.modules.contacts.bridge):
     GET    /{contact_id}/module-rows       - List all module rows linked
 """
 
+import asyncio
 import csv
 import io
 import logging
@@ -489,8 +490,12 @@ def _match_contact_column(header: str) -> str | None:
     return None
 
 
-def _parse_contact_rows_from_csv(content_bytes: bytes) -> list[dict[str, Any]]:
-    """Parse rows from a CSV file for contact import."""
+def _parse_contact_rows_from_csv(content_bytes: bytes) -> list[tuple[int, dict[str, Any]]]:
+    """Parse a CSV file for contact import into ``(row number, row)`` pairs.
+
+    The number is the row a spreadsheet shows for the record, blank rows
+    counted, so an import error points at the right line.
+    """
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             text = content_bytes.decode(encoding)
@@ -517,30 +522,38 @@ def _parse_contact_rows_from_csv(content_bytes: bytes) -> list[dict[str, Any]]:
         if canonical:
             column_map[idx] = canonical
 
-    rows: list[dict[str, Any]] = []
-    for raw_row in reader:
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, raw_row in enumerate(reader, start=2):
         row: dict[str, Any] = {}
         for idx, val in enumerate(raw_row):
             canonical = column_map.get(idx)
             if canonical:
                 row[canonical] = val.strip() if isinstance(val, str) else val
         if row:
-            rows.append(row)
+            rows.append((row_number, row))
 
     return rows
 
 
-def _parse_contact_rows_from_excel(content_bytes: bytes) -> list[dict[str, Any]]:
-    """Parse rows from an Excel (.xlsx) file for contact import."""
+def _parse_contact_rows_from_excel(content_bytes: bytes) -> list[tuple[int, dict[str, Any]]]:
+    """Parse an Excel (.xlsx) file for contact import into ``(row number, row)`` pairs.
+
+    The header is row 1, or the table's header under a company letterhead
+    when the file is one of our own exports (see ``app.core.sheet_header``).
+    The number is the sheet's own row number, so an import error points at
+    the right row either way.
+    """
     from openpyxl import load_workbook
+
+    from app.core.sheet_header import find_header_row
 
     wb = load_workbook(io.BytesIO(content_bytes), read_only=True, data_only=True)
     ws = wb.active
     if ws is None:
         raise ValueError("Excel file has no worksheets")
 
-    rows_iter = ws.iter_rows(values_only=True)
-    raw_headers = next(rows_iter, None)
+    header = find_header_row(ws.iter_rows(values_only=True), _match_contact_column)
+    raw_headers = header.values
     if not raw_headers:
         raise ValueError("Excel file is empty or has no header row")
 
@@ -551,15 +564,15 @@ def _parse_contact_rows_from_excel(content_bytes: bytes) -> list[dict[str, Any]]
             if canonical:
                 column_map[idx] = canonical
 
-    rows: list[dict[str, Any]] = []
-    for raw_row in rows_iter:
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, raw_row in enumerate(header.rows, start=header.number + 1):
         row: dict[str, Any] = {}
         for idx, val in enumerate(raw_row):
             canonical = column_map.get(idx)
             if canonical and val is not None:
                 row[canonical] = val
         if row:
-            rows.append(row)
+            rows.append((row_number, row))
 
     wb.close()
     return rows
@@ -641,7 +654,7 @@ async def import_contacts_file(
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No data rows found in file. Check that the first row contains column headers.",
+            detail="No data rows found in file. Check that the header row names the columns.",
         )
 
     # Convert rows to ContactCreate objects and import
@@ -649,7 +662,7 @@ async def import_contacts_file(
     skipped = 0
     errors: list[dict[str, Any]] = []
 
-    for row_idx, row in enumerate(rows, start=2):
+    for row_idx, row in rows:
         try:
             company_name = str(row.get("company_name", "")).strip()
             first_name = str(row.get("first_name", "")).strip() or None
@@ -766,44 +779,13 @@ async def import_contacts_file(
 # ── Export contacts as Excel ─────────────────────────────────────────────────
 
 
-@router.get(
-    "/export/",
-    summary="Export contacts as Excel",
-    description="Download all active contacts as an Excel (.xlsx) file.",
-    response_description="Excel file stream (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)",
-)
-async def export_contacts(
-    session: SessionDep,
-    user_id: CurrentUserId,
-    _perm: None = Depends(RequirePermission("contacts.read")),
-) -> StreamingResponse:
-    """Export the caller's active contacts as an Excel file.
+def _render_contacts_xlsx(rows: list[tuple[Any, ...]]) -> io.BytesIO:
+    """Write the contacts export from rows already read from the database.
 
-    Mirrors the tenant-scope filter used by ``list_contacts`` /
-    ``search_contacts`` / ``get_stats`` - admins see every row, everyone
-    else only sees contacts whose ``tenant_id`` matches their user id (with
-    a ``created_by`` fallback for pre-v2.3.1 rows). The earlier
-    implementation ran a plain ``select(Contact).where(is_active)`` with no
-    owner filter and exported every tenant's data to anyone with the
-    ``contacts.read`` permission.
+    Pure: it touches no session, so the route runs it in a worker thread.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Font
-
-    stmt = select(Contact).where(Contact.is_active.is_(True))
-    if not await _is_admin(session, user_id):
-        caller = str(user_id)
-        stmt = stmt.where(
-            or_(
-                Contact.tenant_id == caller,
-                and_(
-                    Contact.tenant_id.is_(None),
-                    Contact.created_by == caller,
-                ),
-            )
-        )
-    result = await session.execute(stmt.limit(50000))
-    items = result.scalars().all()
 
     wb = Workbook()
     ws = wb.active
@@ -825,21 +807,77 @@ async def export_contacts(
         cell = ws.cell(row=1, column=i, value=h)
         cell.font = Font(bold=True)
 
-    for row_idx, item in enumerate(items, 2):
-        ws.cell(row=row_idx, column=1, value=item.company_name)
-        ws.cell(row=row_idx, column=2, value=item.first_name)
-        ws.cell(row=row_idx, column=3, value=item.last_name)
-        ws.cell(row=row_idx, column=4, value=item.contact_type)
-        ws.cell(row=row_idx, column=5, value=item.primary_email)
-        ws.cell(row=row_idx, column=6, value=item.primary_phone)
-        ws.cell(row=row_idx, column=7, value=item.country_code)
-        ws.cell(row=row_idx, column=8, value=item.vat_number)
-        ws.cell(row=row_idx, column=9, value=item.prequalification_status)
-        ws.cell(row=row_idx, column=10, value=item.payment_terms_days)
+    for row_idx, row in enumerate(rows, 2):
+        for col_idx, value in enumerate(row, 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    # Company letterhead above the table; a no-op without a company profile.
+    # The importer finds the header under it, so the file re-imports as is.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(ws, title=ws.title)
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
+    return output
+
+
+@router.get(
+    "/export/",
+    summary="Export contacts as Excel",
+    description="Download all active contacts as an Excel (.xlsx) file.",
+    response_description="Excel file stream (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)",
+)
+async def export_contacts(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("contacts.read")),
+) -> StreamingResponse:
+    """Export the caller's active contacts as an Excel file.
+
+    Mirrors the tenant-scope filter used by ``list_contacts`` /
+    ``search_contacts`` / ``get_stats`` - admins see every row, everyone
+    else only sees contacts whose ``tenant_id`` matches their user id (with
+    a ``created_by`` fallback for pre-v2.3.1 rows). The earlier
+    implementation ran a plain ``select(Contact).where(is_active)`` with no
+    owner filter and exported every tenant's data to anyone with the
+    ``contacts.read`` permission.
+    """
+    stmt = select(Contact).where(Contact.is_active.is_(True))
+    if not await _is_admin(session, user_id):
+        caller = str(user_id)
+        stmt = stmt.where(
+            or_(
+                Contact.tenant_id == caller,
+                and_(
+                    Contact.tenant_id.is_(None),
+                    Contact.created_by == caller,
+                ),
+            )
+        )
+    result = await session.execute(stmt.limit(50000))
+    rows = [
+        (
+            item.company_name,
+            item.first_name,
+            item.last_name,
+            item.contact_type,
+            item.primary_email,
+            item.primary_phone,
+            item.country_code,
+            item.vat_number,
+            item.prequalification_status,
+            item.payment_terms_days,
+        )
+        for item in result.scalars().all()
+    ]
+
+    # Up to 50 000 contacts written cell by cell is pure CPU, so the workbook
+    # is built in a worker thread rather than on the event loop.
+    output = await asyncio.to_thread(_render_contacts_xlsx, rows)
 
     return StreamingResponse(
         output,
@@ -1127,7 +1165,7 @@ async def convert_contact_to_lead(
         from app.modules.property_dev.models import Development, Lead
     except ImportError as exc:  # pragma: no cover - install guard
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Property Development module not installed.",
         ) from exc
 
@@ -1221,7 +1259,7 @@ async def convert_contact_to_buyer(
         from app.modules.property_dev.models import Buyer, Development, Plot
     except ImportError as exc:  # pragma: no cover
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Property Development module not installed.",
         ) from exc
 

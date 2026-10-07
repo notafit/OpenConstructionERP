@@ -281,8 +281,8 @@ function HistogramTab({ projectId }: { projectId: string }) {
 
   return (
     <div className="space-y-4">
-      {/* Controls */}
-      <Card padding="md">
+      {/* Controls - z-10 so the SearchableSelect popover paints above the histogram card */}
+      <div className="relative z-10"><Card padding="md">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <div className="lg:col-span-2">
             <label htmlFor="res-histo-resource" className={labelCls}>
@@ -378,7 +378,7 @@ function HistogramTab({ projectId }: { projectId: string }) {
             })}
           </p>
         )}
-      </Card>
+      </Card></div>
 
       {/* Histogram */}
       {resourcesQ.isError ? (

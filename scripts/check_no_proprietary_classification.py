@@ -149,6 +149,17 @@ _ALLOWED_NOMINATIVE: dict[str, frozenset[str]] = {
     # must not be rewritten. An earlier wave read it as an unlicensed claim and
     # rewrote it; the entry exists so that cannot happen a second time.
     "packs/batimatech-ca/": frozenset({"title", "label", "name", "standard", "description"}),
+    # Canada country pack. Its catalogue copy (the PyPI description and the pack
+    # manifest description) lists the standards the pack interoperates with, the same
+    # nominative use as us_pack/manifest.py above. The rule pack is a validation rule
+    # set whose id is the standard's key: its name, standard and description say which
+    # classification it checks, as a validation rule must. Division titles are still
+    # scanned in all three, since only the listed fields are exempt from head 2.
+    "packs/canada-ca/pyproject.toml": frozenset({"description"}),
+    "packs/canada-ca/src/openconstructionerp_canada_ca/manifest.py": frozenset({"description"}),
+    "packs/canada-ca/src/openconstructionerp_canada_ca/rule_packs/masterformat_2020.json": frozenset(
+        {"name", "standard", "description"}
+    ),
     # Pickers and presets: the user chooses a standard and must see which one.
     "frontend/src/features/ai/QuickEstimatePage.tsx": frozenset({"label"}),
     "frontend/src/features/projects/CreateProjectPage.tsx": frozenset({"label"}),

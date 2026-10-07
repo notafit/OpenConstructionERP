@@ -216,6 +216,21 @@ class _StubEVMRepo:
     def __init__(self) -> None:
         self.rows: list[Any] = []
 
+    async def delete_automatic_for_date(self, project_id: uuid.UUID, snapshot_date: str) -> int:
+        """Drop the schedule progress rows of one day, as the real repository does."""
+        keep = [
+            r
+            for r in self.rows
+            if not (
+                r.project_id == project_id
+                and r.snapshot_date == snapshot_date
+                and (r.metadata_ or {}).get("source") == "schedule_progress"
+            )
+        ]
+        dropped = len(self.rows) - len(keep)
+        self.rows = keep
+        return dropped
+
     async def create(self, snapshot: Any) -> Any:
         if getattr(snapshot, "id", None) is None:
             snapshot.id = uuid.uuid4()
@@ -760,11 +775,27 @@ async def test_create_evm_snapshot_zero_pv_spi_is_zero() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_dashboard_returns_invoices_and_budgets() -> None:
+async def test_get_dashboard_returns_invoices_and_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Dashboard aggregates call into repo-level SQL helpers; we wire
     them up directly on the stub repo instances so the calculation
     logic is exercised without a real DB."""
+    from app.modules.finance import cost_position
+
     service = _make_service()
+
+    # Committed, invoiced and paid come from the cost position, which reads
+    # orders, agreements and payments across modules. Stubbed here; the real
+    # read is covered by tests/integration/test_finance_project_cost_position.py.
+    async def _position(*_args: Any, **_kwargs: Any) -> cost_position.CostPosition:
+        return cost_position.CostPosition(
+            committed={"EUR": Decimal("40000")},
+            actual={"EUR": Decimal("12000")},
+            invoiced={"EUR": Decimal("12000")},
+            paid={"EUR": Decimal("15000")},
+            paid_net={"EUR": Decimal("12000")},
+        )
+
+    monkeypatch.setattr(cost_position, "load_cost_position", _position)
 
     async def _inv_agg(
         *, project_id: uuid.UUID | None = None, project_ids: set[uuid.UUID] | None = None
@@ -819,220 +850,210 @@ async def test_get_dashboard_returns_invoices_and_budgets() -> None:
     assert dashboard["total_budget_revised"] == 110_000.0
     assert dashboard["invoices_paid"] == 3
     assert dashboard["budget_warning_level"] == "normal"  # 30/110 ~ 27%
+    assert Decimal(str(dashboard["total_committed"])) == Decimal("40000")
+    assert Decimal(str(dashboard["total_invoiced"])) == Decimal("12000")
+    assert Decimal(str(dashboard["total_paid"])) == Decimal("15000")
+    assert Decimal(str(dashboard["total_actual"])) == Decimal("12000")
 
 
-# ── BUG-346: pay_invoice distributes actuals by (wbs_id, cost_category) ──
+# ── BUG-346: budget rows get each paid amount on ONE line, per bucket ──
+#
+# ``sync_project_budget`` driven over a stub session: the cost position is the
+# real ``build_cost_position`` over the stub invoices, so these pin how the sync
+# applies it to the rows (one line per bucket, a replay changes nothing, typed
+# figures survive, the old recompute's actual is dropped once). The landing
+# rules themselves are pinned in ``test_finance_budget_actuals.py``.
 
 
-class _ExecuteStubSession:
-    """Session stub that satisfies the two ``self.session.execute`` calls
-    in :meth:`FinanceService.pay_invoice`'s recalculation block.
+class _SyncStubSession:
+    """Answers the reads ``sync_project_budget`` makes, by table name."""
 
-    The first execute fetches paid invoices; the second fetches project
-    budgets. We dispatch by the target entity name in the compiled SQL so
-    the stub stays decoupled from SQLAlchemy internals.
-    """
-
-    def __init__(self, paid_invoices: list[Any], budgets: list[Any]) -> None:
-        self.paid_invoices = paid_invoices
+    def __init__(self, budgets: list[Any], *, has_paid_invoice: bool = True) -> None:
         self.budgets = budgets
+        self.has_paid_invoice = has_paid_invoice
 
     async def execute(self, stmt: Any) -> Any:
         target = str(stmt).lower()
+        budgets, paid = self.budgets, self.has_paid_invoice
 
         class _Result:
-            def __init__(self, value: list[Any]) -> None:
-                self._value = value
-
             def scalars(self) -> Any:
-                class _Scalars:
-                    def __init__(self, v: list[Any]) -> None:
-                        self._v = v
+                return SimpleNamespace(all=lambda: list(budgets))
 
-                    def all(self) -> list[Any]:
-                        return self._v
+            def first(self) -> Any:
+                return (uuid.uuid4(),) if paid else None
 
-                return _Scalars(self._value)
+            def all(self) -> list[Any]:
+                return []
 
-        if "oe_finance_invoice" in target and "oe_finance_budget" not in target:
-            return _Result(self.paid_invoices)
-        return _Result(self.budgets)
+        assert "oe_finance_budget" in target or "oe_finance_invoice" in target, target
+        return _Result()
 
-
-def _make_service_with_session(paid_invoices: list[Any], budgets: list[Any]) -> FinanceService:
-    service = _make_service()
-    service.session = _ExecuteStubSession(paid_invoices, budgets)  # type: ignore[assignment]
-    return service
+    async def flush(self) -> None:
+        return None
 
 
 def _make_line_item(*, amount: str, wbs_id: str | None = None, cost_category: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
-        id=uuid.uuid4(),
-        amount=amount,
-        wbs_id=wbs_id,
-        cost_category=cost_category,
-    )
+    return SimpleNamespace(amount=amount, wbs_id=wbs_id, cost_category=cost_category)
 
 
-def _make_paid_invoice(*, project_id: uuid.UUID, amount_total: str, items: list[Any] | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
-        id=uuid.uuid4(),
-        project_id=project_id,
-        status="paid",
-        amount_total=amount_total,
-        invoice_number="INV-TEST",
-        line_items=list(items or []),
-    )
+def _make_paid_invoice(*, amount_total: str, items: list[Any] | None = None) -> SimpleNamespace:
+    # These stubs carry no tax, so the net is the total.
+    return SimpleNamespace(id=uuid.uuid4(), amount_total=amount_total, line_items=list(items or []))
 
 
 def _make_budget_row(
-    *, project_id: uuid.UUID, wbs_id: str | None = None, category: str | None = None
+    *, wbs_id: str | None = None, category: str | None = None, actual: str = "0", metadata: dict | None = None
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(),
-        project_id=project_id,
         wbs_id=wbs_id,
         category=category,
-        actual="0",
+        currency_code="EUR",
+        committed="0",
+        actual=actual,
+        metadata_={"budget_sync": "1"} if metadata is None else metadata,
     )
 
 
-@pytest.mark.asyncio
-async def test_pay_invoice_distributes_actuals_by_category() -> None:
-    """Two budget rows ('material' and 'labor') must receive DIFFERENT
-    actuals pulled from matching invoice-line items — not the combined total."""
-    pid = uuid.uuid4()
+async def _sync(
+    monkeypatch: pytest.MonkeyPatch, invoices: list[Any], budgets: list[Any], *, has_paid_invoice: bool = True
+) -> None:
+    from app.modules.finance import cost_position
 
+    rows = [
+        cost_position.InvoiceRow(
+            id=inv.id,
+            status="paid",
+            currency="EUR",
+            net=Decimal(inv.amount_total),
+            gross=Decimal(inv.amount_total),
+            po_id=None,
+        )
+        for inv in invoices
+    ]
+    lines = {
+        inv.id: [(it.wbs_id, it.cost_category, Decimal(it.amount)) for it in inv.line_items]
+        for inv in invoices
+        if inv.line_items
+    }
+
+    async def _position(*_args: Any, **_kwargs: Any) -> cost_position.CostPosition:
+        return cost_position.build_cost_position([], rows, [], [], [], invoice_lines=lines)
+
+    monkeypatch.setattr(cost_position, "load_cost_position", _position)
+    service = _make_service()
+    service.session = _SyncStubSession(budgets, has_paid_invoice=has_paid_invoice)  # type: ignore[assignment]
+    await service.sync_project_budget(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_pay_invoice_distributes_actuals_by_category(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two budget rows ('material' and 'labor') must receive DIFFERENT
+    actuals pulled from matching invoice-line items - not the combined total."""
     paid_invoice = _make_paid_invoice(
-        project_id=pid,
         amount_total="1000",
         items=[
             _make_line_item(amount="700", cost_category="material"),
             _make_line_item(amount="300", cost_category="labor"),
         ],
     )
-    budget_material = _make_budget_row(project_id=pid, category="material")
-    budget_labor = _make_budget_row(project_id=pid, category="labor")
+    budget_material = _make_budget_row(category="material")
+    budget_labor = _make_budget_row(category="labor")
 
-    service = _make_service_with_session([paid_invoice], [budget_material, budget_labor])
-
-    # Seed an approved invoice and its lookup so pay_invoice can run.
-    approved_invoice = SimpleNamespace(
-        id=uuid.uuid4(),
-        project_id=pid,
-        status="approved",
-        amount_total="1000",
-        invoice_number="INV-SEED",
-        currency_code="EUR",
-    )
-    service.invoices.rows[approved_invoice.id] = approved_invoice  # type: ignore[attr-defined]
-
-    await service.pay_invoice(approved_invoice.id)
+    await _sync(monkeypatch, [paid_invoice], [budget_material, budget_labor])
 
     # Production assigns ``actual`` as a Decimal (MoneyType column expects a
-    # Decimal on the ORM side — BUG-FINANCE-ACT01), so compare numerically.
+    # Decimal on the ORM side - BUG-FINANCE-ACT01), so compare numerically.
     assert Decimal(budget_material.actual) == Decimal("700")
     assert Decimal(budget_labor.actual) == Decimal("300")
 
 
 @pytest.mark.asyncio
-async def test_pay_invoice_unmatched_category_lands_in_catch_all() -> None:
-    """Line items with a cost_category that has NO matching budget row
-    fall through to the ``(None, None)`` bucket if one exists — otherwise
-    they are dropped (logged elsewhere)."""
-    pid = uuid.uuid4()
-
+async def test_pay_invoice_unmatched_category_lands_in_catch_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Line items with a cost_category that has NO matching budget row land
+    on the project-level ``(None, None)`` line. They used to be dropped, so
+    paid money vanished from every budget line."""
     paid_invoice = _make_paid_invoice(
-        project_id=pid,
         amount_total="500",
         items=[_make_line_item(amount="500", cost_category="material")],
     )
-    uncategorized_budget = _make_budget_row(project_id=pid, category=None)
-    # No matching budget row for "material".
+    catch_all = _make_budget_row()
+    labor = _make_budget_row(category="labor")
 
-    service = _make_service_with_session([paid_invoice], [uncategorized_budget])
+    await _sync(monkeypatch, [paid_invoice], [catch_all, labor])
 
-    approved_invoice = SimpleNamespace(
-        id=uuid.uuid4(),
-        project_id=pid,
-        status="approved",
-        amount_total="500",
-        invoice_number="INV-UNMATCHED",
-        currency_code="EUR",
-    )
-    service.invoices.rows[approved_invoice.id] = approved_invoice  # type: ignore[attr-defined]
-
-    await service.pay_invoice(approved_invoice.id)
-
-    # 500 went to the 'material' bucket that has no matching budget; the
-    # catch-all budget (category=None) stays at 0. Production resets every
-    # budget row to ``Decimal("0")`` before assignment, so compare numerically.
-    assert Decimal(uncategorized_budget.actual) == Decimal("0")
+    assert Decimal(catch_all.actual) == Decimal("500")
+    assert Decimal(labor.actual) == Decimal("0")
 
 
 @pytest.mark.asyncio
-async def test_pay_invoice_no_line_items_falls_to_catch_all() -> None:
-    """Invoice without line items — entire amount_total → ``(None, None)`` bucket."""
-    pid = uuid.uuid4()
+async def test_pay_invoice_no_line_items_falls_to_catch_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A headerless invoice lands its whole net on the project-level line."""
+    paid_invoice = _make_paid_invoice(amount_total="2500")
+    catch_all = _make_budget_row()
+    material = _make_budget_row(category="material")
 
-    paid_invoice = _make_paid_invoice(
-        project_id=pid,
-        amount_total="2500",
-        items=[],  # no breakdown
-    )
-    catch_all_budget = _make_budget_row(project_id=pid, wbs_id=None, category=None)
+    await _sync(monkeypatch, [paid_invoice], [material, catch_all])
 
-    service = _make_service_with_session([paid_invoice], [catch_all_budget])
-
-    approved_invoice = SimpleNamespace(
-        id=uuid.uuid4(),
-        project_id=pid,
-        status="approved",
-        amount_total="2500",
-        invoice_number="INV-LUMP",
-        currency_code="EUR",
-    )
-    service.invoices.rows[approved_invoice.id] = approved_invoice  # type: ignore[attr-defined]
-
-    await service.pay_invoice(approved_invoice.id)
-    # Production assigns ``actual`` as a Decimal — compare numerically.
-    assert Decimal(catch_all_budget.actual) == Decimal("2500")
+    assert Decimal(catch_all.actual) == Decimal("2500")
+    assert Decimal(material.actual) == Decimal("0")
 
 
 @pytest.mark.asyncio
-async def test_pay_invoice_does_not_write_total_to_every_budget_row() -> None:
-    """BUG-346 regression guard: two unrelated budget rows must NOT both
-    receive the project grand-total."""
-    pid = uuid.uuid4()
-
+async def test_pay_invoice_does_not_write_total_to_every_budget_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression for BUG-346: three budget rows, one paid invoice of 1000 on
+    'material'. Only the material row may carry it."""
     paid_invoice = _make_paid_invoice(
-        project_id=pid,
         amount_total="1000",
         items=[_make_line_item(amount="1000", cost_category="material")],
     )
-    budget_material = _make_budget_row(project_id=pid, category="material")
-    budget_labor = _make_budget_row(project_id=pid, category="labor")
+    rows = [_make_budget_row(category=c) for c in ("material", "labor", "equipment")]
 
-    service = _make_service_with_session([paid_invoice], [budget_material, budget_labor])
+    await _sync(monkeypatch, [paid_invoice], rows)
 
-    approved_invoice = SimpleNamespace(
-        id=uuid.uuid4(),
-        project_id=pid,
-        status="approved",
+    assert [Decimal(r.actual) for r in rows] == [Decimal("1000"), Decimal("0"), Decimal("0")]
+
+
+@pytest.mark.asyncio
+async def test_a_second_sync_changes_nothing_and_a_typed_actual_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    paid_invoice = _make_paid_invoice(
         amount_total="1000",
-        invoice_number="INV-REGRESSION",
-        currency_code="EUR",
+        items=[_make_line_item(amount="1000", cost_category="material")],
     )
-    service.invoices.rows[approved_invoice.id] = approved_invoice  # type: ignore[attr-defined]
+    material = _make_budget_row(category="material", actual="250")
 
-    await service.pay_invoice(approved_invoice.id)
+    await _sync(monkeypatch, [paid_invoice], [material])
+    await _sync(monkeypatch, [paid_invoice], [material])
 
-    # Production assigns ``actual`` as a Decimal — compare numerically.
-    assert Decimal(budget_material.actual) == Decimal("1000")
-    assert Decimal(budget_labor.actual) == Decimal("0")  # stays zero — the bug would have written 1000 here
+    # 250 typed onto the row, 1000 from the invoice, once.
+    assert Decimal(material.actual) == Decimal("1250")
 
 
-# ── ETC clamp regression (2026-05-21 audit fix #4) ────────────────────────
+@pytest.mark.asyncio
+async def test_the_old_recompute_actual_is_dropped_once_keeping_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row the old paid-invoice recompute wrote: its actual was the paid gross
+    of every invoice (1250 here) plus the receipts (400). The sync keeps the
+    receipts and puts the invoice back at its net, once."""
+    paid_invoice = _make_paid_invoice(
+        amount_total="1000",
+        items=[_make_line_item(amount="1000", cost_category="material")],
+    )
+    material = _make_budget_row(category="material", actual="1650", metadata={"actual_from_receipts": "400"})
+
+    await _sync(monkeypatch, [paid_invoice], [material])
+    await _sync(monkeypatch, [paid_invoice], [material])
+
+    assert Decimal(material.actual) == Decimal("1400")
+
+
+@pytest.mark.asyncio
+async def test_a_row_is_never_reset_in_a_project_nothing_was_paid_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    material = _make_budget_row(category="material", actual="300", metadata={})
+
+    await _sync(monkeypatch, [], [material], has_paid_invoice=False)
+
+    assert Decimal(material.actual) == Decimal("300")
 
 
 @pytest.mark.asyncio
@@ -1203,3 +1224,45 @@ async def test_update_invoice_line_items_replace_logs_audit_row(
     assert md.get("new_count") == 1
     # 200 + 300 = 500 prior; 450 new; delta = -50
     assert Decimal(md.get("total_delta", "0")) == Decimal("-50")
+
+
+async def test_resaving_a_linked_invoice_with_its_own_vendor_does_not_recheck_the_order() -> None:
+    """The invoice form sends ``contact_id`` back as text on every save.
+
+    Compared to the stored UUID it must read as the same vendor, or every
+    edit of a linked invoice re-weighs the order link and an invoice whose
+    order has since been closed could not even have its notes corrected.
+    """
+    from app.modules.finance.schemas import InvoiceUpdate
+
+    service = _make_service()
+    vendor, order = uuid.uuid4(), uuid.uuid4()
+    invoice = SimpleNamespace(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        invoice_number="INV-LINKED-1",
+        invoice_direction="payable",
+        contact_id=vendor,
+        purchase_order_id=order,
+        metadata_={"po_id": str(order)},
+        amount_subtotal="100",
+        tax_amount="25",
+        amount_total="125",
+        status="approved",
+        line_items=[],
+    )
+    service.invoices.rows[invoice.id] = invoice  # type: ignore[attr-defined]
+
+    async def _refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("the order link was re-checked on a plain save")
+
+    service._check_po_link = _refuse  # type: ignore[method-assign]
+    await service.update_invoice(
+        invoice.id,
+        InvoiceUpdate(
+            contact_id=str(vendor),
+            invoice_direction="payable",
+            purchase_order_id=order,
+            notes="Delivery note 4471 attached",
+        ),
+    )

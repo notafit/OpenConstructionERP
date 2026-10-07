@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "sekisan_kijun",
+  "name": "Sekisan Kijun — Public Works Estimation Standards",
+  "standard": "Sekisan Kijun (MLIT Public Works Estimation Standards)",
+  "jurisdiction": "JP",
+  "description": "Validates cost estimates against the Sekisan Kijun (Public Works Estimation Standards) issued by MLIT. Checks that the direct construction cost, common temporary works, site overhead, general overhead and profit are structured according to the standard framework, that unit rates reference the published MLIT unit price tables, and that regional adjustment factors (chiiki hosei) are applied correctly.",
+  "applies_to": ["estimate", "boq", "tender", "validation"],
+  "enables_rule_ids": [
+    "sekisan.cost_structure_framework_valid",
+    "sekisan.chokusetsu_koji_hi_direct_cost_present",
+    "sekisan.kyotsu_kari_setsubi_common_temp_present",
+    "sekisan.genba_kanri_hi_site_overhead_present",
+    "sekisan.ippan_kanri_hi_general_overhead_present",
+    "sekisan.rieki_profit_rate_documented",
+    "sekisan.unit_rate_reference_documented",
+    "sekisan.chiiki_hosei_regional_factor_applied",
+    "sekisan.roudou_tanka_labour_rate_referenced",
+    "sekisan.zairyo_tanka_material_rate_referenced",
+    "sekisan.kikai_keisan_equipment_rate_referenced",
+    "sekisan.fiscal_year_edition_current"
+  ],
+  "regulator": "MLIT (Ministry of Land, Infrastructure, Transport and Tourism)",
+  "publication_year": 2024
+}

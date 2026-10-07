@@ -181,12 +181,23 @@ def main() -> int:
 
     unparsed = [m for m in manifests if not m.name or not m.display_name]
     if unparsed:
-        print(f"\n{len(unparsed)} manifests do not spell out both name and display_name:", file=sys.stderr)
+        print(
+            f"\n{len(unparsed)} manifests do not spell out both name and display_name:",
+            file=sys.stderr,
+        )
         for entry in unparsed:
             missing = ", ".join(
-                field for field, value in (("name", entry.name), ("display_name", entry.display_name)) if not value
+                field
+                for field, value in (
+                    ("name", entry.name),
+                    ("display_name", entry.display_name),
+                )
+                if not value
             )
-            print(f"  {entry.path.relative_to(ROOT).as_posix()}  cannot read: {missing}", file=sys.stderr)
+            print(
+                f"  {entry.path.relative_to(ROOT).as_posix()}  cannot read: {missing}",
+                file=sys.stderr,
+            )
         print(
             "\nThe module loader imports the manifest and checks isinstance, so a module whose\n"
             "fields this guard cannot read still loads and still shows its name to users. Write\n"
@@ -253,7 +264,10 @@ def main() -> int:
 
     if orphans:
         failed = True
-        print(f"\n{len(orphans)} catalog keys have no module behind them:", file=sys.stderr)
+        print(
+            f"\n{len(orphans)} catalog keys have no module behind them:",
+            file=sys.stderr,
+        )
         for key in orphans[:20]:
             print(f'  {key}  = "{catalog[key]}"', file=sys.stderr)
         if len(orphans) > 20:

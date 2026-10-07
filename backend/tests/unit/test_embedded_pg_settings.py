@@ -114,8 +114,9 @@ def test_the_cluster_is_pre_initialised_on_every_platform(tmp_path: Path, monkey
 
     assert embedded_pg._pre_initialize_cluster(tmp_path) is True
 
-    assert [command for command, _ in calls] == ["initdb"]
-    assert "--locale=C" in calls[0][1]
+    assert [command for command, _ in calls] == ["initdb", "initdb"]
+    assert "--version" in calls[0][1]
+    assert "--locale=C" in calls[1][1]
     # The point of the whole exercise: a config to write, before any postmaster.
     assert embedded_pg._apply_server_settings(tmp_path) is True
     assert "max_locks_per_transaction = 512" in read(tmp_path)

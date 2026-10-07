@@ -1,0 +1,20 @@
+{
+  "rule_pack_id": "oenorm_b1801",
+  "name": "OENORM B 1801-1 — Kosten im Hoch- und Tiefbau",
+  "standard": "OENORM B 1801-1",
+  "jurisdiction": "AT",
+  "regulator": "Austrian Standards International (ASI)",
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for OENORM B 1801-1, the Austrian standard for cost planning in building and civil works. It defines the cost groups and the planning phases that structure an estimate as the design progresses through Kostenschaetzung, Kostenberechnung and Kostenanschlag. The standard requires that every position is assigned to a cost group, that the group hierarchy is internally consistent, that the estimate declares which phase it represents, and that the level of detail it carries is the one that phase calls for rather than a later phase's precision claimed early. None of that is implemented as a rule. What the pack checks is the arithmetic underneath it: that positions carry quantities, that totals reconcile, and that currency is consistent.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by an Austrian Baukalkulator or Ziviltechniker before they are relied on for a public submission. The cost-group codes themselves are not reproduced here and no edition year is pinned; both must be confirmed against Austrian Standards International.",
+  "severity_overrides": {},
+  "enables_rule_ids": [
+    "boq_quality.position_has_quantity",
+    "boq_quality.total_mismatch",
+    "boq_quality.currency_consistency"
+  ]
+}

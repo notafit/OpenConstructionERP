@@ -83,7 +83,7 @@ def _parse_booking_status_filter(values: list[str] | None) -> list[str] | None:
     for v in values:
         if v not in _BOOKING_STATUS_VALUES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown booking status: {v!r}",
             )
         if v not in cleaned:
@@ -122,8 +122,11 @@ async def list_accommodations(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[AccommodationResponse]:
-    """List accommodations for projects the current user can access."""
-    accessible = await _accessible_project_ids(session, user_id)
+    """List accommodations for live projects the current user can access.
+
+    Accommodations of a deleted (archived) project are not listed.
+    """
+    accessible = await _accessible_project_ids(session, user_id, live_only=True)
 
     stmt = (
         select(Accommodation)

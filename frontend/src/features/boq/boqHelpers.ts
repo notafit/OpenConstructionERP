@@ -9,7 +9,7 @@
  */
 
 import type { Position, Markup } from './api';
-import { getIntlLocale } from '@/shared/lib/formatters';
+import { fmtDate } from '@/shared/lib/formatters';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 import { formatCurrency } from '@/shared/lib/money';
 import { apiGet, apiPatch } from '@/shared/lib/api';
@@ -141,9 +141,24 @@ const LOCALE_UNITS: Record<string, readonly string[]> = {
        'лм', 'мл', 'м.л',
        'час', 'ден', 'месец', 'година', 'смяна'],
   // Croatian
-  hr: ['kom', 'kpl', 'par', 'set',
+  hr: ['kom', 'kpl', 'pauš.', "m'", 'par', 'set',
        'm', 'm2', 'm3',
        'h', 'sat', 'dan', 'mj', 'god'],
+  // Hungarian
+  hu: ['db', 'klt', 'fm', 'átalány',
+       'óra', 'nap', 'hét', 'hó', 'év'],
+  // Greek
+  el: ['τεμ.', 'τεμ', 'σετ', 'μμ', 'τ.μ.', 'κ.μ.', 'κ.α.',
+       'ώρα', 'ημέρα', 'μήνας'],
+  // Ukrainian
+  uk: ['шт', 'компл', 'компл.', 'п.м', 'м.п.', 'м', 'м2', 'м3', 'кг', 'т',
+       'люд.-год', 'маш.-год', 'год', 'дн', 'міс'],
+  // Finnish
+  fi: ['kpl', 'jm', 'erä', 'h', 'pv', 'vk', 'kk'],
+  // Danish
+  da: ['stk', 'sæt', 'lbm', 'time', 'dag', 'uge', 'md', 'år'],
+  // Norwegian
+  no: ['stk', 'sett', 'lm', 'RS', 'time', 'dag', 'uke', 'mnd', 'år'],
   // Swedish
   sv: ['st', 'styck', 'sats', 'par',
        'lm', 'löpmeter',
@@ -167,17 +182,43 @@ const LOCALE_UNITS: Record<string, readonly string[]> = {
  *
  * The dropdown reads from localStorage for instant render. On app boot we
  * call `syncCustomUnitsFromServer()` to merge the server-side list (per-user,
- * stored on `User.metadata_["custom_units"]`) into the local cache. New unit
- * commits go through `saveCustomUnit()` which writes locally first then
- * fire-and-forgets a PATCH to the server. Anonymous / offline sessions keep
- * working as before — the server sync is best-effort and silently degrades.
+ * stored on `User.metadata_["custom_units"]`) into the local cache; loading
+ * only reads, it never writes to the server. A committed unit goes through
+ * `saveCustomUnit()`, which records it only when it is genuinely new: not a
+ * unit the registry already offers (in any language) and not already in the
+ * list under another case or superscript spelling. A new unit is written
+ * locally and then sent ALONE to the server, whose PATCH adds it to the
+ * stored list rather than replacing the list. Two sessions under one login
+ * therefore can no longer overwrite each other's units. Anonymous / offline
+ * sessions keep working: the server sync is best-effort.
  */
 const CUSTOM_UNITS_KEY = 'oe_custom_units';
+const CUSTOM_UNITS_ENDPOINT = '/v1/users/me/custom-units/';
+
+/** The key two unit spellings are compared by: trimmed, case-folded, with
+ *  the superscript squared / cubed glyphs folded to digits, so `M3`, `m3`
+ *  and `m³` are one unit. Mirrors `unit_identity_key` in
+ *  `backend/app/modules/boq/units.py`. */
+export function unitIdentityKey(unit: string): string {
+  return unit.trim().replace(/²/g, '2').replace(/³/g, '3').toLowerCase();
+}
+
+/** Every unit the picker offers without a custom list, in any language. */
+let registryKeys: Set<string> | null = null;
+function isRegistryUnit(unit: string): boolean {
+  if (!registryKeys) {
+    registryKeys = new Set(
+      [...BASE_UNITS, ...Object.values(LOCALE_UNITS).flat()].map(unitIdentityKey),
+    );
+  }
+  return registryKeys.has(unitIdentityKey(unit));
+}
 
 function loadCustomUnits(): string[] {
   try {
     const raw = localStorage.getItem(CUSTOM_UNITS_KEY);
-    return raw ? (JSON.parse(raw) as string[]) : [];
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === 'string') : [];
   } catch {
     return [];
   }
@@ -187,6 +228,19 @@ function writeCustomUnits(units: string[]): void {
   try {
     localStorage.setItem(CUSTOM_UNITS_KEY, JSON.stringify(units));
   } catch { /* localStorage full / disabled — accept the loss */ }
+}
+
+/** Append the units of `extra` whose identity key is not in `base` yet. */
+function unionUnits(base: string[], extra: string[]): string[] {
+  const out = [...base];
+  const seen = new Set(base.map(unitIdentityKey));
+  for (const unit of extra) {
+    const key = unitIdentityKey(unit);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(unit);
+  }
+  return out;
 }
 
 interface CustomUnitsResponse { units: string[] }
@@ -199,19 +253,17 @@ interface CustomUnitsResponse { units: string[] }
 let inFlightSync: Promise<string[]> | null = null;
 
 /** Pull the server-side catalogue into local cache. Called once on app boot
- *  after auth resolves. Returns the merged list for callers that want it. */
+ *  after auth resolves. Returns the merged list for callers that want it.
+ *  Read-only towards the server: it used to PATCH the merged local list back
+ *  whenever the lengths differed, which replaced another session's list. */
 export async function syncCustomUnitsFromServer(): Promise<string[]> {
   if (inFlightSync) return inFlightSync;
   inFlightSync = (async () => {
     try {
-      const resp = await apiGet<CustomUnitsResponse>('/v1/users/me/custom-units/');
+      const resp = await apiGet<CustomUnitsResponse>(CUSTOM_UNITS_ENDPOINT);
       const server = Array.isArray(resp?.units) ? resp.units : [];
-      const merged = [...new Set([...loadCustomUnits(), ...server])];
+      const merged = unionUnits(loadCustomUnits(), server);
       writeCustomUnits(merged);
-      // If the merge produced new entries that weren't on the server, push them.
-      if (merged.length !== server.length) {
-        apiPatch('/v1/users/me/custom-units/', { units: merged }).catch(() => undefined);
-      }
       return merged;
     } catch {
       // 401 (anonymous) or network failure — local-only path stays valid.
@@ -221,26 +273,32 @@ export async function syncCustomUnitsFromServer(): Promise<string[]> {
   return inFlightSync;
 }
 
+/** Remember a unit the user committed, when it is one the picker lacks. */
 export function saveCustomUnit(unit: string): void {
+  const trimmed = unit.trim();
+  if (!trimmed || isRegistryUnit(trimmed)) return;
   const custom = loadCustomUnits();
-  if (custom.includes(unit)) return;
-  custom.push(unit);
-  writeCustomUnits(custom);
-  // Best-effort server sync. Don't block the UI on the network round-trip;
-  // don't surface the error if it fails — the next syncCustomUnitsFromServer()
-  // call will reconcile the merged list.
-  apiPatch('/v1/users/me/custom-units/', { units: custom }).catch(() => undefined);
+  const key = unitIdentityKey(trimmed);
+  if (custom.some((u) => unitIdentityKey(u) === key)) return;
+  writeCustomUnits([...custom, trimmed]);
+  // Best-effort server sync with the new unit alone: the server adds it to
+  // the stored list. Don't block the UI on the round-trip.
+  apiPatch(CUSTOM_UNITS_ENDPOINT, { units: [trimmed] }).catch(() => undefined);
 }
 
 /**
- * Get units for the current locale. Includes base metric + locale-specific + user custom.
- * Always deduplicates and keeps base units first.
+ * Get units for the current locale: the locale's own trade tokens, then the
+ * base catalogue, then the user's custom units. Deduplicated.
+ *
+ * The locale's tokens lead because they are what a native estimator looks
+ * for. Behind the hundred-odd base tokens a Croatian "kom" or "kpl" sat at the
+ * bottom of the dropdown, far enough down to read as missing.
  */
 export function getUnitsForLocale(lang?: string): string[] {
   const code = (lang || 'en').split('-')[0] ?? 'en';
   const locale = LOCALE_UNITS[code] ?? [];
   const custom = loadCustomUnits();
-  const all = [...BASE_UNITS, ...locale, ...custom];
+  const all = [...locale, ...BASE_UNITS, ...custom];
   // Deduplicate preserving order
   return [...new Set(all)];
 }
@@ -265,14 +323,18 @@ export type EditableField = (typeof EDITABLE_FIELDS)[number];
 export const SUGGESTED_VAT_RATES: Record<string, number> = {
   'DACH (Germany, Austria, Switzerland)': 0.19,
   'United Kingdom': 0.20,
+  // Construction services in Ireland are charged at the 13.5% reduced rate,
+  // not the 23% standard one; the bill seeds the same tier on the server.
+  'Ireland': 0.135,
   'France': 0.20,
   'Spain': 0.21,
   'Italy': 0.22,
   'Netherlands': 0.21,
   'Poland': 0.23,
   'Czech Republic': 0.21,
+  'Croatia': 0.25,
   'Turkey': 0.20,
-  'Russia': 0.20,
+  'Russia': 0.22,
   'United States': 0.0,
   'Canada': 0.05,
   'Brazil': 0.0,
@@ -316,6 +378,15 @@ export function getVatRate(region?: string): number {
   return SUGGESTED_VAT_RATES[region] ?? 0;
 }
 
+/**
+ * The suggested rate as a percentage for display, keeping a fractional rate.
+ * Rounded to two decimals rather than to a whole number: Ireland's 13.5 would
+ * otherwise read as 14, and 0.135 * 100 is 13.500000000000002 in floating point.
+ */
+export function getVatPercent(region?: string): number {
+  return Math.round(getVatRate(region) * 10000) / 100;
+}
+
 /* ── Currency Symbols ────────────────────────────────────────────────── */
 
 /** Map currency code to symbol. */
@@ -323,6 +394,7 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   EUR: '\u20ac', GBP: '\u00a3', USD: '$', CHF: 'Fr.', CAD: 'C$', AUD: 'A$', NZD: 'NZ$',
   JPY: '\u00a5', CNY: '\u00a5', KRW: '\u20a9', INR: '\u20b9', BRL: 'R$', MXN: 'Mex$', TRY: '\u20ba',
   RUB: '\u20bd', PLN: 'z\u0142', CZK: 'K\u010d', SEK: 'kr', NOK: 'kr', DKK: 'kr',
+  UAH: '\u20b4', HUF: 'Ft',
   AED: '\u062f.\u0625', SAR: '\ufdfc', QAR: '\ufdfc', ZAR: 'R', EGP: 'E\u00a3', NGN: '\u20a6',
   SGD: 'S$', MYR: 'RM', THB: '\u0e3f', IDR: 'Rp', PHP: '\u20b1', HKD: 'HK$',
 };
@@ -416,11 +488,8 @@ export function fmtWithCurrency(
  * with semantics: ``1 unit of the foreign currency = rate base units``.
  * So foreign → base is multiplication.
  *
- * Returns the value unchanged when:
- *   - source currency is empty / undefined / equals base
- *   - no FX rate exists for the source currency (best-effort, with a
- *     console warning so the dev tools surface the gap)
- *   - the rate is non-finite or non-positive
+ * Blank or matching currency keeps the value unchanged. Missing, non-finite
+ * or non-positive foreign rates exclude the amount from the base total.
  *
  * This was missing in v2.9.1's #88 fix — positions priced in a foreign
  * currency had their ``total`` summed into directCost as if it were
@@ -439,20 +508,21 @@ export function convertToBase(
   // letting ``Number.isFinite("123")`` (false) zero a real value (#131).
   const v = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(v)) return 0;
-  if (!sourceCurrency) return v;
-  if (!baseCurrency || sourceCurrency === baseCurrency) return v;
+  const source = (sourceCurrency || '').trim().toUpperCase();
+  const base = (baseCurrency || '').trim().toUpperCase();
+  if (!source || !base || source === base) return v;
   const list = fxRates ?? [];
-  const fx = list.find((r) => r.currency === sourceCurrency);
+  const fx = list.find((r) => r.currency.trim().toUpperCase() === source);
   const fxRate = fx ? Number(fx.rate) : NaN;
   if (!fx || !Number.isFinite(fxRate) || fxRate <= 0) {
     // No rate configured — surface the gap in dev tools but don't crash.
     if (typeof console !== 'undefined' && console.warn) {
       console.warn(
         `[boq] no FX rate for ${sourceCurrency} → ${baseCurrency}; ` +
-        `position total left unconverted.`,
+        `amount excluded from base total.`,
       );
     }
-    return v;
+    return 0;
   }
   return v * fxRate;
 }
@@ -527,6 +597,44 @@ export function resourceAwareTotalInBase(
   return convertToBase(num(position.total), src, base, fxRates);
 }
 
+/* ── Catalogue component to resource row ─────────────────────────────────
+ * A catalogue component carries three figures: quantity, unit rate and cost.
+ * In imported cost databases the cost is the source's own figure, computed
+ * from an exact quantity, while the quantity column is rounded (a component
+ * listed at 0.00 kg can cost 12.84). A resource row whose quantity x rate is
+ * not its total is unstable in a bill: the line's rate is priced from the
+ * totals when it is added, the server re-derives it from quantity x rate on
+ * the next edit, and the cost breakdown weighs the rows by quantity x rate,
+ * so the same line reads three ways.
+ *
+ * The row keeps the cost as its total and takes the quantity the cost
+ * implies, so quantity x rate is the total. A component without a cost is
+ * priced at quantity x rate, a missing quantity read as 1, as before.
+ */
+export function catalogComponentAmounts(component: {
+  quantity?: number | string | null;
+  unit_rate?: number | string | null;
+  cost?: number | string | null;
+}): { quantity: number; unit_rate: number; total: number } {
+  const num = (x: unknown): number => {
+    const n = typeof x === 'number' ? x : Number(x);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const rate = num(component.unit_rate);
+  const quantity = component.quantity == null ? 1 : num(component.quantity);
+  const cost = num(component.cost);
+  if (cost === 0) {
+    return { quantity, unit_rate: rate, total: quantity * rate };
+  }
+  // Any disagreement beyond float noise counts: a sub-cent gap per row still
+  // adds up to cents on a line with many components once the server
+  // re-prices it from quantity x rate.
+  if (rate !== 0 && Math.abs(quantity * rate - cost) > 1e-9 * Math.max(1, Math.abs(cost))) {
+    return { quantity: cost / rate, unit_rate: rate, total: cost };
+  }
+  return { quantity, unit_rate: rate, total: cost };
+}
+
 /* ── Resource-driven pricing predicate ───────────────────────────────────
  * A position's Unit Rate is derived (Σ per-unit resource subtotals) and its
  * cell is locked ONLY when the position carries a resource that actually
@@ -553,6 +661,25 @@ export function hasContributingResources(resources: unknown): boolean {
     const n = typeof q === 'number' ? q : parseFloat(String(q ?? ''));
     return Number.isFinite(n) && n !== 0;
   });
+}
+
+/**
+ * True when writing ``field`` onto this position would type over a rate its
+ * resources derive. The Unit Rate cell is locked for such a position, and the
+ * bulk writers (paste, fill down, set value on a selection) skip it the same
+ * way. Sent anyway, a bare rate makes the server rescale every resource of the
+ * position to meet it (and leaves them unscaled when the old rate was zero), a
+ * change the locked cell exists to prevent. The multiply-by-factor action is
+ * not affected: scaling a derived rate by a factor is what it is for.
+ */
+export function isResourceDrivenRate(
+  field: string,
+  position: { metadata?: unknown } | null | undefined,
+): boolean {
+  if (field !== 'unit_rate' || !position) return false;
+  const meta = position.metadata;
+  if (!meta || typeof meta !== 'object') return false;
+  return hasContributingResources((meta as { resources?: unknown }).resources);
 }
 
 /* ── Quality Score ───────────────────────────────────────────────────── */
@@ -605,7 +732,7 @@ export function formatTimeAgo(dateStr: string): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   if (days < 7) return `${days}d ago`;
-  return new Date(dateStr).toLocaleDateString(getIntlLocale());
+  return fmtDate(dateStr);
 }
 
 /**

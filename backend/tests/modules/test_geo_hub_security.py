@@ -584,14 +584,41 @@ async def test_editor_cannot_delete_raster_overlay_requires_delete_perm(
     assert upload.status_code == 201, upload.text
     overlay_id = upload.json()["id"]
 
+    # The editor has to be able to SEE the overlay for the permission gate to
+    # be the thing that answers. This endpoint resolves the row through the
+    # ownership-checked getter BEFORE it checks the permission, deliberately,
+    # so that a cross-tenant id collapses to 404 and never leaks that the row
+    # exists. ``editor_member`` is not on tenant A's project, so asking it to
+    # delete tenant A's overlay gets that 404 and the delete gate never runs -
+    # which is what this test used to assert 403 against. Give the editor an
+    # overlay of its own instead: same "can see it, must not delete it"
+    # contract, no project-membership plumbing needed.
+    editor_project = await _make_project(http_client, editor_member["headers"], "editor-own")
+    own_upload = await http_client.post(
+        "/api/v1/geo-hub/raster-overlays/upload-image",
+        data={"project_id": editor_project},
+        files={"file": ("plan.png", tiny, "image/png")},
+        headers=editor_member["headers"],
+    )
+    assert own_upload.status_code == 201, own_upload.text
+    own_overlay_id = own_upload.json()["id"]
+
     # Editor attempts DELETE -> 403 from RequirePermission("geo_hub.delete").
     res = await http_client.delete(
-        f"/api/v1/geo-hub/raster-overlays/{overlay_id}",
+        f"/api/v1/geo-hub/raster-overlays/{own_overlay_id}",
         headers=editor_member["headers"],
     )
     assert res.status_code == 403, (
         f"Expected 403 for editor on raster overlay delete, got {res.status_code}: {res.text}"
     )
+
+    # The other half of the same ordering decision: someone else's overlay is
+    # masked as 404, not refused as 403, so the answer carries no existence.
+    masked = await http_client.delete(
+        f"/api/v1/geo-hub/raster-overlays/{overlay_id}",
+        headers=editor_member["headers"],
+    )
+    assert masked.status_code == 404, masked.text
 
     # Admin (tenant A) can still delete — sanity-check happy path.
     cleanup = await http_client.delete(

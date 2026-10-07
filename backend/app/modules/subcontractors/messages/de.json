@@ -1,0 +1,71 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "pay_application": {
+    "sub_unapproved_included": {
+      "fail": "Die Nachunternehmer-Abschlagsrechnung {pay_app} ist in dieser Abschlagsrechnung enthalten, obwohl sie {status} ist; der dem Auftraggeber berechnete Betrag ist also nicht zur Zahlung freigegeben",
+      "suggestion": "Geben Sie die Nachunternehmer-Abschlagsrechnung frei oder nehmen Sie sie aus dieser Abschlagsrechnung heraus, bis sie freigegeben ist",
+      "statuses": {
+        "submitted": "eingereicht und noch nicht geprüft",
+        "rejected": "abgelehnt"
+      }
+    },
+    "sub_waiver_missing": {
+      "fail_amount": "Die Nachunternehmer-Abschlagsrechnung {pay_app} beläuft sich netto auf {net}, die vorliegenden Verzichtserklärungen decken aber nur {covered} ab",
+      "fail_through_date": "Die Verzichtserklärung zur Nachunternehmer-Abschlagsrechnung {pay_app} reicht bis {through_date} und damit nicht bis zum Ende ihres Abrechnungszeitraums am {period_end}",
+      "suggestion": "Holen Sie eine Verzichtserklärung ein, die den vollen Nettobetrag bis zum Ende des Zeitraums abdeckt, oder nehmen Sie die Nachunternehmer-Abschlagsrechnung aus dieser Abschlagsrechnung heraus"
+    },
+    "sub_prior_unconditional_missing": {
+      "fail": "Die Nachunternehmer-Abschlagsrechnung {pay_app} wurde mit einer früheren Abschlagsrechnung bezahlt, es liegt aber keine unbedingte Verzichtserklärung bis zum Ende ihres Zeitraums am {period_end} vor",
+      "suggestion": "Holen Sie die unbedingte Verzichtserklärung für die bereits geleistete Zahlung ein und erfassen Sie, bis zu welchem Datum sie gilt"
+    },
+    "sub_line_unmapped": {
+      "fail_none": "Eine Position der Nachunternehmer-Abschlagsrechnung {pay_app} für das Arbeitspaket {package}, freigegeben mit {amount}, ist keiner Position der Leistungswertaufstellung dieses Vertrags zugeordnet",
+      "fail_foreign_line": "Eine Position der Nachunternehmer-Abschlagsrechnung {pay_app} für das Arbeitspaket {package}, freigegeben mit {amount}, ist einer Position eines anderen Vertrags zugeordnet",
+      "fail_parent_line": "Eine Position der Nachunternehmer-Abschlagsrechnung {pay_app} für das Arbeitspaket {package}, freigegeben mit {amount}, ist einer Gliederungsposition zugeordnet, die nicht direkt abgerechnet wird",
+      "suggestion": "Ordnen Sie das Arbeitspaket oder diese Position einer abrechenbaren Position der Leistungswertaufstellung dieses Vertrags zu"
+    },
+    "sub_exceeds_gc_line": {
+      "fail": "Die bis heute freigegebenen Nachunternehmerbeträge auf Position {line} betragen {approved} und liegen damit über ihrem Vertragswert von {scheduled}",
+      "suggestion": "Prüfen Sie die Nachunternehmer-Freigaben auf dieser Position oder erhöhen Sie ihren Vertragswert mit einem Nachtrag"
+    },
+    "sub_certificate_lapsed": {
+      "fail_missing": "Für {subcontractor} liegt zum {as_of}, dem Ende des Abrechnungszeitraums, kein Nachweis vor: {document}",
+      "fail_expired": "Bei {subcontractor} war der Nachweis {document} zum {as_of}, dem Ende des Abrechnungszeitraums, nicht mehr gültig",
+      "fail_revoked": "Bei {subcontractor} wurde der Nachweis {document} widerrufen und war zum {as_of}, dem Ende des Abrechnungszeitraums, nicht gültig",
+      "suggestion": "Fordern Sie einen aktuellen Nachweis beim Nachunternehmer an oder nehmen Sie seine Abschlagsrechnungen aus dieser Abschlagsrechnung heraus",
+      "documents": {
+        "insurance": "Versicherungsnachweis",
+        "license": "Gewerbe- bzw. Zulassungsnachweis",
+        "iso": "ISO-Zertifikat",
+        "safety": "Arbeitsschutznachweis",
+        "bond": "Bürgschaft",
+        "wsl_clearance": "Unbedenklichkeitsbescheinigung der Arbeitssicherheit",
+        "wsib_clearance": "WSIB-Unbedenklichkeitsbescheinigung",
+        "wcb_clearance": "WCB-Unbedenklichkeitsbescheinigung",
+        "attestation_revenu_quebec": "Bescheinigung von Revenu Quebec",
+        "construction_tax_exemption": "Freistellungsbescheinigung für Bauleistungen",
+        "social_security_clearance": "Unbedenklichkeitsbescheinigung der Sozialversicherung",
+        "employers_liability_clearance": "Unbedenklichkeitsbescheinigung der Berufsgenossenschaft"
+      }
+    },
+    "sub_certificate_payment_date": {
+      "fail_missing": "{subcontractor} wurde am {paid_on} für die Abschlagsrechnung {pay_app} bezahlt, ohne dass ein Nachweis vorlag: {document}. {withholding}",
+      "fail_expired": "{subcontractor} wurde am {paid_on} für die Abschlagsrechnung {pay_app} bezahlt, der Nachweis {document} war aber bereits am {lapsed_on} abgelaufen. {withholding}",
+      "fail_revoked": "{subcontractor} wurde am {paid_on} für die Abschlagsrechnung {pay_app} bezahlt, der Nachweis {document} war aber widerrufen. {withholding}",
+      "fail_undated": "Die Abschlagsrechnung {pay_app} von {subcontractor} ist als bezahlt markiert, trägt aber kein Zahlungsdatum. Ob der Nachweis {document} die Zahlung abdeckte, lässt sich daher nicht prüfen. {withholding}",
+      "fail_pending": "Die Abschlagsrechnung {pay_app} von {subcontractor} ist noch nicht bezahlt. Der Nachweis {document} zählt am Tag der Zahlung, nicht zum Ende des Abrechnungszeitraums; der vorliegende gilt bis {valid_until}. {withholding}",
+      "fail_pending_open": "Die Abschlagsrechnung {pay_app} von {subcontractor} ist noch nicht bezahlt. Der Nachweis {document} zählt am Tag der Zahlung, nicht zum Ende des Abrechnungszeitraums; der vorliegende ist unbefristet. {withholding}",
+      "fail_pending_invalid": "Die Abschlagsrechnung {pay_app} von {subcontractor} ist noch nicht bezahlt, und es liegt kein gültiger Nachweis {document} vor, in dessen Laufzeit eine Zahlung nach dem Ende des Abrechnungszeitraums fallen könnte. {withholding}",
+      "suggestion": "Prüfen Sie, ob die Bescheinigung am Tag der Zahlung gültig ist, und fordern Sie beim Nachunternehmer eine aktuelle an, wenn nicht. Die Steuer wird hier nicht einbehalten: Fällt eine Zahlung nicht in die Laufzeit einer gültigen Bescheinigung, liegen Abzug und Anmeldung bei Ihnen.",
+      "withholding": {
+        "gross_limit": "Ohne sie sind {rate} % der Gegenleistung einschließlich Umsatzsteuer einzubehalten und an das Finanzamt abzuführen, es sei denn, die Zahlungen an diesen Nachunternehmer bleiben im Kalenderjahr innerhalb von {limit} ({reference}).",
+        "gross": "Ohne sie sind {rate} % der Gegenleistung einschließlich Umsatzsteuer einzubehalten und an das Finanzamt abzuführen ({reference}).",
+        "net_limit": "Ohne sie sind {rate} % der Zahlung ohne Umsatzsteuer einzubehalten und an das Finanzamt abzuführen, es sei denn, die Zahlungen an diesen Nachunternehmer bleiben im Kalenderjahr innerhalb von {limit} ({reference}).",
+        "net": "Ohne sie sind {rate} % der Zahlung ohne Umsatzsteuer einzubehalten und an das Finanzamt abzuführen ({reference}).",
+        "unknown": "Ohne sie kann für die Zahlung ein Steuerabzug fällig sein."
+      }
+    }
+  }
+}

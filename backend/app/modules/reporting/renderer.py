@@ -16,7 +16,7 @@ This file is the engine. It is deliberately tiny:
 
 - Pure stdlib - no Jinja2, no WeasyPrint, no LaTeX, no headless Chrome. The
   the architecture guide lightweight constraint rules out heavy template engines for
-  the core 2-GB-VPS deploy. A real PDF backend can layer on later via a
+  the core 3-GB-server deploy. A real PDF backend can layer on later via a
   marketplace module.
 - One ``Renderer`` class with one ``render_html`` entry point. Input is a
   template definition (``ReportTemplate.template_data["sections"]``) plus a

@@ -115,7 +115,10 @@ describe('variation order linked-record deep links', () => {
   it('carries the contract id into the contract register', () => {
     renderDrawer(ORDER);
 
-    fireEvent.click(screen.getByText('Contract'));
+    // "Contract" appears both as a chain breadcrumb label (span) and as the
+    // linked-record pill (button). The pill is the navigating element.
+    const pill = screen.getAllByText('Contract').find((el) => el.closest('button'))!;
+    fireEvent.click(pill);
 
     expect(navigateSpy).toHaveBeenCalledWith('/contracts?highlight=ct-7');
     expect(navigateSpy).not.toHaveBeenCalledWith('/contracts');

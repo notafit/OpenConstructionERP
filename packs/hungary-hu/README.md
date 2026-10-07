@@ -6,6 +6,10 @@ is priced in, and the summary cascade it is totalled through. Built from
 Hungarian workbooks in production use rather than from a description of them,
 so a Hungarian estimator opening a bill recognises it on the first screen.
 
+> Developed in collaboration with **Kocsis Tamas** /
+> [BIM Control](https://www.bimcontrol.hu/) — domain expertise for Hungarian
+> construction standards, item orders and estimating workflows.
+
 ## What makes a Hungarian bill Hungarian
 
 Two things, and both are in this pack.
@@ -87,23 +91,20 @@ site setup, item 01 temporary roads and bridges. Each chapter carries a `99` or
 
 ## Language
 
-The pack runs in English. OpenConstructionERP ships no Hungarian interface
-bundle, and a pack cannot conjure one: a `default_locale` the application has
-no strings for resolves back to English regardless, so declaring `hu` here
-would promise a Hungarian interface and quietly deliver an English one. The
-Hungarian vocabulary the pack does carry sits where it is read, in the
-onboarding wizard and in the reference documents. A Hungarian interface bundle
-is a separate piece of work with its own quality bar, and this pack does not
-pretend to have done it.
+Installing the pack switches the interface to Hungarian (`default_locale` is
+`hu`). The pack brings no strings of its own for that: the Hungarian interface
+is the bundle OpenConstructionERP ships and offers in its language picker, and
+anyone can switch back to another language there at any time. The pack's own
+Hungarian vocabulary sits where it is read, in the onboarding wizard and in the
+reference documents.
 
 ## Review status
 
 The item orders, the code shapes and the money structure are derived from
-Hungarian workbooks in production use, and state what those files state. The
-statutory references are drawn from public sources and are pending review by a
-Hungarian quantity surveyor before they are relied on for a tender. Nothing in
-this pack reproduces a third party's cost catalogue, item texts or software
-identifiers.
+Hungarian workbooks in production use, developed in collaboration with
+Kocsis Tamas ([BIM Control](https://www.bimcontrol.hu/)). The statutory
+references are drawn from public sources. Nothing in this pack reproduces a
+third party's cost catalogue, item texts or software identifiers.
 
 ## License
 

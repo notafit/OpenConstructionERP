@@ -63,6 +63,13 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
   const money = (value: string | number | null | undefined) => (
     <MoneyDisplay amount={toNum(value)} currency={currency || undefined} />
   );
+  // Scheduled value, percent and balance are null on the row for money no
+  // schedule line carries: there is nothing to measure them against. An empty
+  // cell says there is no answer, where money() and toNum() would print a zero.
+  const moneyOrBlank = (value: string | null | undefined) =>
+    value === null || value === undefined ? null : money(value);
+  const percentOrBlank = (value: string | null | undefined) =>
+    value === null || value === undefined ? '' : fmtPercent(toNum(value));
 
   return (
     <Card padding="sm" data-testid="aia-application-panel">
@@ -133,6 +140,27 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
               >
                 {money(appQ.data.summary.retainage)}
               </SummaryRow>
+              {/* Lines 5a and 5b. The form asks for retainage split between
+                  work in place and materials on site, and the two together are
+                  line 5 above. Shown only when the server sends the split. */}
+              {appQ.data.summary.retainage_completed_work !== undefined && (
+                <SummaryRow
+                  label={t('contracts.aia.retainage_completed_work', {
+                    defaultValue: 'Retainage on completed work',
+                  })}
+                >
+                  {money(appQ.data.summary.retainage_completed_work)}
+                </SummaryRow>
+              )}
+              {appQ.data.summary.retainage_stored_materials !== undefined && (
+                <SummaryRow
+                  label={t('contracts.aia.retainage_stored_materials', {
+                    defaultValue: 'Retainage on stored material',
+                  })}
+                >
+                  {money(appQ.data.summary.retainage_stored_materials)}
+                </SummaryRow>
+              )}
               <SummaryRow
                 label={t('contracts.aia.earned_less_retainage', {
                   defaultValue: 'Total earned less retainage',
@@ -218,15 +246,15 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
                       <td className="max-w-[16rem] truncate px-2 py-1.5 text-left text-content-secondary">
                         {ln.description}
                       </td>
-                      <td className="px-2 py-1.5">{money(ln.scheduled_value)}</td>
+                      <td className="px-2 py-1.5">{moneyOrBlank(ln.scheduled_value)}</td>
                       <td className="px-2 py-1.5">{money(ln.previous_value)}</td>
                       <td className="px-2 py-1.5">{money(ln.this_period_value)}</td>
                       <td className="px-2 py-1.5">{money(ln.materials_stored)}</td>
                       <td className="px-2 py-1.5">{money(ln.total_completed_stored)}</td>
                       <td className="px-2 py-1.5 text-content-tertiary">
-                        {fmtPercent(toNum(ln.percent_complete))}
+                        {percentOrBlank(ln.percent_complete)}
                       </td>
-                      <td className="px-2 py-1.5">{money(ln.balance_to_finish)}</td>
+                      <td className="px-2 py-1.5">{moneyOrBlank(ln.balance_to_finish)}</td>
                       <td className="px-2 py-1.5">{money(ln.retainage)}</td>
                     </tr>
                   ))}
@@ -246,7 +274,7 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
                       {ln.item_number}
                     </span>
                     <span className="text-[10px] text-content-tertiary">
-                      {fmtPercent(toNum(ln.percent_complete))}
+                      {percentOrBlank(ln.percent_complete)}
                     </span>
                   </div>
                   <p className="mb-2 text-xs text-content-secondary">{ln.description}</p>
@@ -254,7 +282,7 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
                     <MobileCell
                       label={t('contracts.aia.col_scheduled', { defaultValue: 'Scheduled' })}
                     >
-                      {money(ln.scheduled_value)}
+                      {moneyOrBlank(ln.scheduled_value)}
                     </MobileCell>
                     <MobileCell
                       label={t('contracts.aia.col_total', { defaultValue: 'Total' })}
@@ -271,7 +299,7 @@ export function AIAApplicationPanel({ claimId, currency }: AIAApplicationPanelPr
                     <MobileCell
                       label={t('contracts.aia.col_balance', { defaultValue: 'Balance' })}
                     >
-                      {money(ln.balance_to_finish)}
+                      {moneyOrBlank(ln.balance_to_finish)}
                     </MobileCell>
                     <MobileCell
                       label={t('contracts.aia.col_retainage', { defaultValue: 'Retainage' })}

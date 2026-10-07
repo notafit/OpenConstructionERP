@@ -3,6 +3,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import { normalizeListResponse } from '@/shared/lib/apiHelpers';
 import { resolvePartyName } from '@/shared/lib/partyName';
 import {
@@ -26,6 +27,10 @@ import {
   ShoppingCart,
   HelpCircle,
   GitBranch,
+  Lock,
+  Info,
+  Table2,
+  Wallet,
 } from 'lucide-react';
 import { Button, Card, Badge, EmptyState, Breadcrumb, InfoHint, DismissibleInfo, IntroRichText, ConfirmDialog, RecoveryCard, SkeletonTable, SkeletonCard, ModuleGuideButton } from '@/shared/ui';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -39,6 +44,7 @@ import {
 } from '@/shared/ui/WideModal';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { apiGet, apiPost, apiDelete, ApiError } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fmtList, fmtDate } from '@/shared/lib/formatters';
 import { formatCurrency as fmtMoney } from '@/shared/lib/money';
 import { useToastStore } from '@/stores/useToastStore';
@@ -46,9 +52,11 @@ import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { listContracts } from '@/features/contracts/api';
 import { contractDeepLink, linkedVariationDeepLink } from '@/shared/lib/changeChainLinks';
+import { boqDeepLink, changeOrderWriteback, FINANCE_BUDGETS_LINK } from '@/shared/lib/awardChainLinks';
 import { ProvabilityGauge, EvidenceThreadPanel } from '@/features/claims-evidence';
 import { ApprovalTimeline } from './ApprovalTimeline';
 import { ImpactSimulator, type SavedScenario } from './ImpactSimulator';
+import { changeOrderSource } from './changeOrderSource';
 import { AIDraftModal } from './AIDraftModal';
 import { changeordersGuide } from './changeordersGuide';
 import {
@@ -984,10 +992,12 @@ function ApprovalChainBuilderDialog({
   // Fallback textarea state (only used when the directory query failed).
   const [raw, setRaw] = useState('');
 
+  const canListUsers = useHasPermission('users.list');
   const { data: users = [], isError: dirError } = useQuery({
     queryKey: ['users-directory'],
     queryFn: () => apiGet<DirectoryUser[]>('/v1/users/?limit=200&is_active=true'),
     staleTime: 60_000,
+    enabled: canListUsers,
   });
 
   const chosenIds = useMemo(() => new Set(chosen.map((u) => u.id)), [chosen]);
@@ -1041,7 +1051,9 @@ function ApprovalChainBuilderDialog({
     rawIds.length <= 20 &&
     rawIds.every((id) => /^[0-9a-f-]{32,36}$/i.test(id));
 
-  const usePicker = !dirError;
+  // A role without users.list never loads the directory, which is the same
+  // situation as a failed load: fall back to pasting ids.
+  const usePicker = canListUsers && !dirError;
   const canSubmit = usePicker ? chosen.length > 0 : rawLooksValid;
   const handleConfirm = () =>
     onConfirm(usePicker ? chosen.map((u) => u.id) : rawIds);
@@ -1330,6 +1342,7 @@ function DetailView({
   const { data: order, isLoading, isError } = useQuery({
     queryKey: ['changeorder', orderId],
     queryFn: () => apiGet<ChangeOrderWithItems>(`/v1/changeorders/${orderId}`),
+    refetchOnWindowFocus: true,
   });
 
   const submitMut = useMutation({
@@ -1412,6 +1425,7 @@ function DetailView({
   const { data: approvals = [] } = useQuery<ApprovalRow[]>({
     queryKey: ['changeorder-approvals', orderId],
     queryFn: () => getApprovals(orderId),
+    refetchOnWindowFocus: true,
   });
 
   // ── Which bill the approved scope lands in ────────────────────────────
@@ -1448,11 +1462,12 @@ function DetailView({
   // Resolve approver UUIDs to display names for the timeline. Best-effort:
   // if the directory is unavailable (no users.list permission) the timeline
   // falls back to the id snippet on its own.
+  const canListUsers = useHasPermission('users.list');
   const { data: directory = [] } = useQuery<DirectoryUser[]>({
     queryKey: ['users-directory'],
     queryFn: () => apiGet<DirectoryUser[]>('/v1/users/?limit=200&is_active=true'),
     staleTime: 60_000,
-    enabled: approvals.length > 0,
+    enabled: approvals.length > 0 && canListUsers,
   });
   const approverNames = useMemo(() => {
     const map: Record<string, string> = {};
@@ -1574,6 +1589,137 @@ function DetailView({
         </nav>
 
         <WorkflowStepper status={order.status} t={t} />
+
+        {/* Issue #435: warn when a standalone CO exists alongside active VOs */}
+        {typeof (order.metadata as Record<string, unknown>)?.standalone_overlap_warning === 'string' && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-semantic-warning/30 bg-semantic-warning/5 p-3 text-sm text-content-secondary">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-semantic-warning" />
+            <span>{(order.metadata as Record<string, string>).standalone_overlap_warning}</span>
+          </div>
+        )}
+
+        {/* Issue #435 chunk 3: variation-source banner for COs auto-created
+            from a variation order. The origin stamp and both ids come from
+            metadata written by VariationsService.convert_vr_to_vo. */}
+        {(() => {
+          const meta = (order.metadata ?? {}) as {
+            origin?: string;
+            variation_order_id?: string;
+            variation_request_id?: string;
+          };
+          if (meta.origin !== 'variations.convert_vr_to_vo') return null;
+          const voRef = meta.variation_order_id
+            ? `VO-${meta.variation_order_id.slice(0, 8)}`
+            : null;
+          const vrRef = meta.variation_request_id
+            ? `VR-${meta.variation_request_id.slice(0, 8)}`
+            : null;
+          const approvedValue = formatSignedCurrency(
+            Number(order.cost_impact),
+            order.currency,
+          );
+          return (
+            <div className="mb-4 flex items-start gap-2.5 rounded-lg border border-oe-blue/25 bg-oe-blue/[0.06] dark:bg-oe-blue/[0.1] p-3 text-sm text-content-secondary">
+              <Info className="mt-0.5 h-4 w-4 shrink-0 text-oe-blue" />
+              <div className="min-w-0">
+                <p className="font-medium text-content-primary">
+                  {t('changeorders.variation_source_title', {
+                    defaultValue: 'Generated from Variation Order',
+                  })}
+                </p>
+                <p className="mt-0.5 text-content-secondary">
+                  {voRef && (
+                    <span className="font-mono text-xs">{voRef}</span>
+                  )}
+                  {voRef && vrRef && (
+                    <span className="mx-1.5 text-content-tertiary">/</span>
+                  )}
+                  {vrRef && (
+                    <>
+                      {t('changeorders.variation_source_originating', {
+                        defaultValue: 'Originating Request',
+                      })}{' '}
+                      <span className="font-mono text-xs">{vrRef}</span>
+                    </>
+                  )}
+                  {(voRef || vrRef) && (
+                    <span className="mx-1.5 text-content-tertiary">/</span>
+                  )}
+                  {t('changeorders.variation_source_approved_value', {
+                    defaultValue: 'Approved commercial value:',
+                  })}{' '}
+                  <span className="font-semibold text-content-primary">{approvedValue}</span>
+                </p>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* A draft the platform raised from an answered RFI or a closed NCR
+            with a cost impact. Says where it came from and that nothing has
+            been applied, so a person reviews it rather than mistaking it for
+            an instruction somebody already gave. Only while it is a draft. */}
+        {(() => {
+          const src = changeOrderSource(order.metadata as Record<string, unknown> | undefined);
+          if (!src || !src.autoDrafted || order.status !== 'draft') return null;
+          const label =
+            src.number ||
+            (src.kind === 'rfi'
+              ? t('changeorders.source_kind_rfi', { defaultValue: 'RFI' })
+              : t('changeorders.source_kind_ncr', { defaultValue: 'NCR' }));
+          return (
+            <div
+              className="mb-4 flex items-start gap-2.5 rounded-lg border border-semantic-warning/30 bg-semantic-warning/5 p-3 text-sm text-content-secondary"
+              data-testid="co-auto-draft-banner"
+            >
+              <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-semantic-warning" />
+              <div className="min-w-0 flex-1">
+                <p className="font-medium text-content-primary">
+                  {t('changeorders.auto_draft_title', {
+                    defaultValue: 'Drafted automatically from {{source}}',
+                    source: label,
+                  })}
+                </p>
+                <p className="mt-0.5">
+                  {t('changeorders.auto_draft_body', {
+                    defaultValue:
+                      'Nothing has been applied to the budget or the contract. Check the amount, the days and the scope, then submit it for approval or reject it.',
+                  })}
+                </p>
+              </div>
+              <Button variant="secondary" size="sm" onClick={() => navigate(src.to)}>
+                {t('changeorders.auto_draft_open_source', {
+                  defaultValue: 'Open {{source}}',
+                  source: label,
+                })}
+              </Button>
+            </div>
+          );
+        })()}
+
+        {/* The NCR wrote its cost in a way that is not one clear amount, so
+            the order carries 0. Show what was written so the reviewer enters
+            the amount instead of approving the zero. Drafts only, by hand or
+            automatic alike. */}
+        {(() => {
+          const src = changeOrderSource(order.metadata as Record<string, unknown> | undefined);
+          if (!src?.amountUnread || order.status !== 'draft') return null;
+          return (
+            <div
+              className="mb-4 flex items-start gap-2.5 rounded-lg border border-semantic-warning/30 bg-semantic-warning/5 p-3 text-sm text-content-secondary"
+              data-testid="co-amount-unread"
+            >
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-semantic-warning" />
+              <p className="min-w-0 flex-1">
+                {t('changeorders.amount_unread', {
+                  defaultValue:
+                    'The NCR gives the cost as "{{written}}", which could not be read as one amount. The amount stays at 0 until you enter it.',
+                  written: src.amountUnread,
+                })}
+              </p>
+            </div>
+          );
+        })()}
 
         <div className="flex items-start justify-between">
           <div>
@@ -1717,8 +1863,19 @@ function DetailView({
           </p>
         </Card>
         <Card className="p-4">
-          <p className="text-xs text-content-tertiary uppercase tracking-wide">
+          <p className="text-xs text-content-tertiary uppercase tracking-wide flex items-center gap-1">
             {t('changeorders.cost_impact', { defaultValue: 'Cost Impact' })}
+            {(order.metadata as Record<string, unknown>)?.origin === 'variations.convert_vr_to_vo' && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded bg-oe-blue/10 px-1 py-px text-2xs font-medium text-oe-blue-text"
+                title={t('changeorders.cost_inherited_hint', {
+                  defaultValue: 'This value was inherited from the source variation order. You may override it if needed.',
+                })}
+              >
+                <Lock size={9} />
+                {t('changeorders.cost_inherited', { defaultValue: 'inherited' })}
+              </span>
+            )}
           </p>
           {(() => {
             const impact = Number(order.cost_impact);
@@ -1836,7 +1993,33 @@ function DetailView({
         const variationLink =
           meta.origin === 'variations.convert_vr_to_vo' ? linkedVariationDeepLink(meta) : null;
         const linkedContractId = meta.contract_id || '';
-        if (poIds.length === 0 && rfiIds.length === 0 && !variationLink && !linkedContractId) {
+        // The RFI or NCR the order was raised from. An RFI already listed in
+        // linked_rfi_ids gets its pill there, so it is not drawn twice.
+        const sourceRecord = changeOrderSource(order.metadata as Record<string, unknown> | undefined);
+        const sourcePill =
+          sourceRecord && !(sourceRecord.kind === 'rfi' && rfiIds.includes(sourceRecord.id))
+            ? sourceRecord
+            : null;
+        // Where the approval wrote the scope and the money. Stamped on the
+        // order by the approval itself; an order approved before the stamp
+        // existed carries none, and then no pill is drawn rather than one to
+        // a bill the page would have to guess.
+        // Execution is the normal end of an approved order and writes only
+        // the status, so an executed order keeps both the stamp and the rows
+        // it names; the pills stay with it.
+        const writeback = changeOrderWriteback(order.metadata as Record<string, unknown> | undefined);
+        const approvalLanded = order.status === 'approved' || order.status === 'executed';
+        const landedInBoq = approvalLanded && !!writeback.boqId;
+        const landedInBudget = approvalLanded && !!writeback.budgetRowId;
+        if (
+          poIds.length === 0 &&
+          rfiIds.length === 0 &&
+          !variationLink &&
+          !linkedContractId &&
+          !sourcePill &&
+          !landedInBoq &&
+          !landedInBudget
+        ) {
           return null;
         }
         const chipCls =
@@ -1860,6 +2043,28 @@ function DetailView({
                   {t('changeorders.from_variation', { defaultValue: 'From variation' })}
                 </button>
               )}
+              {sourcePill && (
+                <button
+                  type="button"
+                  className={chipCls}
+                  onClick={() => navigate(sourcePill.to)}
+                  title={
+                    sourcePill.kind === 'rfi'
+                      ? t('changeorders.source_hint_rfi', {
+                          defaultValue: 'Open the RFI this change order was raised from',
+                        })
+                      : t('changeorders.source_hint_ncr', {
+                          defaultValue: 'Open the NCR this change order was raised from',
+                        })
+                  }
+                >
+                  {sourcePill.kind === 'rfi' ? <HelpCircle size={12} /> : <AlertTriangle size={12} />}
+                  {sourcePill.number ||
+                    (sourcePill.kind === 'rfi'
+                      ? t('changeorders.source_kind_rfi', { defaultValue: 'RFI' })
+                      : t('changeorders.source_kind_ncr', { defaultValue: 'NCR' }))}
+                </button>
+              )}
               {linkedContractId && (
                 <button
                   type="button"
@@ -1869,6 +2074,32 @@ function DetailView({
                 >
                   <FileText size={12} />
                   {t('changeorders.applies_to_contract', { defaultValue: 'Applies to contract' })}
+                </button>
+              )}
+              {landedInBoq && writeback.boqId && (
+                <button
+                  type="button"
+                  className={chipCls}
+                  onClick={() => navigate(boqDeepLink(writeback.boqId as string, writeback.boqSectionId))}
+                  title={t('changeorders.written_into_boq_hint', {
+                    defaultValue: 'Open the bill of quantities on the section this change order added',
+                  })}
+                >
+                  <Table2 size={12} />
+                  {t('changeorders.written_into_boq', { defaultValue: 'BOQ section' })}
+                </button>
+              )}
+              {landedInBudget && (
+                <button
+                  type="button"
+                  className={chipCls}
+                  onClick={() => navigate(FINANCE_BUDGETS_LINK)}
+                  title={t('changeorders.revised_budget_hint', {
+                    defaultValue: 'Open the budget lines, where this change order is recorded as a revised-budget row',
+                  })}
+                >
+                  <Wallet size={12} />
+                  {t('changeorders.revised_budget', { defaultValue: 'Revised budget' })}
                 </button>
               )}
               {poIds.map((poId, i) => (
@@ -1891,7 +2122,7 @@ function DetailView({
                   key={`rfi-${rfiId}`}
                   type="button"
                   className={chipCls}
-                  onClick={() => navigate('/rfi')}
+                  onClick={() => navigate(`/rfi/${encodeURIComponent(rfiId)}`)}
                   title={rfiId}
                 >
                   <HelpCircle size={12} />
@@ -2127,7 +2358,7 @@ export function ChangeOrdersPage() {
   // Fetch projects
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 

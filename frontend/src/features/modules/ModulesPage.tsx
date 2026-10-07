@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { useState, useMemo, useEffect, useCallback, useRef, useId } from 'react';
 import { useTranslation } from 'react-i18next';
+import { detectCountry } from '@/app/i18n';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, Link, useSearchParams } from 'react-router-dom';
 import clsx from 'clsx';
@@ -46,19 +47,22 @@ import {
 import { Card, Badge, Button, Input, InfoHint, Breadcrumb, ConfirmDialog, DismissibleInfo, IntroRichText, ModuleGuideButton } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { modulesGuide } from './modulesGuide';
+import { AdvancedModeNotice } from './AdvancedModeNotice';
 import { resolveModuleDisplayName } from './moduleDisplayName';
+import { profileDelta, profileShapes } from './profileDifference';
 import {
   ALL_CATEGORIES,
   filterModules,
   tallyModuleCategories,
   type ModuleSearchContext,
 } from './moduleSearch';
-import { PartnerPackApplyDialog } from './PartnerPackApplyDialog';
+import { PackOwnCopyHint, PartnerPackApplyDialog } from './PartnerPackApplyDialog';
 import { PartnerPackDeactivateDialog } from './PartnerPackDeactivateDialog';
 import {
   useAppliedPack,
   useInstallPack,
   useRescanPacks,
+  canInstallPacks,
   MAX_PACK_UPLOAD_BYTES,
 } from './partnerPacks';
 import type { PackType } from '@/shared/hooks/usePartnerPack';
@@ -74,11 +78,14 @@ import {
 import { useToastStore } from '@/stores/useToastStore';
 import { useModuleStore } from '@/stores/useModuleStore';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { type MeOnboarding } from '@/app/layout/useCompanyWorkspace';
+import { useMeOnboardingQueryKey } from '@/app/layout/meOnboardingQuery';
 import { getModulesByCategory } from '@/modules/_registry';
 import { translateManifestText } from '@/modules/_i18n';
 import { fmtList, fmtFixed } from '@/shared/lib/formatters';
-import { packSummary } from '@/shared/lib/regionalPack';
+import { groupPacksByMarket, packNameSlug, packSummary, type PackMarketBand } from '@/shared/lib/regionalPack';
 import { PackEmblem } from '@/shared/ui/PackEmblem';
+import { invalidateProjectLists } from '@/features/projects/invalidateProjectLists';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -393,8 +400,8 @@ export function ModulesPage() {
           defaultValue: 'Show only the tools this company needs',
         })}
         more={
-          t('modules.intro_more', { defaultValue: '' })
-            ? <IntroRichText text={t('modules.intro_more')} />
+          t('modules.intro_more_profiles', { defaultValue: '' })
+            ? <IntroRichText text={t('modules.intro_more_profiles')} />
             : undefined
         }
         links={[
@@ -409,11 +416,16 @@ export function ModulesPage() {
           { label: t('nav.settings', { defaultValue: 'Settings' }), onClick: () => navigate('/settings') },
         ]}
       >
-        {t('modules.intro_body', {
+        {t('modules.intro_body_profiles', {
           defaultValue:
-            'Switch on a company profile to tailor which modules appear in the sidebar, apply a pack to load a ready-made preset for a country, industry, partner or showcase, and install data packages like cost databases, resource catalogues and languages from the marketplace. System modules lists everything currently loaded so you can see what is active and what an install would add.',
+            'Pick a company profile to switch on the modules your company uses and switch off the rest. A profile with its own workspace also shapes the menu in Simple mode; otherwise the menu stays as it is. Apply a pack to load a ready-made preset for a country, industry, partner or showcase, and install data packages like cost databases, resource catalogues and languages from the marketplace. System modules lists everything currently loaded so you can see what is active and what an install would add.',
         })}
       </DismissibleInfo>
+
+      {/* Simple mode hides most of the sidebar regardless of what is enabled
+          below, so say so here rather than leaving the user to discover it by
+          switching a module on and finding no new menu entry. */}
+      <AdvancedModeNotice />
 
       {/* Find a module — spans the page, lands you on the tab that answers. */}
       <div className="max-w-md animate-card-in" style={{ animationDelay: '20ms' }}>
@@ -493,8 +505,31 @@ export function ModulesPage() {
 /* ── Tab 1: Company Profiles ─────────────────────────────────────────── */
 /* ══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * The name a preset's module key wears on screen.
+ *
+ * Presets speak in bare keys (`supplier_catalogs`), the locale files carry
+ * `modules.catalog.supplier_catalogs`, and `moduleDisplayNameKey` already
+ * derives one from the other for the registry page. Reusing it means the
+ * profile cards and the module registry cannot end up calling the same module
+ * two different things.
+ *
+ * The fallback is the key with its underscores opened out rather than the raw
+ * key, because a card reading "supplier_catalogs" tells a reader they are
+ * looking at a bug.
+ */
+function presetModuleName(
+  t: (key: string, options: { defaultValue: string }) => string,
+  language: string,
+  id: string,
+): string {
+  return resolveModuleDisplayName({ name: id, display_name: id.replace(/_/g, ' ') }, t, language);
+}
+
 function CompanyProfilesTab() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
+  const onboardingQueryKey = useMeOnboardingQueryKey();
   const addToast = useToastStore((s) => s.addToast);
   const { isModuleEnabled, setModuleEnabled, canDisable, getEnabledDependents, syncFromServer } =
     useModuleStore();
@@ -525,6 +560,28 @@ function CompanyProfilesTab() {
     queryFn: () => apiGet<CompanyPresetAPI[]>('/v1/users/onboarding-presets/'),
   });
 
+  // The modules no profile governs. Asked for rather than copied, because a
+  // copy here and the list in `onboarding_presets.py` would drift, and the
+  // direction it drifts in decides whether this page tells a reader they are
+  // about to lose Projects. An empty answer degrades to naming a few more
+  // modules in the delta, never to hiding one.
+  const { data: coreModules } = useQuery({
+    queryKey: ['onboarding-presets', 'core'],
+    queryFn: () =>
+      apiGet<{ core_modules: string[] }>('/v1/users/onboarding-presets/core/').then(
+        (r) => r.core_modules,
+      ),
+    staleTime: 60 * 60 * 1000,
+  });
+
+  // What each profile carries that few others do. Computed over the whole set
+  // because "particular to this one" is a claim about the other twenty-one,
+  // and there is no way to make it from a single card's own data.
+  const shapes = useMemo(
+    () => profileShapes(presets ?? [], coreModules ?? []),
+    [presets, coreModules],
+  );
+
   const handleProfileClick = useCallback(
     (preset: CompanyPresetAPI) => {
       if (preset.key === activeProfileKey) return;
@@ -550,12 +607,19 @@ function CompanyProfilesTab() {
         ? Object.values(getModulesByCategory()).flatMap((mods) => mods.map((m) => m.id))
         : switchingTo.enabled_modules;
 
-      await apiPost('/v1/users/me/onboarding/', {
+      // No `interface_mode`: the Simple / Advanced choice has its own per-user
+      // record (`/v1/users/me/view-mode/`), and this field used to be written
+      // as 'advanced' on every switch whatever mode the user was in. A user
+      // who never picked a mode gets the default the new profile implies
+      // (`app/layout/useViewModeDefault.ts`).
+      const saved = await apiPost<MeOnboarding>('/v1/users/me/onboarding/', {
         company_type: switchingTo.key,
         enabled_modules: enabledModules,
-        interface_mode: 'advanced',
         completed: true,
       });
+      // The sidebar picks its Simple-mode workspace from the profile in this
+      // cache entry, so a switch reshapes the menu now, not after it goes stale.
+      queryClient.setQueryData(onboardingQueryKey, saved);
 
       // Reconcile the local module store from the server's canonical
       // module_preferences (set by the POST above). syncFromServer() updates
@@ -586,10 +650,22 @@ function CompanyProfilesTab() {
       setIsSwitching(false);
       setSwitchingTo(null);
     }
-  }, [switchingTo, syncFromServer, addToast, t]);
+  }, [switchingTo, syncFromServer, addToast, t, queryClient, onboardingQueryKey]);
 
   const activePreset = presets?.find((p) => p.key === activeProfileKey);
   const activeModuleCount = activePreset?.module_count ?? 0;
+
+  // What the pending switch would actually do. Computed against the profile in
+  // force, so an account that has never picked one gets "everything gained,
+  // nothing lost", which is the truth rather than a diff against an invented
+  // baseline.
+  const switchDelta = useMemo(
+    () =>
+      switchingTo
+        ? profileDelta(activePreset ?? null, switchingTo, coreModules ?? [])
+        : { gained: [], lost: [], kept: [] },
+    [switchingTo, activePreset, coreModules],
+  );
 
   return (
     <div className="animate-card-in" style={{ animationDelay: '60ms' }}>
@@ -662,9 +738,10 @@ function CompanyProfilesTab() {
         </div>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {presets?.map((preset) => {
+          {[...(presets ?? [])].sort((a, b) => (a.key === 'full_enterprise' ? -1 : b.key === 'full_enterprise' ? 1 : 0)).map((preset) => {
             const Icon = getPresetIcon(preset.icon);
             const isActive = preset.key === activeProfileKey;
+            const isFull = preset.key === 'full_enterprise';
             return (
               <button
                 key={preset.key}
@@ -675,14 +752,16 @@ function CompanyProfilesTab() {
                   'text-left rounded-xl border p-4 transition-all',
                   isActive
                     ? 'border-oe-blue bg-oe-blue-subtle ring-1 ring-oe-blue/30'
-                    : 'border-border-light bg-surface-elevated hover:border-border hover:shadow-xs',
+                    : isFull
+                      ? 'border-emerald-300 bg-emerald-50/60 hover:border-emerald-400 hover:shadow-xs dark:border-emerald-700 dark:bg-emerald-950/30 dark:hover:border-emerald-600'
+                      : 'border-border-light bg-surface-elevated hover:border-border hover:shadow-xs',
                 )}
               >
                 <div className="flex items-start gap-3">
                   <div
                     className={clsx(
                       'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
-                      isActive ? 'bg-oe-blue/10 text-oe-blue' : 'bg-surface-secondary text-content-secondary',
+                      isActive ? 'bg-oe-blue/10 text-oe-blue' : isFull ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900/40 dark:text-emerald-400' : 'bg-surface-secondary text-content-secondary',
                     )}
                   >
                     <Icon size={20} />
@@ -703,6 +782,37 @@ function CompanyProfilesTab() {
                     <p className="mt-1.5 text-2xs text-content-tertiary font-medium">
                       {preset.module_count} {t('modules.modules_label', { defaultValue: 'modules' })}
                     </p>
+                    {/* What this profile is for, said in modules rather than in
+                        adjectives. Two names, because the point is to be read
+                        at a glance across a grid of twenty-two cards; the rest
+                        of the list is on the profile itself. */}
+                    {(() => {
+                      const rare = shapes.get(preset.key)?.rare ?? [];
+                      if (rare.length === 0) return null;
+                      const shown = rare.slice(0, 2).map((id) => presetModuleName(t, i18n.language, id));
+                      return (
+                        <p className="mt-1 text-2xs text-content-tertiary">
+                          <span className="font-medium">
+                            {t('modules.profile_particular', { defaultValue: 'Particular to it' })}:
+                          </span>{' '}
+                          {fmtList(shown)}
+                          {rare.length > shown.length && (
+                            <span className="text-content-tertiary">
+                              {' '}
+                              {/* `n`, not `count`. i18next reads `count` as a
+                                  plural selector, which would make this one
+                                  string owe every locale its own CLDR forms
+                                  for a number that only ever follows a plus
+                                  sign. */}
+                              {t('modules.profile_particular_more', {
+                                defaultValue: '+{{n}}',
+                                n: rare.length - shown.length,
+                              })}
+                            </span>
+                          )}
+                        </p>
+                      );
+                    })()}
                   </div>
                 </div>
               </button>
@@ -729,9 +839,22 @@ function CompanyProfilesTab() {
         title={t('modules.switch_profile_title', {
           defaultValue: 'Switch Profile',
         })}
-        message={t('modules.switch_profile_message', {
-          defaultValue: 'Switch to {{name}}? This will change your active modules to match this profile.',
-          name: switchingTo?.label ?? '',
+        message={t('modules.switch_profile_delta', {
+          // A new key rather than new wording on the old one. The old string is
+          // already translated into forty-one languages, and adding
+          // placeholders to the English alone would have left every other
+          // reader the sentence without the numbers, which no gate we own can
+          // see. Counts follow a colon so no language owes this string a plural
+          // form.
+          defaultValue:
+            'Switch to {{name}}? Turned on: {{gained}}. Turned off: {{lost}}. Kept: {{kept}}. Never changed by a profile: {{core}}.',
+          name: switchingTo
+            ? t(`onboarding.company_${switchingTo.key}`, { defaultValue: switchingTo.label })
+            : '',
+          gained: switchDelta.gained.length,
+          lost: switchDelta.lost.length,
+          kept: switchDelta.kept.length,
+          core: coreModules?.length ?? 0,
         })}
         confirmLabel={t('modules.switch_confirm', { defaultValue: 'Switch Profile' })}
         variant="warning"
@@ -745,8 +868,32 @@ function CompanyProfilesTab() {
 /* ── Tab: Partner Packs ──────────────────────────────────────────────── */
 /* ══════════════════════════════════════════════════════════════════════════ */
 
-function PartnerPacksTab() {
+/**
+ * The heading over each band of packs.
+ *
+ * One literal `t()` call per band rather than a computed
+ * `modules.packs_band_${band}`, so every string this page can render is
+ * greppable from the locale files and the orphan-key gate can see all seven.
+ * A computed key would also have to spell `cross-region` with a hyphen, which
+ * no other key in the family does.
+ */
+function useBandLabels(): Record<PackMarketBand, string> {
   const { t } = useTranslation();
+  return {
+    home: t('modules.packs_band_home', { defaultValue: 'Suggested for your region' }),
+    americas: t('modules.packs_band_americas', { defaultValue: 'Americas' }),
+    china: t('modules.packs_band_china', { defaultValue: 'China' }),
+    india: t('modules.packs_band_india', { defaultValue: 'India' }),
+    europe: t('modules.packs_band_europe', { defaultValue: 'Europe' }),
+    rest: t('modules.packs_band_rest', { defaultValue: 'Other markets' }),
+    'cross-region': t('modules.packs_band_cross_region', {
+      defaultValue: 'Industry and cross-region',
+    }),
+  };
+}
+
+function PartnerPacksTab() {
+  const { t, i18n } = useTranslation();
 
   const {
     data,
@@ -775,6 +922,36 @@ function PartnerPacksTab() {
   const [packSearchParams] = useSearchParams();
   const focusSlug = packSearchParams.get('pack');
 
+  // The order the cards are met in. The endpoint sorts by slug because a
+  // lookup wants a stable order; a reader wants the market that is theirs, and
+  // after that the ones that carry the most work. `detectCountry` is a hint
+  // and nothing here gates on it: a wrong guess only moves one card to the
+  // top, and every other pack stays exactly one click away.
+  const homeCountry = useMemo(() => detectCountry(), []);
+  const bandLabels = useBandLabels();
+  const banded = useMemo(
+    () =>
+      groupPacksByMarket(packs, {
+        homeCountry,
+        locale: i18n.language,
+        // Sort on the string the card renders, not on `partner_name` or the
+        // slug. Ordering a grid by a name nobody can see is the reason
+        // "Batimatech" used to sit between Austria and Belgium.
+        nameOf: (p) =>
+          t(`modules.pp_name_${packNameSlug(p.slug)}`, { defaultValue: p.partner_name }),
+      }),
+    [packs, homeCountry, i18n.language, t],
+  );
+  // Stagger the entrance across the whole page rather than restarting the
+  // delay inside every band, which would make the second band appear to load
+  // again after the first had settled.
+  const cardIndex = useMemo(() => {
+    const order = new Map<string, number>();
+    let n = 0;
+    for (const group of banded) for (const pack of group.packs) order.set(pack.slug, n++);
+    return order;
+  }, [banded]);
+
   return (
     <div className="animate-card-in" style={{ animationDelay: '60ms' }}>
       <div className="mb-4">
@@ -800,6 +977,11 @@ function PartnerPacksTab() {
 
       {/* Install / rescan controls — admin only (gated inside the panel). */}
       <InstallPackPanel onChanged={() => void refetch()} />
+
+      {/* A read-only account (the public demo keeps every account a viewer)
+          sees the packs and why it cannot install them, once, above the grid,
+          rather than a button that ends in a 403. */}
+      <ViewerPackNotice />
 
       {isLoading ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -851,20 +1033,58 @@ function PartnerPacksTab() {
           </p>
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {packs.map((pack, i) => (
-            <PartnerPackCard
-              key={pack.slug}
-              pack={pack}
-              index={i}
-              isActive={activeSlug === pack.slug}
-              activeSource={activeSlug === pack.slug ? activeSource : null}
-              envPinned={activeSource === 'env'}
-              focused={focusSlug === pack.slug}
-            />
+        <div className="space-y-8">
+          {banded.map((group) => (
+            <section key={group.band}>
+              <div className="mb-3 flex items-baseline gap-2">
+                <h3 className="text-sm font-semibold text-content-primary">{bandLabels[group.band]}</h3>
+                <span className="text-2xs text-content-tertiary">{group.packs.length}</span>
+                {group.band === 'home' && (
+                  <span className="text-2xs text-content-tertiary">
+                    {t('modules.packs_band_home_hint', {
+                      defaultValue: 'Guessed from your browser. Any other pack is one click away.',
+                    })}
+                  </span>
+                )}
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {group.packs.map((pack) => (
+                  <PartnerPackCard
+                    key={pack.slug}
+                    pack={pack}
+                    index={cardIndex.get(pack.slug) ?? 0}
+                    isActive={activeSlug === pack.slug}
+                    activeSource={activeSlug === pack.slug ? activeSource : null}
+                    envPinned={activeSource === 'env'}
+                    focused={focusSlug === pack.slug}
+                  />
+                ))}
+              </div>
+            </section>
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Shown instead of the install controls to accounts that may only view packs. */
+function ViewerPackNotice() {
+  const { t } = useTranslation();
+  if (canInstallPacks(useAuthStore((s) => s.userRole))) return null;
+  return (
+    <div
+      role="note"
+      data-testid="pack-viewer-notice"
+      className="mb-4 flex items-start gap-2 rounded-lg border border-border-light bg-surface-secondary px-3.5 py-3 text-sm text-content-secondary"
+    >
+      <ShieldCheck size={16} className="mt-0.5 shrink-0" />
+      <span>
+        {t('modules.pp_viewer_notice', {
+          defaultValue: 'This account can view packs but not install them. Installing a pack needs an administrator.',
+        })}
+        <PackOwnCopyHint />
+      </span>
     </div>
   );
 }
@@ -886,7 +1106,7 @@ function PartnerPacksTab() {
 export function InstallPackPanel({ onChanged }: { onChanged: () => void }) {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const isAdmin = useAuthStore((s) => s.userRole) === 'admin';
+  const isAdmin = canInstallPacks(useAuthStore((s) => s.userRole));
 
   const install = useInstallPack();
   const rescan = useRescanPacks();
@@ -1133,6 +1353,9 @@ function PartnerPackCard({
 }: PartnerPackCardProps) {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
+  // Activating and deactivating are RequireRole("admin") on the server. A
+  // viewer used to get the button, the dialog, and a 403 nobody explained.
+  const canInstall = canInstallPacks(useAuthStore((s) => s.userRole));
   const [applyOpen, setApplyOpen] = useState(false);
   const [deactivateOpen, setDeactivateOpen] = useState(false);
   // Addressed by id rather than by a ref: `Card` spreads its extra props onto
@@ -1219,7 +1442,16 @@ function PartnerPackCard({
           <div className="min-w-0 flex-1">
             <div className="flex items-start gap-2">
               <h3 className="min-w-0 flex-1 text-[15px] font-bold leading-snug text-content-primary">
-                {pack.partner_name}
+                {/* The translated name, the way the onboarding picker, the
+                    dashboard card and the cases strip all render it. This card
+                    printed `partner_name` raw, so the one screen whose whole
+                    job is choosing a market was the one screen that named the
+                    markets in English only. Written inline because
+                    `check_i18n_computed_keys.py` recognises `modules.pp_name_*`
+                    in this exact shape and nowhere else. */}
+                {t(`modules.pp_name_${packNameSlug(pack.slug)}`, {
+                  defaultValue: pack.partner_name,
+                })}
               </h3>
               {isActive && (
                 <Badge variant="success" size="sm" className="mt-0.5 shrink-0">
@@ -1343,6 +1575,7 @@ function PartnerPackCard({
                 size="sm"
                 icon={<Power size={14} />}
                 onClick={() => setDeactivateOpen(true)}
+                disabled={!canInstall}
               >
                 {t('modules.pack_deactivate', { defaultValue: 'Deactivate' })}
               </Button>
@@ -1353,11 +1586,23 @@ function PartnerPackCard({
               size="sm"
               icon={<Power size={14} />}
               onClick={handleActivateClick}
+              disabled={!canInstall}
             >
               {t('modules.pack_activate', { defaultValue: 'Activate pack' })}
             </Button>
           )}
         </div>
+        {!canInstall && !(isActive && activeSource === 'env') && (
+          <p
+            className="mt-1.5 inline-flex items-center gap-1.5 text-2xs text-content-tertiary"
+            data-testid="pack-admin-only"
+          >
+            <ShieldCheck size={12} className="shrink-0" />
+            {t('modules.pack_admin_only_card', {
+              defaultValue: 'Only an administrator can activate or deactivate a pack.',
+            })}
+          </p>
+        )}
       </div>
 
       <PartnerPackApplyDialog
@@ -1766,7 +2011,7 @@ function DataPackagesTab() {
           }
           queryClient.invalidateQueries({ queryKey: ['demo-status'] });
           queryClient.invalidateQueries({ queryKey: ['marketplace'] });
-          queryClient.invalidateQueries({ queryKey: ['projects'] });
+          invalidateProjectLists(queryClient);
           navigate(`/projects/${result.project_id}`);
         } catch (err) {
           addToast({ type: 'error', title: t('marketplace.install_failed', { defaultValue: 'Install failed' }), message: err instanceof Error ? err.message : t('common.unknown_error', { defaultValue: 'Unknown error' }) });
@@ -1787,6 +2032,7 @@ function DataPackagesTab() {
       message: t('marketplace.uninstall_demo_confirm', {
         defaultValue: 'Are you sure you want to uninstall this demo project? All associated data will be deleted.',
       }),
+      confirmLabel: t('marketplace.uninstall', { defaultValue: 'Uninstall' }),
     });
     if (!confirmed) return;
     setInstallingId(`demo-${demoId}`);
@@ -1799,7 +2045,7 @@ function DataPackagesTab() {
       });
       queryClient.invalidateQueries({ queryKey: ['demo-status'] });
       queryClient.invalidateQueries({ queryKey: ['marketplace'] });
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      invalidateProjectLists(queryClient);
     } catch (err) {
       addToast({
         type: 'error',
@@ -1817,6 +2063,7 @@ function DataPackagesTab() {
       message: t('marketplace.reinstall_demo_confirm', {
         defaultValue: 'This will delete the existing demo project and create a fresh copy. All changes you made to the demo will be lost.',
       }),
+      confirmLabel: t('marketplace.reinstall', { defaultValue: 'Reinstall' }),
     });
     if (!confirmed) return;
     setInstallingId(`demo-${demoId}`);
@@ -1832,7 +2079,7 @@ function DataPackagesTab() {
       });
       queryClient.invalidateQueries({ queryKey: ['demo-status'] });
       queryClient.invalidateQueries({ queryKey: ['marketplace'] });
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      invalidateProjectLists(queryClient);
       navigate(`/projects/${result.project_id}`);
     } catch (err) {
       addToast({
@@ -1862,7 +2109,7 @@ function DataPackagesTab() {
       });
       queryClient.invalidateQueries({ queryKey: ['demo-status'] });
       queryClient.invalidateQueries({ queryKey: ['marketplace'] });
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      invalidateProjectLists(queryClient);
     } catch (err) {
       addToast({
         type: 'error',

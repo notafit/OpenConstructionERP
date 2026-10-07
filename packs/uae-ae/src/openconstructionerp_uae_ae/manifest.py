@@ -23,15 +23,20 @@ MANIFEST = PartnerPackManifest(
         "sustainable development. English interface with Arabic greeting "
         "in onboarding."
     ),
-    default_locale="en",
+    default_locale="en-AE",
     additional_locales={},
     cwicr_regions=[
         "cwicr-ar-dubai",  # resolves to AE_DUBAI
     ],
     default_currency="AED",
     default_tax_template="ae_vat_5",
-    default_methodology="uae",
-    validation_rule_packs=[],
+    default_methodology="united_arab_emirates",
+    validation_rule_packs=[
+        "abudhabi_building_code",
+        "dubai_municipality",
+        "civil_defense",
+        "estidama_pearl",
+    ],
     validation_rule_sets=[
         "masterformat",
     ],

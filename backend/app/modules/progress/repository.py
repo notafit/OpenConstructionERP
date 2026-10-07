@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -196,6 +197,8 @@ class ProgressRepository:
         self,
         project_id: uuid.UUID,
         boq_position_id: uuid.UUID,
+        *,
+        as_of: datetime | None = None,
     ) -> ProgressEntry | None:
         """Return the most-recent progress observation for one BOQ position.
 
@@ -210,17 +213,31 @@ class ProgressRepository:
         readings sharing a timestamp - a correction typed in the same
         transaction as the reading it corrects, or a bulk import - left the
         winner to the planner.
+
+        Args:
+            project_id: tenant scope; a position from another project reads
+                nothing.
+            boq_position_id: the position to read.
+            as_of: ignore observations recorded after this instant. A payment
+                application bills one period, so the reading that belongs in
+                it is the latest one taken by the end of that period, not the
+                latest one taken. Without this, a claim raised for March and
+                populated in May billed May's percent complete against March's
+                period and left April's claim to work out the difference.
+                ``recorded_at`` is what this compares, because it is when the
+                measurement was taken; ``period_label`` is a free-form
+                ``String(20)`` with no order to it, and ``seq`` orders writes
+                rather than observations. Callers pass the end of the day,
+                since ``recorded_at`` carries a time and the period end is a
+                date.
         """
-        stmt = (
-            select(ProgressEntry)
-            .where(
-                ProgressEntry.project_id == project_id,
-                ProgressEntry.boq_position_id == boq_position_id,
-            )
-            .order_by(*_latest_first())
-            .limit(1)
+        stmt = select(ProgressEntry).where(
+            ProgressEntry.project_id == project_id,
+            ProgressEntry.boq_position_id == boq_position_id,
         )
-        result = await self.session.execute(stmt)
+        if as_of is not None:
+            stmt = stmt.where(ProgressEntry.recorded_at <= as_of)
+        result = await self.session.execute(stmt.order_by(*_latest_first()).limit(1))
         return result.scalar_one_or_none()
 
     async def get_latest_project_entry(self, project_id: uuid.UUID) -> ProgressEntry | None:

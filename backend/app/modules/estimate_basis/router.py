@@ -75,11 +75,11 @@ async def _load_owned_document(
 
 @router.get("/classes", response_model=EstimateClassCatalog, dependencies=[_READ])
 async def list_classes() -> EstimateClassCatalog:
-    """List the AACE 18R-97 estimate classes and their published accuracy bands.
+    """List all registered estimate classification systems and their classes.
 
-    Served so a client never hardcodes a standard's numbers. The table is the
-    platform's single copy, shared with the BOQ module's classification
-    endpoint. Project-independent, so no project check applies.
+    Returns every class from every system (AACE 18R-97, Canadian CCA, etc.)
+    so a client never hardcodes a standard's numbers. Each item carries a
+    ``classification_system`` field for filtering by jurisdiction.
     """
     return EstimateBasisService.class_catalog()
 

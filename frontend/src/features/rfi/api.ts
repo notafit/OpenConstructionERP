@@ -6,7 +6,15 @@
  * All endpoints are prefixed with /v1/rfi/.
  */
 
-import { apiGet, apiPost, apiPatch, type Page } from '@/shared/lib/api';
+import {
+  API_BASE,
+  activeLanguageTag,
+  apiGet,
+  apiPost,
+  apiPatch,
+  downloadWithAuth,
+  type Page,
+} from '@/shared/lib/api';
 
 /* ── Types ─────────────────────────────────────────────────────────────── */
 
@@ -224,6 +232,19 @@ export async function respondToRFI(id: string, data: RespondRFIPayload): Promise
 
 export async function closeRFI(id: string): Promise<RFI> {
   return apiPost<RFI>(`/v1/rfi/${id}/close/`);
+}
+
+export async function downloadRFIPdf(id: string, rfiNumber: string): Promise<void> {
+  // Route is GET /{rfi_id}/export/pdf/ WITH a trailing slash (router.py).
+  // The download skips apiGet and the Accept-Language header it attaches,
+  // so the UI language travels as ?locale= or the form would follow the
+  // browser's language instead of the one the reader picked.
+  const lang = activeLanguageTag();
+  const query = lang ? `?locale=${encodeURIComponent(lang)}` : '';
+  await downloadWithAuth(
+    `${API_BASE}/v1/rfi/${encodeURIComponent(id)}/export/pdf/${query}`,
+    `${rfiNumber || 'rfi'}.pdf`,
+  );
 }
 
 export async function createVariationFromRFI(id: string): Promise<CreateVariationResponse> {

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "I lavori di questo intervento sono iniziati il {start}, prima della presentazione della domanda avvenuta il {filed}. La maggior parte dei programmi non finanzia nulla se l'intervento è già avviato",
+      "unevidenced": "I lavori sono iniziati in anticipo, il {start}, e la pratica indica che l'ente lo ha autorizzato, ma non riporta alcuna autorizzazione scritta",
+      "evidence": "Registra gli estremi dell'autorizzazione scritta all'inizio anticipato, così la pratica regge da sola a un controllo",
+      "suggestion": "Verifica le condizioni del programma prima di spendere altro. Se l'inizio anticipato è stato autorizzato per iscritto, registralo; in caso contrario, chiedi all'ente prima di procedere oltre con la domanda"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "La richiesta di erogazione {draw} comprende costi sostenuti prima del {period_start}, giorno in cui si apre il periodo di concessione",
+      "after": "La richiesta di erogazione {draw} comprende costi sostenuti dopo il {period_end}, giorno in cui si chiude il periodo di concessione",
+      "spans": "La richiesta di erogazione {draw} va oltre entrambi gli estremi del periodo di concessione, dal {period_start} al {period_end}",
+      "suggestion": "Sposta i costi fuori periodo in una richiesta di erogazione a parte e chiariscili con l'ente, invece di tenere nella stessa richiesta costi dentro e fuori periodo"
+    },
+    "own_share_is_covered": {
+      "fail": "Il programma richiede una quota a proprio carico del {rate} per cento, pari a {required}, ma la domanda riporta {recorded}",
+      "suggestion": "Prima di presentare la domanda indica da dove proviene la quota a proprio carico mancante, perché il programma la calcola sui costi ammissibili e non sul costo totale del progetto"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Le {count} domande di questo progetto raggiungono il {intensity} per cento dei costi ammissibili, oltre il massimale di intensità di aiuto del {cap} per cento fissato dal più restrittivo dei loro programmi",
+      "suggestion": "I finanziamenti pubblici si cumulano tra programmi e tra livelli di governo. Riduci l'importo richiesto in una delle domande, oppure verifica se gli interventi possono essere separati in modo che ciascuno sostenga i propri costi"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Il periodo di concessione si è chiuso il {period_end} e nessuna rendicontazione finale è stata avviata",
+      "late": "La rendicontazione finale era dovuta entro il {due} ed è stata presentata il {submitted}",
+      "overdue": "La rendicontazione finale era dovuta entro il {due} e non è ancora stata presentata",
+      "suggestion": "Presenta ciò che hai invece di aspettare che sia completo. La maggior parte degli enti proroga una scadenza su richiesta, ma nessuno proroga una scadenza già passata"
+    },
+    "errors": {
+      "application_not_found": "Domanda non trovata",
+      "programme_code_taken": "In questo paese esiste già un programma con questo riferimento",
+      "programme_not_found": "Programma non trovato",
+      "programme_has_applications": "Questo programma ha delle domande e non può essere eliminato. Chiudilo invece di eliminarlo.",
+      "application_code_taken": "In questo progetto esiste già una domanda con questo riferimento",
+      "approved_application_not_deletable": "Una domanda concessa non può essere eliminata. Imposta invece lo stato su Ritirata o Chiusa.",
+      "approval_needs_period_end": "Per registrare la concessione serve la data di fine del periodo di concessione, perché tutte le scadenze successive decorrono da quella data",
+      "draw_needs_approval": "Le erogazioni si possono richiedere solo per una domanda concessa",
+      "draw_not_found": "Erogazione non trovata",
+      "paid_draw_not_deletable": "Un'erogazione già pagata non può essere eliminata",
+      "proof_not_found": "Rendicontazione non trovata",
+      "obligation_not_found": "Scadenza non trovata",
+      "eligible_exceeds_amount": "La quota ammissibile non può superare l'importo",
+      "allocation_not_found": "Voce di costo non trovata"
+    }
+  }
+}

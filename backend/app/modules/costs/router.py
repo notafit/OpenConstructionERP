@@ -18,6 +18,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -27,6 +28,8 @@ import re as _re
 import urllib.parse
 import uuid
 import zipfile
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -57,7 +60,7 @@ from app.dependencies import (
     SessionDep,
     verify_project_access,
 )
-from app.modules.costs import base_registry
+from app.modules.costs import base_registry, base_state
 from app.modules.costs.intelligence import (
     CostCertaintyService,
     CostUsageRecorder,
@@ -69,6 +72,7 @@ from app.modules.costs.matcher import (
     match_cwicr_items,
 )
 from app.modules.costs.models import CostItem
+from app.modules.costs.pricelist_router import router as pricelist_router
 from app.modules.costs.region_currency import REGION_CURRENCY
 from app.modules.costs.repository import synonym_text_predicate  # noqa: F401
 from app.modules.costs.resource_pricing import ResourcePriceService
@@ -125,6 +129,7 @@ _MAX_COST_ZIP_ENTRIES = 10_000
 _ALLOWED_COST_IMPORT_SIGNATURES: frozenset[str] = frozenset({"zip", "ole"})
 
 router = APIRouter(tags=["costs"])
+router.include_router(pricelist_router)  # the loader mounts this router only
 logger = logging.getLogger(__name__)
 
 
@@ -461,11 +466,13 @@ async def autocomplete_cost_items(
                     codes = [r.get("code", "") for r in results]
                     components_map: dict[str, list[dict[str, Any]]] = {}
                     metadata_map: dict[str, dict[str, Any]] = {}
+                    id_map: dict[str, str] = {}
                     try:
                         items_from_db = await service.get_by_codes(codes)
                         for db_item in items_from_db:
                             components_map[db_item.code] = db_item.components or []
                             metadata_map[db_item.code] = db_item.metadata_ or {}
+                            id_map[db_item.code] = str(db_item.id)
                     except Exception:
                         logger.debug("Cost search: component lookup failed", exc_info=True)
 
@@ -485,6 +492,7 @@ async def autocomplete_cost_items(
                         slim_md = _slim_autocomplete_metadata(md_full)
                         out.append(
                             CostAutocompleteItem(
+                                id=id_map.get(r.get("code", "")),
                                 code=r.get("code", ""),
                                 description=r.get("description", ""),
                                 unit=r.get("unit", ""),
@@ -534,6 +542,7 @@ async def autocomplete_cost_items(
         slim_md = _slim_autocomplete_metadata(md_full)
         out.append(
             CostAutocompleteItem(
+                id=str(item.id),
                 code=item.code,
                 description=item.description,
                 unit=item.unit,
@@ -587,6 +596,40 @@ async def create_cost_item(
 
 
 # ── Search / List ─────────────────────────────────────────────────────────
+
+# The ``metadata_`` keys a slim (``lite=true``) list row keeps: the small ones
+# the list views render or copy onto a new BOQ position. It drops ``variants``
+# (a CWICR row's alternate price catalogue, kilobytes per row) and any other
+# large array; a caller that needs them reads ``GET /v1/costs/{id}``.
+_LITE_METADATA_KEYS: tuple[str, ...] = (
+    "variant_stats",
+    "labor_cost",
+    "material_cost",
+    "equipment_cost",
+    "other_cost",
+    "labor_hours",
+    "workers_per_unit",
+    "scope_of_work",
+)
+
+
+def _slim_list_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Trim one serialised list row to its ``lite`` shape, in place.
+
+    A CWICR row is mostly its component breakdown (with a variant catalogue on
+    every abstract-resource component) and ``metadata_.variants``. A list
+    renders neither, so the slim row empties ``components``, keeps their count
+    in ``components_count`` for the "has breakdown" badge, and keeps only the
+    ``_LITE_METADATA_KEYS`` of ``metadata_``. Every other field is unchanged,
+    so a slim row is the full row minus its bulk.
+    """
+    comps = payload.get("components") or []
+    payload["components_count"] = len(comps)
+    payload["components"] = []
+    md = payload.get("metadata_") or {}
+    if isinstance(md, dict):
+        payload["metadata_"] = {k: md[k] for k in _LITE_METADATA_KEYS if k in md}
+    return payload
 
 
 @router.get("/")
@@ -830,28 +873,7 @@ async def search_cost_items(
             resolved_locale,
         )
         if lite:
-            comps = payload.get("components") or []
-            payload["components_count"] = len(comps)
-            payload["components"] = []
-            md = payload.get("metadata_") or {}
-            if isinstance(md, dict):
-                # Whitelist tiny keys the list view + BOQ-add synth path
-                # actually consume. Drops ``variants`` (~6 KB / row of
-                # alternate price entries) and any other large arrays.
-                payload["metadata_"] = {
-                    k: md[k]
-                    for k in (
-                        "variant_stats",
-                        "labor_cost",
-                        "material_cost",
-                        "equipment_cost",
-                        "other_cost",
-                        "labor_hours",
-                        "workers_per_unit",
-                        "scope_of_work",
-                    )
-                    if k in md
-                }
+            payload = _slim_list_row(payload)
         return payload
 
     serialized = [_serialize(i) for i in items]
@@ -917,8 +939,12 @@ def _invalidate_cost_cache() -> None:
 @router.get("/regions/", response_model=list[str])
 async def list_loaded_regions(
     session: SessionDep,
+    _user_id: CurrentUserId,
 ) -> list[str]:
-    """List distinct regions that have cost items loaded."""
+    """List distinct regions that have cost items loaded.
+
+    Signed-in callers only, like its sibling ``/regions/stats/``.
+    """
     now = _time.monotonic()
     if _region_cache["regions"] is not None and now - _region_cache["ts"] < _CACHE_TTL:
         return _region_cache["regions"]
@@ -945,8 +971,13 @@ async def list_loaded_regions(
 @router.get("/regions/stats/")
 async def region_stats(
     session: SessionDep,
+    _user_id: CurrentUserId,
 ) -> list[dict]:
-    """Return item count per loaded region. Cached for 30s."""
+    """Return item count per loaded region. Cached for 30s.
+
+    Signed-in callers only: every screen that shows these counts is behind
+    sign-in, and nothing before it asks for them.
+    """
     now = _time.monotonic()
     if _region_cache["stats"] is not None and now - _region_cache["ts"] < _CACHE_TTL:
         return _region_cache["stats"]
@@ -1004,6 +1035,8 @@ async def clear_region_database(
 
     stmt = sql_delete(CostItem).where(CostItem.region == region)
     result = await session.execute(stmt)
+    # The rows the stored market and language described are gone with them.
+    await base_state.forget_base_state(session, region, commit=False)
     await session.commit()
     count = result.rowcount  # type: ignore[union-attr]
 
@@ -1230,29 +1263,363 @@ async def load_base_market(
         raise HTTPException(status_code=404, detail=f"Unknown market '{market_token}'.")
 
     # Ensure the base parquet is loaded before repricing it (idempotent).
-    await load_cwicr_region(base_region, session)
+    await load_cwicr_region(base_region, session, retry_home_language=False)
 
     # Switch the base's work-item TEXT to the market's language before repricing.
     # A national base ships one English parquet plus a translated parquet per app
     # language; the market card picks the language (its ``lang_code``). Text
     # follows the language, price follows the market - the two are orthogonal, so
     # the text swap runs first and the reprice below preserves the translated
-    # component names. No-op for English/untranslated markets.
-    await _ensure_region_text_language(base_region, base_registry.market_lang_code(market_token), session)
+    # component names.
+    #
+    # The language is a promise the card made, so it is checked, not assumed.
+    # When a file holds the base in that language and the swap still does not
+    # land (download refused, swap raised), the request fails before the
+    # reprice: answering "Priced into France" over Turkish text is the silent
+    # wrong-language load this used to be. When no file holds it (Turkiye has
+    # no English text), the base opens in its own language, which is what the
+    # card already says through ``text_lang_code``, never whatever language a
+    # previous market happened to leave behind.
+    #
+    # Both branches are held to the same rule: the language they aim for must
+    # land, or nothing is repriced. The fallback branch used to swallow a failed
+    # swap and answer 200 with the text still in whatever language was there.
+    requested_lang = base_registry.normalize_lang_code(base_registry.market_lang_code(market_token) or "")
+    if base_registry.text_source_region(base_region, requested_lang) is not None:
+        target_lang: str | None = requested_lang
+    else:
+        target_lang = base_registry.home_language_code(base_region) or base_registry.home_parquet_text_lang(base_region)
 
     from app.modules.catalog.router import fetch_market_catalog_rows
 
-    try:
-        rows = await fetch_market_catalog_rows(base_region, market_token)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    actor = _parse_user_uuid(_user_id)
+    # One text swap plus reprice per base at a time, across every worker: two
+    # market clicks on the same base interleaved could leave one market's text
+    # under the other's prices while each tab reports its own.
+    async with _market_lock_or_409(session, base_region):
+        before = await base_state.read_base_state(session, base_region)
+        # Say a switch is under way before anything moves, and keep saying so if
+        # it dies half way: a reader must never be told a market the rows are
+        # only partly in.
+        await base_state.write_base_state(session, base_region, switching_to=market_token, updated_by=actor)
+        try:
+            text_lang = await _ensure_region_text_language(base_region, target_lang, session) if target_lang else None
+            if target_lang and text_lang != target_lang:
+                reason = _LAST_TEXT_SWAP_ERROR.pop(base_region, "")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=(
+                        f"The '{target_lang}' text of '{base_region}' could not be loaded, so "
+                        f"'{market_token}' was not applied. {reason}"
+                    ).strip(),
+                )
 
-    result = await service.apply_market_catalog(base_region, market_token, rows)
+            try:
+                rows = await fetch_market_catalog_rows(base_region, market_token)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        except HTTPException:
+            # Nothing was repriced, so the base is still in the market it was in.
+            await base_state.write_base_state(
+                session,
+                base_region,
+                switching_to=before.switching_to if before else None,
+            )
+            raise
+
+        # From here on prices move. A failure leaves ``switching_to`` set on
+        # purpose: the region may be half repriced, and the catalogue says so
+        # until a switch or a return home completes.
+        result = await service.apply_market_catalog(base_region, market_token, rows)
+        # Inside the lock, so the Resource Catalog always shows the market the
+        # rows were last switched to: a switch or return home queued behind
+        # this one cannot write its catalogue before ours lands.
+        catalog_out = await _mirror_market_catalog(session, base_region, rows)
+        await base_state.write_base_state(
+            session, base_region, active_market=market_token, switching_to=None, updated_by=actor
+        )
     _invalidate_cost_cache()
 
     payload = result.as_dict()
     payload["active_market"] = market_token
+    # What the text is in now, next to what the card asked for, so the client
+    # can say so when they differ instead of implying the market's language.
+    payload["text_language"] = text_lang
+    payload["text_language_requested"] = requested_lang
+    payload["catalog"] = catalog_out
     return payload
+
+
+@asynccontextmanager
+async def _market_lock_or_409(session: AsyncSession | None, base_region: str) -> AsyncIterator[None]:
+    """The base's market lock, answering 409 when another switch holds it too long.
+
+    ``BaseBusyError`` is raised only while the lock is being taken, so nothing
+    the body raises is turned into a 409.
+    """
+    try:
+        async with base_state.base_market_lock(session, base_region):
+            yield
+    except base_state.BaseBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+async def _mirror_market_catalog(session: AsyncSession, base_region: str, rows: list[dict[str, Any]]) -> dict:
+    """Show the market's resources in the Resource Catalog under the base's region.
+
+    The market CSV a switch prices from is the catalogue of that market: the
+    base's own resources at the market's prices and in its currency. It used to
+    be read for the reprice and dropped, so the Resource Catalog stayed empty
+    (or kept the home prices) after a market load. Fail-soft: the reprice has
+    committed by now, so a catalogue error is reported beside it, not raised.
+    """
+    from app.modules.catalog.router import replace_imported_catalog_rows
+
+    try:
+        out = await replace_imported_catalog_rows(session, base_region, rows, source="market_import")
+        await session.commit()
+        return out
+    except Exception as exc:  # noqa: BLE001 - the switch itself has already landed
+        logger.exception("Mirroring the market catalogue of %s failed (non-fatal)", base_region)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - the rollback is best effort
+            logger.debug("rollback after the failed catalogue mirror also failed", exc_info=True)
+        return {"region": base_region, "error": f"The resource catalogue was not updated: {exc.__class__.__name__}."}
+
+
+@router.post(
+    "/base-home/{base_region}",
+    # Same gate as the market switch it undoes: it rewrites the shared rows.
+    dependencies=[Depends(RequirePermission("costs.update"))],
+)
+async def restore_base_home_market(
+    base_region: str,
+    session: SessionDep,
+    _user_id: CurrentUserId,
+) -> dict:
+    """Bring a national base back to its own market, currency and language.
+
+    Once a base had been priced into another market nothing led back: the home
+    card only offered "Set as active", and deleting the region to load it
+    again would cascade away every match, assembly and usage record that
+    points at its items. This puts the rows back in place instead, ids kept:
+
+    1. The base's own parquet is read into a staging region and its text, rate,
+       components and breakdown are copied onto the live rows, joined on code.
+       Those rows, and rows without components, get the home currency back.
+    2. The resource price sheet is rebuilt from the rows in the home currency,
+       as a fresh load builds it. Prices edited on the sheet are replaced; the
+       answer says how many. A priced recipe the home file does not hold is
+       then repriced from that sheet and given the home currency; any that
+       cannot be is counted in ``items_left_in_market``.
+    3. The text is switched to the base's own language, as a fresh load does.
+    4. The Resource Catalog gets the base's own catalogue back (fail-soft).
+
+    The result is what deleting and loading the base again would give, without
+    the delete. 404 for an unknown or not-loaded base, 409 when another switch
+    of the same base is running, 502 when the base's own file cannot be read,
+    and 502 when the price sheet cannot be rebuilt. In that last case the items
+    are already home and the sheet is rolled back to what it was, so the base
+    stays marked as switching until a second return home finishes the job.
+    """
+    from sqlalchemy import delete as sql_delete
+    from sqlalchemy import func
+
+    from app.modules.costs.models import ResourcePrice
+
+    if not base_registry.is_national_region(base_region) or base_registry.variant_by_region(base_region) is None:
+        raise HTTPException(status_code=404, detail=f"'{base_region}' is not a base with markets to return from.")
+    loaded = (
+        await session.execute(
+            select(func.count())
+            .select_from(CostItem)
+            .where(CostItem.region == base_region, CostItem.is_active.is_(True))
+        )
+    ).scalar_one()
+    if not loaded:
+        raise HTTPException(status_code=404, detail=f"'{base_region}' is not loaded.")
+
+    actor = _parse_user_uuid(_user_id)
+    home_currency = _resolve_currency(None, base_region)
+    async with _market_lock_or_409(session, base_region):
+        before = await base_state.read_base_state(session, base_region)
+        parquet = await _find_cwicr_file(base_region)
+        if not parquet:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    f"The home file of '{base_region}' could not be found or downloaded, so nothing was changed. "
+                    f"{_LAST_DOWNLOAD_ERROR.get(base_region, '')}"
+                ).strip(),
+            )
+
+        await base_state.write_base_state(
+            session, base_region, switching_to=base_state.RESTORING_HOME, updated_by=actor
+        )
+        import os as _os
+
+        from app.config import get_settings
+
+        target = _os.environ.get("DATABASE_SYNC_URL") or get_settings().database_sync_url
+        try:
+            restored = await asyncio.to_thread(
+                _overlay_region_from_parquet_sync,
+                target,
+                str(parquet),
+                base_region,
+                f"__xlate_{base_region}_home",
+                _HOME_RESTORE_COLS,
+                home_currency,
+            )
+        except Exception as exc:
+            logger.exception("Returning %s to its home market failed", base_region)
+            # The overlay is one transaction, so the rows are as they were.
+            await base_state.write_base_state(
+                session, base_region, switching_to=before.switching_to if before else None
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"'{base_region}' could not be returned to its home market: {exc.__class__.__name__}.",
+            ) from exc
+        if not restored:
+            await base_state.write_base_state(
+                session, base_region, switching_to=before.switching_to if before else None
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"No work item of '{base_region}' matched its home file, so nothing was changed.",
+            )
+        # The rows now hold the home parquet's text; record that before the
+        # language switch below so it is not skipped as already done.
+        await base_state.write_base_state(
+            session, base_region, text_language=base_registry.home_parquet_text_lang(base_region)
+        )
+
+        # Rebuild the price sheet the way a fresh load builds it: from the rows
+        # just restored. The market switch overwrote every sheet row, so the
+        # sheet is replaced rather than merged, and the edits lost are counted.
+        discarded = (
+            await session.execute(
+                select(func.count())
+                .select_from(ResourcePrice)
+                .where(ResourcePrice.region == base_region, ResourcePrice.source == "user")
+            )
+        ).scalar_one()
+        prices = ResourcePriceService(session)
+        try:
+            # The delete is not committed on its own: it lands with the seed's
+            # commit, so a seed that fails rolls it back and the region is never
+            # left without a price sheet.
+            await session.execute(sql_delete(ResourcePrice).where(ResourcePrice.region == base_region))
+            # Only rows already back in the home currency say what a home price is.
+            seed = await prices.seed_region(base_region, currency=home_currency)
+            # A priced recipe the home file does not hold still carries the
+            # market's prices: reprice it from the home sheet just built, as the
+            # switch repriced it from the market's, and give it the home currency.
+            repriced_home = await prices.reprice_region(
+                base_region, where=CostItem.currency != home_currency, stamp_currency=home_currency
+            )
+            await session.commit()
+        except Exception as exc:
+            logger.exception("Rebuilding the price sheet of %s on its return home failed", base_region)
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001 - the rollback is best effort
+                logger.debug("rollback after the failed price sheet rebuild also failed", exc_info=True)
+            # The work items already hold their home rates, so caches must not
+            # keep serving the market ones.
+            _invalidate_cost_cache()
+            # ``switching_to`` stays on the return home on purpose: the items
+            # are home but the sheet still holds the market's prices, and
+            # calling that "home" would be the half-done state this marker
+            # exists to show. Returning home again finishes it.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    f"The work items of '{base_region}' are back on their home prices, but its resource price "
+                    f"sheet could not be rebuilt ({exc.__class__.__name__}). Return it home again to finish."
+                ),
+            ) from exc
+        left_in_market = (
+            await session.execute(
+                select(func.count())
+                .select_from(CostItem)
+                .where(
+                    CostItem.region == base_region,
+                    CostItem.is_active.is_(True),
+                    CostItem.currency != home_currency,
+                )
+            )
+        ).scalar_one()
+
+        home_lang_out = await _open_in_home_language(base_region, session)
+        # Inside the lock, so a switch that queued behind this one cannot land
+        # its market catalogue first and then have it overwritten by ours.
+        home_catalog = await _restore_home_catalog(session, base_region)
+        await base_state.write_base_state(session, base_region, active_market=None, switching_to=None, updated_by=actor)
+    _invalidate_cost_cache()
+
+    # The rates moved back, so whatever was built on them should follow, as it
+    # does after a reprice. Published after the commits above.
+    from app.modules.costs.resource_pricing import _safe_publish
+
+    await _safe_publish(
+        "costs.region.repriced",
+        {"region": base_region, "items_changed": int(restored) + repriced_home.items_changed},
+        source_module="oe_costs",
+    )
+
+    payload: dict[str, Any] = {
+        "region": base_region,
+        "items_restored": int(restored),
+        # Items the home file does not hold, repriced from the home sheet.
+        "items_repriced_home": repriced_home.items_repriced,
+        # Items still in another currency: their recipe has no line the home
+        # sheet prices, so nothing could bring them back. Shown to the user.
+        "items_left_in_market": int(left_in_market or 0),
+        "currency": home_currency,
+        "resource_prices": seed.as_dict(),
+        "user_prices_discarded": int(discarded or 0),
+        "previous_market": before.active_market if before else None,
+        **home_lang_out,
+    }
+    payload["catalog"] = home_catalog
+    state = await base_state.read_base_state(session, base_region)
+    payload["state"] = state.public() if state else None
+    return payload
+
+
+async def _restore_home_catalog(session: AsyncSession, base_region: str) -> dict:
+    """Give the Resource Catalog the base's own catalogue back after a return home.
+
+    Fail-soft like :func:`_mirror_market_catalog`. When the base's catalogue
+    cannot be read, the market rows a switch put there are retired (hidden, not
+    deleted), so the catalogue shows no other market's prices and every
+    assembly component linked to one of them keeps its link.
+    """
+    from app.modules.catalog.router import fetch_region_catalog_rows, replace_imported_catalog_rows
+
+    try:
+        rows = await fetch_region_catalog_rows(base_region)
+    except (ValueError, RuntimeError) as exc:
+        rows = []
+        reason = str(exc)
+    else:
+        reason = ""
+    try:
+        out = await replace_imported_catalog_rows(session, base_region, rows, source="github_import")
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001 - the return home itself has landed
+        logger.exception("Restoring the home catalogue of %s failed (non-fatal)", base_region)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - the rollback is best effort
+            logger.debug("rollback after the failed catalogue restore also failed", exc_info=True)
+        return {"region": base_region, "error": f"The resource catalogue was not updated: {exc.__class__.__name__}."}
+    if reason:
+        out["error"] = f"The home resource catalogue could not be read, so its market rows were hidden: {reason}"
+    return out
 
 
 # ── Vector database (LanceDB embedded / Qdrant server) ──────────────────────
@@ -1548,14 +1915,15 @@ async def _detect_language_mismatch(
     language-aware fix landed (#236).
 
     Status values:
-        - ``unknown``      - project not found, or no region set
+        - ``unknown``      - project not found, no region set, or a region
+                             that names no single language
         - ``unbound``      - project has no cost_database_id yet
         - ``ok``           - languages match (or both fall back to default)
         - ``mismatch``     - project language ≠ catalogue language
     """
     from sqlalchemy import select  # noqa: PLC0415
 
-    from app.core.match_service.region_language import language_for
+    from app.core.match_service.region_language import project_language, resolve_language
     from app.modules.projects.models import MatchProjectSettings, Project
 
     out: dict[str, Any] = {
@@ -1570,7 +1938,11 @@ async def _detect_language_mismatch(
         if not project or not project.region:
             return out
         out["project_region"] = project.region
-        out["project_language"] = language_for(project.region)
+        # A region the project states without one language ("Nordics")
+        # stays "unknown" rather than being read as English.
+        out["project_language"] = project_language(project.region, getattr(project, "country_code", None)) or ""
+        if not out["project_language"]:
+            return out
 
         # MatchProjectSettings uses an ``id`` PK with a unique FK on
         # ``project_id``; ``db.get`` cannot be used here.
@@ -1580,7 +1952,9 @@ async def _detect_language_mismatch(
             out["status"] = "unbound"
             return out
         out["bound_catalogue"] = settings.cost_database_id
-        out["bound_language"] = language_for(settings.cost_database_id)
+        # A catalogue id with no known language stays "unknown" rather than
+        # being read as English and flagged against every other language.
+        out["bound_language"] = resolve_language(settings.cost_database_id) or ""
 
         if out["project_language"] and out["bound_language"]:
             out["status"] = "ok" if out["project_language"] == out["bound_language"] else "mismatch"
@@ -1916,44 +2290,53 @@ async def vectorize_region(
 
     start = time.monotonic()
 
-    # Fetch cost items
-    stmt = select(CostItem).where(CostItem.is_active.is_(True))
+    # Count first so we can report to the caller and bail early.
+    from sqlalchemy import func as sa_func
+
+    count_stmt = select(sa_func.count()).select_from(CostItem).where(CostItem.is_active.is_(True))
     if region:
-        stmt = stmt.where(CostItem.region == region)
+        count_stmt = count_stmt.where(CostItem.region == region)
+    total_count = (await session.execute(count_stmt)).scalar() or 0
 
-    result = await session.execute(stmt)
-    items = result.scalars().all()
-
-    if not items:
+    if not total_count:
         return {"indexed": 0, "message": "No cost items found to index"}
 
-    logger.info("Vectorizing %d cost items (region=%s)...", len(items), region or "all")
+    logger.info("Vectorizing %d cost items (region=%s)...", total_count, region or "all")
 
-    # Pre-extract all data from ORM objects before they expire
-    items_data = []
-    for item in items:
-        cls = item.classification or {}
-        items_data.append(
-            {
-                "id": str(item.id),
-                "code": item.code,
-                "description": (item.description or "")[:200],
-                "unit": item.unit or "",
-                "rate": float(item.rate) if item.rate else 0.0,
-                "region": item.region or "",
-                "text": " ".join(
-                    p
-                    for p in [
-                        item.description or "",
-                        item.unit or "",
-                        cls.get("collection", ""),
-                        cls.get("department", ""),
-                        cls.get("section", ""),
-                    ]
-                    if p
-                ),
-            }
-        )
+    # Fetch in batches of 5000 to avoid loading 100k+ ORM objects at once.
+    # On a 4 GB server with a full national CWICR base the old unbounded
+    # .all() peaked at 200-400 MB just for ORM instances.
+    _BATCH = 5000
+    items_data: list[dict] = []
+    for offset in range(0, total_count, _BATCH):
+        stmt = select(CostItem).where(CostItem.is_active.is_(True)).order_by(CostItem.id).offset(offset).limit(_BATCH)
+        if region:
+            stmt = stmt.where(CostItem.region == region)
+        result = await session.execute(stmt)
+        for item in result.scalars():
+            cls = item.classification or {}
+            items_data.append(
+                {
+                    "id": str(item.id),
+                    "code": item.code,
+                    "description": (item.description or "")[:200],
+                    "unit": item.unit or "",
+                    "rate": float(item.rate) if item.rate else 0.0,
+                    "region": item.region or "",
+                    "text": " ".join(
+                        p
+                        for p in [
+                            item.description or "",
+                            item.unit or "",
+                            cls.get("collection", ""),
+                            cls.get("department", ""),
+                            cls.get("section", ""),
+                        ]
+                        if p
+                    ),
+                }
+            )
+        await session.flush()
 
     # Run CPU-heavy embedding in a thread to not block event loop.
     # NOTE: Uses ThreadPoolExecutor (not Process) to avoid pickling issues
@@ -1992,6 +2375,45 @@ async def vectorize_region(
         "region": region or "all",
         "duration_seconds": duration,
     }
+
+
+# Rows of the pre-built embedding parquet read, and indexed, at one time.
+#
+# The file carries one 384-float32 embedding per cost item alongside its text
+# columns, so for a large region it is tens of thousands of rows and hundreds of
+# megabytes once decoded. Reading it whole put all of that in memory before a
+# single record reached the vector store, which is the same shape of peak that
+# made a cost-base import kill a small server - and this endpoint runs on the
+# same machines, often right after that import.
+#
+# Streaming the file bounds the decoded rows to this many. The reader's own
+# buffer is bounded by the parquet row group underneath that, which is a weaker
+# guarantee than the batch size but still not the whole file. The value is the
+# batch size the indexing loop already used, so what the vector store is handed
+# per call is unchanged.
+_VECTOR_READ_ROWS = 256
+
+# Cost items read, embedded and indexed in one page of the local fallback below.
+#
+# The fallback used to take a fixed first slice of the region - ``limit=5000``,
+# with the ``total`` and ``has_more`` that came back beside it discarded - and
+# report only how many rows it had indexed. For any base larger than that the
+# caller was handed a plausible, smaller number and nothing at all to say the
+# rest of the catalogue had been left out of the search index. The evidence that
+# it had been truncated was in hand and thrown away.
+_LOCAL_VECTOR_PAGE_ROWS = 2000
+
+# Ceiling on one local generation pass.
+#
+# A cap is still right here, unlike on the reads that were merely buffered:
+# every row on this path is run through a sentence-transformer inside the
+# request, so an uncapped pass is unbounded CPU work on an open connection. It
+# is set above every base the platform ships (the largest is ~60K work items)
+# precisely so that hitting it is an anomaly and not a routine event - and when
+# it is hit the response says so, names the ceiling, and reports how much of the
+# catalogue was left unindexed. A cap that is reported is a decision; the same
+# cap unreported is a wrong answer.
+_LOCAL_VECTOR_MAX_ROWS = 100_000
 
 
 @router.post(
@@ -2054,12 +2476,6 @@ async def load_vector_from_github(
             from app.modules.costs.repository import CostItemRepository
 
             repo = CostItemRepository(session)
-            items_list, total = await repo.search(region=db_id, limit=5000)
-            if not items_list:
-                items_list, total = await repo.search(limit=5000)
-
-            if not items_list:
-                raise HTTPException(400, f"No cost items found for '{db_id}'.")
 
             # Run embedding generation in a thread to not block event loop
             def _generate_vectors(items_data):
@@ -2085,30 +2501,99 @@ async def load_vector_from_github(
                         indexed += vi(records)
                 return indexed
 
-            # Prepare data outside the thread (ORM objects can't cross threads)
-            items_data = [
-                {
-                    "id": str(ci.id),
-                    "code": ci.code or "",
-                    "desc": (ci.description or "")[:200],
-                    "unit": ci.unit or "",
-                    "rate": float(ci.rate) if ci.rate else 0.0,
-                    "region": ci.region or db_id,
-                }
-                for ci in items_list
-            ]
-
+            # Walk the catalogue in pages instead of taking a fixed first slice
+            # of it (see ``_LOCAL_VECTOR_PAGE_ROWS``). ``search`` orders by
+            # ``(code, id)`` and this loop writes neither, so the offsets stay
+            # addressable while it runs; it also returns ``has_more``, which is
+            # the fact the old fixed read discarded and the response below now
+            # carries. ``search`` returns three values - unpacking it into two
+            # names used to raise ValueError on the first call, and the
+            # ``except`` below then reported "vector generation failed", naming
+            # the embedding model rather than the unpack.
+            scanned = 0
+            indexed = 0
+            total: int | None = None
+            more_pending = False
+            offset = 0
+            # ``None`` means "the whole catalogue". Falling back to it when the
+            # named region turns up nothing is what this endpoint has always
+            # done, kept here so a db_id that is not a stored region tag still
+            # produces a usable index rather than a 400.
+            region_filter: str | None = db_id
             loop = asyncio.get_event_loop()
             with ThreadPoolExecutor(max_workers=1) as pool:
-                indexed = await loop.run_in_executor(pool, _generate_vectors, items_data)
+                while scanned < _LOCAL_VECTOR_MAX_ROWS:
+                    page_rows = min(_LOCAL_VECTOR_PAGE_ROWS, _LOCAL_VECTOR_MAX_ROWS - scanned)
+                    items_list, page_total, more_pending = await repo.search(
+                        region=region_filter,
+                        offset=offset,
+                        limit=page_rows,
+                        # Count once, on the first page, so the response can say
+                        # how much of the catalogue it covered. Counting again
+                        # per page would be the same answer at a per-page cost.
+                        skip_count=offset > 0,
+                    )
+                    if not items_list:
+                        if region_filter is not None and scanned == 0:
+                            region_filter = None
+                            continue
+                        break
+                    if total is None:
+                        total = page_total
 
+                    # Prepare data outside the thread (ORM objects can't cross threads)
+                    items_data = [
+                        {
+                            "id": str(ci.id),
+                            "code": ci.code or "",
+                            "desc": (ci.description or "")[:200],
+                            "unit": ci.unit or "",
+                            "rate": float(ci.rate) if ci.rate else 0.0,
+                            "region": ci.region or db_id,
+                        }
+                        for ci in items_list
+                    ]
+                    indexed += await loop.run_in_executor(pool, _generate_vectors, items_data)
+                    scanned += len(items_list)
+                    offset += len(items_list)
+                    if not more_pending:
+                        break
+
+            if not scanned:
+                raise HTTPException(400, f"No cost items found for '{db_id}'.")
+
+            # Truncated only when the pass stopped ON the ceiling with rows
+            # still behind it. A catalogue that ends exactly on the ceiling is
+            # complete and must not raise the flag.
+            truncated = more_pending and scanned >= _LOCAL_VECTOR_MAX_ROWS
             duration = round(time.monotonic() - start, 1)
-            logger.info("Generated %d vectors locally for %s in %.1fs", indexed, db_id, duration)
+            logger.info(
+                "Generated %d vectors locally for %s in %.1fs (%d scanned%s)",
+                indexed,
+                db_id,
+                duration,
+                scanned,
+                f", TRUNCATED at {_LOCAL_VECTOR_MAX_ROWS}" if truncated else "",
+            )
             return {
                 "indexed": indexed,
                 "database": db_id,
                 "source": "local",
                 "duration_seconds": duration,
+                # How much of the catalogue this pass actually walked, next to
+                # how much of it there is. ``indexed`` alone cannot separate
+                # "the base is this small" from "we stopped early".
+                "scanned": scanned,
+                "total": total if total is not None else scanned,
+                "truncated": truncated,
+                "cap": _LOCAL_VECTOR_MAX_ROWS,
+                "message": (
+                    f"Stopped at the {_LOCAL_VECTOR_MAX_ROWS}-item ceiling after the first {scanned} "
+                    f"of {total if total is not None else scanned} cost items. The remainder is NOT in "
+                    f"the search index and will not be found by a semantic search."
+                    if truncated
+                    else f"Indexed {indexed} of {scanned} cost items."
+                ),
             }
         except HTTPException:
             raise
@@ -2123,21 +2608,19 @@ async def load_vector_from_github(
     logger.info("Loading vector data from %s", local_path)
 
     # Read parquet: columns = id, vector, code, description, unit, rate, region
-    import pandas as pd
+    import pyarrow.parquet as pq
 
-    df = pd.read_parquet(local_path)
-    total = len(df)
+    parquet_file = pq.ParquetFile(local_path)
+    total = parquet_file.metadata.num_rows
 
     if total == 0:
         return {"indexed": 0, "database": db_id, "message": "Empty vector file"}
 
-    # Index in batches
-    batch_size = 256
+    # Read and index in bounded batches (see ``_VECTOR_READ_ROWS``).
     indexed = 0
-    for i in range(0, total, batch_size):
-        batch = df.iloc[i : i + batch_size]
+    for record_batch in parquet_file.iter_batches(batch_size=_VECTOR_READ_ROWS):
         records = []
-        for _, row in batch.iterrows():
+        for row in record_batch.to_pylist():
             vec = row.get("vector")
             if vec is None:
                 continue
@@ -2151,18 +2634,34 @@ async def load_vector_from_github(
 
             records.append(
                 {
-                    "id": str(row.get("id", "")),
+                    "id": str(row.get("id") or ""),
                     "vector": vec,
-                    "code": str(row.get("code", "")),
-                    "description": str(row.get("description", ""))[:200],
-                    "unit": str(row.get("unit", "")),
-                    "rate": float(row.get("rate", 0)),
-                    "region": str(row.get("region", db_id)),
+                    "code": str(row.get("code") or ""),
+                    "description": str(row.get("description") or "")[:200],
+                    "unit": str(row.get("unit") or ""),
+                    "rate": float(row.get("rate") or 0),
+                    "region": str(row.get("region") or db_id),
                 }
             )
 
-        if records:
+        if not records:
+            continue
+        try:
             indexed += vector_index(records)
+        except Exception as exc:
+            # The vector store is optional. An install without it raises
+            # "LanceDB not available" from the very first index call, and
+            # letting that escape turned a missing optional dependency into an
+            # unexplained 500. Report it the way the sibling /vector/index
+            # endpoint does - a readable message the caller can act on - and
+            # stop rather than failing once per batch for the whole file.
+            logger.warning("Vector indexing failed for %s: %s", db_id, exc)
+            return {
+                "indexed": indexed,
+                "database": db_id,
+                "source": "github",
+                "message": f"Vector indexing failed: {exc}",
+            }
 
     duration = round(time.monotonic() - start, 1)
     logger.info("Loaded %d vectors for %s from GitHub in %.1fs", indexed, db_id, duration)
@@ -3167,13 +3666,14 @@ async def export_cost_catalog_excel(
         items = result.scalars().all()
         if not items:
             break
+        rows: list[list[object]] = []
         for item in items:
             try:
                 rate_val: object = float(item.rate)
             except (ValueError, TypeError):
                 rate_val = 0
             classification = json.dumps(item.classification, ensure_ascii=False) if item.classification else ""
-            ws.append(
+            rows.append(
                 [
                     _excel_safe(item.code),
                     _excel_safe(item.description),
@@ -3183,13 +3683,14 @@ async def export_cost_catalog_excel(
                     _excel_safe(classification),
                 ]
             )
+        # Serialising the rows into the sheet is pure CPU, so each batch is
+        # written in a worker thread while the next query waits on the loop.
+        await asyncio.to_thread(_append_rows, ws, rows)
         if len(items) < batch_size:
             break
         offset += batch_size
 
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
+    output = await asyncio.to_thread(_save_workbook, wb)
 
     # ASCII slug as the legacy fallback plus RFC 5987 filename* so non-Latin
     # catalog names ("Моя смета 2026") keep their real name in the download.
@@ -3882,7 +4383,7 @@ def _validate_cost_upload(content: bytes, filename: str) -> bool:
                 infos = zf.infolist()
                 if len(infos) > _MAX_COST_ZIP_ENTRIES:
                     raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=(
                             f"Excel archive contains {len(infos)} entries "
                             f"(> {_MAX_COST_ZIP_ENTRIES} limit) - not a valid workbook."
@@ -3963,7 +4464,7 @@ async def preview_cost_file(
             catalog_uuid = uuid.UUID(catalog_id)
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"catalog_id is not a valid UUID: {catalog_id!r}",
             ) from exc
         # Ownership gate: echoing a catalog's name/currency must require the
@@ -3986,6 +4487,77 @@ async def preview_cost_file(
         "has_currency_column": "currency" in detected.values(),
         "catalog": catalog_info,
     }
+
+
+# Parsed rows turned into schema objects before they are handed to the service.
+#
+# The upload is capped at ``_MAX_COST_UPLOAD_BYTES``, which is 100 MB of CSV -
+# comfortably over a million rows. Building a ``CostItemCreate`` for every one
+# of them before the first insert meant the whole file existed three times over
+# at the peak: the parsed row dicts, the schema objects made from them, and the
+# ORM instances the service made from those. On a server with 3 GB of RAM the
+# kernel kills the process there, and because the kill is a SIGKILL the operator
+# sees a server that stopped rather than an import that failed.
+#
+# Handing the rows over in slices removes the middle one of those three: the
+# schema objects now live only as long as the slice. The parsed rows above are
+# still whole-file resident - narrowing that changes what the endpoint can
+# report, since ``total_rows`` is their count.
+_IMPORT_HANDOVER_ROWS = 2000
+
+# What the import promises about a run that does not finish, named so the caller
+# reads it off the response instead of inferring it. ``atomic`` means every row
+# lands or none does; there is no resume point to report because there is never
+# a partial state to resume from.
+_IMPORT_DURABILITY = "atomic"
+
+
+async def _discard_failed_import(
+    service: CostItemService,
+    catalog_service: CostCatalogService,
+    created_catalog_id: uuid.UUID | None,
+) -> None:
+    """Undo a cost-file import that failed part-way through.
+
+    The staged rows go with the transaction. The request-scoped session rolls it
+    back on the way out anyway; doing it here makes the discard a property of
+    this endpoint rather than of its caller, and it is what lets the catalog
+    cleanup below run in a transaction of its own.
+
+    ``create_catalog`` commits, on the SAME session the import then writes
+    through (both service dependencies resolve one ``SessionDep`` per request),
+    so a catalog created inline for this upload outlives the rollback that
+    removes its rows. That is not merely untidy: the name is taken now, and the
+    name-availability gate refuses the next attempt at the same upload with a
+    409. So an import that promises all-or-nothing has to remove it. Only a
+    catalog this request created is touched - one the caller addressed by
+    ``catalog_id`` existed before the upload and is not ours to delete.
+
+    Best effort throughout: a failure while cleaning up must not replace the
+    error that caused it, which is the one the caller needs to read.
+
+    Args:
+        service: The cost item service, read for the session it holds.
+        catalog_service: Used to remove the catalog this request created.
+        created_catalog_id: Id of that catalog, or ``None`` when the upload
+            targeted an existing one. Passed as an id rather than as the ORM
+            instance on purpose - ``rollback`` expires the instance, and
+            reading an attribute off it afterwards would need a lazy refresh
+            this context cannot perform.
+    """
+    session = getattr(service, "session", None)
+    if session is not None:
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("Could not roll back a failed cost import")
+            return
+    if created_catalog_id is None or catalog_service is None:
+        return
+    try:
+        await catalog_service.delete_catalog(created_catalog_id)
+    except Exception:
+        logger.exception("Could not remove the catalog a failed cost import created")
 
 
 @router.post(
@@ -4103,7 +4675,7 @@ async def import_cost_file(
     missing_required = [key for key in ("description", "rate") if key not in mapped_keys]
     if missing_required:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Required column(s) not mapped: {', '.join(missing_required)}. "
                 f"Neither auto-detection nor your column mapping covered them. "
@@ -4125,7 +4697,7 @@ async def import_cost_file(
     # default for rows that carry none of their own.
     if catalog_id and catalog_name and catalog_name.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Pass either catalog_id (existing catalog) or catalog_name (new catalog), not both.",
         )
 
@@ -4138,7 +4710,7 @@ async def import_cost_file(
             catalog_uuid = uuid.UUID(catalog_id)
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"catalog_id is not a valid UUID: {catalog_id!r}",
             ) from exc
         # Ownership gate: importing into an EXISTING catalog requires the
@@ -4164,7 +4736,7 @@ async def import_cost_file(
                 resolved_currency = max(counts, key=lambda k: counts[k])
         if not resolved_currency:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     "catalog_currency is required when creating a new catalog from a "
                     "file that has no mapped currency column. Pass a 3-letter ISO 4217 "
@@ -4179,7 +4751,7 @@ async def import_cost_file(
             )
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Invalid catalog_currency {resolved_currency!r}: expected a 3-letter ISO 4217 code.",
             ) from exc
         catalog = await catalog_service.create_catalog(
@@ -4198,8 +4770,22 @@ async def import_cost_file(
     elif catalog_name and catalog_name.strip():
         catalog_region = catalog_name.strip()[:50]
 
-    # Convert rows to CostItemCreate objects and import via service
+    # Read the id now, while the instance is live. ``_discard_failed_import``
+    # rolls the session back before it gets here, which expires the instance,
+    # and ``catalog.id`` after that is a lazy refresh this context cannot run.
+    # ``catalog_id`` on the request distinguishes the two cases exactly: it is
+    # set only when the caller named an EXISTING catalog, so a value here means
+    # this request created the catalog and may therefore remove it again.
+    created_catalog_id: uuid.UUID | None = None
+    if catalog is not None and not catalog_id:
+        created_catalog_id = catalog.id
+
+    # Convert rows to CostItemCreate objects and import via service in bounded
+    # slices (see ``_IMPORT_HANDOVER_ROWS``) rather than building the whole file
+    # first.
     items_to_import: list[CostItemCreate] = []
+    handed_over = 0
+    imported_count = 0
     skipped = 0
     errors: list[dict[str, Any]] = []
     auto_code = 1
@@ -4210,95 +4796,155 @@ async def import_cost_file(
     mixed_currency_count = 0
     rate_parse_failures = 0
 
-    for row_idx, row in enumerate(rows, start=2):
-        try:
-            code = str(row.get("code", "")).strip()
-            description = str(row.get("description", "")).strip()
+    # The import is ATOMIC, and this is where that is decided rather than
+    # inherited. Nothing below commits: ``bulk_import`` adds and flushes, and
+    # the request-scoped session (``app.dependencies.get_session``) commits once
+    # when this endpoint returns and rolls back when it raises. So a failure
+    # halfway leaves none of the earlier slices behind - and the caller is told
+    # which of the two happened instead of having to guess how far it got.
+    #
+    # Resumable was the alternative and was rejected. A cost base that is half
+    # loaded prices every number downstream of it off an incomplete catalogue -
+    # region totals, the resource-sheet seed, the reprice - and nothing on the
+    # rows themselves says which part is missing, so the user cannot tell a
+    # cheap region from a truncated one. Re-uploading the same file is already
+    # safe (duplicate codes are skipped), which is most of what resuming would
+    # have bought.
+    #
+    # ``raise`` in the handler, never ``return``: returning normally after a
+    # slice has flushed hands the session back to the dependency, which commits
+    # it, and the atomic import quietly becomes the partial one this guards
+    # against.
+    try:
+        for row_idx, row in enumerate(rows, start=2):
+            try:
+                code = str(row.get("code", "")).strip()
+                description = str(row.get("description", "")).strip()
 
-            # Skip rows without both code and description
-            if not code and not description:
-                skipped += 1
-                continue
+                # Skip rows without both code and description
+                if not code and not description:
+                    skipped += 1
+                    continue
 
-            # Auto-generate code if missing
-            if not code:
-                code = f"IMPORT-{auto_code_salt}-{auto_code:04d}"
-            auto_code += 1
+                # Auto-generate code if missing
+                if not code:
+                    code = f"IMPORT-{auto_code_salt}-{auto_code:04d}"
+                auto_code += 1
 
-            # Skip obvious summary rows
-            desc_lower = description.lower()
-            if desc_lower in (
-                "total",
-                "grand total",
-                "summe",
-                "gesamt",
-                "gesamtsumme",
-                "subtotal",
-                "zwischensumme",
-            ):
-                skipped += 1
-                continue
+                # Skip obvious summary rows
+                desc_lower = description.lower()
+                if desc_lower in (
+                    "total",
+                    "grand total",
+                    "summe",
+                    "gesamt",
+                    "gesamtsumme",
+                    "subtotal",
+                    "zwischensumme",
+                ):
+                    skipped += 1
+                    continue
 
-            # Parse unit (default: pcs)
-            unit = str(row.get("unit", "pcs")).strip()
-            if not unit:
-                unit = "pcs"
+                # Parse unit (default: pcs)
+                unit = str(row.get("unit", "pcs")).strip()
+                if not unit:
+                    unit = "pcs"
 
-            # Parse rate. NaN sentinel distinguishes "value present but
-            # unparseable" from a genuine 0 - _safe_float itself never
-            # returns NaN (non-finite direct parses fall to the default).
-            raw_rate = row.get("rate")
-            rate = _safe_float(raw_rate, default=_math.nan)
-            if _math.isnan(rate):
-                if raw_rate is not None and str(raw_rate).strip():
-                    rate_parse_failures += 1
-                rate = 0.0
+                # Parse rate. NaN sentinel distinguishes "value present but
+                # unparseable" from a genuine 0 - _safe_float itself never
+                # returns NaN (non-finite direct parses fall to the default).
+                raw_rate = row.get("rate")
+                rate = _safe_float(raw_rate, default=_math.nan)
+                if _math.isnan(rate):
+                    if raw_rate is not None and str(raw_rate).strip():
+                        rate_parse_failures += 1
+                    rate = 0.0
 
-            # Parse currency - empty if absent, never country-default. Inside
-            # a catalog, an empty row currency inherits the CATALOG currency;
-            # a different non-empty currency is kept as-is but counted so the
-            # caller can surface a mixed-currency warning.
-            currency = str(row.get("currency", "")).strip().upper()
-            if catalog is not None:
-                if not currency:
-                    currency = catalog.currency
-                elif currency != catalog.currency:
-                    mixed_currency_count += 1
+                # Parse currency - empty if absent, never country-default. Inside
+                # a catalog, an empty row currency inherits the CATALOG currency;
+                # a different non-empty currency is kept as-is but counted so the
+                # caller can surface a mixed-currency warning.
+                currency = str(row.get("currency", "")).strip().upper()
+                if catalog is not None:
+                    if not currency:
+                        currency = catalog.currency
+                    elif currency != catalog.currency:
+                        mixed_currency_count += 1
 
-            # Build classification
-            classification: dict[str, str] = {}
-            class_value = str(row.get("classification", "")).strip()
-            if class_value:
-                classification["code"] = class_value
+                # Build classification
+                classification: dict[str, str] = {}
+                class_value = str(row.get("classification", "")).strip()
+                if class_value:
+                    classification["code"] = class_value
 
-            items_to_import.append(
-                CostItemCreate(
-                    code=code,
-                    description=description,
-                    unit=unit,
-                    rate=rate,
-                    currency=currency,
-                    source="file_import",
-                    classification=classification,
-                    region=catalog_region,
-                    catalog_id=catalog.id if catalog is not None else None,
+                items_to_import.append(
+                    CostItemCreate(
+                        code=code,
+                        description=description,
+                        unit=unit,
+                        rate=rate,
+                        currency=currency,
+                        source="file_import",
+                        classification=classification,
+                        region=catalog_region,
+                        catalog_id=catalog.id if catalog is not None else None,
+                    )
                 )
-            )
 
-        except Exception as exc:
-            errors.append(
-                {
-                    "row": row_idx,
-                    "error": str(exc),
-                    "data": {k: str(v)[:100] for k, v in row.items()},
-                }
-            )
-            logger.warning("Cost import error at row %d: %s", row_idx, exc)
+            except Exception as exc:
+                errors.append(
+                    {
+                        "row": row_idx,
+                        "error": str(exc),
+                        "data": {k: str(v)[:100] for k, v in row.items()},
+                    }
+                )
+                logger.warning("Cost import error at row %d: %s", row_idx, exc)
 
-    # Bulk import via service (handles duplicate detection)
-    imported_items = await service.bulk_import(items_to_import) if items_to_import else []
-    imported_count = len(imported_items)
-    skipped_by_duplicate = len(items_to_import) - imported_count
+            # Hand the slice over as soon as it is full, outside the per-row
+            # ``except`` so a failure in the import is never mis-recorded as a
+            # parse error against whichever row happened to fill the slice.
+            if len(items_to_import) >= _IMPORT_HANDOVER_ROWS:
+                handed_over += len(items_to_import)
+                imported_count += len(await service.bulk_import(items_to_import))
+                items_to_import.clear()
+
+        # Bulk import via service (handles duplicate detection). Whatever the loop
+        # did not fill a slice with lands here; both counts accumulate across the
+        # slices, so the reported totals are the same numbers a single hand-over
+        # produced.
+        if items_to_import:
+            handed_over += len(items_to_import)
+            imported_count += len(await service.bulk_import(items_to_import))
+            items_to_import.clear()
+    except HTTPException:
+        # Already a stated outcome, so it keeps its own status and message
+        # rather than being restated as a durability failure. Every gate that
+        # raises one fires before the first row is staged - but if one ever
+        # arrives from further in, the staged rows and the catalog created for
+        # them still have to go, so that case is handled rather than assumed
+        # away.
+        if handed_over:
+            await _discard_failed_import(service, catalog_service, created_catalog_id)
+        raise
+    except Exception as exc:
+        logger.exception("Cost file import failed after %d staged rows", handed_over)
+        await _discard_failed_import(service, catalog_service, created_catalog_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "message": (
+                    "The import failed and was rolled back. No cost items were imported. "
+                    "The same file can be uploaded again unchanged."
+                ),
+                "durability": _IMPORT_DURABILITY,
+                "imported": 0,
+                "rows_discarded": handed_over,
+                "total_rows": len(rows),
+                "error": str(exc)[:500],
+            },
+        ) from exc
+    skipped_by_duplicate = handed_over - imported_count
 
     logger.info(
         "Cost file import complete: imported=%d, skipped=%d (empty) + %d (duplicate), errors=%d",
@@ -4316,6 +4962,11 @@ async def import_cost_file(
         "skipped": skipped + skipped_by_duplicate,
         "errors": errors,
         "total_rows": len(rows),
+        # Which durability the run had, stated rather than implied. On this
+        # path it is also the proof that the run finished: an import that died
+        # part-way never reaches here, and says the same word in its error
+        # detail alongside the count of rows it threw away.
+        "durability": _IMPORT_DURABILITY,
         "catalog": catalog_region,
         "catalog_id": str(catalog.id) if catalog is not None else None,
         "catalog_currency": catalog.currency if catalog is not None else None,
@@ -4350,18 +5001,31 @@ _GITHUB_CWICR_FILES.setdefault("CA_TORONTO", _GITHUB_CWICR_FILES["ENG_TORONTO"])
 # language swap but never surface in the ``/available-databases`` region list.
 _GITHUB_CWICR_LANG_FILES: dict[str, str] = base_registry.national_language_workitems_files()
 
-# Which app language each already-loaded national base currently renders its
-# work-item text in. Process-local fast path for the market-switch language swap
-# (see ``_ensure_region_text_language``): re-selecting a market of the same
-# language becomes a no-op. The swap itself is idempotent, so a cold process
-# simply re-runs it once on the first switch. Cleared whenever a region is loaded
-# fresh (it reverts to the home English text at that point).
-_REGION_ACTIVE_LANG: dict[str, str] = {}
+# Which language each loaded national base's text is in, and which market it is
+# priced into, live in the database (``app.modules.costs.base_state``), not here:
+# a process-local dict was forgotten by a restart and never seen by a second
+# worker, so a re-selected market could skip a swap the rows still needed.
+
+# Why the last text swap of a base did not land, for the error a caller shows.
+# Set only by the swap that failed, so a stale download error from an unrelated
+# earlier attempt is never offered as the reason. Process-local on purpose: it
+# is read back by the same request that set it.
+_LAST_TEXT_SWAP_ERROR: dict[str, str] = {}
+
 
 # CostItem columns the language swap rewrites - the text-bearing ones only.
 # Deliberately excludes ``rate``/``currency`` (the market reprice owns those),
 # ``descriptions`` (the separate multilang map) and the identity columns.
+# ``components`` is text AND price: it carries each resource's name and also its
+# unit rate and cost as the language file has them. The market reprice that
+# follows a swap rewrites those prices again from the sheet.
 _TRANSLATED_TEXT_COLS: tuple[str, ...] = ("description", "unit", "classification", "components", "tags")
+
+# What a return to the home market copies back from the base's own parquet: the
+# text, plus the rate and its breakdown. ``currency`` is not here because the
+# parquet has none (the importer derives it from the region id, which a staging
+# region does not carry), so the restore sets it from the base region instead.
+_HOME_RESTORE_COLS: tuple[str, ...] = (*_TRANSLATED_TEXT_COLS, "rate", "metadata")
 
 CWICR_SEARCH_PATHS = [
     "../../DDC_Toolkit/pricing/data/excel",
@@ -4613,7 +5277,11 @@ async def get_base_catalog(session: SessionDep) -> dict:
     stmt = select(CostItem.region, func.count()).where(CostItem.is_active.is_(True)).group_by(CostItem.region)
     rows = (await session.execute(stmt)).all()
     loaded_counts = {region: int(count) for region, count in rows if region}
-    return base_registry.public_catalog(loaded_counts)
+    # Which market and language each base is in, as stored server side, so
+    # every screen and every browser shows what the rows hold rather than what
+    # one browser remembers clicking.
+    states = {region: state.public() for region, state in (await base_state.read_all_base_states(session)).items()}
+    return base_registry.public_catalog(loaded_counts, states)
 
 
 @router.post(
@@ -4652,7 +5320,83 @@ async def load_cwicr_database(
     return await load_cwicr_region(db_id, session)
 
 
-async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
+# Share of a base's published work-item count below which a region that
+# holds rows is treated as an import that was cut off, not a loaded base. The
+# registry count is the published figure, not the exact number of rows an
+# import keeps, so this leaves room for the few rows an import rejects while
+# still catching the realistic cut (a proxy timeout or a restart part-way
+# leaves a fraction of the base, not 95 % of it).
+_COMPLETE_BASE_SHARE = 0.9
+
+
+async def region_priced_in_other_currency(db_id: str, session: AsyncSession) -> str | None:
+    """The currency a base's work items carry when it is not the base's own.
+
+    A base repriced into another market (``/base-market``) has that market's
+    currency stamped onto every work item. Anything that would add the home
+    market's data to such a region, rows or a catalogue, would put one base in
+    two currencies. Returns ``None`` for an unknown base, an empty region, or a
+    region still in its home currency.
+    """
+    from sqlalchemy import select
+
+    from app.modules.costs.models import CostItem
+
+    variant = base_registry.variant_by_region(db_id)
+    if variant is None or not variant.currency:
+        return None
+    stmt = (
+        select(CostItem.currency)
+        .where(
+            CostItem.region == db_id,
+            CostItem.is_active.is_(True),
+            CostItem.currency != "",
+            CostItem.currency != variant.currency,
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _retry_home_language(db_id: str, session: AsyncSession) -> dict[str, Any]:
+    """Try the switch to the base's own language again when the last one did not land.
+
+    A fresh load opens a national base in its own language, and when that swap
+    fails the base stays in the home parquet's language. Loading it again used
+    to answer ``already_loaded`` and never try again. Retried only when the
+    stored state says the base is on its home market, no switch is running and
+    the text is not (or not known to be) in the base's language. A base with no
+    stored state is left alone: it may be priced into a market nobody recorded.
+    """
+    home_lang = base_registry.home_language_code(db_id)
+    if not home_lang:
+        return {}
+
+    def _needs_retry(stored: base_state.BaseState | None) -> bool:
+        return (
+            stored is not None
+            and not stored.active_market
+            and not stored.switching_to
+            and stored.text_language != home_lang
+        )
+
+    if not _needs_retry(await base_state.read_base_state(session, db_id)):
+        return {}
+    async with _market_lock_or_409(session, db_id):
+        # Read again under the lock: a switch may have finished while we waited.
+        if not _needs_retry(await base_state.read_base_state(session, db_id)):
+            return {}
+        logger.info("CWICR %s: retrying the switch to its own language (%s)", db_id, home_lang)
+        return await _open_in_home_language(db_id, session)
+
+
+async def load_cwicr_region(
+    db_id: str,
+    session: AsyncSession,
+    *,
+    resume_incomplete: bool = False,
+    retry_home_language: bool = True,
+) -> dict:
     """Load one CWICR regional cost database into the relational store.
 
     Optimized: reads Parquet, deduplicates by rate_code (55K unique items
@@ -4666,10 +5410,25 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
     the partner-pack ``full-install`` orchestrator. Raises ``HTTPException`` on
     a missing file (404) or an import failure (500); callers that need fail-soft
     behaviour must catch it. Returns the same body dict the route returns.
+
+    A region with more than a handful of rows counts as loaded. That is wrong
+    for an import that was cut off (every flush of 5 000 rows commits on its
+    own), and a retry then reported a quarter of a base as "already loaded".
+    ``resume_incomplete`` lets a caller that retries on the user's behalf, the
+    pack installer, ask for better: a region well short of the base's published
+    count carries on importing, and the per-flush ``ON CONFLICT DO NOTHING``
+    adds only what is missing. A short region that was already repriced into
+    another market is not topped up with home-currency rows; it comes back as
+    ``status="incomplete"`` for the caller to report. Off by default, so the
+    route and the market switch behave exactly as before.
+
+    ``retry_home_language`` lets an ``already_loaded`` answer try the switch to
+    a national base's own language again when the last one did not land (see
+    :func:`_retry_home_language`). The market switch turns it off: it is about
+    to put the text into the market's language anyway.
     """
     import time
 
-    import pandas as pd
     from sqlalchemy import func, select
 
     start = time.monotonic()
@@ -4681,7 +5440,37 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
         select(func.count()).select_from(CostItem).where(CostItem.region == db_id, CostItem.is_active.is_(True))
     )
     existing_count = (await session.execute(existing_count_stmt)).scalar_one()
-    if existing_count > 10:
+    resuming = False
+    if existing_count > 10 and resume_incomplete:
+        variant = base_registry.variant_by_region(db_id)
+        expected = variant.positions if variant else 0
+        if expected and existing_count < expected * _COMPLETE_BASE_SHARE:
+            foreign = await region_priced_in_other_currency(db_id, session)
+            if foreign:
+                logger.warning(
+                    "CWICR %s holds %d of about %d items and is priced in %s; not topping it up",
+                    db_id,
+                    existing_count,
+                    expected,
+                    foreign,
+                )
+                return {
+                    "imported": 0,
+                    "region": db_id,
+                    "total_items": existing_count,
+                    "expected_items": expected,
+                    "currency": foreign,
+                    "status": "incomplete",
+                    "duration_seconds": round(time.monotonic() - start, 1),
+                }
+            logger.warning(
+                "CWICR %s holds %d of about %d items; resuming the interrupted import",
+                db_id,
+                existing_count,
+                expected,
+            )
+            resuming = True
+    if existing_count > 10 and not resuming:
         duration = round(time.monotonic() - start, 1)
         # Count the resource components already persisted for this region so the
         # partner-pack installer reports the embedded resource database on
@@ -4713,7 +5502,36 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
             existing_count,
             resource_components,
         )
+        already_loaded: dict[str, Any] = {}
+        # A base whose items loaded while its price sheet seed failed (the
+        # dead-session failure described below, before it was fixed) has
+        # resources and no sheet, and nothing else would ever seed it: this
+        # branch is what every later load of the region takes. Seed it here.
+        # Idempotent, and it never overwrites a price a user edited.
+        if resource_components > 0:
+            from app.modules.costs.models import ResourcePrice
+
+            sheet_rows = (
+                await session.execute(
+                    select(func.count()).select_from(ResourcePrice).where(ResourcePrice.region == db_id)
+                )
+            ).scalar_one()
+            if not sheet_rows:
+                try:
+                    seed = await ResourcePriceService(session).seed_region(db_id)
+                    already_loaded["resource_prices"] = seed.as_dict()
+                    logger.info("CWICR %s: seeded the missing resource price sheet", db_id)
+                except Exception:
+                    logger.exception("Resource price seeding failed for %s (non-fatal)", db_id)
+                    try:
+                        await session.rollback()
+                    except Exception:  # noqa: BLE001 - the rollback is best effort
+                        logger.debug("rollback after the failed price seed also failed", exc_info=True)
+                    already_loaded["resource_prices_error"] = "seed_failed"
+        if retry_home_language:
+            already_loaded.update(await _retry_home_language(db_id, session))
         return {
+            **already_loaded,
             "imported": 0,
             "skipped": existing_count,
             "region": db_id,
@@ -4725,9 +5543,24 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
             "duration_seconds": duration,
         }
 
-    # A fresh (re)load repopulates the region from its home English parquet, so
-    # forget any language the market-switch swap had recorded for it.
-    _REGION_ACTIVE_LANG.pop(db_id, None)
+    # End the read transaction the count above opened BEFORE the long part.
+    #
+    # Everything from here to the price sheet seed is not work on this session:
+    # a download that can take minutes, then an import that runs in a thread on
+    # its own sync connection and commits there (a large base takes well over a
+    # quarter of an hour). Held open across that, this session sits "idle in
+    # transaction" and PostgreSQL terminates it once the engine's
+    # ``idle_in_transaction_session_timeout`` runs out. The seed below then fails
+    # on the dead connection and the caller's next ``commit`` raises "Can't
+    # reconnect until invalid transaction is rolled back", although every item
+    # is already in the table. Commit, not rollback: every caller hands in a
+    # session with nothing pending, and if one ever did not, committing keeps
+    # its work where a rollback would silently discard it.
+    await session.commit()
+
+    # A fresh (re)load repopulates the region from its home parquet, so forget
+    # any market and language stored for it until the import says what landed.
+    await base_state.forget_base_state(session, db_id)
 
     # Find the file (async - GitHub download runs in thread pool)
     cwicr_path = await _find_cwicr_file(db_id)
@@ -4752,20 +5585,7 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
 
     logger.info("Loading CWICR from %s", cwicr_path)
 
-    # Read file in thread pool to avoid blocking event loop
     import asyncio
-
-    _path = cwicr_path
-
-    def _read_file() -> pd.DataFrame:
-        if _path.suffix == ".parquet":
-            return pd.read_parquet(_path)
-        return pd.read_excel(_path, engine="openpyxl")
-
-    df = await asyncio.to_thread(_read_file)
-
-    total_rows = len(df)
-    logger.info("Raw data: %d rows", total_rows)
 
     from app.config import get_settings
 
@@ -4817,6 +5637,16 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
             result_data["resource_prices"] = seed.as_dict()
         except Exception:
             logger.exception("Resource price seeding failed for %s (non-fatal)", db_id)
+            # Leave the session usable for the caller: a failed statement (or a
+            # dropped connection) puts it in a state where its next commit
+            # raises instead of committing. And say so in the result rather
+            # than only in the log, so a caller can report a base without its
+            # price sheet instead of reporting it ready.
+            try:
+                await session.rollback()
+            except Exception:  # noqa: BLE001 - the rollback is best effort
+                logger.debug("rollback after the failed price seed also failed", exc_info=True)
+            result_data["resource_prices_error"] = "seed_failed"
 
     _invalidate_cost_cache()
     # A new CWICR parquet may have been written alongside the SQL import
@@ -4843,10 +5673,153 @@ async def load_cwicr_region(db_id: str, session: AsyncSession) -> dict:
     # loaded base reads in English until a market card swaps the language. Open
     # it in its own language instead (China in Chinese, Brazil in Portuguese).
     # No-op for the global markets and for a base whose language has no parquet.
-    if result_data.get("imported", 0) > 0:
-        await _ensure_region_text_language(db_id, base_registry.home_language_code(db_id), session)
+    # Under the base's market lock, like every other change of its language.
+    parquet_lang = base_registry.home_parquet_text_lang(db_id)
+    if result_data.get("imported", 0) > 0 and parquet_lang is not None:
+        async with _market_lock_or_409(session, db_id):
+            # What the import just wrote: the home market, in the parquet's language.
+            await base_state.write_base_state(
+                session, db_id, text_language=parquet_lang, active_market=None, switching_to=None
+            )
+            result_data.update(await _open_in_home_language(db_id, session))
+
+    if resuming:
+        # ``imported`` counts only the rows this run added; the caller reports
+        # the base, so give it the size of the base.
+        result_data["resumed"] = True
+        result_data["total_items"] = (await session.execute(existing_count_stmt)).scalar_one()
 
     return result_data
+
+
+async def _open_in_home_language(db_id: str, session: AsyncSession) -> dict[str, Any]:
+    """Switch a freshly loaded national base to its own language and say how it went.
+
+    Returns ``text_language`` (what the rows are in now) beside
+    ``text_language_requested`` (the base's own language), so a caller can warn
+    when the swap did not land instead of reporting the base ready in a language
+    it is not in. Empty for a base with nothing to swap. On failure the rows are
+    still in the home parquet's language, which is what ``text_language`` says.
+    """
+    home_lang = base_registry.home_language_code(db_id)
+    if not home_lang:
+        return {}
+    shown = await _ensure_region_text_language(db_id, home_lang, session)
+    if shown == home_lang:
+        return {"text_language": shown, "text_language_requested": home_lang}
+    return {
+        "text_language": base_registry.home_parquet_text_lang(db_id),
+        "text_language_requested": home_lang,
+        "text_language_error": _LAST_TEXT_SWAP_ERROR.pop(db_id, "") or "The language file could not be applied.",
+    }
+
+
+# Work items handed to PostgreSQL in one go while an import is running.
+#
+# The COPY inside ``_pg_bulk_insert_cost_rows`` was already chunked, but the
+# caller accumulated every row of a region first, so peak memory scaled with
+# the region: roughly 55 700 tuples for Berlin, each carrying the serialised
+# JSON of its resource breakdown. Flushing as we go bounds that to this many
+# rows, which is what lets the import finish on a 3 GB server.
+#
+# The staging table is ``ON COMMIT DROP`` and the upsert is idempotent on
+# (code, region), so every flush is a complete, self-contained transaction and
+# an interrupted import resumes instead of restarting.
+_INSERT_FLUSH_ROWS = 5000
+
+
+# How many rejected codes an import result lists. The count is always exact;
+# the list is only there so an operator can find the rows.
+_FAILED_CODES_REPORTED = 50
+
+
+# Parquet rows the cost import reads at a time.
+#
+# The import used to read the whole parquet into one pandas frame. A country
+# base is about 900 000 rows, and as object-dtype strings plus the intermediate
+# copies that frame peaked at 2 to 8 GiB of resident memory (measured 29.09 on
+# 23 bases), far over the ~1.8 GiB the 3 GB server floor leaves for an import.
+# Reading a slice at a time bounds the frame to this many rows plus the few a
+# work item spills over, whatever the size of the base. Measured on USA_USD
+# (900 225 rows, 55 719 items) with the inserter stubbed, the import's peak over
+# a warm process went from 2 971 MiB read whole to 441 MiB at 5 000 rows and
+# 578 MiB at 20 000, in about the same wall time.
+_PARQUET_READ_ROWS = 5_000
+
+# How many reads' worth of rows the import may read ahead for items whose last
+# rows sit far down the file (see ``_cwicr_far_rows``). The AR and FR bases
+# need about 2 500 rows; the cap keeps a base made of nothing but such items
+# from reading itself into memory through the side door.
+_CWICR_FAR_ROWS_PER_READ = 10
+
+
+def _insert_cost_rows_isolating_rejects(sync_url: str, rows: list[tuple], failed_codes: list[str]) -> int:
+    """Insert one flush of cost rows, skipping any row PostgreSQL refuses.
+
+    ``_pg_bulk_insert_cost_rows`` loads a flush as one transaction, so one row
+    the database cannot store (a NUL character in a description, a value that
+    breaks a column type) used to fail its whole flush and with it the whole
+    import. On a data error the flush is split in halves and each half retried,
+    down to single rows; a single row that still fails is left out and its code
+    appended to ``failed_codes``. The rows around it load as before.
+
+    Only data errors are isolated. A connection or server error is not a row's
+    fault, so it propagates unchanged and fails the import, rather than being
+    retried row by row and reported as every row rejected.
+
+    Returns:
+        Number of rows actually inserted.
+    """
+    import psycopg2
+
+    try:
+        return _pg_bulk_insert_cost_rows(sync_url, rows)
+    except (psycopg2.DataError, psycopg2.IntegrityError) as exc:
+        if len(rows) == 1:
+            code = str(rows[0][1])
+            logger.warning("CWICR row %s rejected by the database and skipped: %s", code, str(exc).strip())
+            failed_codes.append(code)
+            return 0
+        mid = len(rows) // 2
+        return _insert_cost_rows_isolating_rejects(
+            sync_url, rows[:mid], failed_codes
+        ) + _insert_cost_rows_isolating_rejects(sync_url, rows[mid:], failed_codes)
+
+
+# How much CSV text one ``COPY`` of cost rows carries before the next one starts.
+# A flush used to go over as one buffer, and a row of a large base is mostly
+# the JSON of its resources and their variant catalogues, escaped to ASCII: on
+# RU_STPETERSBURG 5 000 rows came to about 570 MB of text, held once in the
+# rows and once more as CSV, which took that import to about 3 GiB against the
+# ~1.8 GiB its floor allows. The staging table takes any number of COPYs in the
+# one transaction.
+_COPY_CHUNK_CHARS = 8 * 1024 * 1024
+
+
+def _cost_rows_as_csv(rows: list[tuple], max_chars: int | None = None) -> Iterator[io.StringIO]:
+    """Cost rows as CSV for ``COPY``, in buffers of about ``max_chars`` characters, rewound.
+
+    ``max_chars`` defaults to ``_COPY_CHUNK_CHARS``, read at call time.
+
+    ``is_active`` (index 11) is an int flag in the tuple; COPY needs a boolean
+    literal. Everything else is already text (the JSON columns carry JSON text,
+    streamed verbatim into the ``json`` columns).
+    """
+    limit = _COPY_CHUNK_CHARS if max_chars is None else max_chars
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    for row in rows:
+        out = list(row)
+        out[11] = "true" if row[11] else "false"
+        writer.writerow(out)
+        if buf.tell() >= limit:
+            buf.seek(0)
+            yield buf
+            buf = io.StringIO()
+            writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    if buf.tell():
+        buf.seek(0)
+        yield buf
 
 
 def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
@@ -4883,8 +5856,6 @@ def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
     Returns:
         Number of rows actually inserted (conflicts excluded).
     """
-    import csv
-    import io
     import os as _os
 
     from sqlalchemy import create_engine
@@ -4907,17 +5878,8 @@ def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
         "classification, tags, components, descriptions, is_active, region, metadata"
     )
 
-    def _row_for_copy(row: tuple) -> list[object]:
-        # ``is_active`` (index 11) is an int flag in the tuple; COPY needs a
-        # boolean literal. Everything else is already text (the JSON columns
-        # carry JSON text, streamed verbatim into the ``json`` columns).
-        out = list(row)
-        out[11] = "true" if row[11] else "false"
-        return out
-
     engine = create_engine(sync_url)
     inserted = 0
-    copy_chunk = 5000  # bound peak memory of the CSV buffer for large JSON rows
     raw = engine.raw_connection()
     try:
         cur = raw.cursor()
@@ -4928,12 +5890,7 @@ def _pg_bulk_insert_cost_rows(sync_url: str, rows: list[tuple]) -> int:
         # table is dropped automatically when the transaction commits.
         cur.execute(f"CREATE TEMP TABLE _cwicr_stage (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP")  # noqa: S608
         copy_sql = f"COPY _cwicr_stage ({col_list}) FROM STDIN WITH (FORMAT csv)"  # noqa: S608
-        for i in range(0, len(rows), copy_chunk):
-            buf = io.StringIO()
-            writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
-            for r in rows[i : i + copy_chunk]:
-                writer.writerow(_row_for_copy(r))
-            buf.seek(0)
+        for buf in _cost_rows_as_csv(rows):
             cur.copy_expert(copy_sql, buf)
         # One idempotent upsert from staging into the indexed live table. The
         # target's server_default fills created_at/updated_at for the omitted
@@ -4972,11 +5929,44 @@ def _swap_region_text_sync(sync_url: str, lang_parquet: str, base_region: str, s
        live ``base_region`` rows, joined on ``code`` so every id is preserved, and
     3. drops the staging region.
 
-    Prices are untouched here - the caller reprices afterwards, and
-    :meth:`reprice_region` keeps each component's (now translated) name. Runs in a
-    thread (sync DB work). Idempotent: pre-cleans and drops the staging region so a
-    retry starts clean and leaves nothing behind. Returns the number of live rows
-    updated.
+    The rate is untouched here, but ``components`` arrives with the language
+    file's unit rates: the market reprice the caller runs afterwards rewrites
+    them from the sheet and keeps each component's (now translated) name. Runs
+    in a thread (sync DB work). Idempotent: pre-cleans and drops the staging
+    region so a retry starts clean and leaves nothing behind. Returns the number
+    of live rows updated.
+    """
+    return _overlay_region_from_parquet_sync(sync_url, lang_parquet, base_region, staging_region, _TRANSLATED_TEXT_COLS)
+
+
+def _overlay_region_from_parquet_sync(
+    sync_url: str,
+    parquet: str,
+    base_region: str,
+    staging_region: str,
+    columns: tuple[str, ...],
+    currency: str | None = None,
+) -> int:
+    """Copy ``columns`` of a parquet's work items onto ``base_region`` in place.
+
+    The parquet is imported into ``staging_region`` with the canonical transform
+    (:func:`_process_and_insert_cwicr`), the named columns are copied onto the
+    live rows joined on ``code`` so every id is kept, and staging is dropped.
+    The language swap copies the text columns; a return to the home market
+    copies text, rate and breakdown from the base's own parquet and passes
+    ``currency``. That currency is stamped, in the same transaction, onto the
+    rows the parquet just gave their home rate, and onto the rows it does not
+    hold that have no components: a reprice never moves a rate without a
+    recipe, so the market switch only relabelled those and the label is all
+    that goes back. A row the parquet does not hold that has components (a
+    priced recipe someone added under the region) keeps the market's rate and
+    currency here; the caller reprices it from the rebuilt home sheet. Stamping
+    the home currency over its market rate would turn 6 GBP into 6 CNY.
+
+    ``columns`` only ever comes from the module's own tuples, never a caller's
+    input, so naming them in the SQL is safe. Runs in a thread (sync DB work).
+    Idempotent: pre-cleans and drops the staging region so a retry starts clean
+    and leaves nothing behind. Returns the number of live rows updated.
     """
     import os as _os
 
@@ -4986,7 +5976,7 @@ def _swap_region_text_sync(sync_url: str, lang_parquet: str, base_region: str, s
         sync_url = _os.environ.get("DATABASE_SYNC_URL", "")
 
     table = CostItem.__table__.name  # oe_costs_item
-    set_clause = ", ".join(f"{c} = s.{c}" for c in _TRANSLATED_TEXT_COLS)
+    set_clause = ", ".join(f"{c} = s.{c}" for c in columns)
 
     engine = create_engine(sync_url)
     try:
@@ -4996,9 +5986,9 @@ def _swap_region_text_sync(sync_url: str, lang_parquet: str, base_region: str, s
         # Reuse the canonical parquet->rows transform, targeting staging. Same
         # dedup-by-rate_code, so staging carries one row per ``code`` exactly like
         # the live region - the join below is 1:1.
-        _process_and_insert_cwicr(lang_parquet, staging_region, sync_url)
-        # Overlay translated text onto the live region (ids and prices preserved),
-        # then drop staging. A single set-based UPDATE ... FROM self-join.
+        _process_and_insert_cwicr(parquet, staging_region, sync_url)
+        # Overlay the columns onto the live region (ids preserved), then drop
+        # staging. A single set-based UPDATE ... FROM self-join, one transaction.
         with engine.begin() as conn:
             updated = conn.execute(
                 text(  # noqa: S608
@@ -5007,38 +5997,65 @@ def _swap_region_text_sync(sync_url: str, lang_parquet: str, base_region: str, s
                 ),
                 {"base": base_region, "stage": staging_region},
             ).rowcount
+            if currency is not None and updated:
+                conn.execute(
+                    text(  # noqa: S608
+                        f"UPDATE {table} AS t SET currency = :currency WHERE t.region = :base AND ("
+                        f"EXISTS (SELECT 1 FROM {table} AS s WHERE s.region = :stage AND s.code = t.code) "
+                        f"OR COALESCE(t.components::jsonb, '[]'::jsonb) IN ('[]'::jsonb, 'null'::jsonb))"
+                    ),
+                    {"currency": currency, "base": base_region, "stage": staging_region},
+                )
             conn.execute(text(f"DELETE FROM {table} WHERE region = :r"), {"r": staging_region})  # noqa: S608
         return int(updated or 0)
     finally:
         engine.dispose()
 
 
-async def _ensure_region_text_language(base_region: str, lang_code: str | None, session: AsyncSession) -> None:
+async def _ensure_region_text_language(base_region: str, lang_code: str | None, session: AsyncSession) -> str | None:
     """Ensure an already-loaded national base renders its work items in ``lang_code``.
 
-    Swaps the region's text in place (see :func:`_swap_region_text_sync`). No-op
-    for a non-national base, a language we do not translate (e.g. ``en`` markets,
-    which keep the home English text), an unavailable translation parquet, or a
-    region already showing that language. Locales served by another language's
-    parquet, such as ``es-MX``, resolve through
-    :func:`~app.modules.costs.base_registry.normalize_lang_code` first.
+    Swaps the region's text in place (see :func:`_swap_region_text_sync`) from
+    the file :func:`~app.modules.costs.base_registry.text_source_region` names:
+    the translated parquet, or the home parquet when that is already in the
+    language (English for every base but Turkiye, so an English market brings a
+    base back from Chinese or French instead of keeping them). Locales served by
+    another language's parquet, such as ``es-MX``, are normalized first.
+
+    Returns the language the region is now shown in, or ``None`` when nothing
+    was swapped: a non-national base, a language no file holds, or a download or
+    swap that failed. ``None`` never means success, so a caller that promised a
+    language can tell it was not delivered.
+
+    Which language the rows are in is read from and written to the base's
+    stored state (:mod:`app.modules.costs.base_state`), so a restart or another
+    worker sees it too. The swap is skipped only when the stored language is
+    already the one asked for; an unknown language never skips it. The stored
+    language is cleared before the swap starts and set when it lands, so a swap
+    cut off half way leaves "unknown" behind rather than a language the rows
+    may not be in. The caller holds the base's market lock.
     """
     if not lang_code:
-        return
-    lang_region = base_registry.national_language_region(base_region, lang_code)
+        return None
+    lang_code = base_registry.normalize_lang_code(lang_code)
+    lang_region = base_registry.text_source_region(base_region, lang_code)
     if lang_region is None:
-        return
-    if _REGION_ACTIVE_LANG.get(base_region) == lang_code:
-        return
+        return None
+    stored = await base_state.read_base_state(session, base_region)
+    previous = stored.text_language if stored is not None else None
+    if previous == lang_code:
+        return lang_code
 
+    _LAST_TEXT_SWAP_ERROR.pop(base_region, None)
     parquet = await _find_cwicr_file(lang_region)
     if not parquet:
-        logger.info(
-            "No %s translation parquet for base %s; keeping current work-item text",
+        logger.warning(
+            "No %s parquet for base %s; keeping current work-item text",
             lang_code,
             base_region,
         )
-        return
+        _LAST_TEXT_SWAP_ERROR[base_region] = _LAST_DOWNLOAD_ERROR.get(lang_region, "")
+        return None
 
     import asyncio
     import os as _os
@@ -5047,15 +6064,30 @@ async def _ensure_region_text_language(base_region: str, lang_code: str | None, 
 
     target = _os.environ.get("DATABASE_SYNC_URL") or get_settings().database_sync_url
     staging_region = f"__xlate_{base_region}_{lang_code}"
+    # Unknown while the swap runs: the swap commits on its own connection, and a
+    # process that dies before the line below must not leave the old language
+    # claimed over rows that may already be in the new one.
+    await base_state.write_base_state(session, base_region, text_language=None)
     try:
         updated = await asyncio.to_thread(_swap_region_text_sync, target, str(parquet), base_region, staging_region)
-    except Exception:
+    except Exception as exc:
         logger.exception("Language swap to %s failed for %s (keeping current text)", lang_code, base_region)
-        return
+        _LAST_TEXT_SWAP_ERROR[base_region] = f"The text swap failed: {exc.__class__.__name__}."
+        # The overlay is one transaction, so the text is what it was.
+        await base_state.write_base_state(session, base_region, text_language=previous)
+        return None
+    if not updated:
+        # Nothing joined on code, so no row changed language. Recording the
+        # language here would claim a switch that did not happen.
+        logger.warning("Language swap to %s matched no rows of %s", lang_code, base_region)
+        _LAST_TEXT_SWAP_ERROR[base_region] = f"No work item of '{base_region}' matched the '{lang_code}' file."
+        await base_state.write_base_state(session, base_region, text_language=previous)
+        return None
 
-    _REGION_ACTIVE_LANG[base_region] = lang_code
+    await base_state.write_base_state(session, base_region, text_language=lang_code)
     _invalidate_cost_cache()
     logger.info("Swapped %s work-item text to %s (%d items updated)", base_region, lang_code, updated)
+    return lang_code
 
 
 def _join_work_name_columns(
@@ -5096,32 +6128,510 @@ def _join_work_name_columns(
     return joined.where((orig != final) & (orig != "") & (final != ""), single)
 
 
-def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
-    """Process CWICR parquet + insert into PostgreSQL. Runs in a thread.
+# The parquet columns the cost import reads, by their lower-cased name. The full
+# CWICR parquet has ~85 columns; reading them all doubles memory for no reason.
+_CWICR_NEEDED_COLUMNS = frozenset(
+    {
+        "rate_code",
+        "rate_original_name",
+        "rate_final_name",
+        "rate_unit",
+        "total_cost_per_position",
+        "collection_name",
+        "department_name",
+        "section_name",
+        "subsection_name",
+        "category_type",
+        "cost_of_working_hours",
+        "total_value_machinery_equipment",
+        "total_material_cost_per_position",
+        "total_labor_hours_all_personnel",
+        "count_total_people_per_unit",
+        # Resource columns
+        "resource_name",
+        "resource_code",
+        "resource_unit",
+        "resource_quantity",
+        "resource_cost",
+        "resource_cost_eur",
+        "resource_price_per_unit_current",
+        "resource_price_per_unit_eur_current",
+        "row_type",
+        "is_machine",
+        "is_material",
+        "is_labor",
+        # Scope of work
+        "work_composition_text",
+        "is_scope",
+        # Abstract resource / variant columns
+        "price_abstract_resource_variable_parts",
+        "price_abstract_resource_est_price_all_values",
+        "price_abstract_resource_position_count",
+        "price_abstract_resource_est_price_min",
+        "price_abstract_resource_est_price_max",
+        "price_abstract_resource_est_price_mean",
+        "price_abstract_resource_est_price_median",
+        "price_abstract_resource_unit",
+        "price_abstract_resource_group_per_unit",
+        "price_abstract_resource_variable_parts_per_unit",
+        "price_abstract_resource_est_price_all_values_per_unit",
+        "price_abstract_resource_common_start",
+    }
+)
 
-    Uses vectorized pandas (no iterrows!) and delegates the load to
-    ``_pg_bulk_insert_cost_rows`` (PostgreSQL ``COPY`` into a staging table +
-    ``INSERT ... ON CONFLICT (code, region) DO NOTHING``). ``db_file`` carries
-    the sync SQLAlchemy URL (``postgresql+psycopg2://...``) of the target
-    cluster.
+
+class _CwicrImportTally:
+    """What one cost import has done so far, carried from one set of codes to the next.
+
+    The insert batch lives here rather than per set of codes so the flushes land
+    on the same rows as when the whole parquet was one frame: the rows of one
+    flush can come from two sets, and a set never forces a short flush.
     """
-    import json as _json
+
+    def __init__(self, db_file: str, currency: str) -> None:
+        self.db_file = db_file
+        self.currency = currency
+        self.imported = 0
+        self.skipped = 0
+        self.unique_items = 0
+        self.resource_components = 0
+        self.variant_catalogs = 0
+        self.scope_codes = 0
+        # Codes of rows PostgreSQL refused. Kept apart from ``skipped``, which
+        # counts rows the transform drops on purpose (no description, no code):
+        # those are expected on every base, these are a partial load.
+        self.failed_codes: list[str] = []
+        self.batch: list[tuple] = []
+
+    def add(self, row: tuple) -> None:
+        self.batch.append(row)
+        # Hand the rows over in bounded slices instead of building the whole
+        # region first. Each flush is its own committed transaction, so peak
+        # memory stays flat and a killed import resumes rather than restarts.
+        if len(self.batch) >= _INSERT_FLUSH_ROWS:
+            self.flush()
+
+    def flush(self) -> None:
+        # PostgreSQL: idempotent bulk insert via ON CONFLICT (code, region)
+        # DO NOTHING.
+        if self.batch:
+            self.imported += _insert_cost_rows_isolating_rejects(self.db_file, self.batch, self.failed_codes)
+            self.batch.clear()
+
+
+def _cwicr_int_columns_read_as_float(parquet: Any, columns: list[str]) -> frozenset[str]:
+    """Integer columns that pandas reads as floats when it reads the whole file.
+
+    pandas turns an integer column with a missing value into floats, so read as
+    one frame such a column is float in every row, while a batch that happens to
+    have no missing value would come out as integers and stringify as ``5``
+    instead of ``5.0``. Knowing these columns up front lets every batch be
+    converted the way the whole file would have been. A column whose pandas
+    metadata asks for a nullable integer type stays integer either way, which
+    is why the answer comes from converting the column rather than from its
+    missing values alone.
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    out: set[str] = set()
+    for name in columns:
+        if not pa.types.is_integer(parquet.schema_arrow.field(name).type):
+            continue
+        column = parquet.read(columns=[name])
+        if column.column(0).null_count and pd.api.types.is_float_dtype(column.to_pandas().iloc[:, 0]):
+            out.add(name)
+    return frozenset(out)
+
+
+def _cwicr_arrow_frame(table: Any, float_columns: frozenset[str]) -> pd.DataFrame:  # noqa: F821
+    """Convert part of a CWICR parquet to pandas as reading the whole file would.
+
+    The conversion is pyarrow's ``Table.to_pandas``, which is what
+    ``pd.read_parquet`` calls, with two adjustments so the result does not
+    depend on which rows the batch holds: an integer column with a missing value
+    somewhere in the file becomes floats (see
+    :func:`_cwicr_int_columns_read_as_float`), and a dictionary-encoded column is
+    decoded to its plain values, since categories would differ batch to batch.
+    Column names are stripped and lower-cased, as the transform expects.
+    """
+    import pyarrow as pa
+
+    for index, field in enumerate(table.schema):
+        column_type = field.type.value_type if pa.types.is_dictionary(field.type) else field.type
+        if field.name in float_columns:
+            column_type = pa.float64()
+        if column_type != field.type:
+            table = table.set_column(index, field.name, table.column(index).cast(column_type))
+    frame = table.to_pandas()
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
+    return frame
+
+
+def _cwicr_unit_keys(rate_codes: pd.Series) -> pd.Series:  # noqa: F821
+    """The key that decides which rows of a CWICR parquet must be processed together.
+
+    The transform matches rows to a work item through three differently built
+    strings: the resources by the raw code, the scope steps by the stripped
+    code, and the stored code itself is stripped and cut to 100 characters. All
+    three agree on this key, so rows that one of them could bring together never
+    land in different sets.
+    """
+    return rate_codes.astype(str).str.strip().str.slice(0, 100).str.strip()
+
+
+def _cwicr_unit_ids(
+    parquet: Any, rate_code_column: str, float_columns: frozenset[str], read_rows: int
+) -> tuple[Any, Any]:
+    """One integer per parquet row naming the set of rows it has to be processed with.
+
+    Reads the ``rate_code`` column alone, in batches. Ids are handed out in the
+    order the sets first appear, so a lower id always means an earlier first
+    row, which is what lets the import release sets in their original order.
+    Returns the ids, and per set the row its last raw code first appears on.
+
+    Rows that share a key (:func:`_cwicr_unit_keys`) share a set. Two more rules
+    keep the stream equal to the whole frame:
+
+    * A row without a code belongs to no work item, so it is a set of its own.
+      Keyed by its stringified code it would join every other such row in the
+      file into one set that stays open until the last of them, and everything
+      after the first would wait for it. Under pandas 2 the transform files such
+      a row's resources under the word its missing code stringifies to
+      (``None``), so when an item is literally coded that way the rows join that
+      item instead. pandas 3 keeps the code missing, and nothing is joined.
+    * The transform hands its rows over in the order each raw code first
+      appears. Two raw codes of one set (``"H"`` and ``" H"``) can open on
+      either side of another set's first row, and then that set has to be
+      processed in the same frame, or its rows would be handed over after both
+      of them instead of between. Such sets are merged.
+    """
+    import numpy as np
+    import pandas as pd
+    import pyarrow as pa
+
+    ids: dict[str, int] = {}
+    raw_seen: set[str] = set()
+    # Per set id: the row it opens on, and the row its last raw code opens on.
+    first_row: list[int] = []
+    last_open: list[int] = []
+    # Rows without a code, and the key their missing code stringifies to.
+    null_rows: list[Any] = []
+    null_keys: list[Any] = []
+    parts: list[Any] = []
+    offset = 0
+    for record_batch in parquet.iter_batches(batch_size=read_rows, columns=[rate_code_column]):
+        codes = _cwicr_arrow_frame(pa.Table.from_batches([record_batch]), float_columns).iloc[:, 0]
+        n = len(codes)
+        null = codes.isna().to_numpy()
+        keys = _cwicr_unit_keys(codes).to_numpy(dtype=object)
+        coded = np.flatnonzero(~null)
+        local, raws = pd.factorize(codes.astype(str).to_numpy(dtype=object)[coded])
+        _, first_of_raw = np.unique(local, return_index=True)
+        opens = coded[first_of_raw]
+        nulls = np.flatnonzero(null)
+
+        # Walk what can open a set in row order, so ids follow first rows.
+        events = sorted(
+            [(int(pos), raw) for pos, raw in zip(opens, raws, strict=True)] + [(int(p), None) for p in nulls]
+        )
+        unit_of_raw: dict[str, int] = {}
+        null_ids = np.empty(len(nulls), dtype=np.int64)
+        null_index = 0
+        for pos, raw in events:
+            row = offset + pos
+            if raw is None:
+                null_ids[null_index] = len(first_row)
+                null_index += 1
+                first_row.append(row)
+                last_open.append(row)
+                continue
+            key = keys[pos]
+            unit = ids.get(key)
+            if unit is None:
+                unit = ids[key] = len(first_row)
+                first_row.append(row)
+                last_open.append(row)
+            elif raw not in raw_seen:
+                last_open[unit] = row
+            raw_seen.add(raw)
+            unit_of_raw[raw] = unit
+
+        out = np.empty(n, dtype=np.int64)
+        out[coded] = np.fromiter((unit_of_raw[r] for r in raws), dtype=np.int64, count=len(raws))[local]
+        out[nulls] = null_ids
+        if len(nulls):
+            null_rows.append(nulls + offset)
+            null_keys.append(keys[nulls])
+        parts.append(out)
+        offset += n
+    if not parts:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    unit_of_row = np.concatenate(parts)
+
+    for rows, keys in zip(null_rows, null_keys, strict=True):
+        for row, key in zip(rows, keys, strict=True):
+            if key in ids:
+                unit_of_row[row] = ids[key]
+
+    # Merge every set that opens before an earlier set's last raw code does.
+    # Sets are in first-row order, so a running maximum of where each one's
+    # last raw code opened says whether the next set starts inside it.
+    first = np.asarray(first_row, dtype=np.int64)
+    reach = np.maximum.accumulate(np.asarray(last_open, dtype=np.int64))
+    starts_new = np.ones(len(first), dtype=bool)
+    starts_new[1:] = first[1:] > reach[:-1]
+    merged = np.cumsum(starts_new) - 1
+    # A merged set ends where the next one starts, and the running maximum at
+    # its last member is the row its last raw code opens on.
+    ends = np.append(np.flatnonzero(starts_new)[1:] - 1, len(first) - 1)
+    return merged[unit_of_row], reach[ends]
+
+
+def _cwicr_far_rows(unit_of_row: Any, unit_opened: Any, read_rows: int) -> Any:
+    """Rows to read ahead of the stream, because their set came back to them much later.
+
+    A set is processed once all of its rows are in, and every set that opened
+    after it waits for it. So a set whose last rows sit far down the file holds
+    everything between its first and last row in memory. The AR and FR CWICR
+    bases do this: about 600 items open near row 158 000 and get their last two
+    or three rows near row 726 000, which held 570 000 rows, two thirds of the
+    base, in one frame.
+
+    Those late rows are few, so they are read on their own first and handed to
+    the transform with the rest of their set, and the stream skips them when it
+    gets there. A row is read ahead once it lies more than ``read_rows`` rows
+    past its set's first row and past the row the set's last raw code opens on,
+    so the set's codes still first appear in the stream in their file order.
+    Read-ahead is capped at ``_CWICR_FAR_ROWS_PER_READ`` reads' worth of rows by
+    raising that distance; whatever stays over it is held as before.
+
+    Returns the file row indices, ascending.
+    """
+    import numpy as np
+
+    if not len(unit_of_row):
+        return np.empty(0, dtype=np.int64)
+    rows = np.arange(len(unit_of_row), dtype=np.int64)
+    first = np.full(len(unit_opened), len(unit_of_row), dtype=np.int64)
+    np.minimum.at(first, unit_of_row, rows)
+    distance = np.where(rows > unit_opened[unit_of_row], rows - first[unit_of_row], 0)
+    hold = read_rows
+    cap = _CWICR_FAR_ROWS_PER_READ * read_rows
+    if np.count_nonzero(distance > hold) > cap:
+        hold = max(hold, int(np.partition(distance, len(distance) - cap - 1)[len(distance) - cap - 1]))
+    return np.flatnonzero(distance > hold)
+
+
+def _cwicr_take_rows(parquet: Any, columns: list[str], rows: Any, read_rows: int) -> Any:
+    """The given rows of ``columns``, in file order, read batch by batch."""
+    import numpy as np
+    import pyarrow as pa
+
+    parts = []
+    if len(rows):
+        offset = 0
+        for record_batch in parquet.iter_batches(batch_size=read_rows, columns=columns):
+            lo, hi = np.searchsorted(rows, [offset, offset + record_batch.num_rows])
+            if hi > lo:
+                parts.append(record_batch.take(pa.array(rows[lo:hi] - offset)))
+            offset += record_batch.num_rows
+            if hi == len(rows):
+                break
+    if parts:
+        return pa.Table.from_batches(parts)
+    return parquet.schema_arrow.empty_table().select(columns)
+
+
+def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
+    """Process a CWICR parquet and insert it into PostgreSQL. Runs in a thread.
+
+    The parquet is read in batches of ``_PARQUET_READ_ROWS`` rows, never as one
+    frame: read whole, a country base peaked at 2 to 8 GiB of resident memory,
+    far over what a 3 GB server leaves for an import.
+
+    A work item (rate code) spans several rows, its resources, scope steps and
+    variant slots, and those rows are not always next to each other: the CWICR
+    bases come back to a code up to ~100 rows later, a national base up to
+    ~28 000 rows later. So a first pass over the ``rate_code`` column alone
+    records where each code's last row is, and a code is processed only once
+    every one of its rows has been read. Codes are released in the order they
+    first appear, so the rows reach the database in the same order and in the
+    same flushes as when the whole file was one frame, and the transform
+    (:func:`_import_cwicr_codes`) sees each code exactly as it did then. The
+    few rows a code comes back to much later are read ahead
+    (:func:`_cwicr_far_rows`), so such a code does not hold every row between.
+
+    The rows go to ``_pg_bulk_insert_cost_rows`` (PostgreSQL ``COPY`` into a
+    staging table + ``INSERT ... ON CONFLICT (code, region) DO NOTHING``) every
+    ``_INSERT_FLUSH_ROWS`` rows. Each flush commits on its own, so an import that
+    dies part way keeps the flushes before it and a rerun adds only what is
+    missing. ``db_file`` carries the sync SQLAlchemy URL
+    (``postgresql+psycopg2://...``) of the target cluster.
+    """
+    import pyarrow.parquet as pq
+
+    # Closed on the way out: an open handle on Windows keeps the cached
+    # parquet from being replaced by the next download.
+    with pq.ParquetFile(parquet_path) as parquet:
+        return _stream_cwicr_parquet(parquet, parquet_path, db_id, db_file)
+
+
+def _stream_cwicr_parquet(parquet: Any, parquet_path: str, db_id: str, db_file: str) -> dict[str, Any]:
+    """The body of :func:`_process_and_insert_cwicr`, over an open parquet."""
     import logging
-    import math
     import time
 
-    import pandas as pd
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
 
     _log = logging.getLogger("cwicr_import")
     start = time.monotonic()
 
-    # 1. Read parquet
-    df = pd.read_parquet(parquet_path)
-    total_rows = len(df)
-    df.columns = [str(c).strip().lower() for c in df.columns]
-
-    if "rate_code" not in df.columns:
+    total_rows = parquet.metadata.num_rows
+    _orig_by_lower = {n.strip().lower(): n for n in parquet.schema_arrow.names}
+    if "rate_code" not in _orig_by_lower:
         return {"imported": 0, "skipped": 0, "total_rows": total_rows, "error": "no rate_code column"}
+    _use_cols = [_orig_by_lower[k] for k in _CWICR_NEEDED_COLUMNS if k in _orig_by_lower]
+
+    read_rows = max(1, int(_PARQUET_READ_ROWS))
+    float_columns = _cwicr_int_columns_read_as_float(parquet, _use_cols)
+    unit_of_row, unit_opened = _cwicr_unit_ids(parquet, _orig_by_lower["rate_code"], float_columns, read_rows)
+    # Rows read ahead of the stream (see :func:`_cwicr_far_rows`), and their set ids.
+    far_rows = _cwicr_far_rows(unit_of_row, unit_opened, read_rows)
+    far_table = _cwicr_take_rows(parquet, _use_cols, far_rows, read_rows)
+    far_units = unit_of_row[far_rows]
+    # Row index of the last row of every set the stream itself reads; a set is
+    # complete once the import has read past it.
+    in_stream = np.ones(len(unit_of_row), dtype=bool)
+    in_stream[far_rows] = False
+    unit_last = np.full(int(unit_of_row.max()) + 1 if len(unit_of_row) else 0, -1, dtype=np.int64)
+    np.maximum.at(unit_last, unit_of_row[in_stream], np.flatnonzero(in_stream))
+    del in_stream
+
+    # CWICR parquet carries no currency column - every rate is denominated in
+    # the region's local currency. Resolve it ONCE from ``db_id`` (constant for
+    # the whole import) so each row persists its true ISO currency instead of
+    # the empty string that read-side fallbacks then had to paper over.
+    tally = _CwicrImportTally(db_file, _resolve_currency(None, db_id))
+
+    # Rows read but not processed yet: the batches they came in, and their set ids.
+    pending: list[Any] = []
+    pending_units: list[Any] = []
+    rows_read = 0
+    for record_batch in parquet.iter_batches(batch_size=read_rows, columns=_use_cols):
+        if not record_batch.num_rows:
+            continue
+        n = record_batch.num_rows
+        batch_units = unit_of_row[rows_read : rows_read + n]
+        lo, hi = np.searchsorted(far_rows, [rows_read, rows_read + n])
+        if hi > lo:
+            # These rows were read ahead and travel with their set's frame.
+            keep = np.ones(n, dtype=bool)
+            keep[far_rows[lo:hi] - rows_read] = False
+            record_batch = record_batch.filter(pa.array(keep))
+            batch_units = batch_units[keep]
+        rows_read += n
+        if record_batch.num_rows:
+            pending.append(record_batch)
+            pending_units.append(batch_units)
+        if not pending_units:
+            continue
+
+        units = pending_units[0] if len(pending_units) == 1 else np.concatenate(pending_units)
+        # Release every set that first appeared before the earliest set still
+        # waiting for rows. Those are complete, and nothing that comes later
+        # can belong in front of them.
+        waiting = units[unit_last[units] >= rows_read]
+        ready = units < waiting.min() if waiting.size else np.ones(len(units), dtype=bool)
+        if not ready.any():
+            continue
+        table = pa.Table.from_batches(pending)
+        if ready.all():
+            pending, pending_units = [], []
+        else:
+            mask = pa.array(ready)
+            pending = table.filter(pc.invert(mask)).to_batches()
+            pending_units = [units[~ready]]
+            table = table.filter(mask)
+        if far_units.size:
+            # Every set below the earliest one still waiting has had its first
+            # row read, so its read-ahead rows belong in this frame. They go at
+            # the end: the set's raw codes all opened before them, so no code's
+            # first appearance moves, and its own rows stay in file order.
+            bound = waiting.min() if waiting.size else units.max() + 1
+            joins = far_units < bound
+            if joins.any():
+                table = pa.concat_tables([table, far_table.filter(pa.array(joins))])
+                far_table = far_table.filter(pa.array(~joins))
+                far_units = far_units[~joins]
+        _import_cwicr_codes(_cwicr_arrow_frame(table, float_columns), db_id, tally)
+        del table
+
+    if rows_read != len(unit_of_row) or pending or far_units.size:
+        # The first pass and this one disagree about the file, or a set never
+        # completed. Either way the rows above are not the whole base.
+        raise RuntimeError(
+            f"CWICR parquet {parquet_path} changed while it was imported "
+            f"({len(unit_of_row)} rows indexed, {rows_read} read)"
+        )
+    if not total_rows:
+        # An empty base still reports what the transform makes of no rows.
+        _import_cwicr_codes(
+            _cwicr_arrow_frame(parquet.schema_arrow.empty_table().select(_use_cols), float_columns), db_id, tally
+        )
+    # Whatever the last set did not fill a flush with lands here.
+    tally.flush()
+
+    elapsed = round(time.monotonic() - start, 1)
+    _log.info(
+        "Grouped %d unique items from %d rows; %d per-component variant catalogs, "
+        "scope_of_work for %d rate_codes, %d resource components",
+        tally.unique_items,
+        total_rows,
+        tally.variant_catalogs,
+        tally.scope_codes,
+        tally.resource_components,
+    )
+    _log.info(
+        "CWICR %s: %d imported, %d skipped, %d rejected by the database in %.1fs",
+        db_id,
+        tally.imported,
+        tally.skipped,
+        len(tally.failed_codes),
+        elapsed,
+    )
+
+    return {
+        "imported": tally.imported,
+        "skipped": tally.skipped,
+        "failed": len(tally.failed_codes),
+        "failed_codes": tally.failed_codes[:_FAILED_CODES_REPORTED],
+        "total_rows": total_rows,
+        "unique_items": tally.unique_items,
+        # Total resource components carried by the imported work items. Each
+        # CWICR work item (rate_code) bundles a labour/material/equipment
+        # breakdown in its ``components`` array; surfacing the aggregate count
+        # lets the partner-pack installer report the embedded resource database
+        # it just loaded alongside the work catalog.
+        "resource_components": tally.resource_components,
+        "database": db_id,
+    }
+
+
+def _import_cwicr_codes(df: pd.DataFrame, db_id: str, tally: _CwicrImportTally) -> None:  # noqa: F821
+    """Turn the parquet rows of a set of complete work items into cost rows.
+
+    ``df`` holds every row of each work item it touches, in file order, so the
+    vectorized pandas below (no iterrows over the full set) gives each item what
+    it gave when the whole file was one frame. The rows go into ``tally``, which
+    flushes them; the per-item indexes built here are dropped on return.
+    """
+    import json as _json
+    import math
+
+    import pandas as pd
 
     # 2. Vectorized processing - use groupby.first() instead of iterrows
     if "rate_original_name" in df.columns and "rate_final_name" in df.columns:
@@ -5177,7 +6687,7 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
             agg_cols[col] = "first"
 
     grouped = df.groupby("rate_code", sort=False).agg(agg_cols)
-    _log.info("Grouped %d unique items from %d rows in %.1fs", len(grouped), total_rows, time.monotonic() - start)
+    tally.unique_items += len(grouped)
 
     # 3. Build insert tuples (vectorized - no Python loop over rows)
     def _safe_float(v: object) -> float:
@@ -5330,7 +6840,7 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
                     "common_start": common_start,
                 },
             }
-    _log.info("Indexed %d per-component variant catalogs", len(abstract_variants_by_pair))
+    tally.variant_catalogs += len(abstract_variants_by_pair)
 
     # ── Scope-of-work index ──
     # ``work_composition_text`` carries the ordered steps describing HOW a
@@ -5355,7 +6865,7 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
             if not rc or not text or text == "nan":
                 continue
             scope_by_code.setdefault(rc, []).append(text[:500])
-    _log.info("Indexed scope_of_work for %d rate_codes", len(scope_by_code))
+    tally.scope_codes += len(scope_by_code)
 
     resources_by_code: dict[str, list[dict]] = {}
     if "resource_name" in df.columns and _cost_col in df.columns:
@@ -5506,33 +7016,23 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
                     comp["available_variant_stats"] = v_data["variant_stats"]
                 comps.append(comp)
 
-        _log.info("Built resources for %d rate_codes in %.1fs", len(resources_by_code), time.monotonic() - start)
-
-    # 5. Build the insert rows. ``db_file`` carries the sync SQLAlchemy URL
-    # (postgresql://...) of the target cluster - see the caller. Every row is
-    # accumulated and handed to ``_pg_bulk_insert_cost_rows`` (COPY into a
-    # staging table + ON CONFLICT DO NOTHING) below.
-
-    # CWICR parquet carries no currency column - every rate is denominated in
-    # the region's local currency. Resolve it ONCE from ``db_id`` (constant for
-    # the whole import) so each row persists its true ISO currency instead of
-    # the empty string that read-side fallbacks then had to paper over.
-    resolved_currency = _resolve_currency(None, db_id)
-
-    skipped_count = 0
-    batch: list[tuple] = []
+    # The raw rows are no longer needed; only ``grouped`` and the per-code
+    # indexes above survive into the row building below.
+    del df
+    tally.resource_components += sum(len(v) for v in resources_by_code.values())
+    resolved_currency = tally.currency
 
     for rate_code, row in grouped.iterrows():
         desc = _safe_str(row.get("_desc", ""))
         if len(desc) < 3:
             desc = _safe_str(row.get("subsection_name", ""))
         if len(desc) < 3:
-            skipped_count += 1
+            tally.skipped += 1
             continue
 
         code = _safe_str(rate_code)[:100]
         if not code:
-            skipped_count += 1
+            tally.skipped += 1
             continue
 
         unit = _safe_str(row.get("rate_unit", "m2"))[:20] or "m2"
@@ -5620,7 +7120,7 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
         # Get full resource components for this rate_code
         components = resources_by_code.get(code, [])
 
-        batch.append(
+        tally.add(
             (
                 str(uuid.uuid4()),
                 code,
@@ -5638,30 +7138,6 @@ def _process_and_insert_cwicr(parquet_path: str, db_id: str, db_file: str) -> di
                 _json.dumps(metadata),
             )
         )
-
-    # PostgreSQL: idempotent bulk insert via ON CONFLICT (code, region)
-    # DO NOTHING. ``batch`` holds every accumulated row.
-    imported = _pg_bulk_insert_cost_rows(db_file, batch)
-
-    elapsed = round(time.monotonic() - start, 1)
-    _log.info("CWICR %s: %d imported, %d skipped in %.1fs", db_id, imported, skipped_count, elapsed)
-
-    # Total resource components carried by the imported work items. Each CWICR
-    # work item (rate_code) bundles a labour/material/equipment breakdown in its
-    # ``components`` array (the parquet is literally
-    # ``..._workitems_costs_resources_...``); surfacing the aggregate count lets
-    # the partner-pack installer report the embedded resource database it just
-    # loaded alongside the work catalog.
-    resource_components = sum(len(v) for v in resources_by_code.values())
-
-    return {
-        "imported": imported,
-        "skipped": skipped_count,
-        "total_rows": total_rows,
-        "unique_items": len(grouped),
-        "resource_components": resource_components,
-        "database": db_id,
-    }
 
 
 def _build_cwicr_items(df: pd.DataFrame, db_id: str) -> list[dict[str, Any]]:  # noqa: F821
@@ -5844,6 +7320,12 @@ async def clear_cost_database(
         stmt = sql_delete(CostItem)
 
     result = await session.execute(stmt)
+    if source in ("", "cwicr"):
+        # Every loaded base was CWICR rows, so no stored market or language
+        # describes anything any more.
+        from app.modules.costs.models import CostBaseState
+
+        await session.execute(sql_delete(CostBaseState))
     await session.commit()
     count = result.rowcount  # type: ignore[union-attr]
 
@@ -5852,6 +7334,20 @@ async def clear_cost_database(
 
 
 # ── Export cost database as Excel ────────────────────────────────────────────
+
+
+def _append_rows(ws: Any, rows: list[list[object]]) -> None:
+    """Append plain rows to a write-only sheet. Pure, so it runs in a worker thread."""
+    for row in rows:
+        ws.append(row)
+
+
+def _save_workbook(wb: Any) -> io.BytesIO:
+    """Save a workbook into a rewound buffer. Pure, so it runs in a worker thread."""
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 
 def _excel_safe(value: object) -> object:
@@ -5902,12 +7398,13 @@ async def export_cost_database(
         if not items:
             break
 
+        rows: list[list[object]] = []
         for item in items:
             try:
                 rate_val = float(item.rate)
             except (ValueError, TypeError):
                 rate_val = 0
-            ws.append(
+            rows.append(
                 [
                     _excel_safe(item.code),
                     _excel_safe(item.description),
@@ -5918,14 +7415,15 @@ async def export_cost_database(
                     _excel_safe(getattr(item, "region", "")),
                 ]
             )
+        # The whole active cost database can run to tens of thousands of rows;
+        # writing them into the sheet is pure CPU and goes to a worker thread.
+        await asyncio.to_thread(_append_rows, ws, rows)
 
         if len(items) < batch_size:
             break
         offset += batch_size
 
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
+    output = await asyncio.to_thread(_save_workbook, wb)
 
     return StreamingResponse(
         output,

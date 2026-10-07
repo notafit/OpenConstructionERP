@@ -139,6 +139,8 @@ export interface CrossLink {
 export interface PortfolioCpmActivity {
   schedule_id: string;
   activity_id: string;
+  schedule_name: string;
+  activity_name: string;
   es: number;
   ef: number;
   ls: number;

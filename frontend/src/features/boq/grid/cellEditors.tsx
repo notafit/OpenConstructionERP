@@ -17,7 +17,7 @@ import type { ICellEditorParams } from 'ag-grid-community';
 import { AutocompleteInput } from '../AutocompleteInput';
 import type { CostAutocompleteItem, Position } from '../api';
 import { getUnitsForLocale, saveCustomUnit } from '../boqHelpers';
-import { parseDecimalInput } from '@/shared/lib/parseDecimal';
+import { parseDecimalInput, parseMoneyInput } from '@/shared/lib/parseDecimal';
 import { useToastStore } from '@/stores/useToastStore';
 import type { DisplayQuantityApi } from '@/shared/hooks/useDisplayQuantity';
 import {
@@ -118,6 +118,34 @@ function toDisplayQty(params: ICellEditorParams, metricValue: number): number {
   if (!dq) return metricValue;
   const unit = (params.data?.unit as string | undefined) ?? '';
   return dq.convert(metricValue, unit).value;
+}
+
+/**
+ * The text an editor opens on, given the key that opened it.
+ *
+ * When a keystroke starts the edit, AG Grid cancels it and hands it to the
+ * editor as ``eventKey``; its own editors start from that character. An editor
+ * that ignores it loses the first character typed: Tab from quantity into the
+ * rate cell, type 12,50, and 2,50 was saved without a word. A printable key
+ * replaces the value, as in a spreadsheet, Backspace and Delete open the editor
+ * empty, and anything else (Enter, F2, a click) opens on the stored value.
+ */
+export function editorSeed(eventKey: string | null | undefined, stored: string): { text: string; typed: boolean } {
+  if (eventKey === 'Backspace' || eventKey === 'Delete') return { text: '', typed: true };
+  if (typeof eventKey === 'string' && Array.from(eventKey).length === 1) return { text: eventKey, typed: true };
+  return { text: stored, typed: false };
+}
+
+/** Focus an editor's input: caret after a typed seed, the whole value selected otherwise. */
+function focusSeeded(el: HTMLInputElement | null, typed: boolean): void {
+  if (!el) return;
+  el.focus();
+  if (typed) {
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+  } else {
+    el.select();
+  }
 }
 
 /** Check whether an input string looks like a formula (Excel-style `=` prefix,
@@ -325,18 +353,20 @@ export const FormulaCellEditor = forwardRef(
     // Pre-fill with the previously-saved formula if there is one — this
     // means re-editing a "formula" cell takes the user back to the source
     // expression, not just the resolved number (Issue #90 round-trip UX).
-    const [value, setValue] = useState<string>(() => {
-      if (formula) return String(formula);
+    const [seed] = useState(() => {
+      if (formula) return editorSeed(props.eventKey, String(formula));
       // Issue #287: seed the numeric branch with the value in the DISPLAYED
       // measurement system. The commit path (toMetricQty) converts
       // display→metric, so without this an open+commit with no change would
       // double-convert and corrupt the stored quantity. Identity for metric /
       // unmapped units, so metric users see exactly the value as before.
       const raw = props.value;
-      return typeof raw === 'number' && isFinite(raw)
-        ? String(toDisplayQty(props, raw))
-        : String(raw ?? '');
+      return editorSeed(
+        props.eventKey,
+        typeof raw === 'number' && isFinite(raw) ? String(toDisplayQty(props, raw)) : String(raw ?? ''),
+      );
     });
+    const [value, setValue] = useState<string>(seed.text);
     const [showHelp, setShowHelp] = useState(false);
     // Single source of truth — what numeric value we will hand back to AG
     // Grid. Updated only by commitFromInput / getValue so the formula
@@ -392,8 +422,9 @@ export const FormulaCellEditor = forwardRef(
     );
 
     useEffect(() => {
-      inputRef.current?.focus();
-      inputRef.current?.select();
+      focusSeeded(inputRef.current, seed.typed);
+      // Once, on mount: the seed never changes.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Resolve onFormulaApplied: prefer the editor-param prop, fall back to
@@ -572,6 +603,9 @@ export const FormulaCellEditor = forwardRef(
             ev.stopPropagation();
             return;
           }
+          // Cancel. Mark the edit done first: removing the editor blurs the
+          // input, and the blur handler would otherwise commit what was typed.
+          committedRef.current = true;
           props.api.stopEditing(true);
           return;
         }
@@ -797,7 +831,10 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     return dq ? dq.convertRate(raw, unit) : raw;
   }, [props.value, dq, unit]);
 
-  const seedStr = displaySeed != null ? String(displaySeed) : '';
+  // Frozen at mount, like ``defaultValue``: the key that opened the editor, or
+  // the displayed rate.
+  const [seed] = useState(() => editorSeed(props.eventKey, displaySeed != null ? String(displaySeed) : ''));
+  const seedStr = seed.text;
   // ``valueRef`` mirrors the input synchronously. A plain JSX ``onChange`` +
   // ``getValue()`` was NOT enough: ag-grid-react v32 + React 18 (a) can skip
   // ``getValue()`` entirely after ``stopEditing`` on a functional editor, and
@@ -813,8 +850,9 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
   const committedRef = useRef(false);
 
   useEffect(() => {
-    inputRef.current?.focus();
-    inputRef.current?.select();
+    focusSeeded(inputRef.current, seed.typed);
+    // Once, on mount: the seed never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const commit = (cancelNavigation: boolean): boolean => {
@@ -823,8 +861,9 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     // Locale-aware and strict: `48,60` -> 48.6, `1.234,56` -> 1234.56, and
     // garbage is refused instead of parseFloat-truncated. The input is
     // type=text precisely so the comma REACHES this parser - a number input
-    // silently drops it and a German keystroke became a 100x rate.
-    const n = parseDecimalInput(live);
+    // silently drops it and a German keystroke became a 100x rate. A currency
+    // sign typed with the rate (`12,50 €`) is ignored.
+    const n = parseMoneyInput(live);
     if (n === null) {
       // Keep the previously stored rate (Escape-style cancel). Guard set so
       // a tail blur after Enter doesn't re-enter. An empty field is a plain
@@ -856,6 +895,8 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     };
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === 'Escape') {
+        // Cancel, and keep the blur that follows from committing the typed rate.
+        committedRef.current = true;
         props.api.stopEditing(true);
         return;
       }
@@ -891,7 +932,7 @@ export const RateCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     getValue() {
       // Cold path only (programmatic stopEditing without our commit): return the
       // typed DISPLAY value so the column valueParser converts it once to metric.
-      const n = parseDecimalInput(valueRef.current);
+      const n = parseMoneyInput(valueRef.current);
       if (n !== null) return n;
       if (displaySeed != null) return displaySeed;
       return props.value;
@@ -1062,7 +1103,9 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
   const { i18n } = useTranslation();
   const lang = i18n.language || 'en';
   const initial = String(props.value ?? '');
-  const [value, setValue] = useState<string>(initial);
+  // A key that opened the editor starts the search, the stored unit otherwise.
+  const [seed] = useState(() => editorSeed(props.eventKey, initial));
+  const [value, setValue] = useState<string>(seed.text);
   // Open by default so the dropdown is visible the moment the editor
   // mounts (matches the original ``agSelectCellEditor`` UX). The
   // dropdown lives in a portal at <body> level (see render below) so
@@ -1070,6 +1113,11 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
   // earlier ``open=false`` workaround is replaced by the portal fix.
   const [open, setOpen] = useState(true);
   const [activeIdx, setActiveIdx] = useState(0);
+  // Whether the estimator moved the highlight with the arrow keys since they
+  // last typed. The first suggestion is highlighted on its own, and Enter on
+  // that is not a choice: the list filters by prefix, so typing "m" puts "mm"
+  // first, and committing the highlight saved "mm" for a typed "m".
+  const navigatedRef = useRef(false);
   // Anchor rect for portal positioning. Recomputed when the dropdown
   // opens so resizing the column / scrolling doesn't leave a stale popover.
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null);
@@ -1082,7 +1130,7 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
   // (which AG Grid invokes synchronously during stopEditing) returned
   // the stale pre-commit value. The ref is mutated synchronously
   // alongside setValue, so getValue() always sees the latest pick.
-  const valueRef = useRef<string>(initial);
+  const valueRef = useRef<string>(seed.text);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
@@ -1138,11 +1186,10 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
     // to the DOM before we steal focus into the input. Calling focus
     // synchronously inside useEffect on mount caused intermittent
     // races on AG Grid 32 where the cell hadn't received focus yet.
-    const t = setTimeout(() => {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }, 0);
+    const t = setTimeout(() => focusSeeded(inputRef.current, seed.typed), 0);
     return () => clearTimeout(t);
+    // Once, on mount: the seed never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Stable key for the StrictMode-proof commit channel. AG Grid's
@@ -1268,6 +1315,7 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
           setValue(e.target.value);
           setOpen(true);
           setActiveIdx(0);
+          navigatedRef.current = false;
         }}
         onFocus={() => setOpen(true)}
         onClick={() => setOpen(true)}
@@ -1275,18 +1323,24 @@ export const UnitCellEditor = forwardRef((props: ICellEditorParams, ref) => {
           if (e.key === 'Enter') {
             e.preventDefault();
             const sel = filtered[activeIdx];
-            if (open && sel != null) pick(sel);
+            if (open && navigatedRef.current && sel != null) pick(sel);
             else commit();
           } else if (e.key === 'Escape') {
             e.preventDefault();
             if (open) setOpen(false);
-            else props.api.stopEditing(true);
+            else {
+              // Cancel, and keep the deferred blur commit from saving the text.
+              committedRef.current = true;
+              props.api.stopEditing(true);
+            }
           } else if (e.key === 'ArrowDown') {
             e.preventDefault();
             setOpen(true);
+            navigatedRef.current = true;
             setActiveIdx((i) => Math.min(filtered.length - 1, i + 1));
           } else if (e.key === 'ArrowUp') {
             e.preventDefault();
+            navigatedRef.current = true;
             setActiveIdx((i) => Math.max(0, i - 1));
           } else if (e.key === 'Tab') {
             // Plain Tab commits the current text - same behaviour as Enter on

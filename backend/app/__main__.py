@@ -42,6 +42,7 @@ def main() -> None:
     print(f"Starting OpenConstructionERP on http://{host}:{port}")
 
     # Use direct app import for PyInstaller compatibility
+    from app.core.server_loop import uvicorn_loop_option
     from app.main import create_app
 
     app = create_app()
@@ -51,6 +52,8 @@ def main() -> None:
         host=host,
         port=port,
         log_level="info",
+        # Proactor loop that survives a reset client on Windows, see app/core/server_loop.py.
+        loop=uvicorn_loop_option(),
     )
 
 

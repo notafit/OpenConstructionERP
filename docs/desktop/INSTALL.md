@@ -6,7 +6,7 @@ This guide walks you through installing it and signing in for the first time.
 
 ## Where to download
 
-The installers live on the project's GitHub Releases page. Open the latest release and pick the file that matches your computer. Windows gets a `.exe`, macOS gets a `.dmg`, and Linux gets either a `.deb` or an `.AppImage`. Each release is built automatically and the files are attached right there.
+The installers live on the project's GitHub Releases page. Open the latest release and pick the file that matches your computer. Windows gets a `.exe`, macOS gets a `.dmg`, and Linux gets either a `.deb` or an `.AppImage`. Each release is built automatically and the files are attached right there. The macOS build is for Apple Silicon (M1 and later) only; there is no build for Intel Macs, so on an Intel Mac use the pip or Docker route from the README instead.
 
 ## Download and install
 
@@ -18,9 +18,11 @@ The app needs Microsoft's WebView2 runtime. If your machine does not already hav
 
 When it finishes you will find OpenConstructionERP in the Start Menu and as a shortcut, both named "OpenConstructionERP". Click either one to launch it.
 
+The Windows installer is not code signed yet, so Windows warns that it comes from an unknown publisher. If it shows "Windows protected your PC", or if Smart App Control blocks the app, even after it ran once, follow [Windows blocks the app](WINDOWS_BLOCKED.md).
+
 ### macOS
 
-Download the `.dmg`, open it, and drag OpenConstructionERP into your Applications folder. You need macOS 10.15 or later.
+Download the `.dmg`, open it, and drag OpenConstructionERP into your Applications folder. You need a Mac with Apple Silicon, since the `.dmg` will not start on an Intel Mac.
 
 This build is ad-hoc signed but not yet notarized by Apple, so the first time you open it macOS may say it "is damaged and can't be opened" or otherwise block it. The app is not damaged. macOS quarantines anything downloaded from the web, and an app that Apple has not notarized trips that check. To clear it, open Terminal and run this once, then open the app normally:
 
@@ -59,6 +61,10 @@ Sign in with those and you are in. You can create your own account and projects 
 Everything you do stays on your own machine. The app runs its own database locally and does not send your projects anywhere. It works offline, and your data is yours.
 
 All of it lives in a single folder in your home directory, named `.openestimate`. On Windows that is `C:\Users\<your name>\.openestimate`, and on macOS and Linux it is `~/.openestimate`. That folder holds the local PostgreSQL database, every file you have uploaded, and your settings. It sits outside the program folder on purpose, so that installing, upgrading and removing the app never touch your work. To make a backup, close the app and copy that folder somewhere safe.
+
+## Removing the demo projects
+
+The demo projects can be deleted like any other project, or all at once under Settings, Danger Zone, Remove sample data, and they do not come back after a restart or an upgrade. If an earlier version put demo records into your own projects, Settings, Danger Zone, Find leftover demo records lists them by project and module and removes them after you confirm. This is the desktop counterpart of the `openconstructionerp demo-cleanup` command a server administrator runs.
 
 ## Upgrading to a new version
 

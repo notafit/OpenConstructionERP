@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use OpenConstructionERP in your work, please cite it as below."
+title: "OpenConstructionERP"
+type: software
+authors:
+  - name: "DataDrivenConstruction"
+    website: "https://datadrivenconstruction.io"
+  - given-names: "Artem"
+    family-names: "Boiko"
+repository-code: "https://github.com/datadrivenconstruction/OpenConstructionERP"
+url: "https://openconstructionerp.com"
+license: "AGPL-3.0"
+version: "17.7.1"
+date-released: "2026-09-18"
+keywords:
+  - construction
+  - erp
+  - bill-of-quantities
+  - cost-estimation
+  - bim
+  - cad
+  - takeoff
+  - scheduling
+  - tendering
+  - open-source
+abstract: >-
+  Open-source construction ERP platform with AI-powered BOQ editing,
+  multi-CAD import (DWG, RVT, IFC), PDF takeoff with computer vision,
+  4D scheduling, 5D cost modeling, tendering, and a validation pipeline
+  supporting DIN 276, NRM, MasterFormat, GAEB, and DPGF standards.
+  120,000+ priced cost items across 48 regional databases in 44 languages.

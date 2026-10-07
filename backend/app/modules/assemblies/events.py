@@ -392,7 +392,7 @@ async def _on_catalog_resource_updated(event: Event) -> None:
 
 def register_assemblies_subscribers() -> None:
     """Wire the cost / catalog refresh subscribers to the global event bus."""
-    event_bus.subscribe("costs.item.updated", _on_cost_item_updated)
+    event_bus.subscribe_once("costs.item.updated", _on_cost_item_updated)
     # ASM-007 / CAT-002: keep catalog-resource-linked components fresh.
     # ``catalog.resources.updated`` (PLURAL) is the name the catalog
     # router actually emits from its bulk ``adjust-prices`` endpoint -
@@ -401,15 +401,15 @@ def register_assemblies_subscribers() -> None:
     # propagated to assemblies. The singular names are kept as
     # additional subscriptions in case a single-edit publisher is added
     # later (the handler already understands the single-resource shape).
-    event_bus.subscribe("catalog.resources.updated", _on_catalog_resource_updated)
-    event_bus.subscribe("catalog.resource.updated", _on_catalog_resource_updated)
-    event_bus.subscribe("catalog.resource.price_adjusted", _on_catalog_resource_updated)
+    event_bus.subscribe_once("catalog.resources.updated", _on_catalog_resource_updated)
+    event_bus.subscribe_once("catalog.resource.updated", _on_catalog_resource_updated)
+    event_bus.subscribe_once("catalog.resource.price_adjusted", _on_catalog_resource_updated)
     # The third writer of CostItem.rate. costs.item.updated covers the single
     # PATCH and catalog.resources.updated covers the catalog's bulk adjust, but
     # reprice_region - the one that rewrites a whole region from the resource
     # price sheet, and the one a user reaches for when prices move - announced
     # nothing at all until now.
-    event_bus.subscribe("costs.region.repriced", _on_region_repriced)
+    event_bus.subscribe_once("costs.region.repriced", _on_region_repriced)
     logger.info(
         "Assemblies: subscribed to costs.item.updated + costs.region.repriced "
         "+ catalog.resources.updated (+ legacy singular names)"

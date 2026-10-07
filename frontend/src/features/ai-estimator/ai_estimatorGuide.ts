@@ -4,8 +4,9 @@
 // "How it works" guide content for the AI Estimate Builder (/ai-estimator).
 // Consumed by <ModuleGuideButton content={ai_estimatorGuide} /> in the page
 // header. Every key carries its inline English default and is read via
-// t(key, { defaultValue }); these keys are NOT added to en.ts or any locale
-// file. Translators pick the keys up later from the inline defaults.
+// t(key, { defaultValue }); the keys are not in en.ts, the inline defaults
+// are the English source; their translations live in the other locale files,
+// so a changed default needs its translations redone too.
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

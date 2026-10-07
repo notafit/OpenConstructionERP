@@ -285,7 +285,11 @@ def cat_blobs(shas: list[str]) -> dict[str, bytes]:
     """
     if not shas:
         return {}
-    code, out = git("cat-file", "--batch", stdin=("\n".join(sorted(set(shas))) + "\n").encode("ascii"))
+    code, out = git(
+        "cat-file",
+        "--batch",
+        stdin=("\n".join(sorted(set(shas))) + "\n").encode("ascii"),
+    )
     if code != 0:
         raise Refusal("git cat-file could not read the indexed blobs, so this check proved nothing")
 
@@ -585,7 +589,10 @@ def self_test() -> None:
     # exists for, so it is asserted from both sides rather than as one verdict.
     on_disk = dict(line, **{"c.py": _fixture("c", "b"), "d.py": _fixture("d", "c")})
     in_commit = dict(line, **{"d.py": _fixture("d", "c")})  # "c" never committed
-    disk_graph, commit_graph = read_graph(on_disk.items()), read_graph(in_commit.items())
+    disk_graph, commit_graph = (
+        read_graph(on_disk.items()),
+        read_graph(in_commit.items()),
+    )
 
     if disk_graph.faults():
         _fail("the reconstructed incident should look clean on disk, and did not")

@@ -38,6 +38,13 @@ import { ModuleGuideButton } from '@/shared/ui';
 import { Search, X, Network, Box, Table2, ArrowRightLeft, Layers, Info, ChevronRight, Waypoints } from 'lucide-react';
 import { architectureGuide } from './architectureGuide';
 import { computeNeighborhood, neighborCount } from './architectureGraph';
+// Imported as a URL and fetched, never as a JSON module. Under
+// moduleResolution "bundler" TypeScript parses an imported JSON file into the
+// type program, and this one is ~7 MB: it cost about 190 MiB of tsc heap and
+// helped push the CI type check past its ceiling. The `?url` form keeps it
+// out of the program and ships it as a plain asset outside the service worker
+// precache (a JS chunk holding it would also break the 5 MiB precache limit).
+import architectureManifestUrl from './architecture_manifest.json?url';
 
 // ---------------------------------------------------------------------------
 // Types — manifest JSON shape
@@ -1357,22 +1364,28 @@ export function ArchitectureMapPage() {
         }
       })
       .catch(() => {
-        // If API is not available, try to load the static manifest bundled in the repo
-        if (!cancelled) {
-          import('./architecture_manifest.json')
-            .then((mod) => {
-              const data = (mod.default ?? mod) as unknown as ArchitectureManifest;
-              if (data && data.modules && data.modules.length > 0) {
-                setManifest(data);
-              } else {
-                setManifest(null);
-              }
-            })
-            .catch(() => {
-              setError('Failed to load architecture data');
+        // If API is not available, try to load the static manifest bundled in the repo.
+        // Returned so the finally below waits for it: the page keeps its loading
+        // state instead of flashing the empty state while the file downloads.
+        if (cancelled) return undefined;
+        return fetch(architectureManifestUrl)
+          .then((res) => {
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res.json() as Promise<ArchitectureManifest>;
+          })
+          .then((data) => {
+            if (cancelled) return;
+            if (data && data.modules && data.modules.length > 0) {
+              setManifest(data);
+            } else {
               setManifest(null);
-            });
-        }
+            }
+          })
+          .catch(() => {
+            if (cancelled) return;
+            setError('Failed to load architecture data');
+            setManifest(null);
+          });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -1412,7 +1425,12 @@ export function ArchitectureMapPage() {
         <div className="flex flex-col items-center gap-3">
           <div className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin" style={{ borderColor: '#3b82f6', borderTopColor: 'transparent' }} />
           <span className="text-sm" style={{ color: NODE_TEXT_DIM }}>
-            {t('architecture.loading', { defaultValue: 'Loading architecture data (54 modules)...' })}
+            {/* No count here, in any language. This renders while the manifest
+                is still in flight, so there is no number to report yet, and the
+                one that used to be written into the sentence said 54 against a
+                tree of 195. A figure baked into a translated string is a figure
+                nobody recounts: it was wrong in all 43 locales at once. */}
+            {t('architecture.loading', { defaultValue: 'Loading architecture data...' })}
           </span>
         </div>
       </div>

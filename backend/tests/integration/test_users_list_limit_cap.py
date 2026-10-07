@@ -4,10 +4,16 @@ Source defect (user error log openconstructionerp-log-2026-05-22.json,
 v4.3.2): the /admin/audit-log page (and other resolvers) defaulted to
 ``limit=200`` against this endpoint, but the backend caps it at 100 -
 every audit-log mount fired a 422. The frontend default is now 100.
-These tests lock the two ends of the contract:
 
-* limit=100 -> 200 OK (the new frontend default).
-* limit=101 -> 422 (the cap stays enforced).
+The cap itself moved on 2026-06-05 (``36f3ebcb8``): directory and assignee
+pickers load the whole active-user list in one call, and a hard 100 dropped
+assignees silently, so ``app/modules/users/router.py`` now declares
+``le=500`` with that reasoning next to it. This module still locks both ends
+of the contract, it just locks them at the cap the endpoint actually ships:
+
+* limit=100 -> 200 OK (the frontend default).
+* limit=500 -> 200 OK (the cap itself).
+* limit=501 -> 422 (one past it; the cap cannot move without both numbers moving).
 
 Uses the lightweight test pattern (mount just the users router on a
 minimal FastAPI app with auth/perm/session dependencies stubbed) to
@@ -97,17 +103,25 @@ async def test_list_users_limit_above_cap_still_rejected(
     client: AsyncClient,
 ) -> None:
     """Cap must remain enforced — frontend can't sneak a bigger limit."""
-    r = await client.get("/api/v1/users/?limit=101")
+    r = await client.get("/api/v1/users/?limit=501")
     assert r.status_code == 422, r.text
 
 
 @pytest.mark.asyncio
-async def test_list_users_legacy_oversized_limit_still_rejected(
+async def test_list_users_limit_at_the_cap_succeeds(
     client: AsyncClient,
 ) -> None:
-    """The exact previously-shipped frontend default of 200 — must 422.
+    """The cap itself must be admitted — 500 in, and the test above says 501 out.
 
-    Locks the contract: future code can't silently raise the cap.
+    This assertion is the pair of the one above and the reason the module
+    exists: the two of them bracket the cap, so it cannot move without both
+    numbers moving together. Deliberately the cap and not some historical
+    request size, which is what this used to be. It asked for ``limit=200``
+    and a 422 until 2026-09-22, true of the 100-row cap the module was
+    written against and false from ``36f3ebcb8`` onwards, so it had been
+    failing every night for three months while the endpoint served 200 rows
+    quite happily. A number chosen for a frontend default drifts out of date
+    on its own; the boundary cannot, because it is the thing being guarded.
     """
-    r = await client.get("/api/v1/users/?limit=200")
-    assert r.status_code == 422, r.text
+    r = await client.get("/api/v1/users/?limit=500")
+    assert r.status_code == 200, r.text

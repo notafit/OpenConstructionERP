@@ -20,10 +20,14 @@ from __future__ import annotations
 import io
 from typing import Any
 
+import pymupdf
 import pypdf
 import pytest
+from reportlab.lib.pagesizes import landscape
+from reportlab.lib.units import mm
 
 import app.modules.contracts.aia_pdf as aia_pdf
+from app.core.paper_size import PAPER_SIZES
 
 # The probe and the suite must agree about which copy of the package they are
 # reading. Running a file by path puts the script's own directory on sys.path
@@ -126,3 +130,87 @@ def test_a_paragraph_cell_still_escapes_what_it_is_given() -> None:
     described = application(lines=[application()["lines"][0] | {"description": "Steel <b>frame</b> & cladding"}])
     runs = drawn_runs(aia_pdf.render_aia_application_pdf(described))
     assert "Steel <b>frame</b> & cladding" in runs, f"the description was parsed instead of printed: {runs[:12]}"
+
+
+# ── The continuation sheet on the paper ────────────────────────────────────
+#
+# The continuation sheet's columns were fixed at 278mm on a landscape Letter
+# sheet with 247mm inside its margins, so it was drawn to within a millimetre
+# of both paper edges and a printer clipped the item numbers and the retainage.
+# The margin and the frame padding are stated here rather than imported, so the
+# test carries its own idea of where the printable area is.
+
+SIDE_MARGIN = 14 * mm
+FRAME_PADDING = 6.0
+
+LARGE_LINE = "9999999.99"
+LARGE_TOTAL = "99999999.99"
+
+
+def _large_application(lines: int = 20) -> dict[str, Any]:
+    """The largest figures the columns are sized for, in every money cell."""
+    money_fields = (
+        "scheduled_value",
+        "previous_value",
+        "this_period_value",
+        "materials_stored",
+        "total_completed_stored",
+        "balance_to_finish",
+        "retainage",
+    )
+    line = application()["lines"][0] | dict.fromkeys(money_fields, LARGE_LINE)
+    summary = {
+        "contract_sum_to_date": LARGE_TOTAL,
+        "total_completed_stored": LARGE_TOTAL,
+        "balance_to_finish": LARGE_TOTAL,
+        "retainage": LARGE_LINE,
+    }
+    return application(lines=[line | {"item_number": f"{index:02d}"} for index in range(1, lines + 1)], summary=summary)
+
+
+@pytest.mark.parametrize("sheet", ["LETTER", "A4"])
+def test_the_continuation_sheet_columns_fit_the_frame(sheet: str) -> None:
+    """The widths sum to no more than the frame on either landscape sheet, and
+    the description still gets a readable share of it."""
+    page_width = landscape(PAPER_SIZES[sheet])[0]
+    frame = page_width - 2 * SIDE_MARGIN - 2 * FRAME_PADDING
+    widths = aia_pdf._g703_column_widths(frame, "USD")
+    assert len(widths) == 10
+    assert sum(widths) <= frame + 0.01, f"{sheet}: the columns take {sum(widths) / mm:.1f}mm of {frame / mm:.1f}mm"
+    assert widths[1] >= 50 * mm, f"{sheet}: the description column is down to {widths[1] / mm:.1f}mm"
+
+
+def test_nothing_on_the_payment_application_is_drawn_past_the_margins() -> None:
+    """The rendered pages, not the arithmetic: every rule and fill the tables
+    draw lies inside the margins, on the face and on every continuation page."""
+    document = pymupdf.open(stream=aia_pdf.render_aia_application_pdf(_large_application()), filetype="pdf")
+    assert document.page_count > 1, "expected a continuation page to measure"
+    for number, page in enumerate(document, start=1):
+        rects = [drawing["rect"] for drawing in page.get_drawings()]
+        assert rects, f"page {number} draws no table"
+        left = min(rect.x0 for rect in rects)
+        right = max(rect.x1 for rect in rects)
+        assert left >= SIDE_MARGIN, f"page {number}: drawn from {left:.1f}pt, the margin is at {SIDE_MARGIN:.1f}pt"
+        assert right <= page.rect.width - SIDE_MARGIN, (
+            f"page {number}: drawn to {right:.1f}pt, the margin is at {page.rect.width - SIDE_MARGIN:.1f}pt"
+        )
+
+
+def test_the_largest_realistic_amounts_are_printed_on_one_line() -> None:
+    """A figure too wide for its column is broken in two rather than refused,
+    so a column narrowed to fit the frame prints an amount across two lines.
+
+    Counted, not merely found: one broken column among seven still leaves the
+    whole figure in the other six. Scaling the old widths down evenly broke
+    exactly one, the materials stored column, and a presence check passed it.
+    Ten schedule lines put the line figure in seventy money cells and add up to
+    a contract level figure in each of the four totals the sheet foots, so both
+    widths are measured on the columns that print them. The totals row used to
+    take three of its figures off the face instead of adding its own columns
+    up, which is why one line used to be enough to reach both widths here.
+    The face prefixes its amounts with the currency, so none of them counts.
+    """
+    runs = drawn_runs(aia_pdf.render_aia_application_pdf(_large_application(lines=10)))
+    figures = [run for run in runs if run[:1].isdigit() and "," in run]
+    assert runs.count("9,999,999.99") == 70, f"a line figure was broken across lines: {figures}"
+    assert runs.count("99,999,999.90") == 4, f"a total was broken across lines: {figures}"

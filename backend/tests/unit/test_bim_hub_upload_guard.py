@@ -4,7 +4,7 @@
 
 ``upload_bim_data`` used to ``await file.read()`` both the element table and
 the geometry blob with no size cap, and handed the xlsx straight to openpyxl
-with no decompression-bomb guard - a single large drop could push the 2 GB
+with no decompression-bomb guard - a single large drop could push the 3 GB
 box into swap and OOM-kill the worker for everyone.
 
 These tests call the router handler directly (no ASGI / DB): the project

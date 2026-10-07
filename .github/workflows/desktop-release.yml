@@ -133,7 +133,7 @@ jobs:
 
       - name: Build frontend
         # The heap ceiling for this build is NOT set here. frontend/package.json
-        # runs both tsc and vite through node --max-old-space-size=9216 on the
+        # runs both tsc and vite through node --max-old-space-size=12288 on the
         # command line, and an explicit flag beats NODE_OPTIONS in both
         # directions: measured, an environment asking for 9999 alongside a flag
         # of 1024 gives a 1216 MB heap. The value below therefore reaches only
@@ -141,7 +141,7 @@ jobs:
         # cannot fix or cause an out of memory in Vite or tsc. Change
         # package.json for that.
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          NODE_OPTIONS: --max-old-space-size=12288
         run: |
           cd frontend
           npm ci
@@ -182,6 +182,53 @@ jobs:
             --extra-index-url https://download.pytorch.org/whl/cpu
           pip install -e . --no-deps
 
+      # Windows 11 Smart App Control checks every executable file as it is
+      # loaded and has no per-app exception, so a signature on the installer
+      # alone does nothing for it. The sidecar unpacks about 490 .exe, .dll and
+      # .pyd files at every start, 409 of them unsigned on 17.x (all of
+      # PostgreSQL, most of scipy, sklearn, pandas, pyarrow). Those have to be
+      # signed HERE, before PyInstaller seals them into the onefile archive
+      # where no later pass can reach them. Without the ARTIFACT_SIGNING_*
+      # secrets every signing step below is skipped and the build is exactly
+      # what it was. See docs/desktop/WINDOWS_SIGNING.md.
+      - name: Set up Windows code signing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ secrets.ARTIFACT_SIGNING_PROFILE }}
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
+        run: |
+          # A repair dispatch checks out an older tag, and a tag from before
+          # this step existed has no script to run. That tree cannot sign, so
+          # it builds exactly as it did when it was tagged.
+          if [ ! -f scripts/setup_windows_signing.py ]; then
+            echo "WINDOWS_SIGNING=off" >> "$GITHUB_ENV"
+            echo "::notice title=No signing setup in this tree::$RELEASE_REF predates scripts/setup_windows_signing.py, building unsigned."
+            exit 0
+          fi
+          python scripts/setup_windows_signing.py
+
+      - name: Sign the binaries the sidecar collects (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'on'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # Everything PyInstaller may collect: the installed packages and the
+          # interpreter's own DLLs. Files that already carry their publisher's
+          # signature (PSF, Microsoft, Intel) are left as they are.
+          site="$(python -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')"
+          dlls="$(python -c 'import sys, os; print(os.path.join(sys.base_prefix, "DLLs"))')"
+          base="$(python -c 'import sys; print(sys.base_prefix)')"
+          python scripts/sign_windows_binaries.py "$site" "$dlls" "$base/python3.dll" "$base/python312.dll"
+
       - name: Build sidecar with PyInstaller
         run: |
           # PyInstaller is a build tool, not a runtime dependency, so it is
@@ -192,6 +239,24 @@ jobs:
           # the packer changed. A range cannot answer that question later.
           pip install "pyinstaller==6.21.0"
           pyinstaller desktop/pyinstaller.spec --distpath desktop/dist --workpath desktop/build --noconfirm
+
+      # The onefile executable itself, signed before any check below runs it,
+      # so those checks prove the bootloader still finds its archive behind
+      # the appended signature.
+      - name: Sign the sidecar executable (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'on'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          python scripts/sign_windows_binaries.py desktop/dist/openconstructionerp-server.exe
+          # "Signed and verified" above was said about files in site-packages.
+          # This asks the archive itself whether its members kept those
+          # signatures through packing, member by member.
+          python scripts/sign_windows_binaries.py --check-archive desktop/dist/openconstructionerp-server.exe
 
       # Ad-hoc sign the sidecar here, before anything runs it, rather than in
       # the bundling job. The signature is part of the file, so it survives the
@@ -1127,7 +1192,7 @@ jobs:
 
       - name: Build frontend
         # The heap ceiling for this build is NOT set here. frontend/package.json
-        # runs both tsc and vite through node --max-old-space-size=9216 on the
+        # runs both tsc and vite through node --max-old-space-size=12288 on the
         # command line, and an explicit flag beats NODE_OPTIONS in both
         # directions: measured, an environment asking for 9999 alongside a flag
         # of 1024 gives a 1216 MB heap. The value below therefore reaches only
@@ -1135,7 +1200,7 @@ jobs:
         # cannot fix or cause an out of memory in Vite or tsc. Change
         # package.json for that.
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          NODE_OPTIONS: --max-old-space-size=12288
         run: |
           cd frontend
           npm ci
@@ -1351,6 +1416,38 @@ jobs:
           $totalMb = [math]::Round(((Get-ChildItem -Recurse -File $destRoot | Measure-Object -Property Length -Sum).Sum) / 1MB, 2)
           Write-Host "Bundled IFC converter: IfcExporter.exe = $sizeMb MB, total resource = $totalMb MB (was $beforeMb MB before the graphical-only prune)"
 
+      - name: Set up Windows code signing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ secrets.ARTIFACT_SIGNING_PROFILE }}
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
+        run: |
+          # A repair dispatch checks out an older tag, and a tag from before
+          # this step existed has no script to run. That tree cannot sign, so
+          # it builds exactly as it did when it was tagged.
+          if [ ! -f scripts/setup_windows_signing.py ]; then
+            echo "WINDOWS_SIGNING=off" >> "$GITHUB_ENV"
+            echo "::notice title=No signing setup in this tree::$RELEASE_REF predates scripts/setup_windows_signing.py, building unsigned."
+            exit 0
+          fi
+          python scripts/setup_windows_signing.py
+
+      # The converters are started by the app on a user's request, so Smart
+      # App Control judges them like everything else.
+      - name: Sign the bundled converters (Windows)
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'on'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
+        run: python scripts/sign_windows_binaries.py desktop/src-tauri/resources/converters
+
       # tauri-action 1.x manages the release page whenever it is handed a
       # tagName. It fails when releaseDraft is true and the release is already
       # published (it was true here, on three steps), and on a published
@@ -1390,12 +1487,20 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read by the signing plugin only when TAURI_SIGN_ARGS turned signing on.
+          AZURE_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
         with:
           projectPath: desktop
           # Run the pinned CLI instead of whichever one the action resolves.
           tauriScript: npx --yes @tauri-apps/cli@${{ env.TAURI_CLI_VERSION }}
           # Per OS from the matrix: nsis on Windows, empty on macOS, deb on Linux.
-          args: ${{ matrix.bundles }}
+          # TAURI_SIGN_ARGS is set only on a signing Windows run: a --config
+          # that adds bundle.windows.signCommand, so Tauri signs the launcher,
+          # the sidecar copy, the NSIS plugins, the uninstaller and the
+          # installer. Unset, it expands to nothing.
+          args: ${{ matrix.bundles }} ${{ env.TAURI_SIGN_ARGS }}
           # By id, not by tagName: see "Find the release" above.
           releaseId: ${{ steps.release.outputs.id }}
 
@@ -1950,11 +2055,35 @@ jobs:
           AZURE_KV_CLIENT_ID: ${{ secrets.AZURE_KV_CLIENT_ID }}
           AZURE_KV_CLIENT_SECRET: ${{ secrets.AZURE_KV_CLIENT_SECRET }}
           AZURE_KV_TENANT_ID: ${{ secrets.AZURE_KV_TENANT_ID }}
+          # Only emptiness is read, as for the five above.
+          ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ secrets.ARTIFACT_SIGNING_PROFILE }}
+          ARTIFACT_SIGNING_TENANT_ID: ${{ secrets.ARTIFACT_SIGNING_TENANT_ID }}
+          ARTIFACT_SIGNING_CLIENT_ID: ${{ secrets.ARTIFACT_SIGNING_CLIENT_ID }}
+          ARTIFACT_SIGNING_CLIENT_SECRET: ${{ secrets.ARTIFACT_SIGNING_CLIENT_SECRET }}
           SIGNING_REQUIRED: ${{ vars.WINDOWS_SIGNING_REQUIRED }}
           TAG: ${{ env.RELEASE_REF }}
         shell: bash
         run: |
           set -euo pipefail
+
+          # With Artifact Signing configured, build-tauri already signed the
+          # installer (and everything inside it) before uploading it, so there
+          # is nothing left to sign here. What is left is proving it: download
+          # the published installer and verify it, the same check as below.
+          # This comes first so a release signed that way is never announced
+          # as unsigned, and WINDOWS_SIGNING_REQUIRED holds for it too.
+          as_missing=0
+          for name in ARTIFACT_SIGNING_ENDPOINT ARTIFACT_SIGNING_ACCOUNT ARTIFACT_SIGNING_PROFILE \
+                      ARTIFACT_SIGNING_TENANT_ID ARTIFACT_SIGNING_CLIENT_ID ARTIFACT_SIGNING_CLIENT_SECRET; do
+            if [ -z "${!name:-}" ]; then as_missing=$((as_missing + 1)); fi
+          done
+          if [ "$as_missing" -eq 0 ]; then
+            echo "Artifact Signing is configured, so the installers were signed at build time. Verifying the published ones."
+            echo "mode=verify" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           names=(AZURE_KV_URL AZURE_KV_CERT_NAME AZURE_KV_CLIENT_ID AZURE_KV_CLIENT_SECRET AZURE_KV_TENANT_ID)
           missing=()
@@ -2035,7 +2164,7 @@ jobs:
         run: dotnet tool install --global AzureSignTool
 
       - name: Download Windows installers from the release
-        if: steps.preflight.outputs.mode == 'sign'
+        if: steps.preflight.outputs.mode == 'sign' || steps.preflight.outputs.mode == 'verify'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ env.RELEASE_REF }}
@@ -2115,7 +2244,7 @@ jobs:
           done
 
       - name: Verify the signatures
-        if: steps.preflight.outputs.mode == 'sign'
+        if: steps.preflight.outputs.mode == 'sign' || steps.preflight.outputs.mode == 'verify'
         shell: bash
         run: |
           set -euo pipefail

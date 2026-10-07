@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Work on this measure began on {start}, before the application was filed on {filed} - most programmes fund nothing at all once the measure has started",
+      "unevidenced": "Work began early, on {start}, and the file says the authority permitted it, but names no written permission",
+      "evidence": "Record the reference of the written permission to start early, so the file defends itself",
+      "suggestion": "Check the programme's terms before spending more. If the early start was permitted in writing, record it; if it was not, ask the authority before the application goes any further"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Draw {draw} claims costs from before {period_start}, the day the award period opens",
+      "after": "Draw {draw} claims costs from after {period_end}, the day the award period closes",
+      "spans": "Draw {draw} reaches outside the award period at both ends, {period_start} to {period_end}",
+      "suggestion": "Move the costs outside the window into a draw of their own and take them up with the authority, rather than letting one claim carry both"
+    },
+    "own_share_is_covered": {
+      "fail": "The programme requires an own contribution of {rate} percent, which is {required}, but the application records {recorded}",
+      "suggestion": "Name where the remaining own contribution comes from before submitting, because the programme computes it on the eligible base rather than on the project total"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "The {count} applications on this project come to {intensity} percent of the eligible costs, over the {cap} percent ceiling the strictest of their programmes declares",
+      "suggestion": "Public funding cumulates across programmes and across levels of government. Reduce one request, or ask whether the measures can be separated so each carries its own costs"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "The award period ended on {period_end} and no final proof of use has been started",
+      "late": "The final proof of use was due on {due} and was submitted on {submitted}",
+      "overdue": "The final proof of use was due on {due} and has not been submitted",
+      "suggestion": "Submit what exists rather than waiting for it to be complete. Most authorities extend a deadline on request and none extend one that has already passed"
+    },
+    "errors": {
+      "application_not_found": "Application not found",
+      "programme_code_taken": "A programme with this code already exists in this country",
+      "programme_not_found": "Programme not found",
+      "programme_has_applications": "This programme has applications and cannot be deleted. Close it instead.",
+      "application_code_taken": "An application with this code already exists on this project",
+      "approved_application_not_deletable": "An approved application cannot be deleted. Set its status to withdrawn or closed instead.",
+      "approval_needs_period_end": "An approval needs the end of its award period, because every later deadline counts from it",
+      "draw_needs_approval": "Funds can only be drawn against an approved application",
+      "draw_not_found": "Disbursement not found",
+      "paid_draw_not_deletable": "A draw that has been paid cannot be deleted",
+      "proof_not_found": "Proof of use not found",
+      "obligation_not_found": "Obligation not found",
+      "eligible_exceeds_amount": "The eligible amount cannot exceed the amount",
+      "allocation_not_found": "Cost allocation not found"
+    }
+  }
+}

@@ -12,6 +12,7 @@ import logging
 import math
 import random
 import uuid
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import HTTPException, status
@@ -19,11 +20,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import event_bus
 from app.core.json_merge import merge_metadata
+from app.modules.risk.contingency import (
+    MATERIALISED_STATUS,
+    ContingencyLine,
+    DrawdownRecord,
+    RiskMoney,
+    allocated_amount,
+    build_position,
+    clamp_probability,
+    default_line,
+    fx_map_from_rates,
+    norm_code,
+    parse_drawdown_record,
+    quantize_money,
+    resolve_base_currency,
+    risk_weight,
+    to_decimal,
+)
 from app.modules.risk.models import RiskItem
 from app.modules.risk.repository import RiskRepository
 from app.modules.risk.schemas import (
     SEVERITY_ALIASES,
     SEVERITY_CANONICAL,
+    ContingencyDrawdownRequest,
     RiskCreate,
     RiskUpdate,
 )
@@ -352,6 +371,7 @@ class RiskService:
     async def get_summary(self, project_id: uuid.UUID) -> dict[str, Any]:
         """Get aggregated stats for a project's risk register."""
         items = await self.repo.all_for_project(project_id)
+        drawn_ids = await self._drawn_risk_ids(project_id) if items else set()
 
         by_status: dict[str, int] = {}
         by_tier: dict[str, int] = {}
@@ -394,14 +414,19 @@ class RiskService:
             else:
                 without_mitigation += 1
 
-            # Exposure = impact_cost * probability, accumulated per currency.
+            # Exposure = impact_cost x weight, accumulated per currency. The
+            # weight is the contingency card's rule (contingency.risk_weight):
+            # a closed or already drawn risk carries nothing, an occurred one
+            # waiting for its drawdown carries its full impact, every other one
+            # its probability.
             try:
-                exposure = float(item.impact_cost) * float(item.probability)
+                weight = risk_weight(item.status, item.probability, drawn=str(item.id) in drawn_ids)
+                exposure = float(item.impact_cost) * float(weight)
                 # A legacy / raw-written non-finite or absurd impact_cost makes
                 # float() overflow to inf (no exception); inf would poison the
                 # whole rollup (round(inf) -> inf -> RiskSummary 500). Skip just
                 # this contribution. New rows are guarded by the schema validator.
-                if math.isfinite(exposure):
+                if math.isfinite(exposure) and weight > 0:
                     cur = item.currency or ""
                     exposure_by_currency[cur] = exposure_by_currency.get(cur, 0.0) + exposure
             except (ValueError, TypeError):
@@ -585,21 +610,28 @@ class RiskService:
         # the simulation when only the qualitative path is populated.
         cost_triples: list[tuple[float, float, float]] = []
         schedule_triples: list[tuple[float, float, float]] = []
-        prob_weights: list[float] = []
+        cost_weights: list[float] = []
+        schedule_weights: list[float] = []
         item_meta: list[tuple[uuid.UUID, str]] = []
+        drawn_ids = await self._drawn_risk_ids(project_id) if mode in ("cost", "both") else set()
 
         for item in items:
             # Probability weight on a 0..1 scale. Prefer the 1-5 PMBOK
             # score (probability_score) - it's already discretised - and
             # fall back to the raw ``probability`` string if missing.
             if item.probability_score is not None:
-                weight = max(0.0, min(float(item.probability_score) / 5.0, 1.0))
+                probability = max(0.0, min(float(item.probability_score) / 5.0, 1.0))
             else:
                 try:
-                    weight = max(0.0, min(float(item.probability), 1.0))
+                    probability = max(0.0, min(float(item.probability), 1.0))
                 except (ValueError, TypeError):
-                    weight = 0.0
-            prob_weights.append(weight)
+                    probability = 0.0
+            # The status rule the contingency card uses (contingency.risk_weight):
+            # a closed risk is out, an occurred one is certain. Cost and schedule
+            # differ in one place only: a confirmed drawdown takes the cost out
+            # (it is drawn money now), but the delay has still happened.
+            cost_weights.append(float(risk_weight(item.status, probability, drawn=str(item.id) in drawn_ids)))
+            schedule_weights.append(float(risk_weight(item.status, probability)))
             item_meta.append((item.id, item.code))
 
             cost_triples.append(
@@ -629,7 +661,7 @@ class RiskService:
         # them - the same rule get_summary applies to total_exposure.
         cost_currencies: set[str] = set()
         for idx in range(len(items)):
-            if prob_weights[idx] > 0.0 and max(cost_triples[idx]) > 0.0:
+            if cost_weights[idx] > 0.0 and max(cost_triples[idx]) > 0.0:
                 cur = (items[idx].currency or "").strip()
                 if cur:
                     cost_currencies.add(cur)
@@ -655,22 +687,21 @@ class RiskService:
             c_total = 0.0
             s_total = 0.0
             for idx in range(len(items)):
-                weight = prob_weights[idx]
-                if weight <= 0.0:
-                    continue
-                if sample_cost:
+                c_weight = cost_weights[idx]
+                s_weight = schedule_weights[idx]
+                if sample_cost and c_weight > 0.0:
                     lo, mid, hi = cost_triples[idx]
                     # random.triangular(low, high, mode) - note the
                     # argument order is (low, high, mode), NOT
                     # (low, mode, high). Easy off-by-one to make.
                     draw = random.triangular(lo, hi, mid) if hi > lo else mid
-                    contrib = draw * weight
+                    contrib = draw * c_weight
                     c_total += contrib
                     per_risk_cost_sum[idx] += contrib
-                if sample_schedule:
+                if sample_schedule and s_weight > 0.0:
                     lo, mid, hi = schedule_triples[idx]
                     draw = random.triangular(lo, hi, mid) if hi > lo else mid
-                    contrib = draw * weight
+                    contrib = draw * s_weight
                     s_total += contrib
                     per_risk_schedule_sum[idx] += contrib
             if sample_cost:
@@ -776,6 +807,241 @@ class RiskService:
             },
         )
         return result
+
+    # ── Risk-based contingency (EMV vs the finance contingency line) ─────
+
+    async def _contingency_inputs(
+        self,
+        project_id: uuid.UUID,
+    ) -> tuple[list[RiskMoney], list[ContingencyLine], str, dict[str, Any]]:
+        """Load the register and the finance contingency lines for one project.
+
+        Returns the risks, the lines (with their parsed drawdowns), the project
+        currency and its FX table.
+        """
+        from app.modules.finance.service import FinanceService
+        from app.modules.projects.repository import ProjectRepository
+
+        project = await ProjectRepository(self.session).get_by_id(project_id)
+        if project is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        project_currency = norm_code(getattr(project, "currency", "") or "")
+        fx = fx_map_from_rates(getattr(project, "fx_rates", None))
+
+        risks = [
+            RiskMoney(
+                risk_id=str(item.id),
+                code=item.code,
+                title=item.title,
+                status=item.status,
+                probability=clamp_probability(item.probability),
+                impact=to_decimal(item.impact_cost),
+                currency=norm_code(item.currency),
+            )
+            for item in await self.repo.all_for_project(project_id)
+        ]
+
+        lines: list[ContingencyLine] = []
+        for budget in await FinanceService(self.session).list_contingency_lines(project_id):
+            line_currency = norm_code(budget.currency_code)
+            lines.append(
+                ContingencyLine(
+                    budget_id=str(budget.id),
+                    wbs_id=budget.wbs_id,
+                    currency=line_currency,
+                    allocated=allocated_amount(budget.revised_budget, budget.original_budget),
+                    drawdowns=_line_drawdowns(budget, line_currency or project_currency),
+                )
+            )
+        return risks, lines, project_currency, fx
+
+    async def _drawn_risk_ids(self, project_id: uuid.UUID) -> set[str]:
+        """Ids of the risks holding a confirmed drawdown on this project's contingency.
+
+        One read of the contingency lines, for the register summary and the
+        Monte Carlo draw, which apply the card's rule (a drawn risk carries no
+        cost exposure) without building the whole position.
+        """
+        from app.modules.finance.service import FinanceService
+
+        return {
+            record.risk_id
+            for budget in await FinanceService(self.session).list_contingency_lines(project_id)
+            for record in _line_drawdowns(budget, norm_code(budget.currency_code))
+            if record.risk_id
+        }
+
+    async def get_contingency_position(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Risk-based contingency (EMV, P50/P80) against the finance contingency lines."""
+        risks, lines, project_currency, fx = await self._contingency_inputs(project_id)
+        return build_position(risks, lines, project_currency=project_currency, fx=fx)
+
+    async def confirm_contingency_drawdown(
+        self,
+        project_id: uuid.UUID,
+        risk_id: uuid.UUID,
+        data: ContingencyDrawdownRequest,
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """A person confirms the money an occurred risk draws from contingency.
+
+        Nothing is drawn automatically when a risk's status turns to
+        ``occurred``; the risk only shows up as pending on the contingency
+        card until someone confirms an amount here. One drawdown per risk:
+        confirming again replaces it (or moves it to another line), and
+        replaying the same confirmation leaves the stored record, including
+        who confirmed it and when, exactly as it was.
+
+        Raises:
+            HTTPException: 404 when the risk is not in this project or the
+                line is not one of its contingency lines; 409 when the risk has
+                not occurred or the project has no contingency line; 422 when
+                several lines could take it and none was chosen.
+        """
+        from app.modules.finance.service import FinanceService
+
+        risk = await self.get_risk(risk_id)
+        if risk.project_id != project_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Risk item not found")
+        if (risk.status or "").strip().lower() != MATERIALISED_STATUS:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Only a risk that has occurred can draw on contingency. Set its status to Occurred first.",
+            )
+        risk_code = risk.code
+        risk_title = risk.title
+
+        risks, lines, project_currency, fx = await self._contingency_inputs(project_id)
+        if not lines:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This project has no contingency line in its finance budget. "
+                    "Add a budget line with the category Contingency first."
+                ),
+            )
+        base = resolve_base_currency(project_currency, [r.currency for r in risks] + [ln.currency for ln in lines])
+        if data.budget_id is not None:
+            target = next((ln for ln in lines if ln.budget_id == str(data.budget_id)), None)
+            if target is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Contingency budget line not found for this project",
+                )
+        else:
+            target = default_line(lines, base)
+            if target is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="This project has several contingency lines. Choose the one to draw from.",
+                )
+
+        line_currency = norm_code(target.currency) or base
+        amount = quantize_money(data.amount, line_currency)
+        source = f"risk:{risk_id}"
+        existing = next((d for d in target.drawdowns if d.source == source), None)
+        if existing is not None and existing.amount == amount and existing.note == data.note:
+            # Same confirmation replayed: keep the original record untouched.
+            return build_position(risks, lines, project_currency=project_currency, fx=fx)
+
+        record = {
+            "amount": format(amount, "f"),
+            "currency": line_currency,
+            "risk_id": str(risk_id),
+            "risk_code": risk_code,
+            "risk_title": risk_title,
+            "confirmed_by": user_id or "",
+            "confirmed_at": datetime.now(UTC).isoformat(),
+            "note": data.note,
+        }
+        await FinanceService(self.session).set_contingency_drawdown(
+            project_id=project_id,
+            source=source,
+            budget_id=uuid.UUID(target.budget_id),
+            record=record,
+        )
+        logger.info(
+            "Contingency drawdown confirmed: risk=%s line=%s amount=%s %s",
+            risk_code,
+            target.budget_id,
+            amount,
+            line_currency,
+        )
+        await _safe_publish(
+            "risk.contingency.drawdown_confirmed",
+            {
+                "project_id": str(project_id),
+                "risk_id": str(risk_id),
+                "budget_id": target.budget_id,
+                "amount": format(amount, "f"),
+                "currency": line_currency,
+                "confirmed_by": user_id or "",
+            },
+        )
+        return await self.get_contingency_position(project_id)
+
+    async def reverse_contingency_drawdown(
+        self,
+        project_id: uuid.UUID,
+        risk_id: uuid.UUID,
+        *,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Take back a confirmed drawdown (a mistaken confirmation).
+
+        Works for a risk that has since been deleted too: the drawdown is found
+        by its source key on the project's contingency lines, not through the
+        risk row.
+
+        Raises:
+            HTTPException: 404 when no drawdown is recorded for the risk.
+        """
+        from app.modules.finance.service import FinanceService
+
+        _risks, lines, _currency, _fx = await self._contingency_inputs(project_id)
+        source = f"risk:{risk_id}"
+        holder = next((ln for ln in lines if any(d.source == source for d in ln.drawdowns)), None)
+        if holder is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No contingency drawdown is recorded for this risk",
+            )
+        await FinanceService(self.session).set_contingency_drawdown(
+            project_id=project_id,
+            source=source,
+            budget_id=None,
+            record=None,
+        )
+        logger.info("Contingency drawdown reversed: risk=%s line=%s", risk_id, holder.budget_id)
+        await _safe_publish(
+            "risk.contingency.drawdown_reversed",
+            {
+                "project_id": str(project_id),
+                "risk_id": str(risk_id),
+                "budget_id": holder.budget_id,
+                "reversed_by": user_id or "",
+            },
+        )
+        return await self.get_contingency_position(project_id)
+
+
+def _line_drawdowns(budget: Any, line_currency: str) -> tuple[DrawdownRecord, ...]:
+    """The confirmed drawdowns stored on one contingency budget line's metadata."""
+    from app.modules.finance.service import CONTINGENCY_DRAWDOWN_PREFIX
+
+    records: list[DrawdownRecord] = []
+    for key, raw in (getattr(budget, "metadata_", None) or {}).items():
+        if not str(key).startswith(CONTINGENCY_DRAWDOWN_PREFIX):
+            continue
+        record = parse_drawdown_record(
+            str(key)[len(CONTINGENCY_DRAWDOWN_PREFIX) :],
+            raw,
+            line_currency=line_currency,
+        )
+        if record is not None:
+            records.append(record)
+    return tuple(records)
 
 
 # ── Monte Carlo helpers (module-level, pure) ──────────────────────────────

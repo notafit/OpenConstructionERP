@@ -478,6 +478,13 @@ def _get_lancedb():
         _lancedb_instance = lancedb.connect(db_path)
         logger.info("LanceDB connected at %s", db_path)
         return _lancedb_instance
+    except ImportError as exc:
+        # lancedb ships in the optional [vector] extra; app.main already warns
+        # once at boot, so a plain install must not log an ERROR on every start.
+        if not _lancedb_tried:
+            logger.info("LanceDB not installed (optional [vector] extra): %s", exc)
+            _lancedb_tried = True
+        return None
     except Exception as exc:
         if not _lancedb_tried:
             logger.error("Failed to connect LanceDB: %s", exc)
@@ -766,6 +773,41 @@ def _lancedb_delete_generic(collection_name: str, ids: list[str]) -> int:
     except Exception as exc:
         logger.warning("delete_generic %s failed: %s", collection_name, exc)
         return 0
+
+
+#: Columns of a generic record other than the vector, in schema order.
+_GENERIC_RECORD_FIELDS: tuple[str, ...] = tuple(f for f in GENERIC_FIELDS if f != "vector")
+
+
+def _lancedb_get_generic(collection_name: str, row_id: str) -> dict | None:
+    """Return the stored record for ``row_id`` without its vector, or None.
+
+    The id goes through the same strict-UUID check as the delete path before it
+    is interpolated into the filter. Any failure answers None ("not stored").
+    """
+    db = _get_lancedb()
+    if db is None:
+        return None
+    quoted_ids = _safe_quote_ids([row_id])
+    if not quoted_ids:
+        return None
+    try:
+        if collection_name not in db.table_names():
+            return None
+        rows = (
+            db.open_table(collection_name)
+            .search()
+            .where(f"id = {quoted_ids[0]}")
+            .select(list(_GENERIC_RECORD_FIELDS))
+            .limit(1)
+            .to_list()
+        )
+    except Exception as exc:
+        logger.debug("get_generic %s failed: %s", collection_name, exc)
+        return None
+    if not rows:
+        return None
+    return {f: rows[0].get(f, "") for f in _GENERIC_RECORD_FIELDS}
 
 
 def _lancedb_count_generic(collection_name: str) -> int:
@@ -1227,6 +1269,53 @@ def vector_delete_collection(collection_name: str, ids: list[str]) -> int:
             logger.debug("Qdrant delete %s failed: %s", collection_name, exc)
             return 0
     return _lancedb_delete_generic(collection_name, ids)
+
+
+def vector_get_collection_record(collection_name: str, row_id: str) -> dict | None:
+    """Return what ``collection_name`` stores for ``row_id``, without the vector.
+
+    The record has the shape ``vector_index_collection`` writes, minus
+    ``vector``: ``id, text, tenant_id, project_id, module, payload``, with
+    ``payload`` as a JSON string on both backends. Blocking I/O, so async
+    callers run it in a thread.
+
+    Returns:
+        The stored record, or None when the collection or the row does not
+        exist or the backend cannot answer. Callers treat None as "not stored".
+    """
+    if not row_id:
+        return None
+    if _backend() == "qdrant":
+        client = _get_qdrant()
+        if client is None:
+            return None
+        try:
+            records = client.retrieve(collection_name, ids=[row_id], with_payload=True, with_vectors=False)
+        except Exception as exc:
+            logger.debug("Qdrant retrieve %s failed: %s", collection_name, exc)
+            return None
+        if not records:
+            return None
+        import json as _json
+
+        # Split the flat Qdrant payload back into the generic record the same
+        # way ``vector_search_collection`` does for a hit.
+        raw_payload = records[0].payload or {}
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+        reserved = {"text", "tenant_id", "project_id", "module"}
+        return {
+            "id": str(records[0].id),
+            "text": str(raw_payload.get("text") or ""),
+            "tenant_id": str(raw_payload.get("tenant_id") or ""),
+            "project_id": str(raw_payload.get("project_id") or ""),
+            "module": str(raw_payload.get("module") or ""),
+            "payload": _json.dumps(
+                {k: v for k, v in raw_payload.items() if k not in reserved},
+                ensure_ascii=False,
+            ),
+        }
+    return _lancedb_get_generic(collection_name, row_id)
 
 
 def vector_count_collection(collection_name: str) -> int:

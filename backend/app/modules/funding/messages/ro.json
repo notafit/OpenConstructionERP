@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Lucrările la această măsură au început la data de {start}, înainte de depunerea cererii de finanțare la data de {filed}. Majoritatea programelor nu mai finanțează nimic odată ce măsura a început",
+      "unevidenced": "Lucrările au început timpuriu, la data de {start}, iar dosarul menționează că autoritatea a permis acest lucru, dar nu indică nicio permisiune scrisă",
+      "evidence": "Înregistrați referința permisiunii scrise de începere timpurie, pentru ca dosarul să se susțină singur",
+      "suggestion": "Verificați condițiile programului înainte de a mai cheltui. Dacă începerea timpurie a fost permisă în scris, înregistrați permisiunea; dacă nu, consultați autoritatea înainte ca cererea să meargă mai departe"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Tragerea {draw} include costuri de dinainte de {period_start}, ziua în care începe perioada de finanțare",
+      "after": "Tragerea {draw} include costuri de după {period_end}, ziua în care se încheie perioada de finanțare",
+      "spans": "Tragerea {draw} depășește la ambele capete perioada de finanțare, cuprinsă între {period_start} și {period_end}",
+      "suggestion": "Mutați costurile din afara perioadei într-o tragere separată și clarificați-le cu autoritatea, în loc să le includeți în aceeași tragere cu celelalte"
+    },
+    "own_share_is_covered": {
+      "fail": "Programul impune o contribuție proprie de {rate}%, adică {required}, dar cererea de finanțare indică {recorded}",
+      "suggestion": "Precizați sursa contribuției proprii rămase înainte de depunere, deoarece programul o calculează raportat la baza de cost eligibil, nu la costul total al proiectului"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Cererile de finanțare ale acestui proiect ({count}) ajung împreună la {intensity}% din costurile eligibile, peste plafonul de {cap}% declarat de cel mai strict dintre programele lor",
+      "suggestion": "Finanțarea publică se cumulează între programe și între niveluri de guvernare. Reduceți una dintre sumele solicitate sau întrebați autoritatea dacă măsurile pot fi separate, astfel încât fiecare să își poarte propriile costuri"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Perioada de finanțare s-a încheiat la {period_end} și nu a fost începută nicio justificare finală a utilizării",
+      "late": "Justificarea finală a utilizării era scadentă la {due} și a fost depusă la {submitted}",
+      "overdue": "Justificarea finală a utilizării era scadentă la {due} și nu a fost depusă",
+      "suggestion": "Depuneți ce aveți, în loc să așteptați să fie complet. Majoritatea autorităților prelungesc un termen la cerere, dar niciuna nu prelungește un termen deja depășit"
+    },
+    "errors": {
+      "application_not_found": "Cererea nu a fost găsită",
+      "programme_code_taken": "În această țară există deja un program cu această referință",
+      "programme_not_found": "Programul nu a fost găsit",
+      "programme_has_applications": "Acest program are cereri și nu poate fi șters. În schimb, închideți-l.",
+      "application_code_taken": "În acest proiect există deja o cerere cu această referință",
+      "approved_application_not_deletable": "O cerere aprobată nu poate fi ștearsă. În schimb, schimbați-i starea în „Retras” sau „Închis”.",
+      "approval_needs_period_end": "Pentru aprobare este necesară data de sfârșit a perioadei de finanțare, deoarece toate termenele ulterioare se calculează de la aceasta",
+      "draw_needs_approval": "Fondurile pot fi trase doar pe baza unei cereri aprobate",
+      "draw_not_found": "Tragerea nu a fost găsită",
+      "paid_draw_not_deletable": "O tragere plătită nu poate fi ștearsă",
+      "proof_not_found": "Justificarea utilizării nu a fost găsită",
+      "obligation_not_found": "Obligația nu a fost găsită",
+      "eligible_exceeds_amount": "Suma eligibilă nu poate depăși suma totală",
+      "allocation_not_found": "Alocarea de cost nu a fost găsită"
+    }
+  }
+}

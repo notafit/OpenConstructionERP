@@ -63,12 +63,25 @@ def upgrade() -> None:
         # pg_trgm is PostgreSQL-only; nothing to do on other backends.
         return
 
-    # 1. Best-effort enable pg_trgm. It needs a superuser, so never fail the
-    #    migration if the cluster forbids it - the service falls back to ILIKE.
+    # 1. Best-effort enable pg_trgm. It needs a superuser and the extension's
+    #    files have to be installed on the server, so never fail the migration
+    #    when the cluster cannot provide it - the service falls back to ILIKE.
+    #
+    #    The attempt runs inside a SAVEPOINT, and that is the whole point. On
+    #    PostgreSQL a failed statement aborts the entire transaction, so
+    #    catching the exception and returning leaves every later statement
+    #    answering "current transaction is aborted" - including alembic's own
+    #    UPDATE of alembic_version, which is how a cluster reporting
+    #    'extension "pg_trgm" is not available' surfaced as a failure blamed on
+    #    a revision several steps further along. Rolling back to the savepoint
+    #    is what makes the attempt genuinely best-effort.
+    savepoint = bind.begin_nested()
     try:
-        op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    except Exception:  # noqa: BLE001 - a denied CREATE EXTENSION must not abort the upgrade
+        bind.execute(sa.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    except Exception:  # noqa: BLE001 - a cluster without pg_trgm must not abort the upgrade
+        savepoint.rollback()
         return
+    savepoint.commit()
 
     # 2. Only build the GIN trigram index when the extension is actually present
     #    (gin_trgm_ops is defined by pg_trgm) and the index is missing.

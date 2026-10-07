@@ -1,0 +1,20 @@
+{
+  "rule_pack_id": "csa_a23_1",
+  "name": "CSA A23.1 — Concrete Materials and Methods of Concrete Construction",
+  "name_fr-CA": "CSA A23.1 — Béton — Constituants et exécution des travaux",
+  "standard": "CSA A23.1:19",
+  "jurisdiction": "CA",
+  "regulator": "CSA Group",
+  "publication_year": 2019,
+  "applies_to": [
+    "boq",
+    "validation"
+  ],
+  "description": "Reference document for the CSA A23.1 (materials and construction) clause set as it bears on a BOQ position with a concrete cost code. What the standard requires to be specified: exposure class (C-1, C-2, C-3, C-4, F-1, F-2, N, A-1, A-2, A-3, A-4, S-1, S-2, S-3), compressive strength class, slump range, nominal aggregate size, air-content range, cementitious composition (Type GU/MS/HS/HE/LH) and curing regime must all be specified. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur l'ensemble des clauses CSA A23.1 (constituants et exécution) telles qu'elles s'appliquent à un poste BOQ ayant un code de coût « béton ». Ce que la norme exige de préciser : classe d'exposition (C-1, C-2, C-3, C-4, F-1, F-2, N, A-1, A-2, A-3, A-4, S-1, S-2, S-3), classe de résistance à la compression, plage d'affaissement, calibre nominal du granulat, plage de teneur en air, composition du liant (Type GU/MS/HS/HE/LH) et régime de cure doivent tous être précisés. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {
+    "csa_a23_1.exposure_class_required": "ERROR"
+  },
+  "why_no_rules": "This document ships as reference and enables no engine rules. Concrete materials and construction methods are judged against mix, exposure class and placement records, none of which the platform holds. The generic bill-quality rules are not about this standard, so listing one here would move a coverage number without checking anything CSA A23.1 requires.",
+  "enables_rule_ids": []
+}

@@ -218,6 +218,15 @@ AFFECTIVE_TERMS: tuple[str, ...] = (
 #: that is not here fails, which is the point.
 CLEARED_BY_READING: dict[tuple[str, str, str], str] = {
     (
+        "backend/app/modules/erp_chat/service.py",
+        "_call_fallback",
+        "self._system_prompt_no_tools",
+    ): (
+        "Set in __init__ to the module constant SYSTEM_PROMPT_NO_TOOLS and, per turn, to that "
+        "constant plus build_context_block(...), which states the time, locale, open project and "
+        "route as facts. The instruction text is the constant; the block adds no instruction."
+    ),
+    (
         "backend/app/modules/boq/router.py",
         "ai_chat_boq",
         "with_locale(BOQ_CHAT_SYSTEM_PROMPT, locale)",
@@ -279,6 +288,16 @@ CLEARED_BY_READING: dict[tuple[str, str, str], str] = {
         "Both callers pass _build_system_prompt(role, language, standard), which selects one of "
         "three module constants in SYSTEM_PROMPTS by role, with a default, and formats {language} "
         "and {standard} into it. The role only chooses between constants; it cannot supply text."
+    ),
+    (
+        "backend/app/modules/module_builder/service.py",
+        "draft",
+        "system_prompt(locale)",
+    ): (
+        "Returns the module constant SYSTEM_PROMPT, plus LANGUAGE_INSTRUCTION formatted with a name "
+        "from the module-level LANGUAGE_NAMES table. A tag outside the table is named as it is, and "
+        "only a tag matching LOCALE_PATTERN (16 characters at most) reaches the call, so the hole "
+        "holds a language tag, never caller text. The person's description goes in the user turn."
     ),
 }
 

@@ -5,6 +5,7 @@
 Endpoints:
     POST   /boqs/                              - Create a new BOQ
     GET    /boqs/?project_id=xxx               - List BOQs for a project
+    POST   /boqs/by-projects/                  - List BOQs for several projects in one call
     GET    /boqs/templates                     - List available BOQ templates
     POST   /boqs/from-template                 - Create a BOQ from a template
     GET    /boqs/{boq_id}                      - Get BOQ with all positions
@@ -64,7 +65,7 @@ import re
 import tempfile
 import uuid
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -73,13 +74,14 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from app.modules.boq.copilot_service import BOQCopilotService
     from app.modules.boq.importers import ImportedBOQ
-    from app.modules.boq.models import BOQSnapshot
+    from app.modules.boq.models import BOQ, BOQSnapshot
 
 from fastapi import (
     APIRouter,
     Body,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Response,
@@ -103,18 +105,29 @@ from app.dependencies import (
     verify_project_access,
 )
 from app.modules.boq import cost_risk_engine as cre
+from app.modules.boq.change_review_router import change_review_router
 from app.modules.boq.copilot_schemas import (
     CopilotApplyRequest,
     CopilotApplyResponse,
     CopilotChatRequest,
     CopilotChatResponse,
     CopilotMessageOut,
+    CopilotReviewRequest,
+    CopilotReviewResponse,
 )
 from app.modules.boq.exchange_formats import ExchangeCatalogue, build_catalogue
+from app.modules.boq.gaeb_exchange_router import gaeb_exchange_router
+from app.modules.boq.importers.excel import (
+    _parse_csv,
+    _parse_rows_from_csv,
+    _parse_rows_from_excel,
+    _rows_to_positions,
+    partition_summary_rows,
+    summary_row_warning,
+)
 from app.modules.boq.markup_templates import DEFAULT_MARKUP_TEMPLATES
 from app.modules.boq.resource_review_router import resource_review_router
 from app.modules.boq.roundtrip import (
-    ID_COLUMN_ALIASES,
     ID_COLUMN_HEADER,
     RoundTripRow,
     diff_import_rows,
@@ -129,6 +142,7 @@ from app.modules.boq.schemas import (
     BOQCompareResponse,
     BOQCreate,
     BOQFromTemplateRequest,
+    BOQListByProjectsRequest,
     BOQListItem,
     BOQResponse,
     BOQStatisticsResponse,
@@ -215,7 +229,7 @@ from app.modules.boq.service import (
     exportable_positions,
     resource_fx_factor,
 )
-from app.modules.boq.units import to_gaeb_unit_code
+from app.modules.boq.units import is_lump_sum_unit, to_gaeb_unit_code
 from app.modules.costs.repository import CostItemRepository
 from app.modules.measurement.presets import PRESETS as MEASUREMENT_PRESETS
 from app.modules.price_breakdown.presets import PRESETS as PRICE_BREAKDOWN_PRESETS
@@ -225,6 +239,8 @@ router = APIRouter(tags=["boq"])
 # The module loader mounts exactly one router per module, this one. Sub-routers
 # that live in their own files answer nowhere until they are included here.
 router.include_router(resource_review_router)
+router.include_router(change_review_router)
+router.include_router(gaeb_exchange_router)
 _log = logging.getLogger(__name__)
 
 
@@ -238,42 +254,89 @@ async def _verify_boq_owner(
     user_id: str,
     payload: dict | None = None,
 ) -> None:
-    """Load a BOQ, then its project, and verify the user has access.
+    """Verify the user may reach a BOQ through its project.
 
     Admins bypass the check. Grants access to the project owner and to
     any user who is a team member of the project (added via add_project_member).
     Raises 404 (not 403) on denial to keep 'missing' and 'denied'
     indistinguishable, matching verify_project_access.
+
+    One statement, see :func:`_verify_boqs_owner`.
+    """
+    await _verify_boqs_owner(session, [boq_id], user_id, payload)
+
+
+async def _verify_boqs_owner(
+    session: SessionDep,
+    boq_ids: list[uuid.UUID],
+    user_id: str,
+    payload: dict | None = None,
+) -> None:
+    """:func:`_verify_boq_owner` for several BOQs, in one statement for all of them.
+
+    The guard stands in front of nearly every BOQ endpoint, the BOQ editor's
+    whole page load included, and it used to cost two statements for an owner
+    (the bill's project, then the project's owner) and three for a team member
+    (plus the membership lookup), on every request. It now reads the bill, its
+    project's owner and the caller's membership together, and a request that
+    guards two bills, such as a comparison, reads both in that same statement.
+
+    The answer is exactly the one the bills checked one by one in the order
+    given would produce, the first refusal included: 404 "BOQ not found" for a
+    bill that does not exist, 404 "project not found" for a bill whose project
+    row is gone, 404 "BOQ not found" for a bill the caller neither owns nor is a
+    member of. An archived project does not refuse here, as it never has.
+
+    Raises:
+        HTTPException: 404 as above, for the first bill in *boq_ids* refused.
     """
     if payload and payload.get("role") == "admin":
         return
-    from app.modules.boq.repository import BOQRepository
-    from app.modules.projects.repository import ProjectRepository
+    if not boq_ids:
+        return
+    from sqlalchemy import select
 
-    boq_repo = BOQRepository(session)
-    boq = await boq_repo.get_by_id(boq_id)
-    if boq is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOQ not found")
-    project_repo = ProjectRepository(session)
-    project = await project_repo.get_by_id(boq.project_id)
-    if project is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=translate("errors.project_not_found", locale=get_locale())
+    from app.modules.boq.models import BOQ
+    from app.modules.projects.access import caller_uuid, membership_exists
+    from app.modules.projects.models import Project
+
+    # The rows come back keyed by UUID, so a caller handing in the id as a
+    # string must still find its row rather than be told the bill is missing.
+    boq_ids = [b if isinstance(b, uuid.UUID) else uuid.UUID(str(b)) for b in boq_ids]
+    # Scalar columns only. Loading the BOQ object loaded every position and
+    # markup of the bill (both collections are ``selectin``) to read one
+    # column. The outer join keeps a bill whose project row is gone, so it
+    # still answers "project not found" rather than "BOQ not found".
+    rows = (
+        await session.execute(
+            select(
+                BOQ.id,
+                Project.id,
+                Project.owner_id,
+                membership_exists(BOQ.project_id, caller_uuid(user_id)).label("is_member"),
+            )
+            .select_from(BOQ)
+            .outerjoin(Project, Project.id == BOQ.project_id)
+            .where(BOQ.id.in_(list(dict.fromkeys(boq_ids))))
         )
-    if str(project.owner_id) == user_id:
-        return
-    from app.modules.teams.access import is_project_member
-
-    try:
-        uid = uuid.UUID(str(user_id))
-    except (ValueError, TypeError):
-        uid = None
-    if uid is not None and await is_project_member(session, boq.project_id, uid):
-        return
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="BOQ not found",
-    )
+    ).all()
+    by_boq = {row[0]: row for row in rows}
+    for boq_id in boq_ids:
+        row = by_boq.get(boq_id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOQ not found")
+        _, project_id, owner_id, is_member = row
+        if project_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=translate("errors.project_not_found", locale=get_locale()),
+            )
+        if str(owner_id) == user_id or is_member:
+            continue
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="BOQ not found",
+        )
 
 
 async def _verify_project_owner_for_boq(
@@ -286,33 +349,131 @@ async def _verify_project_owner_for_boq(
 
     Grants access to: admins, the project owner, and team members.
     Treats archived (soft-deleted) projects as 404 - no operations on
-    archived projects are permitted via this gateway.
+    archived projects are permitted via this gateway, an admin's included.
+    Anyone else gets 403.
+
+    One statement: the project's owner and status and the caller's membership
+    are read together (:func:`app.modules.projects.access.project_access`).
+    This used to load the whole project, which pulled its milestones and WBS
+    through their ``selectin`` relationships, and then look the membership up
+    on its own.
     """
     is_admin = bool(payload and payload.get("role") == "admin")
-    from app.modules.projects.repository import ProjectRepository
+    from app.modules.projects.access import project_access
 
-    project_repo = ProjectRepository(session)
-    project = await project_repo.get_by_id(project_id)
-    if project is None or project.status == "archived":
+    # The answer is keyed by UUID; a string id must still find its project.
+    if not isinstance(project_id, uuid.UUID):
+        project_id = uuid.UUID(str(project_id))
+    access = (await project_access(session, [project_id], user_id)).get(project_id)
+    if access is None or access.is_archived:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=translate("errors.project_not_found", locale=get_locale())
         )
     if is_admin:
         return
-    if str(project.owner_id) == user_id:
-        return
-    from app.modules.teams.access import is_project_member
-
-    try:
-        uid = uuid.UUID(str(user_id))
-    except (ValueError, TypeError):
-        uid = None
-    if uid is not None and await is_project_member(session, project_id, uid):
+    if access.is_owned_by(user_id) or access.is_member:
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="You do not have access to this project",
     )
+
+
+async def _readable_projects_for_boq(
+    session: SessionDep,
+    project_ids: list[uuid.UUID],
+    user_id: str,
+    payload: dict | None = None,
+) -> list[uuid.UUID]:
+    """The projects among ``project_ids`` whose bills the caller may read.
+
+    The rule is :func:`_verify_project_owner_for_boq`, project by project: an
+    archived project is not readable (for an admin too), and neither is one
+    the caller neither owns nor is a team member of. Those are left out of the
+    answer rather than refusing it. The bill register asks for exactly the
+    projects its project list showed, so such a project is one archived or
+    unshared since the page loaded; refusing the whole register for it left
+    the reader with no estimates at all. The client compares what it asked for
+    with what came back and says which projects are missing, so a total across
+    the rest is never shown as complete.
+
+    An id that names no project at all is different. The page cannot have been
+    shown it, so it is a client error, and it still refuses the whole request.
+
+    It costs one statement for the projects and, only when the caller is not an
+    admin and does not own every live project asked about, one more for the
+    team memberships, however many projects there are.
+
+    Returns:
+        The readable ids, in request order.
+
+    Raises:
+        HTTPException: 404 when any id names no project. The detail carries
+            ``error``, an English ``message`` naming the ids, and the ids
+            themselves: ``project_ids`` and ``not_found`` (both every unknown
+            id, in request order) and ``forbidden`` (always empty, kept so the
+            body keeps its shape).
+    """
+    if not project_ids:
+        return []
+    from sqlalchemy import select
+
+    from app.modules.projects.models import Project
+
+    rows = (
+        await session.execute(
+            select(Project.id, Project.owner_id, Project.status).where(Project.id.in_(project_ids)),
+        )
+    ).all()
+    known = {row[0] for row in rows}
+    not_found = [pid for pid in project_ids if pid not in known]
+    if not_found:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "projects_not_found",
+                "message": (
+                    f"{translate('errors.project_not_found', locale=get_locale())}: "
+                    f"{', '.join(str(p) for p in not_found)}."
+                ),
+                "project_ids": [str(p) for p in not_found],
+                "not_found": [str(p) for p in not_found],
+                "forbidden": [],
+            },
+        )
+    owner_by_project = {row[0]: row[1] for row in rows if row[2] != "archived"}
+
+    forbidden: list[uuid.UUID] = []
+    is_admin = bool(payload and payload.get("role") == "admin")
+    foreign = [pid for pid in project_ids if pid in owner_by_project and str(owner_by_project[pid]) != user_id]
+    if foreign and not is_admin:
+        try:
+            uid: uuid.UUID | None = uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            uid = None
+        member_of: set[uuid.UUID] = set()
+        if uid is not None:
+            from app.modules.teams.access import member_project_ids_subquery
+
+            # Fails closed like ``is_project_member``: a membership lookup that
+            # cannot run answers "not a member", never "a member".
+            try:
+                member_of = set(
+                    (
+                        await session.execute(
+                            select(Project.id).where(
+                                Project.id.in_(foreign),
+                                Project.id.in_(member_project_ids_subquery(uid)),
+                            ),
+                        )
+                    ).scalars()
+                )
+            except Exception:  # noqa: BLE001
+                _log.debug("Team membership lookup failed for the bill register", exc_info=True)
+        forbidden = [pid for pid in foreign if pid not in member_of]
+
+    unreadable = set(forbidden)
+    return [pid for pid in project_ids if pid in owner_by_project and pid not in unreadable]
 
 
 async def _log_activity(
@@ -498,19 +659,83 @@ async def list_boqs(
     """List all BOQs for a given project with computed grand totals."""
     await _verify_project_owner_for_boq(session, project_id, _user_id, payload)
     boqs, _ = await service.list_boqs_for_project(project_id, offset=offset, limit=limit)
-    # Compute grand totals + position counts via aggregate queries
-    boq_ids = [b.id for b in boqs]
-    # ``compute_boq_totals`` returns the full breakdown so list and detail
-    # endpoints stay in lockstep (BUG-008) AND converts every foreign-currency
-    # position into the project base before summing (Issue #111 sibling), so a
-    # mixed-currency BOQ no longer reports a blended, meaningless grand total.
-    breakdown = await service.compute_boq_totals(boq_ids)
+    return await _boq_list_items(service, boqs)
 
-    # Position counts per BOQ. The service owns the definition of a section
-    # header; this endpoint used to open-code it as ``unit != ""`` and so
-    # counted the headers of every imported bill, which spell it "section",
-    # as priced lines.
-    pos_counts = await service.count_line_items(boq_ids)
+
+@router.post(
+    "/boqs/by-projects/",
+    response_model=dict[str, list[BOQListItem]],
+    summary="List BOQs of several projects",
+    description=(
+        "The bill register of every project in the body, in one call, keyed by project id. Each "
+        "project's list is exactly what GET /boqs/?project_id= returns for it with the same offset "
+        "and limit, which apply per project. Every readable project appears as a key, with an empty "
+        "list when it has no bills. A project that is archived, or that the caller may not read, is "
+        "left out of the answer, so the client can tell it apart from a project with no bills by the "
+        "missing key. If any id names no project at all the request answers 404, the detail names "
+        "every such id, and nothing is answered for the others."
+    ),
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def list_boqs_by_projects(
+    body: BOQListByProjectsRequest,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    service: BOQService = Depends(_get_service),
+) -> dict[str, list[BOQListItem]]:
+    """List the BOQs of many projects at once, for the bill register page.
+
+    The page used to ask ``GET /boqs/?project_id=`` once per project. A browser
+    runs six requests to a host at a time over HTTP/1.1, and the desktop app
+    has nothing better, so on a workspace with forty projects most of the wait
+    was queueing rather than work. This answers the same question in one
+    request, with a statement count that does not grow with the number of
+    projects (the money rollup takes one pass per hundred bills, as one
+    project's largest page already did).
+    """
+    project_ids = await _readable_projects_for_boq(session, list(dict.fromkeys(body.project_ids)), _user_id, payload)
+    if not project_ids:
+        return {}
+    by_project = await service.list_boqs_for_projects(project_ids, offset=offset, limit=limit)
+    items = await _boq_list_items(service, [boq for pid in project_ids for boq in by_project.get(pid, [])])
+    register: dict[str, list[BOQListItem]] = {str(pid): [] for pid in project_ids}
+    for item in items:
+        register[str(item.project_id)].append(item)
+    return register
+
+
+#: Most BOQs one pass of the list rollup reads the positions of. It is the most
+#: a single project's page can hold (``limit`` is capped at 100), so the one
+#: project listing is always one pass, exactly as before, and the many project
+#: listing never holds more positions in memory at once than one project's
+#: largest page already did.
+_LIST_ROLLUP_CHUNK = 100
+
+
+async def _boq_list_items(service: BOQService, boqs: "Sequence[BOQ]") -> list[BOQListItem]:
+    """Build the list rows of a page of BOQs, with their money and line counts.
+
+    Shared by the one project and the many projects listing, so the two cannot
+    report different figures for the same bill.
+    """
+    boq_ids = [b.id for b in boqs]
+    breakdown: dict[uuid.UUID, dict[str, Any]] = {}
+    pos_counts: dict[uuid.UUID, int] = {}
+    for start in range(0, len(boq_ids), _LIST_ROLLUP_CHUNK):
+        chunk = boq_ids[start : start + _LIST_ROLLUP_CHUNK]
+        # ``compute_boq_totals`` returns the full breakdown so list and detail
+        # endpoints stay in lockstep (BUG-008) AND converts every foreign-currency
+        # position into the project base before summing (Issue #111 sibling), so a
+        # mixed-currency BOQ no longer reports a blended, meaningless grand total.
+        breakdown.update(await service.compute_boq_totals(chunk))
+        # Position counts per BOQ. The service owns the definition of a section
+        # header; this endpoint used to open-code it as ``unit != ""`` and so
+        # counted the headers of every imported bill, which spell it "section",
+        # as priced lines.
+        pos_counts.update(await service.count_line_items(chunk))
 
     results: list[BOQListItem] = []
     for b in boqs:
@@ -1493,7 +1718,28 @@ async def lock_boq(
     except Exception:
         _log.exception("FSM audit write skipped for BOQ %s lock", boq_id)
 
+    # The first lock freezes the contract quantities the quantity check reads.
+    # Saving a measurement sheet later writes its total into the bill quantity,
+    # so without this the tendered figure is gone once the site measures. A bill
+    # that already names a baseline keeps it, and a failed capture leaves the
+    # lock standing (it runs in its own savepoint).
+    from app.modules.boq.quantity_baseline import capture_baseline_on_lock
+
+    await capture_baseline_on_lock(service.session, boq_id, user_id=user_id)
+
     boq = await service.get_boq(boq_id)
+
+    # OC-41: Locking a BOQ should create budget lines in the cost model so
+    # the Finance tab reflects the locked estimate immediately. Previously
+    # the event was published but had no subscriber, leaving Finance at $0.
+    try:
+        from app.modules.costmodel.service import CostModelService
+
+        cm_svc = CostModelService(service.session)
+        await cm_svc.generate_budget_from_boq(boq.project_id, boq_id)
+    except Exception:
+        _log.exception("Budget line generation skipped for BOQ %s lock", boq_id)
+
     return BOQResponse.model_validate(boq)
 
 
@@ -1594,19 +1840,22 @@ async def create_budget_from_boq(
     session: SessionDep,
     service: BOQService = Depends(_get_service),
 ) -> dict:
-    """Create project budget lines from BOQ sections/positions.
+    """Make the locked bill the project budget, on both the finance and the 5D side.
 
-    Groups positions by WBS (if set) or by section, creates a
-    ProjectBudget entry for each group with original_budget = section total.
-    Idempotent on both sides: finance budgets already created from this BOQ
-    (matched by the boq_id stamped in their metadata plus the group key) are
-    skipped, and the costmodel BudgetLine generation skips positions already
-    wired to a line, so the 5D Cost Spine gets its EVM baseline exactly once.
-    Returns the created budget IDs plus the number of new costmodel budget
-    lines.
+    Locking a bill already does this: the lock generates the cost model's
+    budget lines and the finance budget follows through
+    ``costmodel.budget.generated``. This endpoint is for a bill locked before
+    that existed, or one whose lock-time seeding failed, and it goes through
+    the same writer (``FinanceService.seed_budget_from_boq``), so the finance
+    budget is one set of rows per bill whichever of the two runs first. It
+    used to write a second set of its own (category ``other``), and pressing
+    it after a lock doubled the budget.
+
+    The costmodel BudgetLine generation skips positions already wired to a
+    line, so the 5D Cost Spine gets its EVM baseline exactly once. Returns the
+    bill's finance budget ids, how many of them are new, and the number of new
+    costmodel budget lines.
     """
-    from decimal import Decimal
-
     await _verify_boq_owner(session, boq_id, user_id, payload)
 
     boq = await service.get_boq(boq_id)
@@ -1623,40 +1872,18 @@ async def create_budget_from_boq(
             detail="BOQ has no positions - nothing to budget.",
         )
 
-    # Group positions: by wbs_id if set, otherwise by parent_id (section), else "ungrouped"
-    groups: dict[str, Decimal] = {}
-    for pos in positions:
-        # Skip section headers, which carry no money and would otherwise open a
-        # budget group of their own. Both spellings of the sentinel unit, or an
-        # imported bill's headers become zero-value budget lines.
-        try:
-            total = Decimal(str(pos.total))
-        except Exception:
-            total = Decimal("0")
-        if total == 0 and (pos.unit or "").strip().lower() in SECTION_UNITS:
-            continue
-
-        group_key = pos.wbs_id or (str(pos.parent_id) if pos.parent_id else "ungrouped")
-        groups[group_key] = groups.get(group_key, Decimal("0")) + total
-
-    if not groups:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No budgetable positions found in BOQ.",
-        )
-
-    # Lazy import finance module
-    created_ids: list[str] = []
-    skipped_existing = 0
     try:
         from sqlalchemy import select as sa_select
 
         from app.modules.finance.models import ProjectBudget
+        from app.modules.finance.service import FinanceService
 
-        # Idempotency guard (audit M2): the docstring promises re-running
-        # this endpoint never doubles the finance budget. Load the groups
-        # already materialized from this BOQ (stamped with boq_id in their
-        # metadata) and skip them instead of stacking duplicates.
+        # Idempotency guard (audit M2): the groups this bill already holds a
+        # share of, whether seeded by the lock (``from_boq:<id>`` marker) or
+        # written by this button before 18.1 (``boq_id`` in the metadata).
+        # The writer below leaves them as they are; this set is what the
+        # response reports as skipped rather than created.
+        marker = f"from_boq:{boq_id}"
         existing_rows = (
             (await session.execute(sa_select(ProjectBudget).where(ProjectBudget.project_id == boq.project_id)))
             .scalars()
@@ -1665,37 +1892,29 @@ async def create_budget_from_boq(
         existing_group_keys = {
             row.wbs_id or "ungrouped"
             for row in existing_rows
-            if isinstance(row.metadata_, dict) and row.metadata_.get("boq_id") == str(boq_id)
+            if isinstance(row.metadata_, dict)
+            and (marker in row.metadata_ or row.metadata_.get("boq_id") == str(boq_id))
         }
-
-        # ProjectBudget.currency_code has no DB default - the model requires
-        # the writer to supply it from the project context. Omitting it here
-        # wrote budget lines with "", which reach the finance table as
-        # em-dashes instead of money. Best-effort resolver, "" on failure.
-        currency_code = await service._resolve_project_currency(boq_id)  # noqa: SLF001
-
-        for group_key, total_amount in groups.items():
-            if group_key in existing_group_keys:
-                skipped_existing += 1
-                continue
-            budget = ProjectBudget(
-                project_id=boq.project_id,
-                wbs_id=group_key if group_key != "ungrouped" else None,
-                category="other",
-                currency_code=currency_code,
-                original_budget=str(total_amount),
-                revised_budget=str(total_amount),
-                metadata_={"source": "boq", "boq_id": str(boq_id)},
-            )
-            session.add(budget)
-            await session.flush()
-            created_ids.append(str(budget.id))
+        budgets = await FinanceService(session).seed_budget_from_boq(boq.project_id, boq_id)
+        # Committed before the cost model runs: when it creates lines it
+        # publishes ``costmodel.budget.generated``, and the finance handler
+        # seeds the same bill from a session of its own. It has to find this
+        # bill's share already there, or it writes it a second time.
+        await session.commit()
     except Exception as exc:
         _log.exception("Failed to create budgets from BOQ %s: %s", boq_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create budget lines. Finance module may not be available.",
         )
+    if not budgets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No budgetable positions found in BOQ.",
+        )
+    budget_ids = [str(b.id) for b in budgets]
+    created_ids = [str(b.id) for b in budgets if (b.wbs_id or "ungrouped") not in existing_group_keys]
+    skipped_existing = len(budget_ids) - len(created_ids)
 
     # 5D Cost Spine baseline: one costmodel BudgetLine per BOQ position so
     # progress entries have a row to land earned value on. The costmodel
@@ -1734,7 +1953,7 @@ async def create_budget_from_boq(
     return {
         "created": len(created_ids),
         "skipped_existing": skipped_existing,
-        "budget_ids": created_ids,
+        "budget_ids": budget_ids,
         "budget_lines_created": budget_lines_created,
         "project_id": str(boq.project_id),
     }
@@ -1902,7 +2121,7 @@ async def bulk_add_positions(
 
     if errors and not payloads:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"All {len(errors)} items failed validation. First error: {errors[0]['error']}",
         )
     if errors:
@@ -1921,7 +2140,7 @@ async def bulk_add_positions(
         raise
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
@@ -1989,7 +2208,7 @@ async def update_position(
         # Probe-A scenario 11 - overflow cap and similar service-layer
         # validation failures are user-facing input errors, not 500s.
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
     # Issue #127: master propagation count / unlink flag is on the
@@ -2035,7 +2254,7 @@ async def bulk_update_positions(
         raise
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
@@ -2360,7 +2579,7 @@ async def apply_audit_fix(
         try:
             await service.update_position(data.position_id, update, actor_id=user_id)
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
         changed.append(str(data.position_id))
 
     elif data.fix_type == "merge_duplicate":
@@ -2386,7 +2605,7 @@ async def apply_audit_fix(
             try:
                 await service.update_position(dup_id, PositionUpdate(ordinal=new_ord), actor_id=user_id)
             except ValueError as exc:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
             changed.append(str(dup_id))
         result["kept_position_id"] = str(data.params.get("keep_position_id") or "")
 
@@ -2466,6 +2685,8 @@ async def reorder_positions(
     # IDOR guard: verify BOQ ownership before any mutation
     await _verify_boq_owner(session, boq_id, user_id, payload)
     raw_ids = data.get("position_ids", [])
+    if len(raw_ids) > 50_000:
+        raise HTTPException(status_code=400, detail="Cannot reorder more than 50,000 positions at once")
     position_ids = [uuid.UUID(pid) if isinstance(pid, str) else pid for pid in raw_ids]
     await service.reorder_positions(boq_id, position_ids)
     await _log_activity(
@@ -2874,8 +3095,7 @@ async def compare_boqs(
     Pure read. Ownership is verified on BOTH BOQs so a baseline can never
     leak positions from a project the caller does not own.
     """
-    await _verify_boq_owner(session, boq_id, user_id, payload)
-    await _verify_boq_owner(session, other_id, user_id, payload)
+    await _verify_boqs_owner(session, [boq_id, other_id], user_id, payload)
     return await service.compare_boqs(boq_id, other_id)
 
 
@@ -2884,11 +3104,11 @@ async def compare_boqs(
 
 def _snap_to_response(s: "BOQSnapshot") -> SnapshotResponse:
     """Build a SnapshotResponse from a BOQSnapshot ORM instance."""
-    grand_total: float | None = None
+    grand_total: Decimal | None = None
     if s.total_value is not None:
         try:
-            grand_total = float(s.total_value)
-        except (ValueError, TypeError):
+            grand_total = Decimal(str(s.total_value))
+        except (InvalidOperation, ValueError, TypeError):
             grand_total = None
     return SnapshotResponse(
         id=s.id,
@@ -3082,10 +3302,351 @@ async def _unreviewed_proposal_meta(
     return {UNREVIEWED_PROPOSALS_META_KEY: pending}
 
 
+# Classification standard -> the rule set that checks it. Module level so a
+# test can hold every value against the rule sets the engine registers.
+_STANDARD_RULE_SETS: dict[str, str] = {
+    "din276": "din276",
+    "nrm": "nrm",
+    "masterformat": "masterformat",
+    "sinapi": "sinapi",
+    # NBR 12721 (Brazil ABNT cost-group hierarchy) - picked up when a
+    # Brazilian project sets classification_standard="nbr" explicitly.
+    # SINAPI rules also fire via the BR region rules below; the two
+    # rule packs are complementary, not redundant.
+    "nbr": "nbr",
+    "gesn": "gesn",
+    "dpgf": "dpgf",
+    "onorm": "onorm",
+    "gbt50500": "gbt50500",
+    "cpwd": "cpwd",
+    "birimfiyat": "birimfiyat",
+    "sekisan": "sekisan",
+    "bc3": "bc3",
+    # Hungary. The classification is called ``tetelrend`` and the rule set
+    # that checks it is called ``hungary``: two names for one market, and a
+    # lookup keyed on the first that expects the second finds nothing. The
+    # engine logs an unknown rule set and carries on, so a Hungarian project
+    # validated without a single Hungarian rule and nothing said so.
+    "tetelrend": "hungary",
+    # China. The registry and the demos store the standard as ``gb50500``,
+    # the rule set is registered as ``gbt50500``: the same two-names shape as
+    # Hungary, reachable whenever a Chinese project's region names no country.
+    "gb50500": "gbt50500",
+    # Poland. A kosztorys cites the KNR catalogue table of every line under
+    # ``knr``; the rule set that checks it is ``poland``.
+    "knr": "poland",
+    # Italy. A computo cites the prezzario voce of every line under ``voci``,
+    # the registry's standard for IT; the rule set that checks it is ``italy``.
+    "voci": "italy",
+}
+
+
+# Rule sets that fail every line with an error unless it carries a code of
+# one classification standard, and the classification key they read. A country
+# row is added to every project of the country whatever standard it declares,
+# so a row that carried one of these for another standard failed a correctly
+# coded bill line by line: the Swiss BKP bill against DIN 276, the Emirati
+# MasterFormat bill against NRM, the Mexican and Spanish bills against BC3 and
+# MasterFormat. :func:`_build_rule_sets` drops such a set when the project
+# names a different standard. The import persistence reads the same table to
+# carry a line's raw code under the key the project's rules read.
+_CLASSIFICATION_CODE_SETS: dict[str, str] = {
+    "din276": "din276",
+    "nrm": "nrm",
+    "masterformat": "masterformat",
+    "sinapi": "sinapi",
+    "gesn": "gesn",
+    "gbt50500": "gb50500",
+    "cpwd": "cpwd",
+    "hungary": "tetelrend",
+    "birimfiyat": "birimfiyat",
+    "sekisan": "sekisan",
+    "bc3": "bc3_code",
+    "poland": "knr",
+    "italy": "voci",
+}
+
+# The code sets a spreadsheet import carries its code column into. Each is a
+# market's own price-book or item code, which a bill of that market prints in
+# its code column: the CPWD DSR item, the GESN rate, the SINAPI composition,
+# the GB 50500 item code, the poz number, the sekisan item, the KNR table, the
+# Hungarian item code, the BC3 concept code. The column holds other things
+# too (a price list entry, another bank's composition, a quota number), so a
+# value is carried only when it has the key's shape, see
+# :func:`_national_code_value`. DIN 276,
+# NRM and MasterFormat are left out on purpose. The importer recognises NRM
+# and MasterFormat codes by their shape, and DIN 276 is the cost-group axis
+# many markets map their bills onto beside a national code (Romania, Greece,
+# Ukraine, Croatia, Czechia, Belgium), so the code column of such a bill is
+# the national code and copying it under ``din276`` would turn a missing
+# cost group into a wrong one.
+_IMPORT_CARRIED_CODE_SETS: frozenset[str] = frozenset(
+    {"sinapi", "gesn", "gbt50500", "cpwd", "hungary", "birimfiyat", "sekisan", "bc3", "poland", "italy"}
+)
+
+
+def _national_code_key(rule_sets: list[str], classification_standard: str) -> str | None:
+    """The classification key an imported line's raw code is carried under.
+
+    The rule sets are the project's, as :func:`_build_rule_sets` returns them.
+    The set of the project's standard wins; otherwise the key is taken only
+    when exactly one carried code set is in play, since with two there is no
+    telling which the column holds.
+    """
+    carried = [rs for rs in rule_sets if rs in _IMPORT_CARRIED_CODE_SETS]
+    std_rule = _STANDARD_RULE_SETS.get((classification_standard or "").strip().lower())
+    if std_rule in carried:
+        return _CLASSIFICATION_CODE_SETS[std_rule]
+    keys = {_CLASSIFICATION_CODE_SETS[rs] for rs in carried}
+    return keys.pop() if len(keys) == 1 else None
+
+
+# The printed prefix of a GESN norm code and of the federal and territorial
+# unit rates priced from it: "ГЭСН06-01-001-01", "ФЕР 06-01-001-01". The rule
+# reads the bare number, which is also how the platform's own Russian bill
+# stores it. The montage, commissioning and repair collections (ГЭСНм, ГЭСНп,
+# ГЭСНр and their ФЕР and ТЕР twins) are left out on purpose: they reuse the
+# construction collection's numbers, so stripping their prefix would file a
+# montage norm as the construction norm with the same number.
+_GESN_PRINTED_PREFIX = re.compile(r"^(?:ГЭСН|ФЕР|ТЕР|GESN|FER|TER)(?![мпрmpr])[\s-]*", re.IGNORECASE)
+
+
+def _national_code_value(key: str, value: str, classification: dict[str, Any]) -> str | None:
+    """``value`` as the national rules under ``key`` read it, or ``None`` when it is not such a code.
+
+    A code column holds whatever the estimator wrote: a norm code, a price
+    list entry ("Прайс-лист"), a regional price base item ("ФССЦ-04.1.02.05-0006"),
+    another bank's composition. Copying all of it under the national key turned
+    an uncoded line into a line that cites a norm it does not cite, and the
+    format rules then warned on every line. So a value is carried only when it
+    has the shape the key's own format rule accepts, read from the rule itself
+    so the two cannot drift. Keys whose rule set checks no format (``cpwd``,
+    ``sekisan``) take the value as it is.
+
+    A SINAPI code is carried only from a line whose bank is SINAPI or not
+    given: an orçamento mixes SINAPI, SICRO, ORSE and own compositions in one
+    code column and says which in its bank column.
+    """
+    from app.core.validation import rules as national_rules
+
+    if key == "gesn":
+        bare = re.sub(r"\s+", "", _GESN_PRINTED_PREFIX.sub("", value))
+        return bare if national_rules.GESNValidCode._PATTERN.match(bare) else None
+    if key == "birimfiyat":
+        return value if national_rules.BirimFiyatValidPoz.poz_is_well_formed(value) else None
+    if key == "sinapi":
+        bank = str(classification.get("banco") or "").strip().upper()
+        if bank and not bank.startswith("SINAPI"):
+            return None
+        return value if national_rules._SINAPI_CODE_RE.match(value) else None
+    if key == "gb50500":
+        # A quota number ("A1-1", the 定额编号 column) is not a bill item code.
+        return value if value.isdigit() and len(value) in (9, 12) else None
+    if key == "tetelrend":
+        code = re.sub(r"\s+", "", value).upper()
+        building = national_rules._HU_BUILDING_CODE_RE.match(code)
+        return value if building or national_rules._HU_INFRA_CODE_RE.match(code) else None
+    if key == "knr":
+        recognised = national_rules._PL_KNR_REFERENCE.match(value) or national_rules._PL_OWN_CALCULATION.match(value)
+        return value if recognised else None
+    if key == "bc3_code":
+        shaped = national_rules.BC3ValidCode._PATTERN.match(value) and not value.startswith(".")
+        return value if shaped else None
+    if key == "voci":
+        # The tariffa column of a computo: a ministry coded voce, a nuovo
+        # prezzo, or the item path of a list that prints no region prefix
+        # (Lazio, Umbria). A path is carried and left to the format rule to
+        # judge; a word is not a voce.
+        from app.core.validation.rules import italy_prezzario
+
+        if italy_prezzario.voce_code_is_well_formed(value):
+            return value
+        return value if italy_prezzario.looks_like_item_path(value) else None
+    return value
+
+
+def _carry_national_code(classification: Any, key: str | None, *, is_section: bool) -> Any:
+    """``classification`` with its raw code also under ``key``, the key the project's rules read.
+
+    An importer files a code column under ``code``, or under ``nrm`` or
+    ``masterformat`` when the code has that shape (a DSR item "2.8.1" looks
+    like an NRM element). The national rules read their own key, so a bill
+    whose every line carried its code failed every line as uncoded. A key the
+    line already has is never overwritten, and section rows are left alone.
+    A value that is not a code of that key's kind stays under ``code`` only,
+    see :func:`_national_code_value`. The input is not modified.
+    """
+    if key is None or is_section or not isinstance(classification, dict):
+        return classification
+    if str(classification.get(key) or "").strip():
+        return classification
+    for source in ("code", "nrm", "masterformat"):
+        value = str(classification.get(source) or "").strip()
+        if value:
+            carried = _national_code_value(key, value, classification)
+            return {**classification, key: carried} if carried else classification
+    return classification
+
+
+async def _project_national_code_key(boq_id: uuid.UUID, service: BOQService) -> str | None:
+    """:func:`_national_code_key` for the project the BOQ belongs to, ``None`` if it cannot be read."""
+    from app.modules.projects.repository import ProjectRepository
+
+    try:
+        boq = await service.get_boq(boq_id)
+        project = await ProjectRepository(service.session).get_by_id(boq.project_id)
+    except Exception as exc:  # noqa: BLE001 - a failed lookup must never block an import
+        logger.warning("Import could not read the project of BOQ %s for its code key: %s", boq_id, exc)
+        return None
+    if project is None:
+        return None
+    rule_sets = _build_rule_sets(
+        project_rule_sets=project.validation_rule_sets or ["boq_quality"],
+        classification_standard=project.classification_standard or "",
+        region=project.region or "",
+        country_code=getattr(project, "country_code", None),
+    )
+    return _national_code_key(rule_sets, project.classification_standard or "")
+
+
+# Map country → additional rule sets. This is the rule-pack axis, not
+# the classification-standard axis, and it stays a table of its own on
+# purpose: a country reads exactly one classification standard but can
+# pull several rule packs, so Spain carries BC3 plus MasterFormat and
+# Germany carries GAEB plus DIN 276. Folding the two together would
+# lose that.
+#
+# What it does share with the standard registry is the normaliser. The
+# keys are ISO 3166-1 alpha-2 and the lookup goes through
+# ``normalise_region``, so ``DACH``, ``DE`` and ``DE_BERLIN`` all reach
+# the German row. Before that they did not: the region was upper-cased
+# and looked up verbatim, so a project keyed to a catalogue region such
+# as ``PL_WARSAW`` or ``DE_MUNICH`` picked up no regional rule pack at
+# all.
+#
+# Hispanophone markets pick up BC3 - FIEBDC-3 is the de-facto BOQ
+# format in Spain (AENOR-mandated for public tenders) and much of
+# LATAM. MasterFormat rides along on the US-/CA-leaning LATAM markets
+# that have historically adopted CSI classification alongside BC3.
+_COUNTRY_RULE_SETS: dict[str, list[str]] = {
+    "DE": ["gaeb", "din276"],
+    "AT": ["gaeb", "onorm"],
+    # Swiss bills are coded in BKP / eBKP-H, which has no rule set yet, so
+    # the row carries the GAEB structure checks and no DIN 276 cost group rule.
+    "CH": ["gaeb"],
+    "GB": ["nrm"],
+    # The Commonwealth markets the registry maps onto NRM, which their packs
+    # declare too. Without a row a project created before the pack was active
+    # ran no national rule at all, the Hungarian defect of 5460729b7.
+    "IE": ["nrm"],
+    "AU": ["nrm"],
+    "NZ": ["nrm"],
+    "SG": ["nrm"],
+    "NG": ["nrm"],
+    "ZA": ["nrm"],
+    "US": ["masterformat"],
+    "CA": ["masterformat"],
+    "FR": ["dpgf"],
+    "BR": ["sinapi"],
+    "RU": ["gesn"],
+    "CN": ["gbt50500"],
+    "IN": ["cpwd"],
+    "TR": ["birimfiyat"],
+    "JP": ["sekisan"],
+    # The Gulf tenders against MasterFormat, which is what the registry, the
+    # UAE and Saudi packs and every Gulf demo say. The row said NRM for the
+    # Emirates and failed every line of a MasterFormat bill.
+    "AE": ["masterformat"],
+    "SA": ["masterformat"],
+    "QA": ["masterformat"],
+    "KW": ["masterformat"],
+    "BH": ["masterformat"],
+    "OM": ["masterformat"],
+    "ID": ["masterformat"],
+    # Spain tenders in BC3. MasterFormat was a second code rule no Spanish
+    # bill is written in.
+    "ES": ["bc3"],
+    # Mexico has its own rule set (APU, IVA, CFDI). BC3 is a Spanish exchange
+    # format, and its code rule failed every line of a catalogo de conceptos.
+    "MX": ["mexico"],
+    # The rest of Hispanophone Latin America reads MasterFormat in the
+    # registry. BC3 stays reachable for a BC3 bill through its standard.
+    "AR": ["masterformat"],
+    "CL": ["masterformat"],
+    "CO": ["masterformat"],
+    "PE": ["masterformat"],
+    # Without this row a Hungarian project created before the country pack
+    # was switched on, or on an install that never activated it, imported
+    # its bills with no Hungarian rule run at all.
+    "HU": ["hungary"],
+    # The same gap for the packs that map their bills onto DIN 276 beside a
+    # national code: each declares both, and a project without the pack ran
+    # neither.
+    "RO": ["romania", "din276"],
+    "GR": ["greece", "din276"],
+    "UA": ["ukraine", "din276"],
+    "HR": ["din276"],
+    "CZ": ["din276"],
+    "BE": ["din276"],
+    "PL": ["poland"],
+    # Italy. Without this row an Italian project created with no pack active
+    # validated its computo against no Italian rule at all.
+    "IT": ["italy"],
+}
+
+
+def _is_foreign_code_set(rule_set: str, standard: str, std_rule: str | None) -> bool:
+    """Whether ``rule_set`` demands a code of a standard the project does not name.
+
+    The one predicate behind both filters in :func:`_build_rule_sets`, the
+    country row's and the pack's, so the two cannot drift apart. A project
+    that names no standard keeps every set: nothing says which code its lines
+    carry, and the pack or the country row is then the best statement there is.
+
+    Args:
+        rule_set: A rule-set identifier.
+        standard: The project's classification standard, lower-cased, or "".
+        std_rule: The rule set that checks ``standard``, or ``None``.
+
+    Returns:
+        True when the set should be dropped for this project.
+    """
+    return bool(standard) and rule_set in _CLASSIFICATION_CODE_SETS and rule_set != std_rule
+
+
+def _pack_added_rule_sets(project: Any) -> list[str]:
+    """The rule sets the project's creation pack appended, as recorded on it.
+
+    Written by project creation under
+    :data:`app.core.partner_pack.apply.PACK_RULE_SETS_METADATA_KEY`. A project
+    created before the record existed, or with no pack active, has none, and
+    every set it carries counts as asked for.
+
+    Args:
+        project: A ``Project`` row, or anything with a ``metadata_`` mapping.
+
+    Returns:
+        The recorded names, or an empty list when the record is absent or
+        malformed.
+    """
+    from app.core.partner_pack.apply import PACK_RULE_SETS_METADATA_KEY
+
+    metadata = getattr(project, "metadata_", None)
+    if not isinstance(metadata, dict):
+        return []
+    recorded = metadata.get(PACK_RULE_SETS_METADATA_KEY)
+    if not isinstance(recorded, list):
+        return []
+    return [name for name in recorded if isinstance(name, str)]
+
+
 def _build_rule_sets(
     project_rule_sets: list[str],
     classification_standard: str,
     region: str,
+    country_code: str | None = None,
+    *,
+    pack_rule_sets: Sequence[str] | None = None,
 ) -> list[str]:
     """Determine which validation rule sets to apply based on project config.
 
@@ -3097,81 +3658,54 @@ def _build_rule_sets(
         classification_standard: e.g. "din276", "nrm", "masterformat".
         region: e.g. "DACH", "UK", "US", "PL_WARSAW". Reduced to a country
             through the classification registry before lookup.
+        country_code: The project's ISO 3166-1 alpha-2 column, read when the
+            region names no country. A project created while a country pack
+            is active gets its country from the pack and may carry a region
+            label that is only a city, or nothing at all.
+        pack_rule_sets: The names among ``project_rule_sets`` that the pack
+            active at the project's creation appended, read from
+            ``project.metadata_`` by :func:`_pack_added_rule_sets`. A pack's
+            "code required" set is its country row carried on the project, so
+            it is filtered exactly like the row; every other carried set is
+            kept as asked for.
 
     Returns:
         Deduplicated list of rule set names.
     """
-    from app.core.classification_registry import normalise_region
+    from app.core.classification_registry import is_macro_region, normalise_region
 
-    rule_sets = list(project_rule_sets)
+    standard = (classification_standard or "").strip().lower()
+    std_rule = _STANDARD_RULE_SETS.get(standard)
 
-    # Map classification standard → rule set name
-    STANDARD_RULES: dict[str, str] = {
-        "din276": "din276",
-        "nrm": "nrm",
-        "masterformat": "masterformat",
-        "sinapi": "sinapi",
-        # NBR 12721 (Brazil ABNT cost-group hierarchy) - picked up when a
-        # Brazilian project sets classification_standard="nbr" explicitly.
-        # SINAPI rules also fire via the BR region rules below; the two
-        # rule packs are complementary, not redundant.
-        "nbr": "nbr",
-        "gesn": "gesn",
-        "dpgf": "dpgf",
-        "onorm": "onorm",
-        "gbt50500": "gbt50500",
-        "cpwd": "cpwd",
-        "birimfiyat": "birimfiyat",
-        "sekisan": "sekisan",
-        "bc3": "bc3",
-    }
-    std_rule = STANDARD_RULES.get(classification_standard)
+    # A set the project carries because its pack added it goes through the
+    # same filter as the country row, and for the same reason: the Texas pack
+    # names masterformat, and a project under it that names UniFormat would
+    # otherwise fail masterformat.classification_required on every line,
+    # whatever its standard says now or is changed to later. A set the creator
+    # asked for is kept even when it is another standard's, because a
+    # dual-coded bill (the Warsaw demo carries KNR beside DIN 276) asks for it.
+    pack_added = set(pack_rule_sets or ())
+    rule_sets = [
+        rs for rs in project_rule_sets if not (rs in pack_added and _is_foreign_code_set(rs, standard, std_rule))
+    ]
+
+    # The classification standard's rule set, then the country's.
     if std_rule and std_rule not in rule_sets:
         rule_sets.append(std_rule)
 
-    # Map country → additional rule sets. This is the rule-pack axis, not
-    # the classification-standard axis, and it stays a table of its own on
-    # purpose: a country reads exactly one classification standard but can
-    # pull several rule packs, so Spain carries BC3 plus MasterFormat and
-    # Germany carries GAEB plus DIN 276. Folding the two together would
-    # lose that.
-    #
-    # What it does share with the standard registry is the normaliser. The
-    # keys are ISO 3166-1 alpha-2 and the lookup goes through
-    # ``normalise_region``, so ``DACH``, ``DE`` and ``DE_BERLIN`` all reach
-    # the German row. Before that they did not: the region was upper-cased
-    # and looked up verbatim, so a project keyed to a catalogue region such
-    # as ``PL_WARSAW`` or ``DE_MUNICH`` picked up no regional rule pack at
-    # all.
-    #
-    # Hispanophone markets pick up BC3 - FIEBDC-3 is the de-facto BOQ
-    # format in Spain (AENOR-mandated for public tenders) and much of
-    # LATAM. MasterFormat rides along on the US-/CA-leaning LATAM markets
-    # that have historically adopted CSI classification alongside BC3.
-    COUNTRY_RULES: dict[str, list[str]] = {
-        "DE": ["gaeb", "din276"],
-        "AT": ["gaeb", "onorm"],
-        "CH": ["gaeb", "din276"],
-        "GB": ["nrm"],
-        "US": ["masterformat"],
-        "CA": ["masterformat"],
-        "FR": ["dpgf"],
-        "BR": ["sinapi"],
-        "RU": ["gesn"],
-        "CN": ["gbt50500"],
-        "IN": ["cpwd"],
-        "TR": ["birimfiyat"],
-        "JP": ["sekisan"],
-        "AE": ["nrm"],
-        "ES": ["bc3", "masterformat"],
-        "MX": ["bc3", "masterformat"],
-        "AR": ["bc3", "masterformat"],
-        "CL": ["bc3", "masterformat"],
-        "CO": ["bc3", "masterformat"],
-        "PE": ["bc3", "masterformat"],
-    }
-    country = normalise_region(region)
-    for rs in COUNTRY_RULES.get(country or "", []):
+    # A region that names a country wins over the country column, so a
+    # project filed under ``DE`` validates as German whatever else it says. A
+    # macro label does not name one: ``DACH`` is anchored on Germany, and an
+    # Austrian or Swiss project filed under it was validated as German while
+    # its country column said where it is.
+    from_region = normalise_region(region)
+    from_column = normalise_region(country_code)
+    country = from_column if from_column and (from_region is None or is_macro_region(region)) else from_region
+    for rs in _COUNTRY_RULE_SETS.get(country or "", []):
+        if _is_foreign_code_set(rs, standard, std_rule):
+            # The project names its standard, and this row's code rule is
+            # for another one; it would fail every correctly coded line.
+            continue
         if rs not in rule_sets:
             rule_sets.append(rs)
 
@@ -3260,6 +3794,8 @@ async def _run_import_validation(
             project_rule_sets=project.validation_rule_sets or ["boq_quality"],
             classification_standard=project.classification_standard or "",
             region=project.region or "",
+            country_code=getattr(project, "country_code", None),
+            pack_rule_sets=_pack_added_rule_sets(project),
         )
 
         report = await validation_engine.validate(
@@ -3428,6 +3964,12 @@ async def validate_boq(
         }
         for markup in await service.list_markups(boq_id)
     ]
+    # Each line's amount as the bill's own markup engine computes it, so a
+    # rule that reports what the markups add quotes the bill's figure instead
+    # of working out a second one.
+    from app.modules.boq.markup_rule_inputs import markup_amounts_for_rules
+
+    markup_context = await markup_amounts_for_rules(service, boq_id, markups_data)
 
     # Determine rule sets from project config. Empty classification /
     # region means "no preference"; the rule registry resolves to a
@@ -3439,6 +3981,8 @@ async def validate_boq(
         project_rule_sets=project.validation_rule_sets or ["boq_quality"],
         classification_standard=project.classification_standard or "",
         region=project.region or "",
+        country_code=getattr(project, "country_code", None),
+        pack_rule_sets=_pack_added_rule_sets(project),
     )
 
     # Run validation. The rows are this endpoint's own projection; anything
@@ -3449,7 +3993,7 @@ async def validate_boq(
         data=await with_project_context(
             session,
             boq_data.project_id,
-            {"positions": positions_data, "markups": markups_data},
+            {"positions": positions_data, "markups": markups_data, **markup_context},
         ),
         rule_sets=rule_sets,
         target_type="boq",
@@ -3477,8 +4021,52 @@ async def validate_boq(
         }
         for r in report.results
     ]
+    summary["report_id"] = await _store_editor_validation(
+        session, boq_data.project_id, boq_id, report, rule_sets, _user_id, payload
+    )
 
     return summary
+
+
+async def _store_editor_validation(
+    session: Any,
+    project_id: uuid.UUID,
+    boq_id: uuid.UUID,
+    report: Any,
+    rule_sets: list[str],
+    user_id: str,
+    payload: dict[str, Any],
+) -> str | None:
+    """Store an editor validation run as a validation report, when the caller may create one.
+
+    A run that is not stored exists only in the toast: the validation page,
+    the dashboard and the cross-project status all read stored reports, so an
+    estimate checked here read as never checked. Storing needs
+    ``validation.create``, the permission the validation page's own run asks
+    for; a viewer can still run the check, it just is not recorded.
+
+    The NCR escalation that a validation page run triggers is left out on
+    purpose: every click here is a new report, and an NCR per click would
+    bury the register while an estimator works through the findings.
+
+    Returns the stored report id, or ``None`` when nothing was stored.
+    """
+    try:
+        await RequirePermission("validation.create")(payload)
+    except HTTPException:
+        return None
+    try:
+        from app.modules.validation.service import ValidationModuleService
+    except ImportError:  # validation module not installed
+        return None
+    try:
+        uid = uuid.UUID(str(user_id))
+    except (TypeError, ValueError):
+        uid = None
+    stored = await ValidationModuleService(session).record_boq_report(
+        project_id, boq_id, report, rule_sets, user_id=uid, source="boq_editor"
+    )
+    return str(stored.id)
 
 
 # ── AI Chat ──────────────────────────────────────────────────────────────────
@@ -3680,8 +4268,10 @@ async def ai_chat_boq(
 # A position-scoped chat: the estimator asks the copilot to refine ONE BOQ
 # position and the assistant replies with prose plus structured action
 # proposals (update_description / set_quantity / set_unit_rate / add_resources).
-# High-confidence proposals are auto-applied through BOQService.update_position;
-# the rest can be applied later via the /apply route. Ownership reuses the same
+# Chat never writes: a person accepts or rejects the proposals through the
+# /review route, which applies the accepted ones via
+# BOQService.update_position. /apply (one client-sent action) stays for API
+# compatibility. Ownership reuses the same
 # BOQ -> project check every other position route uses (a cross-tenant
 # position_id 404s/403s before any read or write).
 
@@ -3725,8 +4315,9 @@ async def chat_position_copilot(
     """Run one copilot turn for a position.
 
     Grounds the request against the cost catalogue, asks the configured AI
-    provider for structured proposals, auto-applies high-confidence actions, and
-    returns the assistant message plus the proposal list. When no AI provider is
+    provider for structured proposals, and returns the assistant message plus
+    the proposal list. Nothing is written to the position here; the proposals
+    wait for review. When no AI provider is
     configured the user message is still recorded and a friendly assistant
     message is returned with no actions (HTTP 200).
     """
@@ -3752,6 +4343,29 @@ async def apply_position_copilot_action(
     """Apply a single previously-proposed copilot action via update_position."""
     position, action = await service.apply_action(session, position_id, data.action, payload)
     return CopilotApplyResponse(position=_position_to_response(position), action=action)
+
+
+@router.post(
+    "/positions/{position_id}/copilot/review",
+    response_model=CopilotReviewResponse,
+    summary="Accept or reject position copilot proposals",
+    dependencies=[Depends(RequirePermission("boq.update"))],
+)
+async def review_position_copilot_proposals(
+    position_id: uuid.UUID,
+    data: CopilotReviewRequest,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: "BOQCopilotService" = Depends(_get_copilot_service),
+) -> CopilotReviewResponse:
+    """Apply the proposals a person accepted and dismiss the ones they rejected.
+
+    Proposals are applied from the payloads stored with the assistant turn, so
+    only what the reviewer saw can land. A locked BOQ answers 409 before any
+    write.
+    """
+    position, message = await service.review(session, position_id, data.message_id, data.accept, data.reject, payload)
+    return CopilotReviewResponse(position=_position_to_response(position), message=message)
 
 
 # ── Export (CSV / Excel) ──────────────────────────────────────────────────────
@@ -3811,47 +4425,14 @@ def _fmt_number(value: Any) -> str:
     return text if text else "0"
 
 
-# BUG-EXPORT-TRAILING-SLASH: every export route is registered under both
-# the trailing-slash and bare forms because the app sets
-# ``redirect_slashes=False`` (see ``app/main.py``) - without these aliases,
-# REST-style GETs without the slash return 404. ``include_in_schema=False``
-# keeps OpenAPI clean (one canonical path).
-@router.get(
-    "/boqs/{boq_id}/export/csv",
-    summary="Export BOQ as CSV (no-slash alias)",
-    dependencies=[Depends(RequirePermission("boq.read"))],
-    include_in_schema=False,
-)
-@router.get(
-    "/boqs/{boq_id}/export/csv/",
-    summary="Export BOQ as CSV",
-    dependencies=[Depends(RequirePermission("boq.read"))],
-)
-async def export_boq_csv(
-    boq_id: uuid.UUID,
-    _user_id: CurrentUserId,
-    payload: CurrentUserPayload,
-    session: SessionDep,
-    service: BOQService = Depends(_get_service),
-) -> StreamingResponse:
-    """Export BOQ positions as a CSV file.
+def _render_boq_csv(structured: Any, base_ccy: str, fx_map: Mapping[str, Any]) -> str:
+    """Write the CSV export of a bill already read from the database.
 
-    Emits full-precision numeric values (BUG-150/151/152 - prior 2-decimal
-    truncation was a lossy roundtrip) and preserves secondary metadata
-    (source, confidence, classification blob, cad_element_ids, wbs_id)
-    so the CSV can be re-imported without silent data loss (BUG-163-175).
+    Pure: it touches no session and loads nothing, so the route can run it in a
+    worker thread. ``structured`` is the ``BOQWithSections`` payload and
+    ``fx_map`` the frozen rates, both read on the event loop beforehand.
     """
     import json as _json
-
-    # IDOR guard: every BOQ read endpoint scopes to project owner/member;
-    # exports must do the same before fetching any priced data.
-    await _verify_boq_owner(session, boq_id, _user_id, payload)
-    # Use structured data to include markups in the grand total
-    structured = await service.get_boq_structured_for_export(boq_id)
-    # Issue #111 - freeze the project FX table into the exported artifact so
-    # the base-currency totals are auditable and a later rate edit cannot
-    # retroactively rewrite a delivered BOQ.
-    base_ccy, fx_map = await service.get_export_fx(boq_id)
 
     def _row_currency(pos: Any) -> str:
         meta = getattr(pos, "metadata", None) or getattr(pos, "metadata_", None) or {}
@@ -4043,6 +4624,53 @@ async def export_boq_csv(
 
     content = output.getvalue()
     output.close()
+    return content
+
+
+# BUG-EXPORT-TRAILING-SLASH: every export route is registered under both
+# the trailing-slash and bare forms because the app sets
+# ``redirect_slashes=False`` (see ``app/main.py``) - without these aliases,
+# REST-style GETs without the slash return 404. ``include_in_schema=False``
+# keeps OpenAPI clean (one canonical path).
+@router.get(
+    "/boqs/{boq_id}/export/csv",
+    summary="Export BOQ as CSV (no-slash alias)",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/boqs/{boq_id}/export/csv/",
+    summary="Export BOQ as CSV",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def export_boq_csv(
+    boq_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> StreamingResponse:
+    """Export BOQ positions as a CSV file.
+
+    Emits full-precision numeric values (BUG-150/151/152 - prior 2-decimal
+    truncation was a lossy roundtrip) and preserves secondary metadata
+    (source, confidence, classification blob, cad_element_ids, wbs_id)
+    so the CSV can be re-imported without silent data loss (BUG-163-175).
+    """
+    # IDOR guard: every BOQ read endpoint scopes to project owner/member;
+    # exports must do the same before fetching any priced data.
+    await _verify_boq_owner(session, boq_id, _user_id, payload)
+    # Use structured data to include markups in the grand total
+    structured = await service.get_boq_structured_for_export(boq_id)
+    # Issue #111 - freeze the project FX table into the exported artifact so
+    # the base-currency totals are auditable and a later rate edit cannot
+    # retroactively rewrite a delivered BOQ.
+    base_ccy, fx_map = await service.get_export_fx(boq_id)
+
+    # Writing the file walks every line of the bill and is pure CPU, so it runs in
+    # a worker thread: on the event loop a large bill would hold up every other
+    # request of the install until the last row is written.
+    content = await asyncio.to_thread(_render_boq_csv, structured, base_ccy, fx_map)
 
     filename = f"{structured.name}.csv"
 
@@ -4055,49 +4683,80 @@ async def export_boq_csv(
     )
 
 
-@router.get(
-    "/boqs/{boq_id}/export/excel",
-    summary="Export BOQ as Excel (no-slash alias)",
-    dependencies=[Depends(RequirePermission("boq.read"))],
-    include_in_schema=False,
-)
-@router.get(
-    "/boqs/{boq_id}/export/excel/",
-    summary="Export BOQ as Excel",
-    dependencies=[Depends(RequirePermission("boq.read"))],
-)
-async def export_boq_excel(
-    boq_id: uuid.UUID,
-    _user_id: CurrentUserId,
-    payload: CurrentUserPayload,
-    session: SessionDep,
-    service: BOQService = Depends(_get_service),
-) -> StreamingResponse:
-    """Export BOQ positions as an Excel (xlsx) file with formatting.
+def _project_line(project: Any) -> str | None:
+    """The project line printed above the table of an exported sheet.
 
-    The header layout includes:
-      1. Standard columns (Pos, Description, Unit, Quantity, Rate, Total, Classification)
-      2. Any custom columns the user has defined (from `boq.metadata_.custom_columns`)
-         - values come from `position.metadata_.custom_fields`
+    The bill's own name says which bill this is and not which job it belongs
+    to, under which classification standard or in which region. A recipient
+    outside the company has none of that context, so it is either named on the
+    sheet or nowhere. The Excel export writes it itself, in the row above the
+    header, so it is there whether or not the company has set up a letterhead.
 
-    This guarantees that data added through the Custom Columns dialog
-    survives a round-trip through Excel.
+    Args:
+        project: The project row, or ``None`` when it could not be read.
+
+    Returns:
+        The line, or ``None`` when the project answers none of the three, so a
+        caller prints nothing rather than an empty line.
+    """
+    if project is None:
+        return None
+    labels = (("Project", "name"), ("Standard", "classification_standard"), ("Region", "region"))
+    parts = []
+    for label, attr in labels:
+        value = str(getattr(project, attr, "") or "").strip()
+        if value:
+            parts.append(f"{label}: {value}")
+    return "  |  ".join(parts) or None
+
+
+def _export_details(project_line: str | None, currency: str, exported_at: datetime) -> list[str]:
+    """The detail lines of the Excel export's document block, under the bill's name.
+
+    The project line, then the money and the moment: which currency every
+    total on the sheet is stated in, and when the figures were taken. A sheet
+    forwarded a week later is otherwise a set of numbers with no unit and no
+    date. The date is ISO, like the rest of the sheet's own text, which is
+    English and declared so.
+
+    Args:
+        project_line: From :func:`_project_line`, ``None`` when the project
+            names nothing.
+        currency: The base currency the totals are stated in, ``""`` when the
+            project has none.
+        exported_at: When the export was taken.
+
+    Returns:
+        One or two lines, never an empty one.
+    """
+    money = [f"Currency: {currency.strip().upper()}"] if currency and currency.strip() else []
+    when = f"Exported: {exported_at.astimezone(UTC).date().isoformat()}"
+    lines = [project_line] if project_line else []
+    lines.append("  |  ".join([*money, when]))
+    return lines
+
+
+def _render_boq_xlsx(
+    boq_data: Any,
+    structured_data: Any,
+    *,
+    custom_columns: list[dict],
+    project_line: str | None,
+    base_ccy: str,
+    fx_map: Mapping[str, Any],
+    exported_at: datetime | None = None,
+) -> bytes:
+    """Write the Excel export of a bill already read from the database.
+
+    Pure: it touches no session and loads nothing, so the route can run it in a
+    worker thread. ``boq_data`` is the ``BOQWithPositions`` payload,
+    ``structured_data`` the ``BOQWithSections`` one, and ``project_line`` the
+    project's line of the document block, already built from the project row.
+    ``exported_at`` is the moment printed in that block, now when omitted.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side, numbers
     from openpyxl.utils import get_column_letter
-
-    # IDOR guard: scope the export to the project owner/member, matching
-    # every other BOQ read endpoint.
-    await _verify_boq_owner(session, boq_id, _user_id, payload)
-    boq_data = await service.get_boq_with_positions(boq_id)
-    boq_obj = await service.get_boq(boq_id)
-    structured_data = await service.get_boq_structured_for_export(boq_id)
-    # Issue #111 - structured_data totals are FX-converted into the project
-    # base currency; boq_data.grand_total is a raw position sum (wrong for
-    # mixed-currency BOQs). Source the aggregate cells from structured_data
-    # and freeze the FX table used to produce them.
-    base_ccy, fx_map = await service.get_export_fx(boq_id)
 
     def _xl_row_currency(p: Any) -> str:
         meta = getattr(p, "metadata", None) or getattr(p, "metadata_", None) or {}
@@ -4108,15 +4767,13 @@ async def export_boq_excel(
                     return val.strip().upper()
         return base_ccy or ""
 
-    # ── Custom column definitions from BOQ metadata ──────────────────────
-    boq_meta = boq_obj.metadata_ if isinstance(boq_obj.metadata_, dict) else {}
-    custom_columns: list[dict] = boq_meta.get("custom_columns", [])
-    # Sort by sort_order (defensive - backend assigns it on insert)
-    custom_columns = sorted(custom_columns, key=lambda c: c.get("sort_order", 0))
-
     wb = Workbook()
     ws = wb.active
     ws.title = "BOQ"
+
+    # The bill's name, its project, currency and date go above the table at
+    # the end, as one document block (see the letterhead call below).
+    header_row = 1
 
     # ── Header row: standard + custom ────────────────────────────────────
     # Extended set preserves roundtrip data (BUG-163-175) while keeping
@@ -4160,12 +4817,12 @@ async def export_boq_excel(
     right_align = Alignment(horizontal="right")
 
     for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
         cell.font = bold_font
         cell.fill = gray_fill
 
-    # ── Freeze header row ────────────────────────────────────────────────
-    ws.freeze_panes = "A2"
+    # ── Freeze header row (and the project line above it) ────────────────
+    ws.freeze_panes = f"A{header_row + 1}"
 
     # ── Build section lookup for subtotal insertion ───────────────────────
     section_map: dict[str, tuple[str, str, float]] = {}
@@ -4173,7 +4830,7 @@ async def export_boq_excel(
         section_map[str(sec.id)] = (sec.ordinal, sec.description, sec.subtotal)
 
     # ── Position rows (with section headers and subtotals) ───────────────
-    current_row = 2
+    current_row = header_row + 1
     current_section_id: str | None = None
 
     def _write_subtotal(row: int, sec_ordinal: str, sec_desc: str, subtotal: float) -> int:
@@ -4418,10 +5075,13 @@ async def export_boq_excel(
         last_row = rate_row
 
     # ── Auto-width columns ────────────────────────────────────────────────
+    # From the first data row: the project line above the header is one long
+    # cell that runs across the empty cells beside it, and sizing column A to
+    # it would push the table off screen.
     for col_idx in range(1, len(headers) + 1):
         max_length = len(str(headers[col_idx - 1]))
         for row in ws.iter_rows(
-            min_row=2,
+            min_row=header_row + 1,
             max_row=last_row,
             min_col=col_idx,
             max_col=col_idx,
@@ -4434,9 +5094,27 @@ async def export_boq_excel(
         ws.column_dimensions[get_column_letter(col_idx)].width = adjusted
 
     # Align numeric columns to the right
-    for row in ws.iter_rows(min_row=2, max_row=total_row, min_col=4, max_col=6):
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=total_row, min_col=4, max_col=6):
         for cell in row:
             cell.alignment = right_align
+
+    # ── Document block and company letterhead ────────────────────────────
+    # Last, once every row of the table is final: it moves the table down.
+    # The block (the bill's name, then its project, currency and export date)
+    # is written whether or not the company has a profile, because which job
+    # and which money a sheet is about has nothing to do with whether anyone
+    # uploaded a logo; a profile adds the firm above it. The importers find
+    # the header row by its column names under all of it, so the round trip
+    # holds.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(
+        ws,
+        title=boq_data.name,
+        details=_export_details(project_line, base_ccy, exported_at or datetime.now(tz=UTC)),
+    )
 
     # ── Workbook origin metadata ──────────────────────────────────────────
     # Stamp docProps/core.xml + docProps/app.xml so a downloaded BOQ .xlsx
@@ -4456,15 +5134,90 @@ async def export_boq_excel(
     # ── Write to bytes buffer and return ──────────────────────────────────
     buffer = io.BytesIO()
     wb.save(buffer)
-    buffer.seek(0)
+    return buffer.getvalue()
+
+
+@router.get(
+    "/boqs/{boq_id}/export/excel",
+    summary="Export BOQ as Excel (no-slash alias)",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/boqs/{boq_id}/export/excel/",
+    summary="Export BOQ as Excel",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def export_boq_excel(
+    boq_id: uuid.UUID,
+    _user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+    service: BOQService = Depends(_get_service),
+) -> StreamingResponse:
+    """Export BOQ positions as an Excel (xlsx) file with formatting.
+
+    The header layout includes:
+      1. Standard columns (Pos, Description, Unit, Quantity, Rate, Total, Classification)
+      2. Any custom columns the user has defined (from `boq.metadata_.custom_columns`)
+         - values come from `position.metadata_.custom_fields`
+
+    This guarantees that data added through the Custom Columns dialog
+    survives a round-trip through Excel.
+    """
+    # IDOR guard: scope the export to the project owner/member, matching
+    # every other BOQ read endpoint.
+    await _verify_boq_owner(session, boq_id, _user_id, payload)
+    boq_data = await service.get_boq_with_positions(boq_id)
+    boq_obj = await service.get_boq(boq_id)
+    structured_data = await service.get_boq_structured_for_export(boq_id)
+    # Issue #111 - structured_data totals are FX-converted into the project
+    # base currency; boq_data.grand_total is a raw position sum (wrong for
+    # mixed-currency BOQs). Source the aggregate cells from structured_data
+    # and freeze the FX table used to produce them.
+    base_ccy, fx_map = await service.get_export_fx(boq_id)
+
+    # ── Custom column definitions from BOQ metadata ──────────────────────
+    boq_meta = boq_obj.metadata_ if isinstance(boq_obj.metadata_, dict) else {}
+    custom_columns: list[dict] = boq_meta.get("custom_columns", [])
+    # Sort by sort_order (defensive - backend assigns it on insert)
+    custom_columns = sorted(custom_columns, key=lambda c: c.get("sort_order", 0))
+
+    # ── Project line ─────────────────────────────────────────────────────
+    # Which job this bill belongs to, as the PDF export's cover page already
+    # names it. The sheet is read by whoever receives it, and the bill's name
+    # alone does not tell them. It goes into the document block above the
+    # header, which is written with or without a company letterhead.
+    from app.modules.projects.repository import ProjectRepository
+
+    project = await ProjectRepository(session).get_by_id(boq_data.project_id)
+    project_line = _project_line(project)
+
+    # Styling the sheet cell by cell and deflating it is pure CPU that grows with
+    # the bill, so it runs in a worker thread; the reads above stay on the loop
+    # and hand it plain values, never a row that could lazy-load.
+    xlsx = await asyncio.to_thread(
+        _render_boq_xlsx,
+        boq_data,
+        structured_data,
+        custom_columns=custom_columns,
+        project_line=project_line,
+        base_ccy=base_ccy,
+        fx_map=fx_map,
+    )
 
     filename = f"{boq_data.name}.xlsx"
 
     return StreamingResponse(
-        buffer,
+        iter([xlsx]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition": attachment_disposition(filename),
+            # The sheet's own text, the column headers and the project line, is
+            # written in English literals and the route takes no locale. Declaring
+            # it stops the Accept-Language middleware from labelling the workbook
+            # with the language the reader asked for.
+            "Content-Language": "en",
         },
     )
 
@@ -4499,12 +5252,26 @@ async def export_boq_pdf(
             "stay canonical metric and ignore this parameter."
         ),
     ),
+    include_resources: bool = Query(
+        False,
+        description=(
+            "Print each position's resources (labour, material, equipment) "
+            "under it, scaled to the line, so the build-up of every rate is on "
+            "the page. Off by default: the build-up is the estimator's own "
+            "cost and not every recipient's business. The summary report for "
+            "large bills lists no positions and ignores it, and a bill whose "
+            "positions and resources together pass the PDF's row budget (500 "
+            "rows) prints its lines without the build-up and says so on the page."
+        ),
+    ),
 ) -> StreamingResponse:
     """Export BOQ as a professional PDF cost estimate report.
 
     Generates a multi-page PDF document with:
     - Cover page: project name, BOQ title, cost summary, date, status
+    - Table of contents with page numbers, for a bill of more than one section
     - BOQ table pages: sections, positions, subtotals, markups, totals
+    - Cost summary page: each section's subtotal, then the totals
     - Running headers/footers with page numbering
 
     For large BOQs (> 500 positions), a simplified summary report is generated
@@ -4516,11 +5283,16 @@ async def export_boq_pdf(
     left invariant in the project currency, and the data-interchange exports
     are unaffected.
     """
+    from app.core.regional_format import document_country
     from app.modules.boq.pdf_export import (
         LARGE_BOQ_THRESHOLD,
+        PDF_ROW_BUDGET,
         count_boq_positions,
+        count_boq_resource_rows,
         generate_boq_pdf,
         generate_boq_pdf_simple,
+        pdf_language,
+        resource_rows_fit,
     )
     from app.modules.projects.repository import ProjectRepository
     from app.modules.users.models import User
@@ -4529,6 +5301,11 @@ async def export_boq_pdf(
     # every other BOQ read endpoint.
     await _verify_boq_owner(session, boq_id, _user_id, payload)
     boq_data = await service.get_boq_structured_for_export(boq_id)
+    # The subtotals in ``boq_data`` were rolled up in the project's base
+    # currency with this FX table; each printed line is converted with it too,
+    # or a foreign-currency line prints a figure its section subtotal does not
+    # contain.
+    fx_base, fx_map = await service.get_export_fx(boq_id)
 
     # Load project for cover page info
     project_repo = ProjectRepository(session)
@@ -4559,20 +5336,57 @@ async def export_boq_pdf(
             # than mis-stamped "EUR" on a USD/GBP/JPY project. Operators
             # who genuinely have a NULL project currency see "1,234,567"
             # without a symbol - honest, not lying.
-            pdf_bytes = generate_boq_pdf_simple(
+            #
+            # PDF generation is CPU-bound (ReportLab rendering); run in a
+            # thread so it does not stall the event loop for other requests.
+            import asyncio
+
+            _currency = (project.currency or "").strip()
+            _country = document_country(project.country_code, project.region, _currency)
+            _locale = (project.locale or "en").strip()
+            _page_format = "LETTER" if _country.upper() in {"US", "CA"} else "A4"
+            pdf_bytes = await asyncio.to_thread(
+                generate_boq_pdf_simple,
                 boq_data=boq_data,
                 project_name=project.name,
-                currency=(project.currency or "").strip(),
+                currency=_currency,
                 prepared_by=prepared_by,
                 measurement_system=measurement_system,
+                country_code=_country,
+                locale=_locale,
+                page_format=_page_format,
+                base_currency=fx_base,
+                fx_rates=fx_map,
             )
         else:
-            pdf_bytes = generate_boq_pdf(
+            import asyncio
+
+            if include_resources and not resource_rows_fit(boq_data):
+                _log.info(
+                    "BOQ %s: %d positions with %d resource rows pass the PDF row budget (%d) - "
+                    "printing without the resource build-up",
+                    boq_id,
+                    position_count,
+                    count_boq_resource_rows(boq_data),
+                    PDF_ROW_BUDGET,
+                )
+            _currency = (project.currency or "").strip()
+            _country = document_country(project.country_code, project.region, _currency)
+            _locale = (project.locale or "en").strip()
+            _page_format = "LETTER" if _country.upper() in {"US", "CA"} else "A4"
+            pdf_bytes = await asyncio.to_thread(
+                generate_boq_pdf,
                 boq_data=boq_data,
                 project_name=project.name,
-                currency=(project.currency or "").strip(),
+                currency=_currency,
                 prepared_by=prepared_by,
                 measurement_system=measurement_system,
+                country_code=_country,
+                locale=_locale,
+                page_format=_page_format,
+                base_currency=fx_base,
+                fx_rates=fx_map,
+                include_resources=include_resources,
             )
     except Exception:
         _log.exception("PDF generation failed for BOQ %s", boq_id)
@@ -4598,16 +5412,13 @@ async def export_boq_pdf(
         headers={
             "Content-Disposition": attachment_disposition(filename),
             "Content-Length": str(len(pdf_bytes)),
-            # boq/pdf_export.py writes its labels as English literals and takes
-            # no locale, so English is what this page is. Declaring it stops the
-            # Accept-Language middleware from labelling these bytes with the
-            # language the reader asked for. Worth naming what this does not
-            # cover: the same builder formats money on the currency code and
-            # converts quantities on a query parameter while leaving the
-            # description text in the original system, so a reader is being told
-            # about one axis of three. The other two have nowhere to be declared
-            # in a header and are tracked separately.
-            "Content-Language": "en",
+            # The labels are printed in the project's language (English where
+            # boq/pdf_export.py has no table for it), so that is what the page
+            # declares. Declaring it stops the Accept-Language middleware from
+            # labelling these bytes with the language the reader asked for. The
+            # descriptions are the estimator's own text, in whatever language
+            # they were typed.
+            "Content-Language": pdf_language(_locale),
         },
     )
 
@@ -4662,13 +5473,14 @@ async def export_boq_gaeb(
 
     Phases:
     - **DP 83 - Angebotsaufforderung / Request for bid** (default,
-      ``?format=x83``). A priced LV is valid in DP 83 (the Einheitspreis is
-      optional in the schema, so carrying it does not break conformance).
+      ``?format=x83``). Unpriced: the call for bids goes out without prices,
+      so an ``Item`` carries no ``UP`` or ``IT``, and there are no markup
+      positions and no ``Totals``, whatever rates the bill holds.
     - **DP 84 - Angebotsabgabe / Bid submission** (``?format=x84``). A plain
       Hauptangebot by default; ``bid_type=alternate`` additionally writes the
       Nebenangebot rationale of flagged positions as ``BidComm`` elements.
 
-    Money: each ``Item`` carries ``UP`` (Einheitspreis, 3 dp) and ``IT``
+    Money (DP 84 only): each ``Item`` carries ``UP`` (Einheitspreis, 3 dp) and ``IT``
     (Gesamtbetrag, 2 dp) reconstructed so a consumer recomputing ``Qty x UP``
     lands exactly on ``IT``. Markups are not dropped - every active markup is
     written as a real GAEB ``MarkupItem`` (Zuschlagsposition) in its own
@@ -4694,7 +5506,10 @@ async def export_boq_gaeb(
     project_currency = (project.currency or "").strip()[:3].upper() if project else ""
 
     # Build the schema-valid document via the pure, unit-tested builder.
-    xml_content = build_gaeb_xml(
+    # The builder walks every item of the bill and is pure CPU, so it runs in a
+    # worker thread rather than holding up every other request on the loop.
+    xml_content = await asyncio.to_thread(
+        build_gaeb_xml,
         boq_data,
         project_name=project_name,
         project_currency=project_currency,
@@ -4761,7 +5576,10 @@ async def export_boq_bc3(
     project_name = project.name if project else "OpenConstructionERP Project"
     project_currency = (project.currency or "").strip()[:3].upper() if project else ""
 
-    data, http_charset = build_bc3(
+    # The builder walks every line of the bill and is pure CPU, so it runs in a
+    # worker thread rather than holding up every other request on the loop.
+    data, http_charset = await asyncio.to_thread(
+        build_bc3,
         boq_data,
         project_name=project_name,
         project_currency=project_currency,
@@ -5331,6 +6149,12 @@ def build_gaeb_xml(
     # with the file at rest.
     xml_declaration = '<?xml version="1.0" encoding="UTF-8"?>\n'
     xml_provenance = f"<!-- OpenConstructionERP · DataDrivenConstruction · {_xtok_gaeb} -->\n"
+    # A control character pasted into a description (a vertical tab from a
+    # spreadsheet) is illegal in XML 1.0 even escaped, and ElementTree writes
+    # it raw: the file would not parse anywhere, our own import included.
+    from app.modules.boq.gaeb_common import strip_xml_control_chars
+
+    strip_xml_control_chars(gaeb)
     xml_body = ET.tostring(gaeb, encoding="unicode", xml_declaration=False)
     return xml_declaration + xml_provenance + xml_body
 
@@ -5339,71 +6163,11 @@ def build_gaeb_xml(
 
 logger = logging.getLogger(__name__)
 
-# Column name aliases for flexible matching (all lowercased for comparison)
-_COLUMN_ALIASES: dict[str, list[str]] = {
-    # Round-trip identity (GitHub #360) - matched first so an exported
-    # "Position ID" header maps here, never to ``ordinal``.
-    "position_id": sorted(ID_COLUMN_ALIASES),
-    "ordinal": ["pos", "pos.", "position", "ordinal", "nr.", "nr", "no.", "no", "#"],
-    "description": [
-        "description",
-        "beschreibung",
-        "desc",
-        "text",
-        "bezeichnung",
-        "item",
-        "item description",
-    ],
-    "unit": ["unit", "einheit", "me", "uom", "unit of measure"],
-    "quantity": ["quantity", "qty", "menge", "amount", "qty.", "quantity (qty)"],
-    "unit_rate": [
-        "unit rate",
-        "rate",
-        "ep",
-        "einheitspreis",
-        "unit price",
-        "unit cost",
-        "price",
-        "rate (ep)",
-    ],
-    "total": ["total", "amount", "gesamtpreis", "gp", "sum", "total price"],
-    "classification": [
-        "classification",
-        "din 276",
-        "din276",
-        "kg",
-        "nrm",
-        "code",
-        "masterformat",
-        "cost code",
-        "cost group",
-        "class",
-        # Brazilian estimators commonly label the classification column as
-        # one of these in Excel exports from Orçafascio / Sienge / planilhas
-        # padrão SINAPI - recognising them avoids force-mapping to "ordinal".
-        "sinapi",
-        "código sinapi",
-        "codigo sinapi",
-        "nbr",
-        "nbr 12721",
-    ],
-}
-
-
-def _match_column(header: str) -> str | None:
-    """Match a header string to a canonical column name using the alias map.
-
-    Args:
-        header: Raw column header text from the uploaded file.
-
-    Returns:
-        Canonical column key (e.g. "ordinal", "description") or None if unrecognised.
-    """
-    normalised = header.strip().lower()
-    for canonical, aliases in _COLUMN_ALIASES.items():
-        if normalised in aliases:
-            return canonical
-    return None
+# Column headers are read through the Excel importer's language-tagged table
+# (``importers/excel.py``), so the legacy ``/import/excel/`` and the smart
+# import's direct path read the same headers ``/import/auto/`` does. This file
+# used to keep its own English and German list, so a bill headed in any other
+# language imported through ``/import/auto/`` and was refused here.
 
 
 def _detect_file_format(content_head: bytes) -> Literal["xlsx", "csv", "parquet", "unknown"]:
@@ -5506,110 +6270,6 @@ def _parse_numeric_cell(value: Any) -> tuple[float | None, str | None]:
     return parsed, None
 
 
-def _parse_rows_from_csv(content_bytes: bytes) -> list[dict[str, Any]]:
-    """Parse rows from a CSV file.
-
-    Tries UTF-8 first, then Latin-1 as fallback (common for DACH region files).
-
-    Returns:
-        List of dicts mapping canonical column names to cell values.
-    """
-    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            text = content_bytes.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        raise ValueError("Unable to decode CSV file - unsupported encoding")
-
-    # Detect delimiter by sniffing first 4KB
-    sniffer = csv.Sniffer()
-    try:
-        dialect = sniffer.sniff(text[:4096], delimiters=",;\t|")
-    except csv.Error:
-        dialect = csv.excel  # type: ignore[assignment]
-
-    reader = csv.reader(io.StringIO(text), dialect)
-    raw_headers = next(reader, None)
-    if not raw_headers:
-        raise ValueError("CSV file is empty or has no header row")
-
-    column_map: dict[int, str] = {}
-    for idx, hdr in enumerate(raw_headers):
-        canonical = _match_column(hdr)
-        if canonical:
-            column_map[idx] = canonical
-
-    rows: list[dict[str, Any]] = []
-    for raw_row in reader:
-        row: dict[str, Any] = {}
-        for idx, val in enumerate(raw_row):
-            canonical = column_map.get(idx)
-            if canonical:
-                row[canonical] = val.strip() if isinstance(val, str) else val
-        if row:
-            rows.append(row)
-
-    return rows
-
-
-def _parse_rows_from_excel(
-    content_bytes: bytes,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Parse rows from an Excel (.xlsx) file using openpyxl.
-
-    Reads the first (active) worksheet. The first row is treated as headers.
-
-    Returns:
-        Tuple of (rows, import_metadata).
-        rows: List of dicts mapping canonical column names to cell values.
-        import_metadata: Original file structure info for round-trip export.
-    """
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(content_bytes), read_only=True, data_only=True)
-    ws = wb.active
-    if ws is None:
-        raise ValueError("Excel file has no worksheets")
-
-    sheet_names = wb.sheetnames
-
-    rows_iter = ws.iter_rows(values_only=True)
-    raw_headers = next(rows_iter, None)
-    if not raw_headers:
-        raise ValueError("Excel file is empty or has no header row")
-
-    original_columns = [str(h) if h is not None else "" for h in raw_headers]
-    column_map: dict[int, str] = {}
-    for idx, hdr in enumerate(raw_headers):
-        if hdr is not None:
-            canonical = _match_column(str(hdr))
-            if canonical:
-                column_map[idx] = canonical
-
-    rows: list[dict[str, Any]] = []
-    for raw_row in rows_iter:
-        row: dict[str, Any] = {}
-        for idx, val in enumerate(raw_row):
-            canonical = column_map.get(idx)
-            if canonical and val is not None:
-                row[canonical] = val
-        if row:
-            rows.append(row)
-
-    wb.close()
-
-    import_metadata = {
-        "original_columns": original_columns,
-        "column_mapping": {str(k): v for k, v in column_map.items()},
-        "sheet_names": sheet_names,
-        "total_rows": len(rows),
-    }
-
-    return rows, import_metadata
-
-
 # ── Round-trip apply (GitHub #360) ────────────────────────────────────────────
 #
 # Shared by every spreadsheet import path (legacy /import/excel/ and the
@@ -5640,17 +6300,20 @@ def _prepared_row_to_create(
     boq_id: uuid.UUID,
     pr: Mapping[str, Any],
     parent_id: uuid.UUID | None = None,
+    after_position_id: uuid.UUID | None = None,
 ) -> PositionCreate:
     """Map a validated round-trip row to a ``PositionCreate`` (new position).
 
     ``parent_id`` carries the section link resolved by the create loop -
     without it every imported row landed flat (parent NULL), so an imported
     GAEB LV kept its section rows but they had zero children and every real
-    item fell into the ungrouped bucket.
+    item fell into the ungrouped bucket. ``after_position_id`` places the row
+    straight after the one created before it, see the create loop.
     """
     return PositionCreate(
         boq_id=boq_id,
         parent_id=parent_id,
+        after_position_id=after_position_id,
         ordinal=pr["ordinal"],
         description=pr.get("description", "") or "",
         unit=pr["unit"],
@@ -5683,8 +6346,9 @@ def _resolve_import_parent(
       dotted ordinal is a proper prefix of its own ("01.02" under "01");
       no such ancestor means top-level;
     * an ITEM that names its enclosing section (the GAEB importer stamps
-      ``gaeb_section`` into metadata/classification) attaches to that
-      section's row; an explicitly empty name means top-level;
+      ``gaeb_section`` into metadata/classification, the XPWE importer the
+      neutral ``import_section`` into metadata) attaches to that section's
+      row; an explicitly empty name means top-level;
     * an ITEM with no signal at all (flat Excel / BC3 sheets) attaches to
       the nearest section row above it - exactly how the sheet reads. With
       no section rows in the upload this stays ``None``, so flat imports
@@ -5701,6 +6365,8 @@ def _resolve_import_parent(
     meta = pr.get("metadata") or {}
     cls = pr.get("classification") or {}
     explicit = meta.get("gaeb_section", cls.get("gaeb_section", _NO_SECTION_SIGNAL))
+    if explicit is _NO_SECTION_SIGNAL:
+        explicit = meta.get("import_section", _NO_SECTION_SIGNAL)
     if explicit is not _NO_SECTION_SIGNAL:
         key = str(explicit or "").strip()
         return section_id_by_ordinal.get(key) if key else None
@@ -5743,6 +6409,59 @@ def _prepared_row_to_update(pr: Mapping[str, Any], stored: Any) -> PositionUpdat
     return PositionUpdate(**changed)
 
 
+async def _create_in_document_order(
+    boq_id: uuid.UUID,
+    creates: Sequence[Any],
+    *,
+    service: BOQService,
+    apply_errors: list[dict[str, Any]],
+) -> int | None:
+    """Write an importer's new rows in one batch; ``None`` when they need the per-row path.
+
+    The rows get the parents, the per-row errors and the stored values the
+    loop in :func:`_apply_boq_roundtrip` would give them: parents are resolved
+    the same way, against ids assigned up front, and a row ``PositionCreate``
+    refuses is reported and left out as it is there. Returns how many rows
+    were created. Nothing has been written when it returns ``None``.
+    """
+    from app.modules.boq.service import BulkCreateNotApplicable
+
+    section_id_by_ordinal: dict[str, uuid.UUID] = {}
+    last_section_id: uuid.UUID | None = None
+    items: list[tuple[uuid.UUID, PositionCreate]] = []
+    row_errors: list[dict[str, Any]] = []
+    for action in creates:
+        row_payload = action.row.payload
+        parent_id = _resolve_import_parent(row_payload, section_id_by_ordinal, last_section_id)
+        try:
+            data = _prepared_row_to_create(boq_id, row_payload, parent_id=parent_id)
+        except Exception as exc:  # noqa: BLE001 - reported per row, as the loop does
+            row_errors.append({"row": action.row.row_index, "error": str(exc)})
+            continue
+        position_id = uuid.uuid4()
+        items.append((position_id, data))
+        if row_payload.get("is_section"):
+            ordinal_key = str(row_payload.get("ordinal") or "").strip()
+            if ordinal_key:
+                section_id_by_ordinal[ordinal_key] = position_id
+            last_section_id = position_id
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        # A savepoint, so a statement that fails part way through the batch
+        # takes the whole batch back and the rows are written one by one,
+        # each with its own error, as before.
+        async with service.session.begin_nested():
+            created = await service.add_positions_in_document_order(boq_id, items)
+    except (BulkCreateNotApplicable, HTTPException):
+        return None
+    except SQLAlchemyError:
+        logger.warning("Batch import into BOQ %s failed; writing the rows one by one", boq_id, exc_info=True)
+        return None
+    apply_errors.extend(row_errors)
+    return len(created)
+
+
 async def _apply_boq_roundtrip(
     boq_id: uuid.UUID,
     prepared_rows: list[dict[str, Any]],
@@ -5750,8 +6469,14 @@ async def _apply_boq_roundtrip(
     service: BOQService,
     delete_missing: bool = False,
     actor_id: uuid.UUID | None = None,
+    document_order: bool = False,
 ) -> dict[str, Any]:
     """Apply validated import rows to a BOQ using the round-trip differ.
+
+    ``document_order`` is the importer's word that the rows are in tree order
+    (see ``ImportedBOQ.document_order``): a plain append is then written in
+    one batch, falling back to one row at a time when the batch cannot take
+    the rows.
 
     ``prepared_rows`` items are dicts with keys ``row_index``,
     ``position_id`` (raw id cell or ``None``), ``ordinal``, ``description``,
@@ -5826,12 +6551,28 @@ async def _apply_boq_roundtrip(
     section_id_by_ordinal: dict[str, uuid.UUID] = {}
     last_section_id: uuid.UUID | None = None
 
-    for action in plan.creates:
+    creates = plan.creates
+    if document_order and not round_trip and creates:
+        batch_created = await _create_in_document_order(boq_id, creates, service=service, apply_errors=apply_errors)
+        if batch_created is not None:
+            created += batch_created
+            creates = []
+
+    # Each row goes straight after the row created before it, so the rows
+    # keep the file's order. Placed by its parent alone, a section went ahead
+    # of its parent's earlier sub-sections (the anchoring that keeps a
+    # hand-added item above the sub-sections), and a file's sub-sections came
+    # out last to first.
+    previous_id: uuid.UUID | None = None
+    for action in creates:
         row_payload = action.row.payload
         parent_id = _resolve_import_parent(row_payload, section_id_by_ordinal, last_section_id)
         try:
-            created_row = await service.add_position(_prepared_row_to_create(boq_id, row_payload, parent_id=parent_id))
+            created_row = await service.add_position(
+                _prepared_row_to_create(boq_id, row_payload, parent_id=parent_id, after_position_id=previous_id)
+            )
             created += 1
+            previous_id = getattr(created_row, "id", None) or previous_id
             if row_payload.get("is_section"):
                 created_id = getattr(created_row, "id", None)
                 if created_id is not None:
@@ -5916,7 +6657,10 @@ async def import_boq_excel(
 
     # Verify BOQ exists AND the caller owns its project (IDOR guard).
     await _verify_boq_owner(session, boq_id, _user_id, payload)
-    await service.get_boq(boq_id)
+    # Refuse a locked bill up front with the lock's own 409. Past this point
+    # every row write is caught and collected per row, so a lock found there
+    # came back as a row error (or a 200 with nothing imported) instead.
+    await service._ensure_boq_writable(boq_id)
 
     # Validate file type
     filename = (file.filename or "").lower()
@@ -5998,7 +6742,7 @@ async def import_boq_excel(
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No data rows found in file. Check that the first row contains column headers.",
+            detail="No data rows found in file. Check that the header row names the columns.",
         )
 
     # Validate + normalise each row into a "prepared" dict; persistence is
@@ -6024,7 +6768,13 @@ async def import_boq_excel(
     _rate_samples.sort()
     _median_rate = _rate_samples[len(_rate_samples) // 2] if _rate_samples else 0.0
 
-    for row_idx, row in enumerate(rows, start=2):  # start=2 because row 1 is header
+    # Section totals, tax lines and the recap page are not work: leave them
+    # out and say so, instead of importing each one as an empty section.
+    kept_rows, summary_rows = partition_summary_rows(rows, row_numbers=import_meta.get("row_numbers"))
+    skipped += len(summary_rows)
+    warnings_list.extend(summary_row_warning(report) for report in summary_rows)
+
+    for row_idx, row in kept_rows:  # the sheet's own row numbers when it is an xlsx
         try:
             description = str(row.get("description", "")).strip()
 
@@ -6161,7 +6911,7 @@ async def import_boq_excel(
             # Soft checks - imported, but surfaced in the UI so the user
             # can spot tampered-export attacks (ENH-090 / BUG-154) and
             # data-quality issues.
-            if _median_rate > 0 and unit_rate > _median_rate * 10:
+            if _median_rate > 0 and unit_rate > _median_rate * 10 and not is_lump_sum_unit(unit):
                 warnings_list.append(
                     {
                         "row": row_idx,
@@ -6197,6 +6947,11 @@ async def import_boq_excel(
             class_value = str(row.get("classification", "")).strip()
             if class_value:
                 classification["code"] = class_value
+            # The price bank the line is priced from, which says whose code
+            # the code column holds (see the Brazilian ``banco`` header).
+            bank = str(row.get("banco") or "").strip()
+            if bank:
+                classification["banco"] = bank
 
             # Stamp import provenance for a later round-trip export.
             pos_metadata: dict[str, Any] = {}
@@ -6234,6 +6989,9 @@ async def import_boq_excel(
     # ── Round-trip apply (GitHub #360) ────────────────────────────────────
     # Update-in-place on known ids, create on blank/unknown ids, optional
     # delete of rows the sheet dropped. Cross-BOQ ids can never update.
+    code_key = await _project_national_code_key(boq_id, service)
+    for entry in prepared:
+        entry["classification"] = _carry_national_code(entry["classification"], code_key, is_section=False)
     apply_summary = await _apply_boq_roundtrip(
         boq_id,
         prepared,
@@ -6374,7 +7132,10 @@ async def import_boq_gaeb(
 
     # Verify BOQ exists AND the caller owns its project (IDOR guard).
     await _verify_boq_owner(session, boq_id, _user_id, payload)
-    await service.get_boq(boq_id)
+    # Refuse a locked bill up front with the lock's own 409. Past this point
+    # every row write is caught and collected per row, so a lock found there
+    # came back as a row error (or a 200 with nothing imported) instead.
+    await service._ensure_boq_writable(boq_id)
 
     filename = (file.filename or "").lower()
     if not filename.endswith((".x81", ".x83", ".x84", ".xml")):
@@ -6417,7 +7178,7 @@ async def import_boq_gaeb(
     except ImporterParseError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to parse GAEB XML: {exc}",
+            detail=exc.as_detail(),
         ) from exc
 
     apply_summary = await _persist_imported_boq(
@@ -6505,10 +7266,17 @@ async def _persist_imported_boq(
     Returns the apply summary dict (``created`` / ``updated`` / ``unchanged``
     / ``deleted`` / ``would_delete`` / ``round_trip`` / ``problems`` /
     ``apply_errors``).
+
+    Each new line's raw code is also carried under the classification key the
+    project's national code rules read, see :func:`_carry_national_code`. An
+    update never writes classification, so a re-import leaves a code the user
+    corrected alone.
     """
+    code_key = await _project_national_code_key(boq_id, service)
     prepared: list[dict[str, Any]] = []
     for idx, row in enumerate(imported.positions, start=1):
         meta = row.metadata if isinstance(row.metadata, dict) else {}
+        is_section = bool(getattr(row, "is_section", False))
         prepared.append(
             {
                 "row_index": int(meta.get("import_row_index", idx) or idx),
@@ -6520,10 +7288,10 @@ async def _persist_imported_boq(
                 "unit": row.unit,
                 "quantity": row.quantity,
                 "unit_rate": row.unit_rate,
-                "classification": row.classification,
+                "classification": _carry_national_code(row.classification, code_key, is_section=is_section),
                 "source": row.source,
                 "metadata": {**meta, "import_source": file_name},
-                "is_section": bool(getattr(row, "is_section", False)),
+                "is_section": is_section,
             }
         )
 
@@ -6533,6 +7301,7 @@ async def _persist_imported_boq(
         service=service,
         delete_missing=delete_missing,
         actor_id=actor_id,
+        document_order=bool(getattr(imported, "document_order", False)),
     )
 
     # Persist parsed markups (GAEB Zuschlagsposition / MarkupItem). The GAEB
@@ -6543,8 +7312,75 @@ async def _persist_imported_boq(
     # natively created one (and a later GAEB export round-trips it).
     if (summary["created"] + summary["updated"] + summary["deleted"]) > 0:
         await _persist_imported_markups(boq_id, imported, service=service, errors=summary["apply_errors"])
+        await _persist_import_deductions(boq_id, imported, service=service, errors=summary["apply_errors"])
 
     return summary
+
+
+# The bill's one deductions line, found again by this role on every import.
+_DEDUCTIONS_ROLE = "import_deductions"
+_DEDUCTIONS_NAME = "Detrazioni / minori lavori"
+
+
+async def _persist_import_deductions(
+    boq_id: uuid.UUID,
+    imported: "ImportedBOQ",  # noqa: F821 - resolved at call site
+    *,
+    service: BOQService,
+    errors: list[dict[str, Any]],
+) -> None:
+    """Take the bill's deduction lines off its total with one fixed markup line.
+
+    An importer that met items with a negative amount imports them without a
+    price, flagged ``metadata.deduction`` with the signed amount kept, and says
+    so in ``imported.metadata['deductions']``. The markup line carries minus
+    the sum of every such line on the bill, read from the stored rows, so a
+    second import of the same file updates the one line instead of adding
+    another, and the line always matches the deductions the bill holds.
+
+    The amount is negative, which ``MarkupCreate`` refuses from a client
+    (``fixed_amount >= 0``), so the payload is built without validation; the
+    engine adds a fixed amount as it is. Failures never abort the import.
+    """
+    meta = getattr(imported, "metadata", None)
+    try:
+        existing = next(
+            (
+                m
+                for m in await service.list_markups(boq_id)
+                if isinstance(m.metadata_, dict) and m.metadata_.get("role") == _DEDUCTIONS_ROLE
+            ),
+            None,
+        )
+        # A positive replacement file can remove the last deduction position.
+        # Reconcile an existing import credit even when this file has none.
+        if existing is None and not (isinstance(meta, dict) and meta.get("deductions")):
+            return
+        positions = await service.position_repo.list_all_for_boq(boq_id)
+        lines = [
+            p.metadata_ for p in positions if isinstance(p.metadata_, dict) and p.metadata_.get("deduction") is True
+        ]
+        amount = sum((Decimal(str(m.get("deduction_amount") or "0")) for m in lines), Decimal(0))
+        line_meta = {"source": "import", "role": _DEDUCTIONS_ROLE, "lines": len(lines)}
+        if existing is not None:
+            await service.update_markup(
+                existing.id, MarkupUpdate.model_construct(fixed_amount=amount, metadata=line_meta)
+            )
+        else:
+            await service.add_markup(
+                boq_id,
+                MarkupCreate.model_construct(
+                    name=_DEDUCTIONS_NAME,
+                    markup_type="fixed",
+                    category="other",
+                    fixed_amount=amount,
+                    apply_to="direct_cost",
+                    metadata=line_meta,
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 - never abort an import on a markup
+        errors.append({"ordinal": "", "code": "import_deductions_failed", "error": f"Deductions line failed: {exc}"})
+        logger.warning("Deductions line for BOQ %s failed: %s", boq_id, exc)
 
 
 async def _persist_imported_markups(
@@ -6690,6 +7526,7 @@ async def import_boq_auto(
     ),
     service: BOQService = Depends(_get_service),
     session: SessionDep = None,  # type: ignore[assignment]
+    response: Response = None,  # type: ignore[assignment]
     delete_missing: bool = Query(
         False,
         description=(
@@ -6697,6 +7534,40 @@ async def import_boq_auto(
             "Excel/CSV carrying a Position ID column, positions absent from "
             "the sheet are DELETED. Off by default; the response always "
             "reports how many WOULD be deleted so nothing is removed silently."
+        ),
+    ),
+    background: bool = Query(
+        False,
+        description=(
+            "Read and write the file in a background job and answer 202 with "
+            "its ``job_id`` at once; poll ``GET /boqs/{boq_id}/import/jobs/"
+            "{job_id}/`` for progress and, once it succeeded, the response "
+            "the synchronous call would have given. The same file posted "
+            "again to the same bill with the same options gets the same job "
+            "back while it runs, so a retry never imports a bill twice; "
+            "posted after it was imported, while what it imported is still "
+            "there, it is answered 409 ``import_already_done`` with the date "
+            "(see ``force``). A file no native reader claims is still "
+            "answered synchronously."
+        ),
+    ),
+    force: bool = Query(
+        False,
+        description=(
+            "With ``background``: import the file again although it was "
+            "imported into this bill before. Sent when the person chose "
+            '"Import again" after the 409 ``import_already_done``.'
+        ),
+    ),
+    column_mapping: str | None = Form(
+        None,
+        description=(
+            "Spreadsheets only. A JSON object of column index to the field the "
+            "column holds, for the columns the user changed in the import "
+            'preview: {"3": "quantity", "5": ""}. The indices are those of '
+            "metadata.original_columns in the preview; an empty string leaves "
+            "the column out; every column not named keeps the importer's own "
+            "reading."
         ),
     ),
 ) -> dict[str, Any]:
@@ -6717,6 +7588,9 @@ async def import_boq_auto(
     (LLM) path so legacy ``smart_import`` behaviour remains the
     last-chance fallback.
 
+    With ``background=true`` and a native reader, the answer is 202
+    ``{job_id, status, progress_percent, phase, reused}`` instead.
+
     Returns:
         ``{imported, skipped, errors, warnings, source_format,
           format_id, currency, validation_report, metadata, method}``.
@@ -6724,11 +7598,14 @@ async def import_boq_auto(
     # Import here to avoid a circular at module load (importers package
     # depends on ``app.core.file_signature`` which is fine, but the
     # registry is consulted only at request time).
-    from app.modules.boq.importers import REGISTERED_IMPORTERS, ImportedBOQ, ImporterParseError
+    from app.modules.boq.importers import REGISTERED_IMPORTERS
 
     # Verify BOQ exists AND the caller owns its project (IDOR guard).
     await _verify_boq_owner(session, boq_id, user_id, payload)
-    await service.get_boq(boq_id)
+    # Refuse a locked bill up front with the lock's own 409. Past this point
+    # every row write is caught and collected per row, so a lock found there
+    # came back as a row error (or a 200 with nothing imported) instead.
+    await service._ensure_boq_writable(boq_id)
 
     content = await file.read()
     if not content:
@@ -6737,6 +7614,9 @@ async def import_boq_auto(
             detail="Uploaded file is empty.",
         )
     file_name = file.filename or "upload"
+    from app.modules.boq.importers.excel import column_mapping_warning
+
+    overrides = _read_column_mapping(column_mapping)
 
     head = content[:4096]
     chosen: type | None = None
@@ -6780,14 +7660,108 @@ async def import_boq_auto(
         )
         result["method"] = "smart_fallback"
         result["format_id"] = "smart"
+        if overrides:
+            result["warnings"] = [*(result.get("warnings") or []), column_mapping_warning("format")]
         return result
 
+    if background:
+        from app.modules.boq.import_jobs import enqueue_boq_import
+
+        job = await enqueue_boq_import(
+            session,
+            boq_id=boq_id,
+            actor_id=user_id,
+            content=content,
+            file_name=file_name,
+            format_id=chosen.format_id,
+            delete_missing=delete_missing,
+            column_mapping=column_mapping,
+            force=force,
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return job
+
+    return await _run_native_import(
+        boq_id,
+        chosen,
+        content,
+        file_name=file_name,
+        overrides=overrides,
+        delete_missing=delete_missing,
+        actor_id=user_id,
+        service=service,
+    )
+
+
+@router.get(
+    "/boqs/{boq_id}/import/jobs/{job_id}/",
+    summary="Progress and result of a background BOQ import",
+    dependencies=[Depends(RequirePermission("boq.read"))],
+)
+async def get_boq_import_job(
+    boq_id: uuid.UUID,
+    job_id: uuid.UUID,
+    user_id: CurrentUserId,
+    payload: CurrentUserPayload,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """The state of an import started with ``POST /import/auto/?background=true``.
+
+    ``{job_id, status, progress_percent, phase}``, plus ``result`` (what the
+    synchronous import would have answered) once it succeeded, or ``error``
+    (the reason the file was refused, worded for the reader, or null for an
+    internal failure) once it failed. A job is found only through the bill it
+    imports into, by someone with access to that bill.
+    """
+    from app.modules.boq.import_jobs import read_boq_import_job
+
+    await _verify_boq_owner(session, boq_id, user_id, payload)
+    return await read_boq_import_job(session, boq_id=boq_id, job_id=job_id)
+
+
+def _unexpected_parse_failure(chosen: type) -> dict[str, Any]:
+    """The 400 ``detail`` for an importer that failed in a way it did not word itself.
+
+    Coded like an :class:`ImporterParseError` detail, so the import dialog
+    words it in the reader's language; ``format`` is the importer's id.
+    """
+    return {
+        "code": "import_parse_unexpected",
+        "params": {"format": chosen.format_id},
+        "message": f"Could not read the file as {chosen.display_name}.",
+    }
+
+
+async def _run_native_import(
+    boq_id: uuid.UUID,
+    chosen: type,
+    content: bytes,
+    *,
+    file_name: str,
+    overrides: dict[int, str] | None,
+    delete_missing: bool,
+    actor_id: uuid.UUID | None,
+    service: BOQService,
+    on_phase: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
+    """Read ``content`` with the importer ``chosen`` and write it into the bill: the body of ``/import/auto/``.
+
+    The synchronous route and the background import job both run it, so a
+    job's result is exactly the response the route would have given.
+    ``on_phase`` hears ``"writing"`` once the file is read and
+    ``"validating"`` once the rows are committed.
+
+    Raises:
+        HTTPException 400: the file could not be read as ``chosen``'s format.
+    """
+    from app.modules.boq.importers import ImportedBOQ, ImporterParseError
+
     try:
-        imported_boq: ImportedBOQ = await chosen.parse(content, locale=get_locale())
+        imported_boq: ImportedBOQ = await _parse_with_mapping(chosen, content, overrides)
     except ImporterParseError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not parse file as {chosen.display_name}: {exc}",
+            detail=exc.as_detail(),
         ) from exc
     except Exception as exc:  # noqa: BLE001 - log + sanitise
         logger.exception(
@@ -6798,16 +7772,18 @@ async def import_boq_auto(
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not parse file as {chosen.display_name}: unexpected error.",
+            detail=_unexpected_parse_failure(chosen),
         ) from exc
 
+    if on_phase is not None:
+        await on_phase("writing")
     apply_summary = await _persist_imported_boq(
         boq_id,
         imported_boq,
         file_name=file_name,
         service=service,
         delete_missing=delete_missing,
-        actor_id=user_id,
+        actor_id=actor_id,
     )
     created = int(apply_summary["created"])
     updated = int(apply_summary["updated"])
@@ -6844,6 +7820,8 @@ async def import_boq_auto(
     # (philosophy: validation is a first-class citizen of every import).
     validation_report = None
     if (created + updated) > 0:
+        if on_phase is not None:
+            await on_phase("validating")
         validation_report = await _run_import_validation(boq_id, service, service.session)
 
     logger.info(
@@ -6908,6 +7886,17 @@ async def import_preview(
             "JSON without persisting anything."
         ),
     ),
+    column_mapping: str | None = Form(
+        None,
+        description=(
+            "Spreadsheets only. A JSON object of column index to the field the "
+            "column holds, for the columns the user changed in the import "
+            'preview: {"3": "quantity", "5": ""}. The indices are those of '
+            "metadata.original_columns in the preview; an empty string leaves "
+            "the column out; every column not named keeps the importer's own "
+            "reading."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Parse a BOQ upload and return positions without persisting to the database.
 
@@ -6934,6 +7923,7 @@ async def import_preview(
             detail="Uploaded file is empty.",
         )
     file_name = file.filename or "upload"
+    overrides = _read_column_mapping(column_mapping)
 
     head = content[:4096]
     chosen: type | None = None
@@ -6956,16 +7946,16 @@ async def import_preview(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 "No native importer recognised this file format. "
-                "Supported formats: GAEB XML, BC3 / FIEBDC-3, Excel (.xlsx/.xls), CSV."
+                "Supported formats: GAEB XML, BC3 / FIEBDC-3, XPWE, Excel (.xlsx, .xls), CSV."
             ),
         )
 
     try:
-        imported_boq: ImportedBOQ = await chosen.parse(content, locale=get_locale())
+        imported_boq: ImportedBOQ = await _parse_with_mapping(chosen, content, overrides)
     except ImporterParseError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not parse file as {chosen.display_name}: {exc}",
+            detail=exc.as_detail(),
         ) from exc
     except Exception as exc:  # noqa: BLE001 - log + sanitise
         logger.exception(
@@ -6975,7 +7965,7 @@ async def import_preview(
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Could not parse file as {chosen.display_name}: unexpected error.",
+            detail=_unexpected_parse_failure(chosen),
         ) from exc
 
     all_positions = imported_boq.positions
@@ -7012,6 +8002,36 @@ async def import_preview(
     )
 
     return response.model_dump()
+
+
+def _read_column_mapping(raw: str | None) -> dict[int, str] | None:
+    """The ``column_mapping`` form field, or a 422 that says what is wrong with it."""
+    from app.modules.boq.importers.excel import parse_column_mapping
+
+    try:
+        return parse_column_mapping(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+
+
+async def _parse_with_mapping(
+    chosen: type,
+    content: bytes,
+    overrides: dict[int, str] | None,
+) -> "ImportedBOQ":
+    """Parse with the importer the dispatcher chose, laying the user's column mapping over a spreadsheet.
+
+    Any other format has no columns to map, so the mapping is noted as not
+    used rather than dropped without a word.
+    """
+    from app.modules.boq.importers.excel import ExcelImporter, column_mapping_warning
+
+    if chosen is ExcelImporter:
+        return await ExcelImporter.parse(content, locale=get_locale(), column_mapping=overrides)
+    imported = await chosen.parse(content, locale=get_locale())
+    if overrides:
+        imported.warnings.append(column_mapping_warning("format"))
+    return imported
 
 
 # ── Smart import helpers ─────────────────────────────────────────────────────
@@ -7078,19 +8098,26 @@ def _extract_from_excel_for_smart(content: bytes) -> dict[str, Any]:
         Dict with ``text``, ``structured`` flag, and optionally ``rows``.
     """
     try:
-        rows, _meta = _parse_rows_from_excel(content)
+        rows, meta = _parse_rows_from_excel(content)
         if rows:
             # Check if we have enough structure for a direct import
             has_description = any(r.get("description") for r in rows)
             if has_description:
-                return {"text": "", "structured": True, "rows": rows}
+                return {
+                    "text": "",
+                    "structured": True,
+                    "rows": rows,
+                    "row_numbers": meta.get("row_numbers"),
+                    "header_language": meta.get("header_language"),
+                    "sheet_notes": meta.get("sheet_notes"),
+                }
     except Exception:
         logger.debug("Smart import: structured Excel parsing failed, using raw text", exc_info=True)
 
     # Fall back to extracting raw text from all cells
-    from openpyxl import load_workbook
+    from app.modules.boq.importers._workbook import open_workbook
 
-    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    wb = open_workbook(content)
     ws = wb.active
     text_parts: list[str] = []
     if ws is not None:
@@ -7116,11 +8143,17 @@ def _extract_from_csv_for_smart(content: bytes) -> dict[str, Any]:
         Dict with ``text``, ``structured`` flag, and optionally ``rows``.
     """
     try:
-        rows = _parse_rows_from_csv(content)
+        rows, meta = _parse_csv(content)
         if rows:
             has_description = any(r.get("description") for r in rows)
             if has_description:
-                return {"text": "", "structured": True, "rows": rows}
+                return {
+                    "text": "",
+                    "structured": True,
+                    "rows": rows,
+                    "row_numbers": meta.get("row_numbers"),
+                    "header_language": meta.get("header_language"),
+                }
     except Exception:
         logger.debug("Smart import: structured CSV parsing failed, using raw text", exc_info=True)
 
@@ -7237,6 +8270,69 @@ _SMART_IMPORT_EXTS: frozenset[str] = frozenset(
 )
 
 
+async def _native_spreadsheet_import(content: bytes) -> "ImportedBOQ | None":
+    """The spreadsheet importer's reading of an upload, or ``None`` when it has none.
+
+    ``None`` means the file is not a workbook the importer can open at all;
+    a reading with no positions still comes back, carrying the errors that
+    say why.
+    """
+    from app.modules.boq.importers import ImporterParseError
+    from app.modules.boq.importers.excel import ExcelImporter
+
+    try:
+        return await ExcelImporter.parse(content, locale=get_locale())
+    except ImporterParseError:
+        return None
+    except Exception:  # noqa: BLE001 - the text extraction below still gets its chance
+        logger.debug("Smart import: native spreadsheet reading failed", exc_info=True)
+        return None
+
+
+async def _smart_native_result(
+    boq_id: uuid.UUID,
+    imported_boq: "ImportedBOQ",
+    file_name: str,
+    service: BOQService,
+    user_id: str,
+) -> dict[str, Any]:
+    """Persist a native spreadsheet reading and validate it, in the smart route's shape."""
+    apply_summary = await _persist_imported_boq(
+        boq_id,
+        imported_boq,
+        file_name=file_name,
+        service=service,
+        actor_id=user_id,
+    )
+    created = int(apply_summary["created"])
+    updated = int(apply_summary["updated"])
+    validation_report = None
+    if (created + updated) > 0:
+        validation_report = await _run_import_validation(boq_id, service, service.session)
+    logger.info(
+        "Smart import (native) for BOQ %s: created=%d, updated=%d, skipped=%d",
+        boq_id,
+        created,
+        updated,
+        imported_boq.skipped,
+    )
+    return {
+        "imported": created,
+        "updated": updated,
+        "unchanged": int(apply_summary["unchanged"]),
+        "skipped": imported_boq.skipped,
+        "errors": imported_boq.errors + apply_summary["apply_errors"],
+        "warnings": imported_boq.warnings,
+        "total_items": len(imported_boq.positions) + imported_boq.skipped,
+        "source_format": imported_boq.source_format,
+        "currency": imported_boq.currency,
+        "metadata": imported_boq.metadata,
+        "validation_report": validation_report,
+        "method": "direct",
+        "model_used": None,
+    }
+
+
 @router.post(
     "/boqs/{boq_id}/import/smart/",
     summary="Smart import: any file via AI (deprecated - use /import/auto/)",
@@ -7286,6 +8382,10 @@ async def smart_import(
 
     # Verify BOQ exists AND the caller owns its project (IDOR guard).
     await _verify_boq_owner(session, boq_id, user_id, payload)
+    # Refuse a locked bill up front with the lock's own 409. Past this point
+    # every row write is caught and collected per row, so a lock found there
+    # came back as a row error (or a 200 with nothing imported) instead.
+    await service._ensure_boq_writable(boq_id)
 
     # Capture project currency for downstream LLM prompts.
     boq_obj = await service.get_boq(boq_id)
@@ -7311,6 +8411,7 @@ async def smart_import(
     # No upload size cap - per product policy.
 
     # ── 1. Extract text/data based on file type ────────────────────────
+    native: ImportedBOQ | None = None
     if ext in _SMART_IMPORT_EXCEL_EXTS:
         # BUG-UPLOAD01b: smart-import path used to skip the xlsx-bomb
         # guard that import_boq_excel calls - same DoS surface via this
@@ -7318,9 +8419,15 @@ async def smart_import(
         from app.core.upload_guards import reject_if_xlsx_bomb
 
         reject_if_xlsx_bomb(content)
-        extracted = _extract_from_excel_for_smart(content)
+        native = await _native_spreadsheet_import(content)
+        extracted = (
+            {"structured": False} if native is not None and native.positions else _extract_from_excel_for_smart(content)
+        )
     elif ext == "csv":
-        extracted = _extract_from_csv_for_smart(content)
+        native = await _native_spreadsheet_import(content)
+        extracted = (
+            {"structured": False} if native is not None and native.positions else _extract_from_csv_for_smart(content)
+        )
     elif ext == "pdf":
         extracted = _extract_from_pdf(content)
     elif ext in _SMART_IMPORT_IMAGE_EXTS:
@@ -7340,82 +8447,57 @@ async def smart_import(
             detail=extracted["text"],
         )
 
+    # ── 2a. The spreadsheet reader /import/auto/ uses ─────────────────
+    # A spreadsheet goes through the same importer as /import/auto/, so the
+    # Hungarian workbook profiles, every item sheet of a workbook and the
+    # import's validation run here too. This route is what the project page's
+    # Import button posts to, and it read the item sheet on its own, so a
+    # Hungarian chapter workbook lost its item codes and its sections and was
+    # never validated.
+    if native is not None and native.positions:
+        return await _smart_native_result(boq_id, native, file.filename or "upload", service, user_id)
+
     # ── 2. Direct import for structured Excel/CSV ──────────────────────
     if extracted.get("structured") and extracted.get("rows"):
+        # The same row reader ``/import/auto/`` uses: sections stay sections,
+        # section totals, tax lines and the recap page are left out and
+        # reported, and a row carrying an exported Position ID updates that
+        # position instead of duplicating it. This branch used to create every
+        # row, headings and totals included, as a priced "pcs" line.
         rows = extracted["rows"]
-        imported = 0
-        skipped = 0
-        errors: list[dict[str, Any]] = []
-        auto_ordinal = 1
-
-        for row_idx, row in enumerate(rows, start=2):
-            try:
-                description = str(row.get("description", "")).strip()
-                if not description:
-                    skipped += 1
-                    continue
-
-                desc_lower = description.lower()
-                if desc_lower in (
-                    "grand total",
-                    "total",
-                    "summe",
-                    "gesamt",
-                    "gesamtsumme",
-                    "subtotal",
-                    "zwischensumme",
-                ):
-                    skipped += 1
-                    continue
-
-                ordinal = str(row.get("ordinal", "")).strip()
-                if not ordinal:
-                    ordinal = str(auto_ordinal)
-                auto_ordinal += 1
-
-                unit = str(row.get("unit", "pcs")).strip() or "pcs"
-                quantity = _safe_float(row.get("quantity"), default=0.0)
-                unit_rate = _safe_float(row.get("unit_rate"), default=0.0)
-
-                classification: dict[str, Any] = {}
-                class_value = str(row.get("classification", "")).strip()
-                if class_value:
-                    classification["code"] = class_value
-
-                position_data = PositionCreate(
-                    boq_id=boq_id,
-                    ordinal=ordinal,
-                    description=description,
-                    unit=unit,
-                    quantity=quantity,
-                    unit_rate=unit_rate,
-                    classification=classification,
-                    source="smart_import",
-                )
-                await service.add_position(position_data)
-                imported += 1
-
-            except Exception as exc:
-                errors.append(
-                    {
-                        "row": row_idx,
-                        "error": str(exc),
-                        "data": {k: str(v)[:100] for k, v in row.items()},
-                    }
-                )
+        imported_boq = _rows_to_positions(
+            rows,
+            source="smart_import",
+            row_numbers=extracted.get("row_numbers"),
+            header_language=extracted.get("header_language"),
+            sheet_notes=extracted.get("sheet_notes"),
+        )
+        apply_summary = await _persist_imported_boq(
+            boq_id,
+            imported_boq,
+            file_name=file.filename or "upload",
+            service=service,
+            actor_id=user_id,
+        )
+        created = int(apply_summary["created"])
+        updated = int(apply_summary["updated"])
+        errors = imported_boq.errors + apply_summary["apply_errors"]
 
         logger.info(
-            "Smart import (direct) for BOQ %s: imported=%d, skipped=%d, errors=%d",
+            "Smart import (direct) for BOQ %s: created=%d, updated=%d, skipped=%d, errors=%d",
             boq_id,
-            imported,
-            skipped,
+            created,
+            updated,
+            imported_boq.skipped,
             len(errors),
         )
 
         return {
-            "imported": imported,
-            "skipped": skipped,
+            "imported": created,
+            "updated": updated,
+            "skipped": imported_boq.skipped,
             "errors": errors,
+            "warnings": imported_boq.warnings,
             "total_items": len(rows),
             "method": "direct",
             "model_used": None,
@@ -7438,6 +8520,12 @@ async def smart_import(
     try:
         provider, api_key, model_override = resolve_provider_key_model(ai_settings)
     except ValueError as exc:
+        if native is not None:
+            # No AI to hand the sheet to, and the spreadsheet reader has
+            # already said why it found no lines (a header it could not read,
+            # the sheets it left out). That report is what the user can act
+            # on; "configure an AI provider" is not.
+            return await _smart_native_result(boq_id, native, file.filename or "upload", service, user_id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -7656,6 +8744,10 @@ async def get_resource_summary(
         ResourceSummaryResponse with per-type counts/totals and a flat
         resource list sorted by total_cost descending.
     """
+    from decimal import Decimal as Money
+
+    from app.core.currency_registry import money_quantum
+
     await _verify_boq_owner(session, boq_id, _user_id, payload)
     boq_data = await service.get_boq_with_positions(boq_id)
 
@@ -7663,15 +8755,15 @@ async def get_resource_summary(
     # foreign currency are converted to the base before they are aggregated.
     # Without this the per-type totals and grand_total would blend currencies
     # (adding raw EUR and USD numbers). Mirrors BOQService.get_cost_breakdown;
-    # a foreign currency with no FX rate is left in its own units (never zeroed).
+    # foreign amounts without usable FX are excluded and reported separately.
     base_currency, fx_map = await service.get_export_fx(boq_id)
     _base_cur = (base_currency or "").strip().upper()
 
     # Aggregation key: (name_lower, type_lower) → accumulator
     agg: dict[tuple[str, str], dict[str, Any]] = {}
-    # Foreign-currency money that reached ``grand_total`` without conversion,
+    # Foreign-currency money excluded from ``grand_total`` without conversion,
     # keyed by the currency it is still in. Populated by ``_add_resource``.
-    unconverted: dict[str, float] = {}
+    unconverted: dict[str, Money] = {}
 
     def _add_resource(
         raw: dict[str, Any],
@@ -7698,31 +8790,18 @@ async def get_resource_summary(
         except (ValueError, TypeError):
             return
 
-        cost = qty * rate * max(pos_qty, 1.0)
-        # Convert this resource's subtotal into the project base currency
-        # before aggregating, so mixed-currency BOQs never blend raw numbers.
-        # A foreign currency whose rate is missing/non-positive is left in its
-        # own units (deterministic, never zeroed) - same policy as
-        # BOQService._resource_total_in_base.
-        #
-        # That amount still enters ``grand_total``, so it is recorded here in
-        # the currency it is still denominated in. The total is unchanged by
-        # this; what changes is that the response can now say how much of it
-        # was never converted, instead of leaving the reader to assume none of
-        # it. The missing-rate warning elsewhere carries the code only, and a
-        # code without an amount cannot be weighed.
-        # The policy itself now lives in ``resource_fx_factor`` rather than
-        # being written out again here. This block previously carried its own
-        # copy, including an ``and fx_map`` guard that skipped the whole branch
-        # when a project had no FX table at all - which is the case where the
-        # most value goes unconverted, and so the worst one to stay silent
-        # about. Conversion behaviour is unchanged, since no rate is no rate.
+        cost = Money(str(raw.get("quantity", 1.0))) * Money(str(raw.get("unit_rate", 0))) * Money(str(pos_qty))
+        if not cost.is_finite():
+            return
+        # Unconvertible amounts are reported separately, never mixed into
+        # base-currency totals or ABC percentages.
         rcur = str(raw.get("currency") or "").strip().upper()
         factor = resource_fx_factor(rcur, _base_cur, fx_map)
         if factor is None:
-            unconverted[rcur] = unconverted.get(rcur, 0.0) + cost
+            unconverted[rcur] = unconverted.get(rcur, Money("0")) + cost
+            cost = Money("0")
         else:
-            cost = cost * factor
+            cost *= Money(str(fx_map[rcur])) if rcur and _base_cur and rcur != _base_cur else Money("1")
         key = (name.lower(), rtype)
 
         if key not in agg:
@@ -7731,7 +8810,7 @@ async def get_resource_summary(
                 "type": rtype,
                 "unit": unit,
                 "total_quantity": 0.0,
-                "total_cost": 0.0,
+                "total_cost": Money("0"),
                 "rates": [],
                 "positions": set(),
                 # Variant surface - first-seen wins for the catalog/stats,
@@ -7748,7 +8827,7 @@ async def get_resource_summary(
             }
 
         entry = agg[key]
-        entry["total_quantity"] += qty * max(pos_qty, 1.0)
+        entry["total_quantity"] += qty * pos_qty
         entry["total_cost"] += cost
         entry["rates"].append(rate)
         entry["positions"].add(pos_id)
@@ -7795,15 +8874,15 @@ async def get_resource_summary(
             for idx, raw in enumerate(resources):
                 if not isinstance(raw, dict):
                     continue
-                _add_resource(raw, str(pos.id), resource_idx=idx)
+                _add_resource(raw, str(pos.id), pos_qty=pos_qty, resource_idx=idx)
         else:
             # Fast heuristic: classify by description and create a synthetic resource
             desc = pos.description or ""
             if not desc.strip():
                 continue
             rate = float(pos.unit_rate or 0) if hasattr(pos, "unit_rate") else 0.0
-            total = rate * max(pos_qty, 1.0)
-            if total <= 0:
+            total = rate * pos_qty
+            if total == 0:
                 continue
             cat = BOQService._classify_position_category(desc)
             _add_resource(
@@ -7813,6 +8892,7 @@ async def get_resource_summary(
                     "unit": str(getattr(pos, "unit", "") or ""),
                     "quantity": pos_qty,
                     "unit_rate": rate,
+                    "currency": meta.get("currency") or meta.get("position_currency"),
                 },
                 str(pos.id),
             )
@@ -7961,12 +9041,10 @@ async def get_resource_summary(
         by_type=by_type,
         resources=resource_items,
         grand_total=grand_total,
-        # Quantised with the same quantum AND the same rounding mode as
-        # ``grand_total`` just above. A reader subtracting one from the other
-        # is the whole point of publishing it, and two figures rounded
-        # differently do not subtract cleanly.
+        # Excluded native-currency amounts, independent of the base total.
         unconverted={
-            code: Decimal(str(amount)).quantize(_Q2, rounding=_RHU) for code, amount in sorted(unconverted.items())
+            code: Decimal(str(amount)).quantize(money_quantum(code), rounding=_RHU)
+            for code, amount in sorted(unconverted.items())
         },
     )
 
@@ -7989,9 +9067,10 @@ async def enrich_resources(
     1. If metadata has cost_item_code → look up cost item → copy components
     2. Else → fuzzy match by description via _lookup_cost_item_components
 
-    Returns count of enriched positions.
+    Returns count of enriched positions. A locked bill is refused with 409.
     """
     await _verify_boq_owner(session, boq_id, _user_id, payload)
+    await service._ensure_boq_writable(boq_id)
     boq_data = await service.get_boq_with_positions(boq_id)
     cost_repo = CostItemRepository(session)
     enriched_count = 0
@@ -8093,9 +9172,11 @@ async def enrich_co2(
 
     Loops through positions, matches descriptions to the 77 EPD materials,
     calculates GWP totals, and stores results in position metadata.
-    Skips positions that already have manually assigned CO2 data.
+    Skips positions that already have manually assigned CO2 data. A locked
+    bill is refused with 409.
     """
     await _verify_boq_owner(session, boq_id, _user_id, payload)
+    await service._ensure_boq_writable(boq_id)
     boq_data = await service.get_boq_with_positions(boq_id)
     enriched = 0
     skipped = 0
@@ -8158,6 +9239,7 @@ async def assign_position_co2(
     """Manually assign an EPD material to a BOQ position.
 
     Updates the position's metadata with CO2 data from the specified EPD material.
+    A position in a locked bill is refused with 409.
     """
     from fastapi import HTTPException
 
@@ -8173,6 +9255,7 @@ async def assign_position_co2(
         raise HTTPException(status_code=404, detail=translate("errors.position_not_found", locale=get_locale()))
 
     await _verify_boq_owner(session, pos.boq_id, _user_id, auth_payload)
+    await service._ensure_boq_writable(pos.boq_id)
 
     meta = dict(pos.metadata_) if pos.metadata_ else {}
     qty = float(pos.quantity) if pos.quantity else 0.0
@@ -8565,7 +9648,10 @@ async def compute_position_measurement(
     """Compute a quantity from formula-based take-off lines without saving.
 
     Body: ``{"lines": [{"description", "formula", "variables", "factor",
-    "sign"}], "unit"?, "strict"?}``. Each line's formula (for example
+    "sign"}], "unit"?, "strict"?, "row_decimals"?}``. ``row_decimals`` (0 to
+    6) rounds every line to that many decimals before the lines are added,
+    the way a sheet imported from a market that rounds partial quantities is
+    totalled; it is stored beside the lines under ``metadata.measurement``. Each line's formula (for example
     ``3.50 * 2.40`` or ``L * B * H``) is evaluated safely and the signed
     partial quantities are totalled, so the number is auditable. The UI can then
     persist the accepted quantity and the lines with a normal position update
@@ -8602,10 +9688,11 @@ async def compute_position_measurement(
             unit=str(data.get("unit") or existing.unit or ""),
             lines=list(data.get("lines") or []),
             strict=bool(data.get("strict", False)),
+            row_decimals=data.get("row_decimals"),
         )
     except MeasurementError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"measurement error: {exc}",
         ) from exc
 
@@ -8647,7 +9734,10 @@ async def get_position_measurement(
     """Return the measurement sheet stored on a position (``metadata.measurement``).
 
     Bad stored formulas are kept as per-line errors (quantity 0) rather than
-    failing the whole read, so a saved sheet always renders.
+    failing the whole read, so a saved sheet always renders. A stored
+    ``row_decimals`` rounds each line before the total and the reconcile, so
+    a sheet imported with its partial quantities rounded reconciles with the
+    quantity it was imported with.
 
     Omitting ``preset`` resolves it from the project's country, exactly as the
     compute endpoint does. The pair has to answer the same way: a sheet
@@ -8684,6 +9774,7 @@ async def get_position_measurement(
         unit=str(stored.get("unit") or existing.unit or ""),
         lines=lines,
         strict=False,
+        row_decimals=stored.get("row_decimals"),
     )
     if preset is None:
         project = await service.project_for_boq(existing.boq_id)
@@ -8867,7 +9958,7 @@ async def get_sensitivity(
 @router.get(
     "/boqs/{boq_id}/classification/",
     response_model=EstimateClassificationResponse,
-    summary="Get AACE estimate classification",
+    summary="Get estimate classification",
     dependencies=[Depends(RequirePermission("boq.read"))],
 )
 async def get_estimate_classification(
@@ -8877,14 +9968,15 @@ async def get_estimate_classification(
     session: SessionDep,
     service: BOQService = Depends(_get_service),
 ) -> EstimateClassificationResponse:
-    """Get the AACE 18R-97 estimate classification for a BOQ.
+    """Get the estimate classification for a BOQ.
 
-    Auto-detects the estimate class (1-5) based on the number of positions,
-    rate completeness, resource completeness, and classification coverage.
+    The classification system is resolved from the project's jurisdiction:
+    AACE 18R-97 (classes 1-5) by default, Canadian CCA (classes D/C/B/A)
+    for Canadian projects, extensible to other systems via pack registration.
 
     Returns:
-        EstimateClassificationResponse with class, accuracy range, definition
-        level, methodology description, and underlying metrics.
+        EstimateClassificationResponse with class, system, accuracy range,
+        definition level, methodology description, and underlying metrics.
     """
     await _verify_boq_owner(session, boq_id, _user_id, payload)
     return await service.get_estimate_classification(boq_id)
@@ -9128,8 +10220,10 @@ async def add_custom_column(
     """Add a custom column definition to a BOQ.
 
     Body: {"name": "supplier", "display_name": "Supplier", "column_type": "text", "options": []}
+    A locked bill is refused with 409.
     """
     await _verify_boq_owner(session, boq_id, _user_id, user_payload)
+    await service._ensure_boq_writable(boq_id)
     name = payload.name.strip().lower().replace(" ", "_")
     if not name or not name.isidentifier():
         raise HTTPException(400, "Invalid column name - use alphanumeric + underscore")
@@ -9222,10 +10316,14 @@ async def delete_custom_column(
     session: SessionDep,
     service: BOQService = Depends(_get_service),
 ) -> None:
-    """Remove a custom column definition (data in positions preserved)."""
+    """Remove a custom column definition (data in positions preserved).
+
+    A locked bill is refused with 409.
+    """
     from sqlalchemy.orm.attributes import flag_modified
 
     await _verify_boq_owner(session, boq_id, _user_id, payload)
+    await service._ensure_boq_writable(boq_id)
     boq = await service.get_boq(boq_id)
     existing_meta = boq.metadata_ if isinstance(boq.metadata_, dict) else {}
     existing_columns = list(existing_meta.get("custom_columns", []))
@@ -9336,9 +10434,11 @@ async def replace_boq_variables(
 
     The plan calls for whole-list replacement (vs per-row CRUD) - the
     list is small (≤50) and the editor UI sends the whole table back
-    on save, so a single round-trip keeps state simple.
+    on save, so a single round-trip keeps state simple. A locked bill is
+    refused with 409: its formulas resolve through these values.
     """
     await _verify_boq_owner(session, boq_id, _user_id, payload)
+    await service._ensure_boq_writable(boq_id)
     if len(variables) > _MAX_VARIABLES_PER_BOQ:
         raise HTTPException(
             400,
@@ -9426,8 +10526,12 @@ async def renumber_positions(
 
     Positions are processed in their current ``sort_order`` so the user's
     drag-and-drop order is preserved. Only the ``ordinal`` field is rewritten.
+
+    A locked bill is refused with 409: its numbers are what the issued
+    document and every reference to it quote.
     """
     await _verify_boq_owner(session, boq_id, _user_id, payload)
+    await service._ensure_boq_writable(boq_id)
     opts = options or RenumberRequest()
 
     # Step (gap) per scheme. Sequential and dotted have step=1; gap10/gap100
@@ -9578,6 +10682,12 @@ async def boq_vector_reindex(
     even one BOQ at a time without re-embedding the entire tenant.  Set
     ``purge_first=true`` to wipe the matching subset before re-encoding -
     useful when the embedding model has changed.
+
+    Positions are walked in bounded pages and released as they are indexed,
+    so the pass holds one page rather than the table.  A scope larger than
+    the ceiling is indexed up to it and the response says so: ``scanned``
+    next to ``cap`` and ``truncated``.  Narrowing with ``boq_id`` or
+    ``project_id`` is how a scope that large gets covered in full.
     """
     # Cross-tenant guard. Reindexing - and especially ``purge_first=true``,
     # which wipes the matching subset before re-encoding - must be scoped to
@@ -9599,7 +10709,7 @@ async def boq_vector_reindex(
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
 
-    from app.core.vector_index import reindex_collection
+    from app.core.vector_routes import reindex_statement_in_pages
     from app.modules.boq.models import BOQ as BOQModel  # noqa: N811  -- domain class, not constant
     from app.modules.boq.models import Position
     from app.modules.boq.vector_adapter import boq_position_adapter
@@ -9617,12 +10727,14 @@ async def boq_vector_reindex(
     elif project_id is not None:
         stmt = stmt.join(BOQModel, Position.boq_id == BOQModel.id).where(BOQModel.project_id == project_id)
 
-    rows = list((await session.execute(stmt)).scalars().all())
-    return await reindex_collection(
-        boq_position_adapter,
-        rows,
-        purge_first=purge_first,
-    )
+    # The statement, not its rows. This endpoint cannot use
+    # ``create_vector_routes`` - the gate above has no equivalent there and the
+    # factory knows nothing of ``boq_id`` - but positions are the highest-count
+    # rows in the product, so it is the last place that should own a private
+    # copy of the read. ``reindex_statement_in_pages`` orders the walk, pages
+    # it, flushes each page before releasing it, stops at a ceiling and reports
+    # whether it hit one.
+    return await reindex_statement_in_pages(session, boq_position_adapter, stmt, purge_first=purge_first)
 
 
 @router.get(

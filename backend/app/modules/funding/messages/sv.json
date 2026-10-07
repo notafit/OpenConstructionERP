@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Arbetet med åtgärden påbörjades den {start}, innan ansökan lämnades in den {filed}. De flesta program ger inget stöd alls när åtgärden redan har påbörjats",
+      "unevidenced": "Arbetet påbörjades i förtid, den {start}, och ärendet anger att myndigheten medgav det, men inget skriftligt medgivande är angivet",
+      "evidence": "Ange referensen till det skriftliga medgivandet till tidig start, så att ärendet håller vid en granskning",
+      "suggestion": "Kontrollera programvillkoren innan fler kostnader uppstår. Om den tidiga starten medgavs skriftligen, registrera medgivandet; om inte, kontakta myndigheten innan ansökan går vidare"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Rekvisition {draw} tar upp kostnader från tiden före {period_start}, då finansieringsperioden börjar",
+      "after": "Rekvisition {draw} tar upp kostnader från tiden efter {period_end}, då finansieringsperioden slutar",
+      "spans": "Rekvisition {draw} går utanför finansieringsperioden i båda ändar, {period_start} till {period_end}",
+      "suggestion": "Flytta kostnaderna utanför perioden till en egen rekvisition och ta upp dem med myndigheten, i stället för att låta en rekvisition bära båda"
+    },
+    "own_share_is_covered": {
+      "fail": "Programmet kräver en egen finansiering på {rate} procent, det vill säga {required}, men ansökan anger {recorded}",
+      "suggestion": "Ange varifrån den återstående egna finansieringen kommer innan ansökan lämnas in, eftersom programmet beräknar den på den bidragsgrundande kostnaden och inte på projektets totala kostnad"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "De {count} ansökningarna i detta projekt ger tillsammans en stödintensitet på {intensity} procent av de bidragsgrundande kostnaderna, över taket på {cap} procent som det strängaste av deras program anger",
+      "suggestion": "Offentligt stöd kumuleras över program och över förvaltningsnivåer. Minska en av ansökningarna, eller fråga om åtgärderna kan delas upp så att var och en bär sina egna kostnader"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Finansieringsperioden slutade den {period_end} och ingen slutlig redovisning av användning har påbörjats",
+      "late": "Den slutliga redovisningen av användning skulle lämnas senast den {due} och lämnades in den {submitted}",
+      "overdue": "Den slutliga redovisningen av användning skulle lämnas senast den {due} och har inte lämnats in",
+      "suggestion": "Lämna in det som finns i stället för att vänta tills allt är komplett. De flesta myndigheter förlänger en tidsfrist på begäran, men ingen förlänger en tidsfrist som redan har passerat"
+    },
+    "errors": {
+      "application_not_found": "Ansökan hittades inte",
+      "programme_code_taken": "Det finns redan ett program med den här koden i det här landet",
+      "programme_not_found": "Programmet hittades inte",
+      "programme_has_applications": "Det här programmet har ansökningar och kan inte tas bort. Stäng det i stället.",
+      "application_code_taken": "Det finns redan en ansökan med den här koden i det här projektet",
+      "approved_application_not_deletable": "En beviljad ansökan kan inte tas bort. Ändra dess status till återkallad eller stängd i stället.",
+      "approval_needs_period_end": "Ett beslut kräver ett slutdatum för finansieringsperioden, eftersom alla senare tidsfrister räknas från det",
+      "draw_needs_approval": "Medel kan bara rekvireras mot en beviljad ansökan",
+      "draw_not_found": "Rekvisitionen hittades inte",
+      "paid_draw_not_deletable": "En rekvisition som redan har betalats ut kan inte tas bort",
+      "proof_not_found": "Redovisningen av användning hittades inte",
+      "obligation_not_found": "Tidsfristen hittades inte",
+      "eligible_exceeds_amount": "Det bidragsgrundande beloppet kan inte vara större än hela beloppet",
+      "allocation_not_found": "Kostnadsposten hittades inte"
+    }
+  }
+}

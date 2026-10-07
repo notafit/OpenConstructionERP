@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "Đạt"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Hạng mục này khởi công ngày {start}, trước khi hồ sơ được nộp ngày {filed} - hầu hết các chương trình hoàn toàn không tài trợ một khi hạng mục đã khởi công",
+      "unevidenced": "Hạng mục đã khởi công sớm, ngày {start}, và hồ sơ ghi rằng cơ quan đã cho phép, nhưng không nêu văn bản cho phép nào",
+      "evidence": "Ghi số hiệu văn bản cho phép khởi công sớm, để hồ sơ tự chứng minh được",
+      "suggestion": "Kiểm tra điều kiện của chương trình trước khi chi thêm. Nếu việc khởi công sớm đã được cho phép bằng văn bản, hãy ghi lại; nếu không, hãy hỏi cơ quan trước khi tiếp tục với hồ sơ"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Lần giải ngân {draw} đề nghị chi phí phát sinh trước {period_start}, ngày bắt đầu thời hạn tài trợ",
+      "after": "Lần giải ngân {draw} đề nghị chi phí phát sinh sau {period_end}, ngày kết thúc thời hạn tài trợ",
+      "spans": "Lần giải ngân {draw} vượt ra ngoài thời hạn tài trợ ở cả hai đầu, từ {period_start} đến {period_end}",
+      "suggestion": "Tách các chi phí nằm ngoài thời hạn tài trợ thành một lần giải ngân riêng và làm rõ với cơ quan, thay vì để một đề nghị gánh cả hai"
+    },
+    "own_share_is_covered": {
+      "fail": "Chương trình yêu cầu phần vốn tự có {rate} phần trăm, tức là {required}, nhưng hồ sơ ghi {recorded}",
+      "suggestion": "Trước khi nộp, hãy nêu rõ phần vốn tự có còn lại đến từ đâu, vì chương trình tính phần này trên cơ sở chi phí hợp lệ chứ không phải trên tổng chi phí dự án"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "{count} hồ sơ của dự án này cộng lại đạt cường độ hỗ trợ {intensity} phần trăm chi phí hợp lệ, vượt mức trần {cap} phần trăm do chương trình khắt khe nhất trong số đó quy định",
+      "suggestion": "Các khoản tài trợ công được cộng dồn qua các chương trình và qua các cấp chính quyền. Hãy giảm một đề nghị, hoặc hỏi xem có thể tách các hạng mục để mỗi hạng mục tự gánh chi phí của mình hay không"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Thời hạn tài trợ đã kết thúc ngày {period_end} và chưa bắt đầu lập báo cáo sử dụng cuối cùng",
+      "late": "Báo cáo sử dụng cuối cùng đến hạn ngày {due} nhưng được nộp ngày {submitted}",
+      "overdue": "Báo cáo sử dụng cuối cùng đến hạn ngày {due} và vẫn chưa được nộp",
+      "suggestion": "Hãy nộp những gì đang có thay vì chờ cho đầy đủ. Hầu hết các cơ quan gia hạn khi có yêu cầu, và không cơ quan nào gia hạn một thời hạn đã qua"
+    },
+    "errors": {
+      "application_not_found": "Không tìm thấy hồ sơ xin tài trợ",
+      "programme_code_taken": "Đã có một chương trình dùng mã này tại quốc gia này",
+      "programme_not_found": "Không tìm thấy chương trình",
+      "programme_has_applications": "Chương trình này đã có hồ sơ nên không thể xóa. Thay vào đó, hãy đóng chương trình.",
+      "application_code_taken": "Đã có một hồ sơ dùng mã này trong dự án này",
+      "approved_application_not_deletable": "Không thể xóa hồ sơ đã được duyệt. Thay vào đó, hãy đặt trạng thái thành đã rút lại hoặc đã đóng.",
+      "approval_needs_period_end": "Để duyệt hồ sơ, cần có ngày kết thúc thời hạn tài trợ, vì mọi thời hạn về sau đều được tính từ ngày đó",
+      "draw_needs_approval": "Chỉ có thể giải ngân cho hồ sơ đã được duyệt",
+      "draw_not_found": "Không tìm thấy khoản giải ngân",
+      "paid_draw_not_deletable": "Không thể xóa khoản giải ngân đã được chi trả",
+      "proof_not_found": "Không tìm thấy báo cáo sử dụng",
+      "obligation_not_found": "Không tìm thấy nghĩa vụ",
+      "eligible_exceeds_amount": "Số tiền hợp lệ không được vượt quá tổng số tiền",
+      "allocation_not_found": "Không tìm thấy khoản phân bổ chi phí"
+    }
+  }
+}

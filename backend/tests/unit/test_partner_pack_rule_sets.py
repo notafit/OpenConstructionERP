@@ -30,6 +30,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -76,6 +77,21 @@ print(json.dumps(sorted(rule_registry.list_rule_sets())))
 """
 
 
+_RULE_ID_PROBE = """
+import importlib, json, pathlib, warnings
+warnings.filterwarnings("ignore")
+from app.core.validation.rules import register_builtin_rules
+from app.core.validation.engine import rule_registry
+register_builtin_rules()
+for p in sorted(pathlib.Path("app/modules").glob("*/validators.py")):
+    try:
+        importlib.import_module("app.modules." + p.parent.name + ".validators")
+    except Exception:
+        pass
+print(json.dumps(sorted(r["rule_id"] for r in rule_registry.list_rules())))
+"""
+
+
 def _shipped_rule_sets() -> set[str]:
     """Every rule set a clean interpreter registers, core plus module owned."""
     result = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -89,9 +105,34 @@ def _shipped_rule_sets() -> set[str]:
     return set(json.loads(result.stdout.strip().splitlines()[-1]))
 
 
+def _shipped_rule_ids() -> set[str]:
+    """Every rule *id* with a real body, measured the same way as the sets.
+
+    One level below :func:`_shipped_rule_sets`. A rule set is what a pack
+    switches on; a rule id is what a document's ``enables_rule_ids`` points at,
+    and the two answer different questions. Measured in a subprocess for the
+    reason given in the module docstring: the registry is filled by imports, so
+    an in-process reading describes the pytest session rather than the software.
+    """
+    result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _RULE_ID_PROBE],
+        cwd=BACKEND,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, f"the rule-id probe would not run: {result.stderr[-2000:]}"
+    return set(json.loads(result.stdout.strip().splitlines()[-1]))
+
+
 @pytest.fixture(scope="module")
 def shipped_rule_sets() -> set[str]:
     return _shipped_rule_sets()
+
+
+@pytest.fixture(scope="module")
+def shipped_rule_ids() -> set[str]:
+    return _shipped_rule_ids()
 
 
 def declared_rule_sets() -> dict[str, list[str]]:
@@ -146,6 +187,25 @@ def _manifest_objects() -> dict[str, PartnerPackManifest]:
         spec.loader.exec_module(module)
         out[path.parts[-4]] = module.MANIFEST
     return out
+
+
+def _shipped_rule_pack_documents() -> list[tuple[str, Path, dict]]:
+    """Every ``rule_packs/*.json`` in the tree as ``(slug, path, payload)``.
+
+    The stem reader above answers "which files exist". This one opens them, so
+    the assertions below can ask what a document says about itself rather than
+    only what its file is called.
+    """
+    out: list[tuple[str, Path, dict]] = []
+    for path in sorted(PACKS_DIR.glob("*/src/*/rule_packs/*.json")):
+        out.append((path.parts[-5], path, json.loads(path.read_text(encoding="utf-8"))))
+    return out
+
+
+def _declared_rule_ids(payload: dict) -> list[str]:
+    """The ``enables_rule_ids`` a document declares, as written."""
+    raw = payload.get("enables_rule_ids")
+    return [item for item in raw if isinstance(item, str)] if isinstance(raw, list) else []
 
 
 def _shipped_rule_pack_stems(slug: str) -> set[str]:
@@ -373,6 +433,173 @@ def test_every_declared_document_id_is_a_file_the_pack_ships() -> None:
 
     assert not missing_file, f"pack(s) declare a rule-pack document they do not ship: {missing_file}"
     assert not missing_id, f"pack(s) ship a rule-pack document nothing declares: {missing_id}"
+
+
+# ── What a document says about itself ───────────────────────────────────────
+#
+# The test above pairs a manifest declaration with a file name. Nothing paired
+# a file with its own contents: a document could call itself something else,
+# repeat a rule id, or point its whole ``enables_rule_ids`` list at rules that
+# do not exist, and every assertion in this file would still read green.
+
+
+def test_a_document_calls_itself_by_its_own_file_name() -> None:
+    """``rule_pack_id`` has to equal the stem, because the stem is the join key.
+
+    ``test_every_declared_document_id_is_a_file_the_pack_ships`` matches the
+    manifest's declared ids against file names, and the coverage resolver keys
+    a document by the ``rule_pack_id`` *inside* it. When those two disagree the
+    operator is told the pack covers a standard under one name while every
+    report about it comes back under another, and nothing raises.
+
+    The older sibling of this assertion exists five times over, once each in
+    the uk, us-state, china, hungary and russia pack tests, which between them
+    cover five of the packs under ``packs/``. Written once here it covers all
+    of them, including the ones that do not have a per-country test file.
+
+    ``slug`` is accepted in place of ``rule_pack_id`` because a minority of
+    documents use it, and the resolver's ``_pack_identity`` accepts it too; the
+    point is that whichever field carries the identity agrees with the name the
+    rest of the system joins on.
+    """
+    documents = _shipped_rule_pack_documents()
+    assert len(documents) >= 150, (
+        f"only {len(documents)} rule-pack documents were opened; the glob has stopped "
+        "seeing the tree and every assertion below would pass by reading nothing"
+    )
+
+    disagreements = {
+        f"{slug}/{path.name}": identity
+        for slug, path, payload in documents
+        if (identity := payload.get("rule_pack_id") or payload.get("slug")) != path.stem
+    }
+    assert not disagreements, (
+        f"document(s) disagree with their own file name: {disagreements}. The file stem is "
+        "what a manifest declares and what the coverage resolver reports under, so a "
+        "document that calls itself something else is reachable under neither name."
+    )
+
+
+def test_a_document_does_not_declare_the_same_rule_twice() -> None:
+    """A repeated rule id is a typo that inflates a coverage count.
+
+    The resolver de-duplicates before counting, so a repeat never reaches a
+    report as a double. That is exactly why it has to be caught here: the one
+    place it would show up is a partner writing two different rules and getting
+    one of them wrong, and the de-duplication hides the evidence.
+    """
+    repeats = {}
+    for slug, path, payload in _shipped_rule_pack_documents():
+        ids = _declared_rule_ids(payload)
+        if len(ids) != len(set(ids)):
+            repeats[f"{slug}/{path.name}"] = sorted({rid for rid in ids if ids.count(rid) > 1})
+    assert not repeats, f"document(s) declare the same rule id more than once: {repeats}"
+
+
+def test_a_document_whose_rule_ids_name_nothing_is_reported_and_never_counted_as_covered() -> None:
+    """The negative control for ``enables_rule_ids``, run against shipped code.
+
+    A document is a declaration; the rules it names are written separately, so
+    an id that resolves to nothing is common in this register. It is common
+    because it is recorded debt, not because it is the intended shape:
+    ``test_uk_pack`` pins the count per pack precisely so a pack that is clean
+    stays clean. What ``pack_coverage`` has to guarantee is the narrower thing,
+    that the debt is never indistinguishable from coverage. It is the component
+    that draws that line, so the guard belongs on it: feed it a document whose
+    every id names nothing and require it to say so.
+
+    Built inline rather than pinned to a real pack, so the assertion keeps its
+    meaning when somebody implements the rules a real document is waiting for.
+    """
+    from app.core.validation.pack_coverage import _coverage_for_file, _PackFile
+
+    real = "boq_quality.position_has_quantity"
+    invented = [
+        "spurious_pack.rule_that_does_not_exist",
+        "spurious_pack.another_one",
+        "din276.a_well_formed_id_in_a_real_namespace_that_names_nothing",
+    ]
+    document = {
+        "rule_pack_id": "probe_document",
+        "name": "A document built for a test",
+        "standard": "none",
+        "enables_rule_ids": [real, *invented],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        written = Path(tmp) / "probe_document.json"
+        written.write_text(json.dumps(document), encoding="utf-8")
+        coverage = _coverage_for_file(_PackFile(source_pack="probe-pack", path=written), {real})
+
+    assert coverage is not None, "the resolver refused a well-formed document"
+    assert coverage.implemented == (real,), (
+        f"the one implemented rule was not reported as implemented: {coverage.implemented}"
+    )
+    assert list(coverage.declared_only) == invented, (
+        f"a rule id that names nothing was not reported as declared-only: {coverage.declared_only}"
+    )
+    assert coverage.implemented_count == 1, "the count over-claims"
+    assert coverage.declared_only_count == len(invented)
+    assert coverage.fully_implemented is False, (
+        "a document whose rules mostly do not exist reported itself as fully implemented, "
+        "which is the 'looks validated, isn't' failure this resolver exists to prevent"
+    )
+
+
+def test_the_three_repaired_packs_name_only_rules_that_actually_run(shipped_rule_ids: set[str]) -> None:
+    """austria-at, canada-ca and switzerland-ch declare nothing the engine lacks.
+
+    These three shipped a manifest declaring documents they did not carry, so
+    every rule id they advertised resolved to nothing by way of a file that was
+    not there. Writing the files is only half a repair: a document that lands
+    and then names rules nobody wrote reproduces the same lie one layer down,
+    and this time with a file to back it up.
+
+    The property asserted is total rather than a floor. A floor ("at least one
+    id resolves") passes a document that grounds one id and invents twelve,
+    which is the shape the debt in ``test_uk_pack`` was accumulated in. These
+    three packs were absent from that debt list before the repair and have to
+    stay absent, so the bar here is the one that keeps them absent.
+
+    The honest way to meet it is an empty list, not a padded one. Eleven of the
+    twelve Canadian documents and two of the three Swiss ones enable nothing,
+    because the engine registers no Canadian or Swiss rules and a building code
+    is not satisfied by a bill-arithmetic check wearing its name. Each of those
+    carries ``why_no_rules``, which is the shape ``uk-jct`` already uses.
+    """
+    assert shipped_rule_ids, "the rule-id probe came back empty"
+    assert "boq_quality.position_has_quantity" in shipped_rule_ids, (
+        "the probe did not see a rule this repo certainly registers, so it is measuring "
+        "an under-loaded registry and every assertion below would read as 'names nothing'"
+    )
+
+    unbacked: dict[str, list[str]] = {}
+    silent: list[str] = []
+    for slug in ("austria-at", "canada-ca", "switzerland-ch"):
+        documents = [(p, d) for s, p, d in _shipped_rule_pack_documents() if s == slug]
+        assert documents, f"{slug} ships no rule-pack document at all"
+
+        for path, payload in documents:
+            declared = _declared_rule_ids(payload)
+            missing = [rid for rid in declared if rid not in shipped_rule_ids]
+            if missing:
+                unbacked[f"{slug}/{path.name}"] = missing
+            if not declared and len((payload.get("why_no_rules") or "").strip()) <= 80:
+                silent.append(f"{slug}/{path.name}")
+
+    assert not unbacked, (
+        f"document(s) promise checks the engine does not define: {unbacked}. Measured against "
+        f"{len(shipped_rule_ids)} registered rule ids. An id nothing implements reads to an "
+        "operator as a check that runs, and the pack reports no error either way; remove it, or "
+        "write the rule."
+    )
+    assert not silent, (
+        f"document(s) enable nothing and do not say why, or explain themselves in a sentence "
+        f"fragment: {silent}. An empty list is the right answer for a standard the engine does "
+        "not check, but it is also what a document looks like when the ids were deleted without "
+        "a decision, so it has to explain itself. The 80-character floor is the one "
+        "``test_uk_pack`` already applies to the same field."
+    )
 
 
 def test_a_demo_project_carries_its_own_rule_sets_rather_than_inheriting_them() -> None:

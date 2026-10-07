@@ -13,24 +13,33 @@
  * had so the panel paints instantly.
  */
 
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Calendar, MapPin, RotateCcw, Tag, User } from 'lucide-react';
+import { Calendar, MapPin, Pencil, RotateCcw, Tag, User } from 'lucide-react';
 import clsx from 'clsx';
-import { Badge, SideDrawer } from '@/shared/ui';
+import { Badge, Button, SideDrawer } from '@/shared/ui';
 import { useToastStore } from '@/stores/useToastStore';
 import {
   fetchPunchItem,
   transitionPunchStatus,
+  updatePunchItem,
   type PunchItem,
   type PunchPriority,
   type PunchStatus,
 } from './api';
 import { PunchClosureStepper } from './PunchClosureStepper';
 import { PunchPhotoGallery } from './PunchPhotoGallery';
+import { PunchContractAssignment } from './PunchContractField';
 import { AssigneeLabel } from './assignee';
+import {
+  formatReworkCost,
+  parseReworkCostInput,
+  projectCurrencyCode,
+  reworkCostForInput,
+} from './reworkCost';
 import { getIntlLocale } from '@/shared/lib/formatters';
+import { RaiseBackCharge } from '@/features/cost-recovery/RaiseBackCharge';
 
 const STATUS_VARIANT: Record<PunchStatus, 'error' | 'warning' | 'blue' | 'success' | 'neutral'> = {
   open: 'error',
@@ -59,10 +68,12 @@ function titleCase(value: string): string {
 function formatDate(value: string | null | undefined): string {
   if (!value) return '-';
   try {
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
     return new Date(value).toLocaleDateString(getIntlLocale(), {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
+      ...(isDateOnly ? { timeZone: 'UTC' } : {}),
     });
   } catch {
     return value;
@@ -89,10 +100,160 @@ function Field({
   );
 }
 
+/**
+ * The item's rework cost, and the one place it can be changed after the item
+ * exists. Snags raised from a clash, an inspection or an NCR never pass
+ * through the add form, so without this they could not be priced at all.
+ */
+function ReworkCostSection({
+  item,
+  projectCurrency,
+  onSaved,
+}: {
+  item: PunchItem;
+  projectCurrency: string;
+  onSaved: () => void;
+}) {
+  const { t } = useTranslation();
+  const addToast = useToastStore((s) => s.addToast);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [touched, setTouched] = useState(false);
+
+  const shown = formatReworkCost(item);
+  // A price recorded in another currency is not carried into the edit box:
+  // saving records the amount in the project's currency, and keeping the old
+  // number under the new code would restate the money without anyone saying so.
+  const currencyChanges =
+    item.rework_cost != null && projectCurrencyCode(item.rework_cost_currency) !== projectCurrency;
+  const parsed = parseReworkCostInput(draft);
+  const invalid = touched && !parsed.ok;
+
+  const saveMut = useMutation({
+    mutationFn: (value: string | null) =>
+      updatePunchItem(item.id, { rework_cost: value, rework_cost_currency: projectCurrency }),
+    onSuccess: () => {
+      setEditing(false);
+      onSaved();
+      addToast({
+        type: 'success',
+        title: t('punch.rework_cost_saved', { defaultValue: 'Rework cost saved' }),
+      });
+    },
+    onError: (e: Error) =>
+      addToast({
+        type: 'error',
+        title: t('common.error', { defaultValue: 'Error' }),
+        message: e.message,
+      }),
+  });
+
+  const startEditing = () => {
+    setDraft(currencyChanges ? '' : reworkCostForInput(item.rework_cost));
+    setTouched(false);
+    setEditing(true);
+  };
+
+  const save = () => {
+    setTouched(true);
+    if (parsed.ok) saveMut.mutate(parsed.value);
+  };
+
+  return (
+    <section data-testid="punch-rework-cost">
+      <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-content-tertiary">
+        {t('punch.field_rework_cost', { defaultValue: 'Rework cost' })}
+      </h4>
+      {editing ? (
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              // Enter saves. Escape is the drawer's (a capture listener on
+              // document closes it first), so there is no Escape branch here.
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') save();
+              }}
+              aria-label={t('punch.field_rework_cost', { defaultValue: 'Rework cost' })}
+              aria-invalid={invalid || undefined}
+              placeholder="0.00"
+              className={clsx(
+                'h-9 w-40 rounded-lg border bg-surface-primary px-3 text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-oe-blue/30',
+                invalid ? 'border-semantic-error' : 'border-border focus:border-oe-blue',
+              )}
+            />
+            <span className="text-sm text-content-tertiary">{projectCurrency}</span>
+            <Button size="sm" variant="primary" onClick={save} loading={saveMut.isPending}>
+              {t('common.save', { defaultValue: 'Save' })}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setEditing(false)} disabled={saveMut.isPending}>
+              {t('common.cancel', { defaultValue: 'Cancel' })}
+            </Button>
+          </div>
+          {invalid ? (
+            <p className="text-xs text-semantic-error">
+              {t('punch.rework_cost_invalid', { defaultValue: 'Enter an amount of zero or more' })}
+            </p>
+          ) : currencyChanges ? (
+            <p className="text-xs text-content-secondary">
+              {t('punch.rework_cost_currency_changes', {
+                defaultValue:
+                  'The current cost is in {{stored}}. Enter the amount in {{currency}}; it replaces the old figure.',
+                stored: item.rework_cost_currency,
+                currency: projectCurrency,
+              })}
+            </p>
+          ) : (
+            <p className="text-xs text-content-secondary">
+              {t('punch.rework_cost_hint', {
+                defaultValue: 'In {{currency}}. What it will cost to put this right. Leave empty until it is priced.',
+                currency: projectCurrency,
+              })}
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={clsx(
+              'text-sm tabular-nums',
+              shown ? 'text-content-secondary' : 'text-content-tertiary',
+            )}
+          >
+            {shown ?? t('punch.rework_cost_unpriced', { defaultValue: 'Not priced' })}
+          </span>
+          {projectCurrency ? (
+            <button
+              type="button"
+              onClick={startEditing}
+              className="inline-flex items-center gap-1 rounded-md text-xs font-medium text-oe-blue hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue/40"
+            >
+              <Pencil size={12} />
+              {t('common.edit', { defaultValue: 'Edit' })}
+            </button>
+          ) : (
+            <span className="text-xs text-content-tertiary">
+              {t('punch.rework_cost_no_currency', {
+                defaultValue: "Set the project's currency before pricing items.",
+              })}
+            </span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function PunchDetailDrawer({
   itemId,
   projectId,
   initialItem,
+  projectCurrency,
   onClose,
   onOpenPinBoard,
 }: {
@@ -100,6 +261,8 @@ export function PunchDetailDrawer({
   projectId: string;
   /** Item from the list, used as instant seed data while the fresh copy loads. */
   initialItem?: PunchItem;
+  /** The project's ISO currency, '' when the project has none set. */
+  projectCurrency: string;
   onClose: () => void;
   /** Jump to the pin board focused on this item's drawing (optional). */
   onOpenPinBoard?: (item: PunchItem) => void;
@@ -115,17 +278,26 @@ export function PunchDetailDrawer({
     enabled: Boolean(itemId),
   });
 
-  const refresh = useCallback(() => {
-    qc.invalidateQueries({ queryKey: ['punchlist'] });
-    qc.invalidateQueries({ queryKey: ['punchlist', 'item', itemId] });
-    qc.invalidateQueries({ queryKey: ['punchlist-summary'] });
-  }, [qc, itemId]);
+  const refresh = useCallback(
+    () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: ['punchlist'] }),
+        qc.invalidateQueries({ queryKey: ['punchlist', 'item', itemId] }),
+        qc.invalidateQueries({ queryKey: ['punchlist-summary'] }),
+      ]),
+    [qc, itemId],
+  );
 
   const transitionMut = useMutation({
     mutationFn: ({ next, notes }: { next: PunchStatus; notes?: string }) =>
       transitionPunchStatus(itemId, next, notes),
-    onSuccess: (_data, vars) => {
-      refresh();
+    onSuccess: async (updated, vars) => {
+      // The response is the item as it now stands, so the stepper shows the
+      // next status's actions at once instead of the old ones until the refetch
+      // lands. The mutation stays pending until the lists are fresh, which keeps
+      // the buttons disabled and holds the toast until the screen agrees with it.
+      qc.setQueryData(['punchlist', 'item', itemId], updated);
+      await refresh();
       addToast({
         type: 'success',
         title: t('punch.status_updated', {
@@ -206,6 +378,18 @@ export function PunchDetailDrawer({
             {formatDate(item.created_at)}
           </Field>
         </section>
+
+        {/* ── Rework cost ─────────────────────────────────────────────── */}
+        <PunchContractAssignment item={item} onSaved={refresh} />
+        <ReworkCostSection
+          key={item.id}
+          item={item}
+          projectCurrency={projectCurrency}
+          onSaved={refresh}
+        />
+        {item.rework_cost != null && item.rework_cost !== '' && (
+          <RaiseBackCharge key={`bc-${item.id}`} projectId={item.project_id} source={{ kind: 'punch_item', id: item.id }} />
+        )}
 
         {/* ── Description ──────────────────────────────────────────────── */}
         {item.description?.trim() && (

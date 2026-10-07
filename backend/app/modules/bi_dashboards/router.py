@@ -393,7 +393,7 @@ async def create_kpi(
         row = await service.create_custom_kpi(payload)
     except kpi_spec.KPISpecError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=exc.as_dict(),
         ) from exc
     except CustomKPICodeInUse as exc:
@@ -510,7 +510,9 @@ async def compute_kpi(
     if project_id is not None:
         await verify_project_access(project_id, user_id, session)
     else:
-        allowed = await accessible_project_ids(session, user_id)
+        # A portfolio KPI counts live projects only: a deleted (archived)
+        # project is not part of it, for admins either.
+        allowed = await accessible_project_ids(session, user_id, live_only=True)
     try:
         return await service.compute_kpi(
             code,
@@ -524,7 +526,7 @@ async def compute_kpi(
         )
     except KPIScopeUnavailable as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"error": "kpi_scope_unavailable", "code": exc.code, "message": str(exc)},
         ) from exc
     except CustomKPINotFound as exc:
@@ -623,12 +625,12 @@ async def drill_down(
 ) -> DrillDownResponse:
     # Same portfolio IDOR scope as compute_kpi: a specific project is
     # access-checked; a project-less drill-down is scoped to the caller's
-    # accessible projects (admins get None = unrestricted).
+    # accessible live projects, the same set compute_kpi counts.
     allowed: set[uuid.UUID] | None = None
     if payload.project_id is not None:
         await verify_project_access(payload.project_id, user_id, session)
     else:
-        allowed = await accessible_project_ids(session, user_id)
+        allowed = await accessible_project_ids(session, user_id, live_only=True)
     result = await service.drill_down(
         code,
         project_id=payload.project_id,
@@ -1217,7 +1219,7 @@ async def create_alert(
         # looking at what they wrote. The message names the path into the
         # tree that was refused.
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"error": "invalid_alert_expression", "message": str(exc)},
         ) from exc
     return AlertRuleRead.model_validate(row)

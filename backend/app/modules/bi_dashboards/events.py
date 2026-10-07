@@ -197,8 +197,8 @@ def register_subscribers() -> None:
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
     for ev_name in _PROJECTION_INVALIDATING_EVENTS:
-        event_bus.subscribe(ev_name, _on_invalidation_event)
-    event_bus.subscribe("bi_dashboards.kpi_recompute", _on_kpi_recompute)
+        event_bus.subscribe_once(ev_name, _on_invalidation_event)
+    event_bus.subscribe_once("bi_dashboards.kpi_recompute", _on_kpi_recompute)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info(
         "BI Dashboards: %d cross-module subscriber(s) registered",

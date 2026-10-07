@@ -1,0 +1,27 @@
+{
+  "rule_pack_id": "dlgs_36_2023",
+  "name": "D.Lgs. 36/2023 — Public Procurement Code (Codice dei contratti pubblici)",
+  "standard": "D.Lgs. 36/2023",
+  "jurisdiction": "IT",
+  "description": "Validates public tender documents against the new Italian public procurement code (Codice dei contratti pubblici, D.Lgs. 36/2023, effective 2023-07-01). Checks that the progetto esecutivo is complete, that the quadro economico (cost breakdown) follows the prescribed structure, that RUP (Responsabile Unico del Procedimento) is designated, that subcontracting limits are documented, and that BIM obligations are met for contracts above the applicable threshold.",
+  "applies_to": ["tender", "estimate", "validation"],
+  "enables_rule_ids": [
+    "dlgs36.procedura_type_defined",
+    "dlgs36.rup_designated",
+    "dlgs36.quadro_economico_present",
+    "dlgs36.quadro_economico_structure_valid",
+    "dlgs36.importo_lavori_stated",
+    "dlgs36.oneri_sicurezza_non_soggetti_ribasso",
+    "dlgs36.progetto_esecutivo_present",
+    "dlgs36.capitolato_speciale_present",
+    "dlgs36.subappalto_limits_documented",
+    "dlgs36.bim_obligation_above_threshold",
+    "dlgs36.criterio_aggiudicazione_documented",
+    "dlgs36.termini_esecuzione_set",
+    "dlgs36.penali_ritardo_set",
+    "dlgs36.garanzia_provvisoria_documented",
+    "dlgs36.garanzia_definitiva_documented"
+  ],
+  "regulator": "ANAC (Autorita Nazionale Anticorruzione)",
+  "publication_year": 2023
+}

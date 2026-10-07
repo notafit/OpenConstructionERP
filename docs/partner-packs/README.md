@@ -238,7 +238,10 @@ wheels and are independent of the core release cycle.
 | `aus-nzs` | Australia / NZ | AUD | en-AU | AS 1684, NZS 3604, Rawlinsons, AS 4000 | AU/NZ residential + commercial |
 | `brazil-sinapi` | Brazil | BRL | pt-BR | NBR 12721, RPS PDF, SINAPI | Latam tier-1 |
 | `india-cpwd` | India | INR | en, hi | CPWD Specifications and DSR, IS 456, IS 800, the IS 1893 seismic bundle, IS 1200 measurement, NBC 2016, RERA, GST and TDS | Central PWD works; state SoRs are named, not shipped |
-| `hungary-hu` | Hungary | HUF | en | Building and infrastructure item orders, material and fee split, VAT | Runs in English: no Hungarian UI bundle ships yet |
+| `hungary-hu` | Hungary | HUF | hu | Building and infrastructure item orders, material and fee split, VAT | Engine rule set `hungary` |
+| `romania-ro` | Romania | RON | ro | Deviz general (HG 907/2016), public procurement (Legea 98/2016), building permits, TVA | Engine rule set `romania`; carries the `cwicr-ro-bucharest` cost database |
+| `greece-gr` | Greece | EUR | el | Unified price lists (ΝΕΤ), public works budget markups (Ν. 4412/2016), building permits (Ν. 4495/2017, ΝΟΚ), ΦΠΑ | Engine rule set `greece` |
+| `ukraine-ua` | Ukraine | UAH | uk | Кошторисні норми України (наказ №281), summary estimate chapters, Prozorro procurement, ДБН, ПДВ | Engine rule set `ukraine` |
 | `russia-gesn` | Russia | RUB | ru | GESN/FER norm base, resource decomposition, price level, overhead and profit on payroll | Ships a Russian UI; carries the `cwicr-ru-stpetersburg` cost database |
 | `saudi-vision2030` | Saudi Arabia | SAR | ar, en | SBC, MoMRAH, Aramco standards | KSA mega-projects |
 | `renewables-epc` | Cross-region | EUR | en | IEC 61400 wind, IEC 61730 PV, MV cables, LCOE, grid compliance | Renewables EPC vertical |
@@ -278,10 +281,13 @@ pip install -e packs/brazil-sinapi
 pip install -e packs/doker-formwork
 pip install -e packs/hungary-hu
 pip install -e packs/russia-gesn
+pip install -e packs/greece-gr
 pip install -e packs/india-cpwd
 pip install -e packs/renewables-epc
+pip install -e packs/romania-ro
 pip install -e packs/saudi-vision2030
 pip install -e packs/uk-jct
+pip install -e packs/ukraine-ua
 pip install -e packs/us-costdata
 ```
 
@@ -450,6 +456,7 @@ teach identifiers that were never rule sets at all.
 | `ai_estimator` | Guards on machine-produced estimate lines |
 | `field_time` | Site time capture |
 | `procurement` | Purchase orders and reconciliation |
+| `invoice_po_match` | Supplier invoice against its order: net within what is still open, quantity and value within what was received |
 | `rfq_issue` | Enquiry at the point of issue |
 | `rfq_award` | Enquiry at the point of award |
 | `subcontract` | Subcontract packages |
@@ -473,6 +480,10 @@ teach identifiers that were never rule sets at all.
 | `birimfiyat` | Birim Fiyat (TR) |
 | `gesn` | GESN (RU) |
 | `hungary` | Hungarian item orders, material and fee split (HU) |
+| `romania` | Deviz general chapters, HG 907/2016 (RO) |
+| `greece` | Unified price list (ΝΕΤ) articles (GR) |
+| `ukraine` | Summary estimate chapters, наказ Мінрегіону №281 (UA) |
+| `poland` | KNR and KNNR catalogue references of a kosztorys (PL) |
 
 Modules add more. Anything with a `validators.py` registers its own sets when it
 loads, `formwork` and `carbon_6d` among them, and several of them register
@@ -568,8 +579,12 @@ cd backend
 uvicorn app.main:create_app --factory --reload --port 8000
 # Expect log line: "Active partner pack (env-selected): your-pack"
 
-# 5. Hit the API
-curl http://localhost:8000/api/v1/partner-pack/current | jq
+# 5. Hit the API. The pack routes answer signed-in callers, so sign in first
+#    with any account on this install.
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/users/auth/login/ \
+  -H "Content-Type: application/json" \
+  -d '{"email": "you@example.com", "password": "your-password"}' | jq -r '.access_token')
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/v1/partner-pack/current | jq
 ```
 
 ### Unit tests

@@ -66,6 +66,10 @@ CI_ONLY_BY_DESIGN = {
     ),
     "check_docker_force_include_context.py": ("Self-test. Step: 'Prove the Docker force-include gate can fail'."),
     "check_prompt_provenance.py": ("Self-test. Step: 'Prove the prompt provenance guard can fail'."),
+    "check_wheel_ships_every_pack.py": (
+        "Reads the installed wheel. Step: 'Ask the installed wheel which packs it lists'. "
+        "At pre-commit time no wheel has been built."
+    ),
     "check_workflow_guard_count.py": (
         "Guards repo-hygiene.yml itself rather than the source tree. Step: 'Check this "
         "file's header still counts its own guards correctly'. A hook scoped by files: "
@@ -101,6 +105,15 @@ CI_ONLY_BY_DESIGN = {
         "read the locale files alone. Nine seconds of hook accounting was already judged "
         "too much here (673773c00); this is fourteen times that."
     ),
+    "check_architecture_manifest.py": (
+        "Too slow for a hook, measured at 1m14s. It walks all 195 backend modules "
+        "and 188 frontend features to rebuild what the manifest claims, so its cost "
+        "is the size of the tree rather than the size of the commit, and "
+        "pass_filenames: false would charge that to every commit that touches a "
+        "router or a feature directory. Step: 'Check the architecture manifest "
+        "against the tree it describes'. The generator beside it is run by hand "
+        "when the tree changes shape, which is the moment the manifest is stale."
+    ),
     "check_public_language_counts.py": (
         "Counts locale files and offered languages at import time, then checks "
         "every number in README.md and DEVELOPING.md against the live count. "
@@ -108,6 +121,13 @@ CI_ONLY_BY_DESIGN = {
         "with 'Prove the public language count guard can fail' beside it. A hook "
         "scoped to locale files would miss a prose change, and a hook scoped to "
         "the docs would miss a locale addition; the gate needs both sides at once."
+    ),
+    "check_frontend_api_routes.py": (
+        "Needs the backend installed, because it builds the real route table with "
+        "create_app() and every module router mounted, and that import takes minutes "
+        "on a developer machine against a minute on the runner. Step: 'Check every "
+        "frontend API call has a backend route', below the backend install in "
+        "repo-hygiene.yml. Its self-tests run with the other scripts/test_*.py there."
     ),
 }
 

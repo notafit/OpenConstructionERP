@@ -5,6 +5,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 import clsx from 'clsx';
 import {
   FileText,
@@ -28,6 +29,8 @@ import {
   Network,
   ArrowRight,
   Trash2,
+  Gavel,
+  Table2,
 } from 'lucide-react';
 import {
   Button,
@@ -59,12 +62,21 @@ import {
   TEMPLATE_CATALOGUE_KEY,
 } from './ContractTemplatesPanel';
 import { ContractStatusPipeline } from './ContractStatusPipeline';
+import { SovLineLinkEditor, SovLineLinkSummary } from './SovLineLink';
+import { ContractCodeRename } from './ContractCodeRename';
 import { ContractExpiryBadge } from './ContractExpiryBadge';
 import { ComplianceGate } from './ComplianceGate';
 import { ContractPartiesPanel } from './ContractPartiesPanel';
 import { ContractSecuritiesPanel } from './ContractSecuritiesPanel';
+import {
+  RetentionReleasePanel,
+  retentionEventLabel,
+} from './RetentionReleasePanel';
 import { ContractAnalyticsPanels } from './ContractAnalyticsPanels';
+import { PaymentPlanPanel } from './PaymentPlanPanel';
+import { SovReconcilePanel } from './SovReconcilePanel';
 import { contractsGuide } from './contractsGuide';
+import { bidPackageDeepLink, boqDeepLink, contractSource, tenderPackageDeepLink } from '@/shared/lib/awardChainLinks';
 import { useToastStore } from '@/stores/useToastStore';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -78,6 +90,10 @@ import {
   listProgressClaims,
   listContractLines,
   createContract,
+  createContractLine,
+  updateContractLine,
+  deleteContractLine,
+  sovLineRefusal,
   createProgressClaim,
   suspendContract,
   resumeContract,
@@ -85,6 +101,7 @@ import {
   closeContract,
   cloneContract,
   deleteContract,
+  contractDeleteRefusal,
   listClauseTemplates,
   submitClaim,
   approveClaim,
@@ -94,16 +111,34 @@ import {
   getContractDashboard,
   type ContractItem,
   type ContractLine,
+  type ContractLineUpdatePayload,
   type ProgressClaimItem,
   type ContractType,
   type ContractStatus,
   type ClaimStatus,
   type CounterpartyType,
   type ContractDashboard,
+  type ContractCountryDefaults,
+  type ContractCreatePayload,
+  type CountryDefaultField,
+  type ValuationInterval,
 } from './api';
+import { ContractPaymentTermsCard } from './ContractPaymentTermsEditor';
+import {
+  DefaultHint,
+  RELEASE_SPLIT_PRESETS,
+  VALUATION_INTERVALS,
+  countryName,
+  releaseSplitText,
+  splitPresetId,
+  useContractCountryDefaults,
+  valuationIntervalLabel,
+} from './ContractPaymentTerms';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildContractsInsights } from './contractsInsights';
-import { fmtPercent } from '@/shared/lib/formatters';
+import { DEFAULT_CONTRACTS_TAB, isContractsTab, type ContractsTab } from './contractsTabs';
+import { ClaimPeriod } from './ClaimPeriod';
+import { fmtList, fmtPercent } from '@/shared/lib/formatters';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 
 // English fallbacks for the computed `contracts.type_*` keys. The default used to be
@@ -116,7 +151,7 @@ const CONTRACTS_TYPE_LABELS: Record<string, string> = {
 };
 
 
-type Tab = 'contracts' | 'claims' | 'final_accounts' | 'templates';
+type Tab = ContractsTab;
 
 const CONTRACT_TYPE_COLORS: Record<
   ContractType,
@@ -247,6 +282,14 @@ function toNum(v: number | string | null | undefined): number {
   if (v === null || v === undefined) return 0;
   const n = typeof v === 'string' ? Number(v) : v;
   return Number.isFinite(n) ? n : 0;
+}
+
+/** The claims register of one contract: one key and one read for the list and for the new-claim dialog. */
+function claimsListQuery(contractId: string) {
+  return {
+    queryKey: ['contracts', 'claims', contractId],
+    queryFn: () => listProgressClaims({ contract_id: contractId, limit: 200 }),
+  };
 }
 
 function todayIso(): string {
@@ -485,7 +528,23 @@ export function ContractsPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [tab, setTab] = useState<Tab>('contracts');
+  // The active tab lives in ?tab= so a menu row, a guide step or a case can
+  // open the register straight on Progress Claims (/contracts?tab=claims) and
+  // a reload keeps it. The URL is the only source: a link followed while the
+  // page is open switches the tab too. An unknown value falls back to the
+  // Contracts tab. Switches replace the entry rather than push, so tabbing
+  // around does not bury the page the user came from under history.
+  const rawTab = searchParams.get('tab');
+  const tab: Tab = isContractsTab(rawTab) ? rawTab : DEFAULT_CONTRACTS_TAB;
+  const setTab = (next: Tab) =>
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        params.set('tab', next);
+        return params;
+      },
+      { replace: true },
+    );
   const activeProjectId = useActiveProjectId();
 
   // CONN-43 consumer: a subcontractor's "Subcontract agreement" pill deep-links
@@ -506,6 +565,14 @@ export function ContractsPage() {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<ContractType | ''>('');
   const [statusFilter, setStatusFilter] = useState<string>('');
+  // A tab click clears the filters itself (below). A tab reached through the
+  // URL, a menu row clicked while this page is open, has to clear them too:
+  // the status values differ per tab, so a contract status carried over to
+  // the claims list would hide every claim.
+  useEffect(() => {
+    setSearch('');
+    setStatusFilter('');
+  }, [tab]);
   // Deep-link consumer (Issue #435): a variation order's "Contract" pill and
   // a change order's "Applies to contract" pill land here as
   // /contracts?highlight=<id>, so the register opens on that contract's
@@ -548,6 +615,7 @@ export function ContractsPage() {
     queryKey: ['contracts', 'list', projectId],
     queryFn: () => listContracts({ project_id: projectId, limit: 200 }),
     enabled: !!projectId,
+    refetchOnWindowFocus: true,
   });
 
   /* `.items` is the page and `.total` is how many rows matched. The
@@ -577,9 +645,7 @@ export function ContractsPage() {
   const effectiveClaimsContract = claimsContractId || contracts[0]?.id || '';
 
   const claimsQ = useQuery({
-    queryKey: ['contracts', 'claims', effectiveClaimsContract],
-    queryFn: () =>
-      listProgressClaims({ contract_id: effectiveClaimsContract, limit: 200 }),
+    ...claimsListQuery(effectiveClaimsContract),
     enabled: tab !== 'contracts' && !!effectiveClaimsContract,
   });
 
@@ -720,7 +786,7 @@ export function ContractsPage() {
       >
         {t('contracts.intro_body', {
           defaultValue:
-            'Set up each commercial agreement with its type-aware schedule of values, retention and lifecycle, then bill the work through progress claims and settle in the final account. Variations adjust the contract sum mid-flight and approved claims push their net due into Finance, so what you signed and what you owe never drift apart.',
+            'Set up each commercial agreement with its type-aware schedule of values, retention and lifecycle, then bill the work through progress claims and settle in the final account. Variations adjust the contract sum mid-flight and approved claims push their net due into Finance, so what you signed and what is billed never drift apart.',
         })}
       </DismissibleInfo>
 
@@ -956,6 +1022,7 @@ export function ContractsPage() {
       {createOpen && (
         <CreateContractModal
           projectId={projectId}
+          defaultCurrency={selectedProject?.currency || ''}
           onClose={() => setCreateOpen(false)}
         />
       )}
@@ -966,6 +1033,7 @@ export function ContractsPage() {
           contracts={contracts.filter((c) => c.status === 'active')}
           defaultContractId={effectiveClaimsContract}
           onClose={() => setNewClaimOpen(false)}
+          onCreated={(contractId) => setClaimsContractId(contractId)}
         />
       )}
     </div>
@@ -1131,8 +1199,11 @@ function ContractTable({
             <td colSpan={5} className="px-4 py-2 text-xs uppercase tracking-wide text-content-tertiary">
               {t('contracts.register_total', { defaultValue: 'Register total' })}
               <span className="ml-2 normal-case text-content-secondary">
-                ({rows.length}{' '}
-                {t('contracts.contracts_label', { defaultValue: 'contracts' })})
+                ({t('contracts.register_count', {
+                  count: rows.length,
+                  defaultValue_one: '{{count}} contract',
+                  defaultValue_other: '{{count}} contracts',
+                })})
               </span>
             </td>
             <td className="px-4 py-2 text-right text-sm font-medium">
@@ -1280,9 +1351,9 @@ function ClaimRow({
         )}
       </td>
       <td className="px-4 py-2 text-xs text-content-secondary">
-        {claim.period_start ? <DateDisplay value={claim.period_start} /> : '—'}
-        {' → '}
-        {claim.period_end ? <DateDisplay value={claim.period_end} /> : '—'}
+        {/* The parsed dates, as the claim's own header shows them. The raw
+            string alone read "—" or a different date than the detail page. */}
+        <ClaimPeriod claim={claim} />
       </td>
       <td className="px-4 py-2 text-right">
         <MoneyDisplay
@@ -1448,6 +1519,316 @@ function FinalAccountsView({
   );
 }
 
+/* ─── Schedule of values ─── */
+
+/** What a write to a SoV line makes stale. */
+function invalidateSoV(qc: QueryClient, contractId: string): void {
+  qc.invalidateQueries({ queryKey: ['contracts', 'lines', contractId] });
+  // The dashboard adds the lines up, and the compliance gate is computed from
+  // them: a line given the unit it was missing has to change the answer the
+  // gate gives, or the person fixes the line and still cannot sign.
+  qc.invalidateQueries({ queryKey: ['contracts', 'dashboard', contractId] });
+  qc.invalidateQueries({ queryKey: ['contracts', 'compliance-gate', contractId] });
+}
+
+/**
+ * Why the lines of a signed contract cannot be changed here. Said under the
+ * table, and again if the server refuses a write the screen still offered.
+ */
+function sovLockedText(t: TFunction): string {
+  return t('contracts.sov_locked', {
+    defaultValue:
+      'A signed contract is billed on these lines, so they cannot be changed or removed here. Adjust the scope with a variation.',
+  });
+}
+
+/** The same for a line a progress claim has billed on, signed contract or not. */
+function sovBilledLockedText(t: TFunction): string {
+  return t('contracts.sov_billed_locked', {
+    defaultValue:
+      'Lines a progress claim has billed on cannot be changed or removed here, because the claim is built on them. Adjust the scope with a variation.',
+  });
+}
+
+/**
+ * Why the server refused to delete a contract, in the reader's language, or
+ * null when the refusal is not one of the three the delete gives.
+ */
+function contractDeleteRefusalText(t: TFunction, err: unknown): string | null {
+  const refusal = contractDeleteRefusal(err);
+  if (refusal === null) return null;
+  if (refusal.code === 'contract_not_draft') {
+    return t('contracts.delete_refused_not_draft', {
+      defaultValue: 'Only a draft contract can be deleted. Terminate or complete this one instead.',
+    });
+  }
+  if (refusal.code === 'contract_has_claims_past_draft') {
+    return t('contracts.delete_refused_claims_past_draft', {
+      defaultValue:
+        'This contract has progress claims past draft ({{claims}}), so it cannot be deleted: they would be deleted with it. Terminate the contract instead.',
+      claims: fmtList(refusal.claimNumbers),
+    });
+  }
+  return t('contracts.delete_refused_billed', {
+    defaultValue:
+      "A progress claim has billed on this contract's schedule of values, so it cannot be deleted. If the claim is still a draft, take the lines off it first; otherwise terminate the contract.",
+  });
+}
+
+const lineInputCls =
+  'w-full rounded border border-border-light bg-surface-elevated px-2 py-1 text-sm';
+
+/** The typed form of a line, as strings, because that is what inputs hold. */
+function lineDraftOf(line: ContractLine) {
+  return {
+    code: line.code ?? '',
+    description: line.description ?? '',
+    quantity: String(toNum(line.quantity)),
+    unit: line.unit ?? '',
+    unit_rate: String(toNum(line.unit_rate)),
+  };
+}
+
+/**
+ * One line of the schedule of values, correctable in place.
+ *
+ * Correcting a line is the common case, not an edge one: it is how a typo in
+ * a rate is fixed and how a line that the compliance gate refuses to sign
+ * over gets its unit. So the controls sit on the row rather than behind a
+ * drawer, and only the fields that changed are sent.
+ *
+ * `editable` says the contract is still a draft, which is when the table has
+ * a column for the controls at all. A line a claim has billed on keeps that
+ * cell empty: the server refuses to change or delete it, and a row without
+ * its cell would slide its figures under the wrong headings.
+ */
+/** A contract whose schedule lines may still be linked to the bill: not yet closed. */
+const SOV_LINKABLE_STATUSES: ContractStatus[] = ['draft', 'active', 'suspended'];
+
+function SoVLineRow({
+  line,
+  contractId,
+  projectId,
+  currency,
+  editable,
+  linkable,
+}: {
+  line: ContractLine;
+  contractId: string;
+  projectId: string;
+  currency: string | null;
+  editable: boolean;
+  /** The line's link to the bill may be set: any contract that is not closed. */
+  linkable: boolean;
+}) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const addToast = useToastStore((s) => s.addToast);
+  const [editing, setEditing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [linking, setLinking] = useState(false);
+  const [draft, setDraft] = useState(() => lineDraftOf(line));
+  const billed = line.billed === true;
+
+  // The listing this row was drawn from can be older than the server's
+  // answer: a claim may have billed on the line since, or the contract been
+  // signed. The refusal is then said in the reader's language, in the same
+  // sentence the note under the table uses, and the lines are read again so
+  // the row locks itself instead of offering the same write twice.
+  const onWriteFailed = (err: unknown) => {
+    const refusal = sovLineRefusal(err);
+    if (refusal === null) {
+      addToast({ type: 'error', title: getErrorMessage(err) });
+      return;
+    }
+    addToast({
+      type: 'error',
+      title: refusal === 'contract_line_billed' ? sovBilledLockedText(t) : sovLockedText(t),
+    });
+    setEditing(false);
+    invalidateSoV(qc, contractId);
+    // Signed under this screen: the drawer reads the status off the list.
+    if (refusal === 'contract_lines_frozen') {
+      qc.invalidateQueries({ queryKey: ['contracts', 'list'] });
+    }
+  };
+
+  const saveMut = useMutation({
+    mutationFn: () => {
+      const was = lineDraftOf(line);
+      const payload: ContractLineUpdatePayload = {};
+      if (draft.code !== was.code) payload.code = draft.code;
+      if (draft.description !== was.description) payload.description = draft.description;
+      if (draft.unit !== was.unit) payload.unit = draft.unit;
+      if (draft.quantity !== was.quantity) payload.quantity = parseFloat(draft.quantity) || 0;
+      if (draft.unit_rate !== was.unit_rate) payload.unit_rate = parseFloat(draft.unit_rate) || 0;
+      return updateContractLine(line.id, payload);
+    },
+    onSuccess: () => {
+      invalidateSoV(qc, contractId);
+      setEditing(false);
+    },
+    onError: onWriteFailed,
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: () => deleteContractLine(line.id),
+    onSuccess: () => {
+      invalidateSoV(qc, contractId);
+      setConfirming(false);
+    },
+    onError: (err) => {
+      setConfirming(false);
+      onWriteFailed(err);
+    },
+  });
+
+  const startEdit = () => {
+    setDraft(lineDraftOf(line));
+    setEditing(true);
+  };
+
+  if (editing) {
+    // The total is the two numbers multiplied, so it follows what is typed
+    // rather than showing the stored figure the edit is replacing.
+    const total = (parseFloat(draft.quantity) || 0) * (parseFloat(draft.unit_rate) || 0);
+    return (
+      <tr className="border-t border-border-light" data-testid={`sov-row-${line.id}`}>
+        <td className="py-1 pr-1">
+          <input
+            type="text"
+            value={draft.code}
+            onChange={(e) => setDraft((p) => ({ ...p, code: e.target.value }))}
+            className={lineInputCls}
+            aria-label={t('contracts.code', { defaultValue: 'Code' })}
+          />
+        </td>
+        <td className="py-1 pr-1">
+          <input
+            type="text"
+            value={draft.description}
+            onChange={(e) => setDraft((p) => ({ ...p, description: e.target.value }))}
+            className={lineInputCls}
+            aria-label={t('contracts.description', { defaultValue: 'Description' })}
+            autoFocus
+          />
+        </td>
+        <td className="py-1 pr-1">
+          <div className="flex gap-1">
+            <input
+              type="number"
+              value={draft.quantity}
+              onChange={(e) => setDraft((p) => ({ ...p, quantity: e.target.value }))}
+              className={`${lineInputCls} w-20 text-right`}
+              aria-label={t('contracts.qty', { defaultValue: 'Qty' })}
+            />
+            <input
+              type="text"
+              value={draft.unit}
+              onChange={(e) => setDraft((p) => ({ ...p, unit: e.target.value }))}
+              className={`${lineInputCls} w-16`}
+              aria-label={t('boq.unit', { defaultValue: 'Unit' })}
+            />
+          </div>
+        </td>
+        <td className="py-1 pr-1">
+          <input
+            type="number"
+            value={draft.unit_rate}
+            onChange={(e) => setDraft((p) => ({ ...p, unit_rate: e.target.value }))}
+            className={`${lineInputCls} w-24 text-right`}
+            aria-label={t('contracts.unit_rate', { defaultValue: 'Rate' })}
+          />
+        </td>
+        <td className="py-1 text-right font-medium">
+          <MoneyDisplay amount={total} currency={currency || undefined} />
+        </td>
+        <td className="py-1 text-right">
+          <div className="flex gap-1 justify-end">
+            <Button size="sm" onClick={() => saveMut.mutate()} loading={saveMut.isPending}>
+              {t('common.save', { defaultValue: 'Save' })}
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setEditing(false)}>
+              {t('common.cancel', { defaultValue: 'Cancel' })}
+            </Button>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
+  return (
+    <>
+      <tr className="border-t border-border-light" data-testid={`sov-row-${line.id}`}>
+        <td className="py-1 font-mono text-xs text-content-secondary">
+          {line.code || '—'}
+        </td>
+        <td className="py-1 max-w-[260px]">
+          <span className="block truncate">{line.description || '—'}</span>
+          <SovLineLinkSummary line={line} canLink={linkable} onOpen={() => setLinking((v) => !v)} />
+        </td>
+        <td className="py-1 text-right text-content-secondary">
+          {toNum(line.quantity).toLocaleString(getNumberLocale())} {line.unit || ''}
+        </td>
+        <td className="py-1 text-right text-content-secondary">
+          <MoneyDisplay amount={toNum(line.unit_rate)} currency={currency || undefined} />
+        </td>
+        <td className="py-1 text-right font-medium">
+          <MoneyDisplay amount={toNum(line.total_value)} currency={currency || undefined} />
+        </td>
+        {editable && billed && <td className="py-1" />}
+        {editable && !billed && (
+          <td className="py-1 text-right">
+            <div className="flex gap-1 justify-end">
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={<PenLine size={12} />}
+                onClick={startEdit}
+              >
+                {t('common.edit', { defaultValue: 'Edit' })}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                icon={<Trash2 size={12} />}
+                onClick={() => setConfirming(true)}
+              >
+                {t('common.delete', { defaultValue: 'Delete' })}
+              </Button>
+            </div>
+            <ConfirmDialog
+              open={confirming}
+              onConfirm={() => deleteMut.mutate()}
+              onCancel={() => setConfirming(false)}
+              title={t('contracts.delete_line_title', { defaultValue: 'Remove this line' })}
+              message={t('contracts.delete_line_message', {
+                defaultValue:
+                  'The line leaves the schedule of values and the contract total drops by its amount.',
+              })}
+              confirmLabel={t('common.delete', { defaultValue: 'Delete' })}
+              variant="danger"
+              loading={deleteMut.isPending}
+            />
+          </td>
+        )}
+      </tr>
+      {linking && (
+        <tr data-testid={`sov-link-row-${line.id}`}>
+          <td colSpan={editable ? 6 : 5} className="pb-2">
+            <SovLineLinkEditor
+              line={line}
+              contractId={contractId}
+              projectId={projectId}
+              onDone={() => setLinking(false)}
+            />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
 /* ─── Detail drawer ───
    Exported for the delete-affordance test; the page itself renders it
    directly. */
@@ -1470,15 +1851,36 @@ export function ContractDetailDrawer({
   // user sign once there are no blocking errors.
   const [gateOpen, setGateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [addingLine, setAddingLine] = useState(false);
+  const [newLine, setNewLine] = useState({ description: '', quantity: '', unit_rate: '', unit: '' });
+
+  const addLineMut = useMutation({
+    mutationFn: () =>
+      createContractLine(contractId, {
+        contract_id: contractId,
+        description: newLine.description,
+        quantity: parseFloat(newLine.quantity) || 0,
+        unit_rate: parseFloat(newLine.unit_rate) || 0,
+        unit: newLine.unit,
+      }),
+    onSuccess: () => {
+      invalidateSoV(qc, contractId);
+      setNewLine({ description: '', quantity: '', unit_rate: '', unit: '' });
+      setAddingLine(false);
+    },
+    onError: (err) => addToast({ type: 'error', title: getErrorMessage(err) }),
+  });
 
   const linesQ = useQuery({
     queryKey: ['contracts', 'lines', contractId],
     queryFn: () => listContractLines(contractId),
+    refetchOnWindowFocus: true,
   });
 
   const claimsQ = useQuery({
     queryKey: ['contracts', 'claim-history', contractId],
     queryFn: () => listProgressClaims({ contract_id: contractId, limit: 50 }),
+    refetchOnWindowFocus: true,
   });
 
   const dashQ = useQuery<ContractDashboard>({
@@ -1538,11 +1940,14 @@ export function ContractDetailDrawer({
     onError: (err) => addToast({ type: 'error', title: getErrorMessage(err) }),
   });
 
+  // Close states no figures. Without a final account the server reads them
+  // from the contract and its claims; with one, the figures on it stand. The
+  // button used to restate the contract value, which overwrote a final account
+  // agreed at a negotiated figure, and an agreed one now refuses that.
   const closeMut = useMutation({
     mutationFn: () =>
       closeContract(contractId, {
         contract_id: contractId,
-        final_contract_value: toNum(contract?.total_value),
         status: 'agreed',
       }),
     onSuccess: () => {
@@ -1600,7 +2005,7 @@ export function ContractDetailDrawer({
     },
     onError: (err) => {
       setDeleteOpen(false);
-      addToast({ type: 'error', title: getErrorMessage(err) });
+      addToast({ type: 'error', title: contractDeleteRefusalText(t, err) ?? getErrorMessage(err) });
     },
   });
 
@@ -1618,6 +2023,18 @@ export function ContractDetailDrawer({
     (acc, l) => acc + toNum(l.total_value),
     0,
   );
+
+  // A draft's schedule of values is still being written, and correcting it is
+  // the ordinary thing to do: the compliance gate refuses to sign over a line
+  // with no unit, and the person who typed the rate wrong has to be able to
+  // fix it. Once the contract is signed the lines are what is billed on, so
+  // the server refuses to change or delete them and the variation is the
+  // instrument. The same holds line by line on a draft: nothing ties a claim
+  // to the contract's status, so a draft can carry claims, and a line one has
+  // billed on is refused too, because a claim line goes with its SoV line
+  // (the foreign key cascades). The listing says which lines those are.
+  const linesEditable = contract.status === 'draft';
+  const someLineBilled = (linesQ.data ?? []).some((l) => l.billed === true);
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
@@ -1637,9 +2054,13 @@ export function ContractDetailDrawer({
       >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-border-light bg-surface-elevated px-5 py-3">
           <div>
-            <h2 id="contract-drawer-title" className="text-base font-semibold">
-              {contract.code} — {contract.title || 'Untitled'}
-            </h2>
+            <div className="flex items-center gap-1">
+              <h2 id="contract-drawer-title" className="text-base font-semibold">
+                {contract.code} —{' '}
+                {contract.title || t('contracts.untitled', { defaultValue: 'Untitled' })}
+              </h2>
+              <ContractCodeRename key={contract.code} contract={contract} />
+            </div>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <ContractTypeChip type={contract.contract_type} />
               <Badge variant={CONTRACT_STATUS_VARIANT[contract.status]} dot>
@@ -1784,6 +2205,7 @@ export function ContractDetailDrawer({
                   icon={<Archive size={14} />}
                   onClick={() => closeMut.mutate()}
                   loading={closeMut.isPending}
+                  data-testid="contract-close"
                 >
                   {t('contracts.close', { defaultValue: 'Close' })}
                 </Button>
@@ -1841,6 +2263,55 @@ export function ContractDetailDrawer({
                 defaultValue: 'Variations on this contract',
               })}
             </Link>
+            {/* Where an awarded contract came from. The award that drafted it
+                stamped the tender package, the bid package and the bill on
+                its metadata; a contract written by hand carries none, and
+                then none of these is drawn. */}
+            {(() => {
+              const source = contractSource(contract.metadata);
+              const chip =
+                'inline-flex items-center gap-1 rounded-md border border-border-light px-2 py-1 text-content-secondary hover:text-oe-blue hover:border-oe-blue transition-colors';
+              return (
+                <>
+                  {source.tenderPackageId && (
+                    <Link
+                      to={tenderPackageDeepLink(source.tenderPackageId)}
+                      className={chip}
+                      title={t('contracts.from_tender_hint', {
+                        defaultValue: 'Open the tender package this contract was awarded from',
+                      })}
+                    >
+                      <Gavel size={12} />
+                      {t('contracts.from_tender', { defaultValue: 'From tender' })}
+                    </Link>
+                  )}
+                  {source.bidPackageId && (
+                    <Link
+                      to={bidPackageDeepLink(source.bidPackageId)}
+                      className={chip}
+                      title={t('contracts.from_bid_package_hint', {
+                        defaultValue: 'Open the bid package this contract was awarded from',
+                      })}
+                    >
+                      <Gavel size={12} />
+                      {t('contracts.from_bid_package', { defaultValue: 'From bid package' })}
+                    </Link>
+                  )}
+                  {source.boqId && (
+                    <Link
+                      to={boqDeepLink(source.boqId)}
+                      className={chip}
+                      title={t('contracts.source_boq_hint', {
+                        defaultValue: 'Open the bill of quantities the awarded scope was priced in',
+                      })}
+                    >
+                      <Table2 size={12} />
+                      {t('contracts.source_boq', { defaultValue: 'Source BOQ' })}
+                    </Link>
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           {/* Header fields */}
@@ -1892,7 +2363,7 @@ export function ContractDetailDrawer({
                 label={t('contracts.release_event', {
                   defaultValue: 'Retention release',
                 })}
-                value={contract.retention_release_event}
+                value={retentionEventLabel(t, contract.retention_release_event)}
               />
               {/* The pin, shown only when there is one. Version 0 is a built-in
                   standard form, which has no versions of its own, so printing
@@ -1913,6 +2384,15 @@ export function ContractDetailDrawer({
             </div>
           </Card>
 
+          {/* The payment terms beside the rate, each marked where the
+              project's country filled it in. */}
+          <Card padding="sm">
+            <p className="text-xs font-semibold uppercase tracking-wide text-content-secondary mb-2">
+              {t('contracts.payment_terms.section', { defaultValue: 'Payment terms' })}
+            </p>
+            <ContractPaymentTermsCard contract={contract} />
+          </Card>
+
           {/* Who the contract is between. Directly under the header because the
               header's counterparty field is one side and a category, and this
               is the list the signature block is actually built from. */}
@@ -1931,10 +2411,20 @@ export function ContractDetailDrawer({
                 />
                 )
               </span>
+              {!addingLine && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="ml-auto"
+                  onClick={() => setAddingLine(true)}
+                >
+                  {t('contracts.add_line', { defaultValue: 'Add line' })}
+                </Button>
+              )}
             </p>
             {linesQ.isLoading ? (
               <SkeletonTable rows={3} columns={4} />
-            ) : (linesQ.data ?? []).length === 0 ? (
+            ) : (linesQ.data ?? []).length === 0 && !addingLine ? (
               <p className="text-sm text-content-tertiary py-2">
                 {t('contracts.no_sov', {
                   defaultValue: 'No schedule of values yet.',
@@ -1960,38 +2450,97 @@ export function ContractDetailDrawer({
                       <th className="text-right py-1">
                         {t('contracts.total', { defaultValue: 'Total' })}
                       </th>
+                      {linesEditable && <th className="py-1" />}
                     </tr>
                   </thead>
                   <tbody>
                     {(linesQ.data ?? []).map((l: ContractLine) => (
-                      <tr key={l.id} className="border-t border-border-light">
-                        <td className="py-1 font-mono text-xs text-content-secondary">
-                          {l.code || '—'}
-                        </td>
-                        <td className="py-1 truncate max-w-[260px]">
-                          {l.description || '—'}
-                        </td>
-                        <td className="py-1 text-right text-content-secondary">
-                          {toNum(l.quantity).toLocaleString(getNumberLocale())} {l.unit || ''}
-                        </td>
-                        <td className="py-1 text-right text-content-secondary">
-                          <MoneyDisplay
-                            amount={toNum(l.unit_rate)}
-                            currency={contract.currency || undefined}
-                          />
-                        </td>
-                        <td className="py-1 text-right font-medium">
-                          <MoneyDisplay
-                            amount={toNum(l.total_value)}
-                            currency={contract.currency || undefined}
-                          />
-                        </td>
-                      </tr>
+                      <SoVLineRow
+                        key={l.id}
+                        line={l}
+                        contractId={contractId}
+                        projectId={contract.project_id}
+                        currency={contract.currency}
+                        editable={linesEditable}
+                        linkable={SOV_LINKABLE_STATUSES.includes(contract.status)}
+                      />
                     ))}
                   </tbody>
+                  {addingLine && (
+                    <tfoot>
+                      <tr className="border-t border-border-light">
+                        <td className="py-1">
+                          <input
+                            type="text"
+                            placeholder={t('contracts.description', { defaultValue: 'Description' })}
+                            value={newLine.description}
+                            onChange={(e) => setNewLine((p) => ({ ...p, description: e.target.value }))}
+                            className="w-full rounded border border-border-light bg-surface-elevated px-2 py-1 text-sm"
+                            autoFocus
+                          />
+                        </td>
+                        <td className="py-1" colSpan={2}>
+                          <div className="flex gap-1">
+                            <input
+                              type="number"
+                              placeholder={t('contracts.qty', { defaultValue: 'Qty' })}
+                              value={newLine.quantity}
+                              onChange={(e) => setNewLine((p) => ({ ...p, quantity: e.target.value }))}
+                              className="w-20 rounded border border-border-light bg-surface-elevated px-2 py-1 text-sm text-right"
+                            />
+                            <input
+                              type="text"
+                              placeholder={t('boq.unit', { defaultValue: 'Unit' })}
+                              value={newLine.unit}
+                              onChange={(e) => setNewLine((p) => ({ ...p, unit: e.target.value }))}
+                              className="w-16 rounded border border-border-light bg-surface-elevated px-2 py-1 text-sm"
+                            />
+                          </div>
+                        </td>
+                        <td className="py-1">
+                          <input
+                            type="number"
+                            placeholder={t('contracts.unit_rate', { defaultValue: 'Rate' })}
+                            value={newLine.unit_rate}
+                            onChange={(e) => setNewLine((p) => ({ ...p, unit_rate: e.target.value }))}
+                            className="w-24 rounded border border-border-light bg-surface-elevated px-2 py-1 text-sm text-right"
+                          />
+                        </td>
+                        <td className="py-1 text-right" colSpan={linesEditable ? 2 : 1}>
+                          <div className="flex gap-1 justify-end">
+                            <Button size="sm" onClick={() => addLineMut.mutate()} loading={addLineMut.isPending}>
+                              {t('common.save', { defaultValue: 'Save' })}
+                            </Button>
+                            <Button size="sm" variant="secondary" onClick={() => setAddingLine(false)}>
+                              {t('common.cancel', { defaultValue: 'Cancel' })}
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    </tfoot>
+                  )}
                 </table>
               </div>
             )}
+            {!linesEditable && (linesQ.data ?? []).length > 0 && (
+              <p
+                className="mt-2 text-xs text-content-tertiary"
+                data-testid="sov-lines-locked"
+              >
+                {sovLockedText(t)}
+              </p>
+            )}
+            {/* On a draft the signed-contract sentence would be false, so a
+                billed line gets its own reason. */}
+            {linesEditable && someLineBilled && (
+              <p
+                className="mt-2 text-xs text-content-tertiary"
+                data-testid="sov-lines-billed"
+              >
+                {sovBilledLockedText(t)}
+              </p>
+            )}
+            <SovReconcilePanel contractId={contractId} />
           </Card>
 
           {/* Retention ledger - real per-currency/direction rollup pulled from
@@ -2065,7 +2614,7 @@ export function ContractDetailDrawer({
             <div className="mt-3 border-t border-border-light pt-2">
               <Field
                 label={t('contracts.release_event_short', { defaultValue: 'Release on' })}
-                value={contract.retention_release_event}
+                value={retentionEventLabel(t, contract.retention_release_event)}
               />
             </div>
           </Card>
@@ -2155,6 +2704,25 @@ export function ContractDetailDrawer({
             currency={contract.currency}
           />
 
+          {/* Retention, and the way it goes back. It sits under the bonds
+              because a release at substantial completion regularly needs the
+              surety's consent, which is a row in the register above. */}
+          <RetentionReleasePanel
+            contractId={contractId}
+            currency={contract.currency}
+            contractStatus={contract.status}
+          />
+
+          {/* The instalments the client pays and the schedule milestones they
+              wait for. Above the analytics because it is something people
+              edit and act on (a reached line raises its claim here), not a
+              read-out. */}
+          <PaymentPlanPanel
+            contractId={contractId}
+            projectId={contract.project_id}
+            currency={contract.currency}
+          />
+
           {/* Analytics & close-out — four read-only endpoints surfaced as
               stacked panels (SoV status, completeness, EOT exposure, final-
               account checklist). Each owns its query so one slow/forbidden
@@ -2226,16 +2794,27 @@ function Field({ label, value }: { label: React.ReactNode; value: React.ReactNod
   );
 }
 
-/* ─── Create modal ─── */
+/* ─── Create modal ───
+   Exported for the currency test; the page renders it directly. */
 
-function CreateContractModal({
+/** The payment-term fields of the create form, the same names the server's country defaults use. */
+type PaymentTermField = CountryDefaultField;
+
+/** The release select's value for a country default no preset describes. */
+const DEFAULT_SPLIT_OPTION = '__country_default__';
+
+export function CreateContractModal({
   projectId,
+  defaultCurrency,
   onClose,
 }: {
   projectId: string;
+  /** The project's own currency. Empty when the project does not name one,
+   *  and then the field starts empty and the server decides. */
+  defaultCurrency?: string;
   onClose: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const [busy, setBusy] = useState(false);
@@ -2246,12 +2825,61 @@ function CreateContractModal({
     contract_type: 'lump_sum' as ContractType,
     counterparty_type: 'subcontractor' as CounterpartyType,
     total_value: '0',
-    currency: 'EUR',
-    retention_percent: '5',
+    // The project's currency, not a guess. A contract seeded in the wrong one
+    // carries it to every claim raised on it and on to the certificate, where
+    // the figures are the contract's and the sign is not. Empty when the
+    // project names none, and then the server decides.
+    currency: defaultCurrency ?? '',
     start_date: todayIso(),
     end_date: '',
     template_code: '',
   });
+
+  // Payment terms start from the usual figures of the project's country and
+  // stay editable. Only what the person changes is sent: a figure left as the
+  // country filled it is left out, so the server fills it the same way and
+  // the contract records that it was the country's default rather than
+  // claiming the person typed it. A project whose country has no usual terms
+  // gets empty fields, never another country's figures.
+  const defaultsQ = useContractCountryDefaults(projectId);
+  const defaults = defaultsQ.data;
+  const knownDefaults = defaults?.has_defaults ? defaults : null;
+  const prefill = useMemo<Record<PaymentTermField, string>>(() => {
+    const v: ContractCountryDefaults['values'] = knownDefaults?.values ?? {};
+    const split = v.retention_release_split ?? null;
+    return {
+      retention_percent: v.retention_percent ?? '',
+      retention_cap_percent: v.retention_cap_percent ?? '',
+      retention_release_split: splitPresetId(split) ?? (split ? DEFAULT_SPLIT_OPTION : ''),
+      payment_period_days: v.payment_period_days != null ? String(v.payment_period_days) : '',
+      valuation_interval: v.valuation_interval ?? '',
+      certificate_name: v.certificate_name ?? '',
+    };
+  }, [knownDefaults]);
+  const [terms, setTerms] = useState<Record<PaymentTermField, string>>({
+    retention_percent: '',
+    retention_cap_percent: '',
+    retention_release_split: '',
+    payment_period_days: '',
+    valuation_interval: '',
+    certificate_name: '',
+  });
+  const [touched, setTouched] = useState<ReadonlySet<PaymentTermField>>(() => new Set());
+  const termValue = (field: PaymentTermField): string =>
+    touched.has(field) ? terms[field] : prefill[field];
+  const setTerm = (field: PaymentTermField, value: string) => {
+    setTerms((prev) => ({ ...prev, [field]: value }));
+    setTouched((prev) => new Set(prev).add(field));
+  };
+  const defaultHint = (field: PaymentTermField) =>
+    knownDefaults && !touched.has(field) && prefill[field] !== '' ? (
+      <DefaultHint
+        field={field}
+        country={knownDefaults.country_code}
+        source={knownDefaults.sources[field]}
+      />
+    ) : null;
+  const defaultSplit = knownDefaults?.values.retention_release_split ?? null;
 
   // Only paper that can be drawn from is offered. An unpublished draft is
   // refused by the server, so listing it here would be an option that fails.
@@ -2272,21 +2900,60 @@ function CreateContractModal({
       });
       return;
     }
+    // With no usual figure for the country the rate has to come from the
+    // person: the server would otherwise fall back to a platform figure that
+    // is nobody's law. While the defaults are still loading, or could not be
+    // read, an empty field is left to the server, which applies the same
+    // table this form would have shown.
+    if (defaultsQ.isSuccess && termValue('retention_percent').trim() === '') {
+      addToast({
+        type: 'error',
+        title: t('contracts.payment_terms.retention_required', {
+          defaultValue: 'Enter the retention this contract states (0 if none).',
+        }),
+      });
+      return;
+    }
+    const payload: ContractCreatePayload = {
+      project_id: projectId,
+      code: form.code.trim(),
+      title: form.title.trim(),
+      contract_type: form.contract_type,
+      counterparty_type: form.counterparty_type,
+      total_value: Number(form.total_value) || 0,
+      currency: form.currency.trim().toUpperCase() || undefined,
+      start_date: form.start_date || null,
+      end_date: form.end_date || null,
+      template_code: form.template_code || null,
+    };
+    const retention = termValue('retention_percent').trim();
+    if (touched.has('retention_percent') && retention !== '') {
+      payload.retention_percent = Number(retention) || 0;
+    }
+    if (touched.has('retention_cap_percent')) {
+      const cap = terms.retention_cap_percent.trim();
+      payload.retention_cap_percent = cap === '' ? null : Number(cap);
+    }
+    if (touched.has('retention_release_split')) {
+      const choice = terms.retention_release_split;
+      payload.retention_release_split =
+        choice === DEFAULT_SPLIT_OPTION
+          ? defaultSplit
+          : (RELEASE_SPLIT_PRESETS.find((p) => p.id === choice)?.split ?? null);
+    }
+    if (touched.has('payment_period_days')) {
+      const days = terms.payment_period_days.trim();
+      payload.payment_period_days = days === '' ? null : Math.round(Number(days));
+    }
+    if (touched.has('valuation_interval')) {
+      payload.valuation_interval = (terms.valuation_interval || null) as ValuationInterval | null;
+    }
+    if (touched.has('certificate_name')) {
+      payload.certificate_name = terms.certificate_name.trim() || null;
+    }
     setBusy(true);
     try {
-      await createContract({
-        project_id: projectId,
-        code: form.code.trim(),
-        title: form.title.trim(),
-        contract_type: form.contract_type,
-        counterparty_type: form.counterparty_type,
-        total_value: Number(form.total_value) || 0,
-        currency: form.currency.trim().toUpperCase() || undefined,
-        retention_percent: Number(form.retention_percent) || 0,
-        start_date: form.start_date || null,
-        end_date: form.end_date || null,
-        template_code: form.template_code || null,
-      });
+      await createContract(payload);
       addToast({
         type: 'success',
         title: t('contracts.created_ok', { defaultValue: 'Contract created' }),
@@ -2439,16 +3106,158 @@ function CreateContractModal({
         </WideModalField>
         <WideModalField
           label={t('contracts.retention_pct', { defaultValue: 'Retention %' })}
+          required={defaultsQ.isSuccess && !knownDefaults}
         >
           <input
             type="number"
             step="0.1"
-            value={form.retention_percent}
-            onChange={(e) =>
-              setForm({ ...form, retention_percent: e.target.value })
-            }
+            min={0}
+            max={100}
+            value={termValue('retention_percent')}
+            onChange={(e) => setTerm('retention_percent', e.target.value)}
+            // Select the prefilled figure on focus so typing replaces it;
+            // typing 5 over a 5 used to append and read 55.
+            onFocus={(e) => e.currentTarget.select()}
+            data-testid="contract-retention"
             className={inputCls}
           />
+          {defaultHint('retention_percent')}
+        </WideModalField>
+      </WideModalSection>
+
+      <WideModalSection
+        title={t('contracts.payment_terms.section', { defaultValue: 'Payment terms' })}
+        columns={3}
+      >
+        <WideModalField span={3}>
+          <p className="text-xs text-content-secondary" data-testid="country-defaults-status">
+            {defaultsQ.isError
+              ? t('contracts.payment_terms.defaults_unavailable', {
+                  defaultValue:
+                    "The usual terms for this project's country could not be loaded. Anything left blank is filled by the server from them.",
+                })
+              : defaultsQ.isPending
+                ? t('contracts.payment_terms.defaults_loading', {
+                    defaultValue: "Looking up the usual terms for this project's country",
+                  })
+                : knownDefaults
+                  ? t('contracts.payment_terms.defaults_loaded', {
+                      defaultValue:
+                        'Pre-filled with the usual terms for {{country}}. Every figure can be changed.',
+                      // The form qualifies the country, it is not a second
+                      // item of a list: "United Kingdom (JCT 2016 / NEC4)".
+                      country: knownDefaults.standard_form
+                        ? `${countryName(knownDefaults.country_code, i18n.language)} (${knownDefaults.standard_form})`
+                        : countryName(knownDefaults.country_code, i18n.language),
+                    })
+                  : defaults?.country_code
+                    ? t('contracts.payment_terms.no_defaults', {
+                        defaultValue:
+                          'No usual payment terms are on file for {{country}}. Enter the figures the contract states.',
+                        country: countryName(defaults.country_code, i18n.language),
+                      })
+                    : t('contracts.payment_terms.no_country', {
+                        defaultValue:
+                          'This project names no country, so nothing is pre-filled. Enter the figures the contract states.',
+                      })}
+          </p>
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.payment_terms.retention_cap', {
+            defaultValue: 'Retention cap (% of contract sum)',
+          })}
+        >
+          <input
+            type="number"
+            step="0.1"
+            min={0}
+            max={100}
+            value={termValue('retention_cap_percent')}
+            onChange={(e) => setTerm('retention_cap_percent', e.target.value)}
+            placeholder={t('contracts.payment_terms.no_cap', { defaultValue: 'No cap' })}
+            data-testid="contract-retention-cap"
+            className={inputCls}
+          />
+          {defaultHint('retention_cap_percent')}
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.payment_terms.payment_period_days', {
+            defaultValue: 'Payment period (days)',
+          })}
+        >
+          <input
+            type="number"
+            step="1"
+            min={0}
+            max={365}
+            value={termValue('payment_period_days')}
+            onChange={(e) => setTerm('payment_period_days', e.target.value)}
+            data-testid="contract-payment-days"
+            className={inputCls}
+          />
+          {defaultHint('payment_period_days')}
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.payment_terms.valuation_interval', {
+            defaultValue: 'Valuation interval',
+          })}
+        >
+          <select
+            value={termValue('valuation_interval')}
+            onChange={(e) => setTerm('valuation_interval', e.target.value)}
+            data-testid="contract-valuation-interval"
+            className={inputCls}
+          >
+            <option value="">
+              {t('contracts.payment_terms.not_stated', { defaultValue: 'Not stated' })}
+            </option>
+            {VALUATION_INTERVALS.map((interval) => (
+              <option key={interval} value={interval}>
+                {valuationIntervalLabel(t, interval)}
+              </option>
+            ))}
+          </select>
+          {defaultHint('valuation_interval')}
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.payment_terms.release_split', {
+            defaultValue: 'Retention release',
+          })}
+          span={2}
+        >
+          <select
+            value={termValue('retention_release_split')}
+            onChange={(e) => setTerm('retention_release_split', e.target.value)}
+            data-testid="contract-release-split"
+            className={inputCls}
+          >
+            <option value="">
+              {t('contracts.payment_terms.not_stated', { defaultValue: 'Not stated' })}
+            </option>
+            {defaultSplit && splitPresetId(defaultSplit) === null && (
+              <option value={DEFAULT_SPLIT_OPTION}>{releaseSplitText(t, defaultSplit)}</option>
+            )}
+            {RELEASE_SPLIT_PRESETS.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {releaseSplitText(t, preset.split)}
+              </option>
+            ))}
+          </select>
+          {defaultHint('retention_release_split')}
+        </WideModalField>
+        <WideModalField
+          label={t('contracts.payment_terms.certificate_name', {
+            defaultValue: 'Interim certificate',
+          })}
+        >
+          <input
+            value={termValue('certificate_name')}
+            onChange={(e) => setTerm('certificate_name', e.target.value)}
+            maxLength={200}
+            data-testid="contract-certificate-name"
+            className={inputCls}
+          />
+          {defaultHint('certificate_name')}
         </WideModalField>
       </WideModalSection>
 
@@ -2481,16 +3290,20 @@ function CreateContractModal({
   );
 }
 
-/* ─── New claim modal ─── */
+/* ─── New claim modal ───
+   Exported for the currency test; the page renders it directly. */
 
-function NewClaimModal({
+export function NewClaimModal({
   contracts,
   defaultContractId,
   onClose,
+  onCreated,
 }: {
   contracts: ContractItem[];
   defaultContractId: string;
   onClose: () => void;
+  /** Called with the contract the claim was raised against, once its list is loaded. */
+  onCreated?: (contractId: string) => void;
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -2512,8 +3325,17 @@ function NewClaimModal({
     claim_number: '',
     period_start: todayIso(),
     period_end: todayIso(),
-    currency: 'EUR',
+    // Empty means "whatever the contract is in". A claim is billed against
+    // one contract and certified in that contract's money, so a seeded
+    // currency that disagrees with the selected contract prints the
+    // contract's figures under the wrong sign.
+    currency: '',
   });
+
+  const selectedContract = contracts.find((c) => c.id === form.contract_id);
+  // What the field shows, and what is sent: the typed value if there is one,
+  // otherwise the contract's. Neither, and the server picks.
+  const currency = form.currency || selectedContract?.currency || '';
 
   const submit = async () => {
     if (!form.contract_id) {
@@ -2532,13 +3354,21 @@ function NewClaimModal({
         claim_number: form.claim_number || null,
         period_start: form.period_start || null,
         period_end: form.period_end || null,
-        currency: form.currency.trim().toUpperCase() || undefined,
+        currency: currency.trim().toUpperCase() || undefined,
       });
       addToast({
         type: 'success',
         title: t('contracts.claim_created', { defaultValue: 'Claim created' }),
       });
-      qc.invalidateQueries({ queryKey: ['contracts', 'claims'] });
+      // The list is read before the dialog closes, and for the contract the
+      // claim was raised against. Closing on an unawaited invalidation showed
+      // the list it already held, empty on a first claim, until the refetch
+      // landed; and the list could be showing another contract altogether,
+      // because the dialog offers active contracts only while the list
+      // defaults to the first contract of any status.
+      await qc.invalidateQueries({ queryKey: ['contracts', 'claims'] });
+      await qc.fetchQuery(claimsListQuery(form.contract_id));
+      onCreated?.(form.contract_id);
       onClose();
     } catch (err) {
       addToast({ type: 'error', title: getErrorMessage(err) });
@@ -2605,10 +3435,11 @@ function NewClaimModal({
           label={t('contracts.currency', { defaultValue: 'Currency' })}
         >
           <input
-            value={form.currency}
+            value={currency}
             onChange={(e) => setForm({ ...form, currency: e.target.value })}
             className={inputCls}
             maxLength={3}
+            data-testid="claim-currency"
           />
         </WideModalField>
         <WideModalField

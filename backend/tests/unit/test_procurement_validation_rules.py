@@ -139,8 +139,8 @@ class TestLineAmount:
     def test_amount_that_disagrees_with_quantity_times_rate_is_flagged(self) -> None:
         findings = po_checks.check_line_amount(_po(items=[_line(amount="1500.00")]))
         assert len(findings) == 1
-        assert findings[0].params["expected"] == "1200.00"
-        assert findings[0].params["actual"] == "1500.00"
+        assert findings[0].params["expected"] == "1,200.00 EUR"
+        assert findings[0].params["actual"] == "1,500.00 EUR"
 
     def test_one_cent_of_rounding_is_tolerated(self) -> None:
         # 3 x 33.333 = 99.999, stored quantised to 100.00.
@@ -163,7 +163,7 @@ class TestSubtotalMatchesLines:
     def test_subtotal_that_disagrees_with_the_lines_is_flagged(self) -> None:
         findings = po_checks.check_subtotal_matches_lines(_po(amount_subtotal="999.00"))
         assert len(findings) == 1
-        assert findings[0].params["expected"] == "1200.00"
+        assert findings[0].params["expected"] == "1,200.00 EUR"
 
     def test_empty_po_defers_to_the_has_lines_check(self) -> None:
         """One problem, one finding: an empty PO is not also a subtotal mismatch."""
@@ -184,7 +184,7 @@ class TestTotalMatchesSubtotalPlusTax:
     def test_total_that_ignores_tax_is_flagged(self) -> None:
         findings = po_checks.check_total_matches_subtotal_plus_tax(_po(amount_total="1200.00"))
         assert len(findings) == 1
-        assert findings[0].params["expected"] == "1428.00"
+        assert findings[0].params["expected"] == "1,428.00 EUR"
 
     def test_zero_tax_is_honoured_not_coalesced(self) -> None:
         po = _po(tax_amount="0", amount_total="1200.00")
@@ -332,7 +332,7 @@ class TestRuleBodies:
         message = results[0].message
         assert "procurement.po_line_amount" not in message
         assert "{" not in message
-        assert "1200.00" in message
+        assert "1,200.00 EUR" in message
 
     async def test_locale_reaches_the_message(self) -> None:
         results = await ProcurementPOVendorAssigned().validate(_ctx(_po(vendor_contact_id=None), locale="de"))

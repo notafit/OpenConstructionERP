@@ -15,8 +15,10 @@ import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -225,6 +227,10 @@ async def purge_demo_tagged_global_rows(
     _targets = (
         ("app.modules.equipment.models", "Equipment"),
         ("app.modules.subcontractors.models", "Subcontractor"),
+        # The demo's own parties. They are offered in every assignee picker
+        # and on the contacts register, so a purged demo must take them along;
+        # the rows that point at a contact do so with SET NULL or no key.
+        ("app.modules.contacts.models", "Contact"),
     )
     for module_path, attr in _targets:
         try:
@@ -246,6 +252,14 @@ async def purge_demo_tagged_global_rows(
         deleted[model.__tablename__] = len(pks)
 
     return deleted
+
+
+# Tags a seeded project carries that a new project made from it must not inherit.
+_SEED_WORKSPACE_TAGS = ("demo_id", "partner_pack")
+
+
+def _without_seed_tags(metadata: dict | None) -> dict:
+    return {k: v for k, v in dict(metadata or {}).items() if k not in _SEED_WORKSPACE_TAGS}
 
 
 def _compliance_pack_source(
@@ -410,7 +424,7 @@ class ProjectService:
             # instead of letting latency creep silently.
             if len(_PROJECT_CODE_RESERVED) >= _PROJECT_CODE_RESERVED_HARD_CAP:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=(
                         f"Project-code reservation set exceeded "
                         f"{_PROJECT_CODE_RESERVED_HARD_CAP} entries; "
@@ -513,8 +527,25 @@ class ProjectService:
 
         # Metadata the pack and the resolution contribute, merged onto the
         # project once it exists.
-        pack_meta: dict[str, str] = {}
+        pack_meta: dict[str, Any] = {}
         country_code = (data.country_code or "").strip().upper() or None
+
+        # Resolve from the address country name when no explicit code was
+        # given.  The UI autocomplete fills ``country_code`` from the
+        # geocoder, but a user who types an address by hand (e.g.
+        # "Deutschland") skips the geocoder, and the code stays null while
+        # the country name is right there in the address.  This is a
+        # stronger signal than the active pack: the user stated the country
+        # in their own language, and we should honour it.
+        if not country_code and data.address:
+            _country_name = (data.address.get("country") or "").strip()
+            if _country_name:
+                from app.core.country_resolver import resolve_country_code
+
+                _resolved = resolve_country_code(_country_name)
+                if _resolved:
+                    country_code = _resolved
+                    pack_meta["country_from_address"] = _resolved
 
         if active_pack is not None:
             try:
@@ -586,10 +617,22 @@ class ProjectService:
         # the pack's sets are appended, and a set the engine does not register
         # is dropped rather than written - a project must be creatable even
         # when a pack is wrong. Fail-soft, like the pack lookup above.
+        #
+        # Which names the pack added is recorded beside them. A pack's "code
+        # required" set (masterformat under the Texas pack, birimfiyat under
+        # the Turkish one) is its country row carried on the project, and the
+        # BOQ router drops it, as it drops the row's, while the project names
+        # another standard: a UniFormat bill under the Texas pack must not
+        # fail masterformat on every line. A set the caller asked for is not
+        # in the record and is never dropped, because a dual-coded bill asks
+        # for a second code set on purpose.
+        _pack_added: list[str] = []
         try:
-            from app.core.partner_pack.apply import inherited_rule_sets
+            from app.core.partner_pack.apply import PACK_RULE_SETS_METADATA_KEY, split_inherited_rule_sets
 
-            _rule_sets = inherited_rule_sets(data.validation_rule_sets, active_pack)
+            _rule_sets, _pack_added = split_inherited_rule_sets(data.validation_rule_sets, active_pack)
+            if _pack_added:
+                pack_meta[PACK_RULE_SETS_METADATA_KEY] = _pack_added
         except Exception:  # noqa: BLE001 - creation must never break on pack lookup
             _rule_sets = list(data.validation_rule_sets or [])
 
@@ -611,6 +654,7 @@ class ProjectService:
             parent_project_id=data.parent_project_id,
             address=data.address,
             country_code=country_code,
+            subdivision_code=data.subdivision_code,
             contract_value=data.contract_value,
             planned_start_date=data.planned_start_date,
             planned_end_date=data.planned_end_date,
@@ -904,6 +948,23 @@ class ProjectService:
         if isinstance(fields.get("metadata_"), dict):
             fields["metadata_"] = merge_metadata(project.metadata_, fields["metadata_"])
 
+        # When the PATCH carries an address with a country name but no
+        # explicit country_code, resolve the code from the name. Same
+        # logic as the create path: a user who edits the address by hand
+        # and types "Deutschland" should not end up with country_code=null.
+        # Only fires when the PATCH itself did not set country_code, so an
+        # explicit choice always wins.
+        if "address" in fields and "country_code" not in fields:
+            _addr = fields.get("address")
+            if isinstance(_addr, dict):
+                _country_name = (_addr.get("country") or "").strip()
+                if _country_name:
+                    from app.core.country_resolver import resolve_country_code
+
+                    _resolved = resolve_country_code(_country_name)
+                    if _resolved:
+                        fields["country_code"] = _resolved
+
         await self.repo.update_fields(project_id, **fields)
 
         # Refresh the project object
@@ -1016,7 +1077,7 @@ class ProjectService:
         unknown = [p for p in requested if p not in valid]
         if unknown:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "error": "unknown_compliance_rule_packs",
                     "message": (
@@ -1132,7 +1193,7 @@ class ProjectService:
             # showcase project to start real work must not inherit demo_id
             # (the demo-data purge hard-deletes everything tagged with it)
             # or the partner_pack workspace tag.
-            metadata_={k: v for k, v in dict(source.metadata_ or {}).items() if k not in ("demo_id", "partner_pack")},
+            metadata_=_without_seed_tags(source.metadata_),
             # v2.9.4 per-project storage override
             storage_path_override=source.storage_path_override,
             storage_uses_default=source.storage_uses_default,
@@ -1311,6 +1372,9 @@ class ProjectService:
         owner_id = str(project.owner_id)
         project_name = project.name
         prior_status = project.status
+        from app.core.demo_marker import demo_id_of
+
+        demo_id = demo_id_of(project.metadata_)
 
         # Cascade-delete child records that belong to this project.
         # These models all have project_id FK with ondelete=CASCADE, but
@@ -1378,6 +1442,13 @@ class ProjectService:
                 )
 
         await self.repo.update_fields(project_id, status="archived")
+
+        # A deleted demo project is recorded as retired, so a later purge of
+        # the archived row does not turn into a reinstall on the next boot.
+        if demo_id:
+            from app.core.demo_marker import retire_demo_ids
+
+            await retire_demo_ids(self.session, {demo_id: project_id}, reason="archived")
 
         # Status-history row for the archive transition (-> archived) so the
         # project's status timeline includes soft-deletes alongside ordinary
@@ -1462,6 +1533,17 @@ class ProjectService:
             p.metadata_["demo_id"] for p in rows if isinstance(p.metadata_, dict) and p.metadata_.get("demo_id")
         }
 
+        # Recorded before the rows go, because after the delete nothing in the
+        # database says these demos were ever installed, and a boot that finds
+        # no demo project installs the showcase again.
+        from app.core.demo_marker import demo_id_of, retire_demo_ids
+
+        await retire_demo_ids(
+            self.session,
+            {demo_id_of(p.metadata_): p.id for p in rows if demo_id_of(p.metadata_)},
+            reason="purged",
+        )
+
         # Children with bare/no-cascade FK columns first - otherwise the
         # deterministic-id demo installers PK-collide on a later re-seed.
         await purge_project_children_without_cascade(self.session, demo_pks)
@@ -1508,8 +1590,14 @@ class ProjectService:
             )
         owner_id = str(project.owner_id)
         prior_status = project.status
+        from app.core.demo_marker import demo_id_of, restore_demo_id
+
+        demo_id = demo_id_of(project.metadata_)
 
         await self.repo.update_fields(project_id, status="active")
+        # Bringing a demo project back is a person asking for the demo again.
+        if demo_id:
+            await restore_demo_id(self.session, demo_id)
 
         # Status-history row for the restore transition (archived -> active).
         await self._record_status_change(
@@ -1718,6 +1806,7 @@ class ProjectService:
                         approved_by=boq.approved_by,
                         approved_at=boq.approved_at,
                         base_date=boq.base_date,
+                        tax_date=boq.tax_date,
                         metadata=dict(getattr(boq, "metadata_", None) or {}),
                         positions=positions_data,
                         markups=markups_data,
@@ -1788,7 +1877,10 @@ class ProjectService:
             fx_rates=list(meta.fx_rates or []),
             default_vat_rate=meta.default_vat_rate,
             custom_units=list(meta.custom_units or []),
-            metadata_=dict(meta.metadata or {}),
+            # A restore makes a new project, so like a copy it must not carry
+            # the demo tag: the purge and the demo cleanup would take it for
+            # the demo, and a later delete would retire the demo it names.
+            metadata_=_without_seed_tags(meta.metadata),
         )
         # Auto-generate a project code for the restored project
         project.project_code = await self._generate_project_code()
@@ -1862,6 +1954,7 @@ class ProjectService:
                     approved_by=boq_data.approved_by,
                     approved_at=boq_data.approved_at,
                     base_date=boq_data.base_date,
+                    tax_date=boq_data.tax_date,
                     metadata_=dict(boq_data.metadata or {}),
                 )
                 self.session.add(boq)
@@ -1973,6 +2066,26 @@ def _settings_snapshot(row: object) -> dict:
     }
 
 
+# MatchGroup statuses that record a person's decision on a match.
+SETTLED_MATCH_STATUSES: tuple[str, ...] = ("confirmed", "overridden", "applied")
+
+
+async def project_has_settled_matches(db: AsyncSession, project_id: uuid.UUID) -> bool:
+    """True when any match session of the project holds a confirmed match."""
+    from sqlalchemy import select  # noqa: PLC0415
+
+    from app.modules.match_elements.models import MatchGroup, MatchSession  # noqa: PLC0415
+
+    stmt = (
+        select(MatchGroup.id)
+        .join(MatchSession, MatchSession.id == MatchGroup.session_id)
+        .where(MatchSession.project_id == project_id)
+        .where(MatchGroup.status.in_(SETTLED_MATCH_STATUSES))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).first() is not None
+
+
 async def auto_bind_dominant_catalogue(
     db: AsyncSession,
     project_id: uuid.UUID,
@@ -2004,7 +2117,11 @@ async def auto_bind_dominant_catalogue(
     """
     from sqlalchemy import func, select  # noqa: PLC0415
 
-    from app.core.match_service.region_language import language_for  # noqa: PLC0415
+    from app.core.match_service.region_language import (  # noqa: PLC0415
+        language_for,
+        project_language,
+        resolve_language,
+    )
     from app.core.vector import vector_count_with_payload_substring  # noqa: PLC0415
     from app.core.vector_index import COLLECTION_COSTS  # noqa: PLC0415
     from app.modules.costs.models import CostItem  # noqa: PLC0415
@@ -2013,24 +2130,29 @@ async def auto_bind_dominant_catalogue(
     row = await get_or_create_match_settings(db, project_id)
     # Resolve the project's preferred catalogue language early - we need
     # it both to decide whether to keep the current binding and to seed
-    # Pass 1 below. Two signals, in order of trust:
-    #   1. ``match_settings.target_language`` - explicit user choice, the
-    #      most direct signal of what language descriptions they want.
-    #   2. ``project.region`` → ``language_for()`` - geographic inference,
-    #      used when the user hasn't picked a target language.
-    # Without the target_language fallback, projects with an empty region
-    # (E2E fixtures, freshly-created projects, or anything imported without
-    # a country tag) get ``project_lang=None`` and skip Pass 1+1b entirely,
-    # falling through to Pass 2 which binds whichever catalogue has the
-    # most SQL rows - typically Russian.
+    # Pass 1 below. ``project_language`` reads the address country code,
+    # then the region label the project form stores ("Italy", "DACH").
+    # It returns None when the project states no single language, e.g. a
+    # "Nordics" project; such a project is not steered to any language.
+    #
+    # ``match_settings.target_language`` is consulted only when the
+    # project states no geography at all (E2E fixtures, imports without a
+    # country tag). It is NOT NULL with an "en" default, so it cannot tell
+    # a user's choice from the default, and letting it answer for a
+    # project that named its region would re-steer that project to
+    # English, which is the bug ``project_language`` exists to fix.
     project_lang: str | None = None
+    states_geography = False
     try:
         proj = await db.get(Project, project_id)
-        if proj and proj.region:
-            project_lang = language_for(proj.region)
+        if proj is not None:
+            region = (proj.region or "").strip()
+            country = (getattr(proj, "country_code", None) or "").strip()
+            states_geography = bool(region or country)
+            project_lang = project_language(region, country)
     except Exception:
         project_lang = None
-    if not project_lang:
+    if not project_lang and not states_geography:
         tl = (getattr(row, "target_language", None) or "").strip().lower()
         if tl:
             project_lang = tl
@@ -2087,12 +2209,28 @@ async def auto_bind_dominant_catalogue(
             except Exception:  # noqa: BLE001 - degrade to SQL-only signal
                 pass
 
-        current_lang = language_for(row.cost_database_id) if row.cost_database_id else None
+        # ``resolve_language``, not ``language_for``: a catalogue id we cannot
+        # place (a custom import) has no known language, and reading it as
+        # English would re-bind it away from every non-English project.
+        current_lang = resolve_language(row.cost_database_id) if row.cost_database_id else None
         # Language mismatch is only a reason to re-bind when we actually
         # have a language target - otherwise we'd thrash on projects with
         # no resolvable region.
         lang_mismatch = bool(project_lang and current_lang and project_lang != current_lang)
         if current_count > 0 and not lang_mismatch:
+            return row.cost_database_id
+        if current_count > 0 and await project_has_settled_matches(db, project_id):
+            # The project already has matches a person confirmed against
+            # this catalogue. Re-binding now would price the rest of the
+            # model from a different rate book mid-work. Keep it; the
+            # /match-elements readiness card offers the switch instead.
+            logger.info(
+                "auto_bind_dominant_catalogue: keeping %r for %s despite language %r != project %r (settled matches)",
+                row.cost_database_id,
+                project_id,
+                current_lang,
+                project_lang,
+            )
             return row.cost_database_id
         reason = "0 rows" if current_count == 0 else f"language {current_lang!r} != project {project_lang!r}"
         logger.info(
@@ -2168,6 +2306,14 @@ async def auto_bind_dominant_catalogue(
         "pl": "PL",
         "ar": "AE",
     }
+    # Every other language with a published catalogue gets that catalogue's
+    # id (``"sv"`` -> ``"SV_STOCKHOLM"``); without it a Swedish project bound
+    # nothing even with the Swedish collection installed.
+    from app.modules.costs.cwicr_v3_catalogue import CWICR_V3_CATALOGUES  # noqa: PLC0415
+
+    for _cat in CWICR_V3_CATALOGUES:
+        if _cat.available:
+            _LANG_TO_REGION.setdefault(_cat.language, _cat.region)
     if project_lang:
         fallback_region = _LANG_TO_REGION.get(project_lang)
         if fallback_region:
@@ -2263,8 +2409,26 @@ async def get_or_create_match_settings(
         mode=MATCH_DEFAULT_MODE,
         sources_enabled=list(MATCH_DEFAULT_SOURCES),
     )
-    db.add(row)
-    await db.flush()
+    # Select-then-insert is a race, and this one is reachable: two requests
+    # opening the same project for the first time both miss the select and
+    # both insert, and ``uq_oe_projects_match_settings_project_id`` answers the
+    # second with an IntegrityError that reaches the caller as a 500 on a plain
+    # GET. The savepoint keeps that failure from poisoning the caller's
+    # transaction, which may already hold work of its own.
+    #
+    # Re-reading after the conflict is sound rather than hopeful: an in-flight
+    # insert of the same key makes us WAIT rather than fail, so by the time
+    # PostgreSQL raises a unique violation the winner has committed, and the
+    # next statement takes a fresh snapshot that contains its row.
+    try:
+        async with db.begin_nested():
+            db.add(row)
+            await db.flush()
+    except IntegrityError:
+        winner = (await db.execute(stmt)).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
     await db.refresh(row)
     return row
 

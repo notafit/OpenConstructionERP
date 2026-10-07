@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+  # A release candidate is assembled on a branch and gated here before any of it
+  # lands on main, so the full matrix can be asked for by hand against that branch.
+  workflow_dispatch:
 
 # We commit straight to main at a high rate, so nearly every run is a main push
 # and, with nothing superseding them, twenty jobs per commit pile up behind each
@@ -484,24 +487,27 @@ jobs:
       - name: Type check
         # tsc --noEmit whole-program check OOMs at the old 6 GB ceiling
         # ("Reached heap limit Allocation failed", exit 134). ubuntu and windows
-        # are 16 GB runners and get the proven-local 9 GB ceiling for headroom as
-        # the codebase grows. macOS is a 7 GB Apple-Silicon runner where even the
-        # 6 GB ceiling already thrashes at the physical limit (GC "Ineffective
+        # are 16 GB runners. The 9 GB ceiling they had ran out at e03fcee77, so
+        # it is 12 GB now; higher makes no sense, heap plus the process's own
+        # overhead would no longer fit 16 GB. The ceiling that counts is the
+        # explicit flag in frontend/package.json, which beats NODE_OPTIONS; the
+        # value here is kept equal to it. macOS is a 7 GB Apple-Silicon runner
+        # where even the 6 GB ceiling already thrashes at the physical limit (GC "Ineffective
         # mark-compacts", ~16 min) and a 9 GB heap exceeds total RAM, so it skips
         # this step. tsc is OS-independent, so ubuntu (case-sensitive, strictest)
         # plus windows fully cover the type check; macOS still runs lint and the
         # unit tests for its OS-specific (path/CRLF/runtime) signal.
         if: matrix.os != 'macos-latest'
         env:
-          NODE_OPTIONS: --max-old-space-size=9216
+          NODE_OPTIONS: --max-old-space-size=12288
         run: npm run typecheck
 
       - name: Build
         # `tsc -b && vite build` runs another whole-program compile, so it needs
-        # the same 9 GB heap and likewise cannot fit the 7 GB macOS runner.
+        # the same 12 GB heap and likewise cannot fit the 7 GB macOS runner.
         if: matrix.os != 'macos-latest'
         env:
-          NODE_OPTIONS: --max-old-space-size=9216
+          NODE_OPTIONS: --max-old-space-size=12288
         run: npm run build
 
       - name: Run tests

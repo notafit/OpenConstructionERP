@@ -3538,6 +3538,12 @@ export interface DocumentAppearance {
   logo_align: string;
   footer_text: string;
   show_page_numbers: boolean;
+  /**
+   * Whether the company letterhead heads the first page. The letterhead itself
+   * (logo, legal name, address) is the company profile; this only switches it
+   * off, for a firm that prints on pre-printed letterhead paper.
+   */
+  show_letterhead: boolean;
 }
 
 /**

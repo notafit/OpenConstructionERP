@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Pekerjaan untuk kegiatan ini dimulai pada {start}, sebelum pengajuan diserahkan pada {filed} - sebagian besar program sama sekali tidak mendanai kegiatan yang sudah dimulai",
+      "unevidenced": "Pekerjaan dimulai lebih awal, pada {start}, dan berkas pengajuan menyebutkan bahwa otoritas mengizinkannya, tetapi tidak mencantumkan izin tertulis",
+      "evidence": "Catat nomor referensi izin tertulis untuk mulai lebih awal, agar berkas pengajuan dapat membuktikannya sendiri saat diperiksa",
+      "suggestion": "Periksa ketentuan program sebelum mengeluarkan biaya lagi. Jika mulai lebih awal diizinkan secara tertulis, catat izin tersebut; jika tidak, tanyakan kepada otoritas sebelum pengajuan dilanjutkan"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Pencairan {draw} mengklaim biaya dari sebelum {period_start}, tanggal dimulainya periode pemberian",
+      "after": "Pencairan {draw} mengklaim biaya dari setelah {period_end}, tanggal berakhirnya periode pemberian",
+      "spans": "Pencairan {draw} melampaui periode pemberian di kedua ujungnya, {period_start} sampai {period_end}",
+      "suggestion": "Pindahkan biaya yang berada di luar periode ke pencairan tersendiri dan bahas dengan otoritas, alih-alih membiarkan satu klaim memuat keduanya"
+    },
+    "own_share_is_covered": {
+      "fail": "Program mensyaratkan kontribusi sendiri sebesar {rate} persen, yaitu {required}, tetapi pengajuan mencatat {recorded}",
+      "suggestion": "Sebelum mengajukan, sebutkan dari mana sisa kontribusi sendiri berasal, karena program menghitungnya dari basis biaya yang memenuhi syarat, bukan dari total biaya proyek"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Sebanyak {count} pengajuan pada proyek ini secara bersama-sama mencapai intensitas bantuan {intensity} persen dari biaya yang memenuhi syarat, melebihi batas maksimum {cap} persen yang ditetapkan oleh program yang paling ketat di antaranya",
+      "suggestion": "Pendanaan publik terakumulasi lintas program dan lintas tingkat pemerintahan. Kurangi salah satu permintaan, atau tanyakan apakah kegiatan dapat dipisahkan sehingga masing-masing menanggung biayanya sendiri"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Periode pemberian berakhir pada {period_end} dan bukti penggunaan akhir belum mulai disusun",
+      "late": "Bukti penggunaan akhir jatuh tempo pada {due} dan baru diserahkan pada {submitted}",
+      "overdue": "Bukti penggunaan akhir jatuh tempo pada {due} dan belum diserahkan",
+      "suggestion": "Serahkan apa yang sudah ada alih-alih menunggu sampai lengkap. Sebagian besar otoritas memperpanjang tenggat bila diminta, dan tidak ada yang memperpanjang tenggat yang sudah lewat"
+    },
+    "errors": {
+      "application_not_found": "Pengajuan tidak ditemukan",
+      "programme_code_taken": "Program dengan referensi ini sudah ada di negara ini",
+      "programme_not_found": "Program tidak ditemukan",
+      "programme_has_applications": "Program ini memiliki pengajuan dan tidak dapat dihapus. Tutup program ini sebagai gantinya.",
+      "application_code_taken": "Pengajuan dengan referensi ini sudah ada di proyek ini",
+      "approved_application_not_deletable": "Pengajuan yang disetujui tidak dapat dihapus. Ubah statusnya menjadi ditarik atau ditutup sebagai gantinya.",
+      "approval_needs_period_end": "Persetujuan memerlukan tanggal akhir periode pemberian, karena setiap tenggat waktu berikutnya dihitung dari tanggal itu",
+      "draw_needs_approval": "Dana hanya dapat dicairkan untuk pengajuan yang disetujui",
+      "draw_not_found": "Pencairan tidak ditemukan",
+      "paid_draw_not_deletable": "Pencairan yang sudah dibayarkan tidak dapat dihapus",
+      "proof_not_found": "Bukti penggunaan tidak ditemukan",
+      "obligation_not_found": "Kewajiban tidak ditemukan",
+      "eligible_exceeds_amount": "Jumlah yang memenuhi syarat tidak boleh melebihi jumlah keseluruhan",
+      "allocation_not_found": "Alokasi biaya tidak ditemukan"
+    }
+  }
+}

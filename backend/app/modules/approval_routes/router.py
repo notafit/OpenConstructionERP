@@ -166,7 +166,7 @@ async def list_routes(
     """
     if target_kind is not None and target_kind not in TARGET_KINDS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Unknown target_kind: {target_kind!r}",
         )
     if project_id is not None:
@@ -267,8 +267,14 @@ async def clone_route(
 
     Copies the source route's steps into a new project-scoped route with no
     ``system_key`` - editable straight away. The source route (a tenant-wide
-    preset or another project's route) is left untouched.
+    preset or another project's route) is left untouched. A source route
+    that belongs to a project is only readable by people on that project,
+    the same as ``GET /routes/{id}``; otherwise a clone would copy its
+    steps and named approvers out of a project the caller cannot see.
     """
+    source = await service.get_route(route_id)
+    if source.project_id is not None:
+        await verify_project_access(source.project_id, user_id, session)
     await verify_project_access(payload.project_id, user_id, session)
     clone = await service.clone_route(
         route_id,
@@ -508,12 +514,12 @@ async def get_project_analytics(
     """
     if target_kind is not None and target_kind not in TARGET_KINDS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Unknown target_kind: {target_kind!r}",
         )
     if started_after is not None and started_before is not None and started_after > started_before:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="started_after must not be after started_before",
         )
     await verify_project_access(project_id, user_id, session)

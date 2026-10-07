@@ -138,6 +138,8 @@ class PortfolioCpmActivity(BaseModel):
 
     schedule_id: UUID
     activity_id: UUID
+    schedule_name: str = ""
+    activity_name: str = ""
     es: int
     ef: int
     ls: int

@@ -27,7 +27,9 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
+from app.core.i18n import get_locale
 from app.core.validation.engine import ValidationReport
+from app.core.validation.messages import translate
 from app.dependencies import CurrentUserId, RequirePermission, SessionDep
 from app.modules.fx.repository import RateSetLockedError
 from app.modules.fx.schemas import (
@@ -65,7 +67,7 @@ def _get_fx_service(session: SessionDep) -> FxService:
 def _unknown_currency(exc: UnknownCurrencyError) -> HTTPException:
     """422 for a currency the active rates cannot price."""
     return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=f"Unknown currency: {exc}",
     )
 
@@ -201,7 +203,16 @@ async def fx_refresh(
     response records ``network_ok=false``; the endpoint never fails on a
     network error.
     """
-    return RefreshResponse(**await service.refresh())
+    try:
+        return RefreshResponse(**await service.refresh())
+    except RateSetLockedError as exc:
+        # A pinned set is kept as it was; the create and delete routes answer
+        # the same refusal with a 409, and so does the refresh.
+        day = exc.rate_date.isoformat() if exc.rate_date else ""
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=translate("errors.fx_rate_set_locked", locale=get_locale(), date=day),
+        ) from exc
 
 
 # ── Rate sets ────────────────────────────────────────────────────────────────
@@ -354,7 +365,7 @@ async def put_fx_policy(
     except RateSetUnavailableError as exc:
         raise _rate_set_unavailable(exc) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     return FxPolicyResponse(**data)
 
 

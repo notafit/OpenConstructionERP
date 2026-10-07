@@ -5,8 +5,9 @@
 // Consumed by <ModuleGuideButton content={validationGuide} /> on ValidationPage.
 //
 // i18n: every key carries its inline English default and is read via
-// t(key, { defaultValue }). These keys are NOT added to en.ts or any
-// locale file; the inline defaults are the single source of truth.
+// t(key, { defaultValue }). The keys are not in en.ts, the inline defaults
+// are the English source; their translations live in the other locale files,
+// so a changed default needs its translations redone too.
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

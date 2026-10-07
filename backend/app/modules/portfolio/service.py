@@ -33,7 +33,7 @@ def _not_found(detail: str = "Not found") -> HTTPException:
 
 
 def _unprocessable(detail: str) -> HTTPException:
-    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail)
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 class PortfolioService:
@@ -57,7 +57,21 @@ class PortfolioService:
     async def get_tree(self, user_id: str) -> list[dict]:
         scope = await accessible_project_ids(self.session, user_id)
         nodes = (await self.session.execute(select(PortfolioNode))).scalars().all()
-        memberships = (await self.session.execute(select(PortfolioMembership))).scalars().all()
+        # A deleted project is archived and keeps its membership row; leave it
+        # out, or the tree lists a project that opens as "Project not found".
+        from app.modules.projects.models import Project
+
+        memberships = (
+            (
+                await self.session.execute(
+                    select(PortfolioMembership)
+                    .join(Project, Project.id == PortfolioMembership.project_id)
+                    .where(Project.status != "archived")
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         node_rows = [
             {
@@ -354,7 +368,9 @@ class PortfolioService:
         nodes = (await self.session.execute(select(PortfolioNode))).scalars().all()
         memberships = (await self.session.execute(select(PortfolioMembership))).scalars().all()
         project_ids = self._subtree_project_ids(node_id, list(nodes), list(memberships))
-        scope = await accessible_project_ids(self.session, user_id)
+        # Deleted (archived) projects keep their membership rows; their
+        # schedules are not part of the programme's critical path.
+        scope = await accessible_project_ids(self.session, user_id, live_only=True)
         if scope is not None:
             project_ids &= {str(p) for p in scope}
         if not project_ids:
@@ -466,12 +482,17 @@ class PortfolioService:
                 detail=f"Cross-schedule cycle detected: {exc}",
             ) from exc
 
+        sched_names = {str(s.id): s.name for s in schedules}
+        act_names = {str(a.id): a.name for a in acts}
+
         def _row(namespaced: str) -> dict:
             sid, aid = split_nid(namespaced)
             res = results[namespaced]
             return {
                 "schedule_id": uuid.UUID(sid),
                 "activity_id": uuid.UUID(aid),
+                "schedule_name": sched_names.get(sid, ""),
+                "activity_name": act_names.get(aid, ""),
                 "es": res.es,
                 "ef": res.ef,
                 "ls": res.ls,

@@ -141,7 +141,17 @@ class RouteTable:
 # counting parentheses by hand.
 
 _REGEX_PRECEDERS = set("(,=:[!&|?{};\n+-*%<>~^")
-_REGEX_PRECEDING_WORDS = {"return", "typeof", "case", "in", "of", "do", "else", "yield", "await"}
+_REGEX_PRECEDING_WORDS = {
+    "return",
+    "typeof",
+    "case",
+    "in",
+    "of",
+    "do",
+    "else",
+    "yield",
+    "await",
+}
 
 
 class _Scan:
@@ -292,7 +302,11 @@ class _Scan:
         self, i: int, brackets: list[int], template_stack: list[int]
     ) -> tuple[int, list[int], list[int]]:
         template_stack.append(len(brackets))
-        return self._resume_template(i + 1, brackets, template_stack), brackets, template_stack
+        return (
+            self._resume_template(i + 1, brackets, template_stack),
+            brackets,
+            template_stack,
+        )
 
     def _resume_template(self, j: int, brackets: list[int], template_stack: list[int]) -> int:
         """Consume template text from ``j`` until the closing backtick or a ``${``."""
@@ -520,7 +534,10 @@ def _resolve_computed_path(
     for expr in exprs:
         member = _MEMBER_RE.match(expr.strip())
         if not member:
-            return [], f"substitution `${{{expr.strip()}}}` is not a simple param.property reference"
+            return (
+                [],
+                f"substitution `${{{expr.strip()}}}` is not a simple param.property reference",
+            )
         members.append((member.group(1), member.group(2)))
     params = {p for p, _ in members}
     if len(params) != 1:
@@ -536,15 +553,24 @@ def _resolve_computed_path(
             map_call = (open_index, before.group(1))
             break
     if map_call is None:
-        return [], f"`{param}` is not bound by any enclosing `.map(` call this collector can see"
+        return (
+            [],
+            f"`{param}` is not bound by any enclosing `.map(` call this collector can see",
+        )
     open_index, array_expr = map_call
 
     arrow_param = re.match(rf"\s*\(?\s*({IDENT})", src[open_index + 1 :])
     if not arrow_param or arrow_param.group(1) != param:
-        return [], f"the enclosing `.map(` binds `{arrow_param.group(1) if arrow_param else '?'}`, not `{param}`"
+        return (
+            [],
+            f"the enclosing `.map(` binds `{arrow_param.group(1) if arrow_param else '?'}`, not `{param}`",
+        )
 
     if "." in array_expr:
-        return [], f"the mapped value `{array_expr}` is a member expression, not a plain array name"
+        return (
+            [],
+            f"the mapped value `{array_expr}` is a member expression, not a plain array name",
+        )
 
     array_src, array_scan, array_file = src, scan, manifest
     array_open = _find_const_array(src, scan, array_expr)
@@ -557,11 +583,17 @@ def _resolve_computed_path(
         array_scan = _Scan(array_src)
         array_open = _find_const_array(array_src, array_scan, array_expr)
         if array_open is None:
-            return [], f"`{array_expr}` is imported from {imported.name} but is not a const array literal there"
+            return (
+                [],
+                f"`{array_expr}` is imported from {imported.name} but is not a const array literal there",
+            )
 
     array_close = array_scan.close_of.get(array_open)
     if array_close is None:
-        return [], f"the array literal `{array_expr}` in {array_file.name} is not closed"
+        return (
+            [],
+            f"the array literal `{array_expr}` in {array_file.name} is not closed",
+        )
 
     entries = [
         i
@@ -578,22 +610,33 @@ def _resolve_computed_path(
             value = _array_entry_property(array_src, array_scan, entry, prop)
             if value is None:
                 line = _line_of(array_src, entry)
-                return [], f"entry at {array_file.name}:{line} has no string `{prop}` property"
+                return (
+                    [],
+                    f"entry at {array_file.name}:{line} has no string `{prop}` property",
+                )
             rendered = rendered.replace("${" + f"{param}.{prop}" + "}", value, 1)
             rendered = _TEMPLATE_PART_RE.sub(
                 lambda m, p=prop, v=value: v if m.group(1).strip() == f"{param}.{p}" else m.group(0),
                 rendered,
             )
         if "${" in rendered or not rendered.strip():
-            return [], f"entry at {array_file.name}:{_line_of(array_src, entry)} did not render to a path"
+            return (
+                [],
+                f"entry at {array_file.name}:{_line_of(array_src, entry)} did not render to a path",
+            )
         paths.append(rendered)
 
     if len(paths) != len(entries):
-        return [], f"resolved {len(paths)} paths from {len(entries)} entries of `{array_expr}`"
+        return (
+            [],
+            f"resolved {len(paths)} paths from {len(entries)} entries of `{array_expr}`",
+        )
     return paths, None
 
 
-def read_module_routes(modules_dir: Path) -> tuple[list[Route], list[Unresolved], list[str], int]:
+def read_module_routes(
+    modules_dir: Path,
+) -> tuple[list[Route], list[Unresolved], list[str], int]:
     """Every route the bundled module manifests declare, computed ones included."""
     routes: list[Route] = []
     unresolved: list[Unresolved] = []
@@ -601,7 +644,10 @@ def read_module_routes(modules_dir: Path) -> tuple[list[Route], list[Unresolved]
     resolved_count = 0
 
     for module_dir in sorted(p for p in modules_dir.iterdir() if p.is_dir()):
-        manifest = next((module_dir / name for name in MANIFEST_NAMES if (module_dir / name).is_file()), None)
+        manifest = next(
+            (module_dir / name for name in MANIFEST_NAMES if (module_dir / name).is_file()),
+            None,
+        )
         if manifest is None:
             continue
         manifests_read.append(module_dir.name)
@@ -907,60 +953,116 @@ def self_test(stream=sys.stdout) -> int:  # noqa: C901 - a flat list of assertio
         table = collect(app_tsx=app, modules_dir=modules, registry_ts=registry)
 
         paths = sorted(r.path for r in table.routes)
-        expected = sorted(["/alpha", "/beta/:betaId", "/litmod", "/one", "/two", "/three-x", "/four-x", "/stray"])
+        expected = sorted(
+            [
+                "/alpha",
+                "/beta/:betaId",
+                "/litmod",
+                "/one",
+                "/two",
+                "/three-x",
+                "/four-x",
+                "/stray",
+            ]
+        )
         if paths != expected:
-            print(f"SELF-TEST FAIL: route paths came back as {paths}, expected {expected}.", file=stream)
+            print(
+                f"SELF-TEST FAIL: route paths came back as {paths}, expected {expected}.",
+                file=stream,
+            )
             return 1
         if table.layout_routes != 1:
-            print(f"SELF-TEST FAIL: counted {table.layout_routes} pathless layout routes, expected 1.", file=stream)
+            print(
+                f"SELF-TEST FAIL: counted {table.layout_routes} pathless layout routes, expected 1.",
+                file=stream,
+            )
             return 1
         if table.resolved_count != 4:
-            print(f"SELF-TEST FAIL: resolved {table.resolved_count} paths from tables, expected 4.", file=stream)
+            print(
+                f"SELF-TEST FAIL: resolved {table.resolved_count} paths from tables, expected 4.",
+                file=stream,
+            )
             return 1
 
         # A route the collector cannot read has to be named, never dropped.
         reasons = " | ".join(u.reason for u in table.unresolved)
         expressions = sorted(u.expression for u in table.unresolved)
         if len(table.unresolved) != 5:
-            print(f"SELF-TEST FAIL: {len(table.unresolved)} unresolved, expected 5. Got: {expressions}", file=stream)
+            print(
+                f"SELF-TEST FAIL: {len(table.unresolved)} unresolved, expected 5. Got: {expressions}",
+                file=stream,
+            )
             return 1
         if not any("expression" in u.reason for u in table.unresolved):
-            print(f"SELF-TEST FAIL: a Route with a computed path attribute was not reported. {reasons}", file=stream)
+            print(
+                f"SELF-TEST FAIL: a Route with a computed path attribute was not reported. {reasons}",
+                file=stream,
+            )
             return 1
         if not any("ROUTE_PATH" in u.expression for u in table.unresolved):
-            print(f"SELF-TEST FAIL: an opaque path identifier was not reported. {expressions}", file=stream)
+            print(
+                f"SELF-TEST FAIL: an opaque path identifier was not reported. {expressions}",
+                file=stream,
+            )
             return 1
         if not any("NOWHERE" in u.reason for u in table.unresolved):
-            print(f"SELF-TEST FAIL: a map over an array with no definition was not reported. {reasons}", file=stream)
+            print(
+                f"SELF-TEST FAIL: a map over an array with no definition was not reported. {reasons}",
+                file=stream,
+            )
             return 1
         if not any("phantom" in u.expression for u in table.unresolved):
-            print(f"SELF-TEST FAIL: a registered module with no manifest was not reported. {expressions}", file=stream)
+            print(
+                f"SELF-TEST FAIL: a registered module with no manifest was not reported. {expressions}",
+                file=stream,
+            )
             return 1
         if not any("stray" in u.expression for u in table.unresolved):
-            print(f"SELF-TEST FAIL: a manifest nobody registers was not reported. {expressions}", file=stream)
+            print(
+                f"SELF-TEST FAIL: a manifest nobody registers was not reported. {expressions}",
+                file=stream,
+            )
             return 1
 
         # A `path:` inside a comment or a translation value is not a route.
         if any(p in ("/ghost", "/nope", "not a route") for p in paths):
-            print(f"SELF-TEST FAIL: a comment or a string was read as a route. {paths}", file=stream)
+            print(
+                f"SELF-TEST FAIL: a comment or a string was read as a route. {paths}",
+                file=stream,
+            )
             return 1
 
         # The module that ships off still contributes routes, tagged. Only
         # check_case_routes.py drops them; the proxy allowlist needs them.
         off = [r for r in table.module_routes if r.default_enabled is False]
         if sorted(r.path for r in off) != ["/four-x", "/three-x"]:
-            print(f"SELF-TEST FAIL: routes of a module that ships off came back as {off}.", file=stream)
+            print(
+                f"SELF-TEST FAIL: routes of a module that ships off came back as {off}.",
+                file=stream,
+            )
             return 1
         on = {r.path: r.default_enabled for r in table.module_routes if r.default_enabled is not False}
         if sorted(on) != ["/litmod", "/one", "/stray", "/two"]:
-            print(f"SELF-TEST FAIL: routes of a module that ships on came back as {sorted(on)}.", file=stream)
+            print(
+                f"SELF-TEST FAIL: routes of a module that ships on came back as {sorted(on)}.",
+                file=stream,
+            )
             return 1
         if any(r.default_enabled is not None for r in table.app_routes):
-            print("SELF-TEST FAIL: an App.tsx route was tagged with a module enablement flag.", file=stream)
+            print(
+                "SELF-TEST FAIL: an App.tsx route was tagged with a module enablement flag.",
+                file=stream,
+            )
             return 1
 
-    print("SELF-TEST OK: resolves a table-built path, follows a relative import, refuses four", file=stream)
-    print("              shapes it cannot read, ignores comments and strings, and cross-checks", file=stream)
+    print(
+        "SELF-TEST OK: resolves a table-built path, follows a relative import, refuses four",
+        file=stream,
+    )
+    print(
+        "              shapes it cannot read, ignores comments and strings, and cross-checks",
+        file=stream,
+    )
     print("              the manifests on disk against the module registry.", file=stream)
     return 0
 
@@ -979,7 +1081,11 @@ def require_self_test(stream=sys.stdout) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Print the route table the SPA can serve.")
     parser.add_argument("--json", action="store_true", help="emit the table as JSON")
-    parser.add_argument("--self-test", action="store_true", help="prove the collector can fail, then exit")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="prove the collector can fail, then exit",
+    )
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -1008,7 +1114,12 @@ def main(argv: list[str] | None = None) -> int:
                 for r in table.routes
             ],
             "unresolved": [
-                {"file": u.file, "line": u.line, "expression": u.expression, "reason": u.reason}
+                {
+                    "file": u.file,
+                    "line": u.line,
+                    "expression": u.expression,
+                    "reason": u.reason,
+                }
                 for u in table.unresolved
             ],
             "app_route_count": len(table.app_routes),

@@ -92,8 +92,18 @@ RULES = [
     Rule("comparison table row", r"<b>UI languages</b>.*?<b>(\d+)</b>", "offered", 1),
     Rule("prose count of languages", r"(?<![\d.,])(\d+) languages\b", "offered", 3),
     Rule("count of locale bundles", r"(?<![\d.,])(\d+) locale files\b", "files", 3),
-    Rule("offered in the picker", r"(?<![\d.,])(\d+)(?: of them)? offered\b", "offered", 2),
-    Rule("entries in the language list", r"(?<![\d.,])(\d+) entries in the `SUPPORTED_LANGUAGES`", "offered", 1),
+    Rule(
+        "offered in the picker",
+        r"(?<![\d.,])(\d+)(?: of them)? offered\b",
+        "offered",
+        2,
+    ),
+    Rule(
+        "entries in the language list",
+        r"(?<![\d.,])(\d+) entries in the `SUPPORTED_LANGUAGES`",
+        "offered",
+        1,
+    ),
     Rule("distinct languages", r"(?<![\d.,])(\d+) distinct\s+languages\b", "base", 1),
 ]
 

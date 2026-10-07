@@ -154,6 +154,16 @@
     "note": "named open data / interchange standard or format code (CLAUDE.md: not translated)",
     "reason_category": "standard_code"
   },
+  "boq.gaeb_site.col_oz": {
+    "en_value": "OZ",
+    "note": "OZ (Ordnungszahl) is the GAEB DA XML position number element; the column names the field of the exchange format, written the same in every locale including ru",
+    "reason_category": "standard_code"
+  },
+  "boq.gaeb_site.title": {
+    "en_value": "GAEB X31 / X89",
+    "note": "names the two GAEB DA XML exchange phases X31 and X89 by their format codes; identical in every locale including ru (CLAUDE.md: open data standards are not translated)",
+    "reason_category": "standard_code"
+  },
   "boq.markup_percentage": {
     "en_value": "%",
     "note": "bare symbol/punctuation glyph, not a word",
@@ -369,6 +379,11 @@
     "note": "bare technical/business acronym or initialism",
     "reason_category": "abbreviation"
   },
+  "contracts.gaeb_invoice.missing_field": {
+    "en_value": "{{who}}: {{what}}",
+    "note": "Pure template joining an already translated party label and field name; there are no words to translate.",
+    "reason_category": "template_only"
+  },
   "contracts.mod_crm": {
     "en_value": "CRM",
     "note": "bare technical/business acronym or initialism",
@@ -543,6 +558,11 @@
     "en_value": "ZUGFeRD 2.1",
     "note": "German hybrid invoice standard name and version, see einvoice.profile.en16931",
     "reason_category": "standard_code"
+  },
+  "erp_chat.action.option.rfi_discipline.mep": {
+    "en_value": "MEP",
+    "note": "acronym for the mechanical, electrical and plumbing discipline, kept as MEP by the same locales that keep coordination_hub.trade_mep (AI dock RFI discipline option)",
+    "reason_category": "acronym"
   },
   "exchange.direction_export": {
     "en_value": "Export",
@@ -884,6 +904,11 @@
     "note": "bare technical/business acronym or initialism",
     "reason_category": "abbreviation"
   },
+  "portal.signin_link_placeholder": {
+    "en_value": "you@example.com",
+    "note": "example email address in the portal sign-in link form; example.com is the reserved documentation domain (RFC 2606) and an address has no language, identical in ru.ts and every other locale",
+    "reason_category": "regex_or_placeholder_pattern"
+  },
   "portfolio.col_ef": {
     "en_value": "EF",
     "note": "bare short acronym/initialism",
@@ -898,6 +923,11 @@
     "en_value": "{{value}}%",
     "note": "placeholder plus a bare percent sign, no literal text to translate. Five keys in this tree carry that exact shape and two are already settled here, cost_match.confidence_percent and pipeline.dock.progress. Diffing the leaked sets against those two, the only locale this key leaks in that they do not is en-US, which is a delta locale over en and identical there by construction. It is in fact the best covered of the family: cs, da, de, fa, fi, fr, sv and tr all give it their own percent typography ({{value}} %, %{{value}}, {{value}} with the Arabic percent sign), which is a typographic convention rather than a translation, and five of those eight still leak on the two settled siblings (postcalc-ui addition)",
     "reason_category": "template_placeholder"
+  },
+  "postcalc.qc.source_x31": {
+    "en_value": "GAEB X31",
+    "note": "names the GAEB DA XML quantity determination phase X31 by its format code; identical in every locale including ru (CLAUDE.md: open data standards are not translated)",
+    "reason_category": "standard_code"
   },
   "prefab.insights.f_ref": {
     "en_value": "Unit",
@@ -1264,6 +1294,11 @@
     "note": "ISO 13616 account-number standard, used as the bare acronym in all 39 including ru; the rest of the field family on the same form is genuinely translated (Account holder, Payment terms, Company name), so this is the standard's own name standing alone rather than an untranslated label",
     "reason_category": "acronym"
   },
+  "settings.text_size_key_ctrl": {
+    "en_value": "Ctrl",
+    "note": "keyboard shortcut key label named in the text size hints; Ctrl in every locale we ship except de, which says Strg",
+    "reason_category": "keyboard_shortcut"
+  },
   "site_inventory.col_sku": {
     "en_value": "SKU",
     "note": "bare technical/business acronym or initialism",
@@ -1309,6 +1344,11 @@
     "note": "named open data / interchange standard or format code (CLAUDE.md: not translated)",
     "reason_category": "standard_code"
   },
+  "takeoff_create.created_msg": {
+    "en_value": "{{posOrdinal}}: {{qty}} {{unit}}",
+    "note": "Pure template: position ordinal, quantity and unit, all substituted and already localised; there are no words to translate. fr differs only by its typographic space before the colon.",
+    "reason_category": "template_placeholder"
+  },
   "takeoff_viewer.col_ordinal": {
     "en_value": "#",
     "note": "row-number column header, a single symbol with no word to translate",
@@ -1338,6 +1378,21 @@
     "en_value": "PDF",
     "note": "named open data / interchange standard or format code (CLAUDE.md: not translated)",
     "reason_category": "standard_code"
+  },
+  "tendering.export_bidder_xlsx": {
+    "en_value": "Excel",
+    "note": "Microsoft Excel product name, identical in every script and locale",
+    "reason_category": "product_name"
+  },
+  "tendering.export_comparison_csv": {
+    "en_value": "CSV",
+    "note": "bare technical/business acronym or initialism",
+    "reason_category": "abbreviation"
+  },
+  "tendering.export_comparison_xlsx": {
+    "en_value": "Excel",
+    "note": "Microsoft Excel product name, identical in every script and locale",
+    "reason_category": "product_name"
   },
   "tendering.export_gaeb": {
     "en_value": "GAEB X83",
@@ -1403,5 +1458,75 @@
     "en_value": "DIN 276",
     "note": "named open data / interchange standard or format code (CLAUDE.md: not translated)",
     "reason_category": "standard_code"
+  },
+  "about.team_name": {
+    "en_value": "DataDrivenConstruction",
+    "note": "company/product proper noun, identical in all languages by design",
+    "reason_category": "product_name"
+  },
+  "modules.profile_particular_more": {
+    "en_value": "+{{n}}",
+    "note": "a plus sign and a placeholder, rendered after a truncated list of module traits as +3; the count is deliberately passed as n rather than count so i18next does not read it as a plural selector, and there is no literal word in it to translate in any of the 43 locales that carry it",
+    "reason_category": "template_placeholder"
+  },
+  "settings.company.email": {
+    "en_value": "Email",
+    "note": "field label on the Company & documents tab; Email is the standard UI word in Indonesian, Italian and Vietnamese, and the same files already write it that way for contacts.field_email, files.transmittals.recipient_email and notifications.preferences.channel_email",
+    "reason_category": "cognate_loanword"
+  },
+  "validation.rs_label_bc3": {
+    "en_value": "FIEBDC-3 (BC3)",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_birimfiyat": {
+    "en_value": "Birim fiyat",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_cpwd": {
+    "en_value": "CPWD",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_dpgf": {
+    "en_value": "DPGF",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_gbt50500": {
+    "en_value": "GB/T 50500",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_nbr": {
+    "en_value": "NBR",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_onorm": {
+    "en_value": "ÖNORM",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "validation.rs_label_sinapi": {
+    "en_value": "SINAPI",
+    "note": "name of a national estimating standard or data format shown as a validation rule set label; written the same way in every locale we ship, Cyrillic and CJK ones included",
+    "reason_category": "standard_code"
+  },
+  "boq.import_preview.col_total": {
+    "en_value": "Total",
+    "note": "Total is the ordinary word for this column in da, es (all variants), id, no, pt (both) and ro, so the translation equals English by design",
+    "reason_category": "cognate_loanword"
+  },
+  "boq.import_preview.field_total": {
+    "en_value": "Total",
+    "note": "Total is the ordinary word for this column in da, es (all variants), id, no, pt (both) and ro, so the translation equals English by design",
+    "reason_category": "cognate_loanword"
+  },
+  "preliminaries.subtotal": {
+    "en_value": "Subtotal",
+    "note": "Subtotal is the ordinary word for this column in da, es (all variants), id, no, pt (both) and ro, so the translation equals English by design",
+    "reason_category": "cognate_loanword"
   }
 }

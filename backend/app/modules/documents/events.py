@@ -90,6 +90,6 @@ async def _on_document_deleted(event: Event) -> None:
     await _delete_document_vector(event)
 
 
-event_bus.subscribe("documents.document.created", _on_document_created)
-event_bus.subscribe("documents.document.updated", _on_document_updated)
-event_bus.subscribe("documents.document.deleted", _on_document_deleted)
+event_bus.subscribe_once("documents.document.created", _on_document_created)
+event_bus.subscribe_once("documents.document.updated", _on_document_updated)
+event_bus.subscribe_once("documents.document.deleted", _on_document_deleted)

@@ -21,6 +21,7 @@ from app.dependencies import (
 )
 from app.modules.boq.schemas import BOQResponse
 from app.modules.variations.schemas import (
+    ContractImpactResponse,
     DayworkSheetCreate,
     DayworkSheetLineCreate,
     DayworkSheetLineResponse,
@@ -734,6 +735,45 @@ async def void_variation_order(
     await verify_project_access(existing.project_id, str(user_id), session)
     vo = await service.transition_variation_order(vo_id, "voided", user_id=user_id)
     return VariationOrderResponse.model_validate(vo)
+
+
+@router.post("/variation-orders/{vo_id}/create-linked-co", response_model=VariationOrderResponse)
+async def create_linked_change_order(
+    vo_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("variations.update")),
+    service: VariationsService = Depends(_get_service),
+) -> VariationOrderResponse:
+    """Create a Change Order linked to a standalone Variation Order.
+
+    Standalone VOs have no linked CO because only the VR promotion path
+    makes one. This fills the gap so the VO drawer can offer a one-click
+    action instead of asking the user to create one manually and paste
+    the id.
+    """
+    existing = await service.get_order(vo_id)
+    await verify_project_access(existing.project_id, str(user_id), session)
+    vo = await service.create_linked_change_order(vo_id, user_id=user_id)
+    return VariationOrderResponse.model_validate(vo)
+
+
+# ── Contract impact ────────────────────────────────────────────────────────
+
+
+@router.get("/variation-orders/{vo_id}/contract-impact", response_model=ContractImpactResponse)
+async def get_contract_impact(
+    vo_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("variations.read")),
+    service: VariationsService = Depends(_get_service),
+) -> ContractImpactResponse:
+    """Return the contract-level before-and-after for one Variation Order."""
+    vo = await service.get_order(vo_id)
+    await verify_project_access(vo.project_id, str(user_id), session)
+    data = await service.get_contract_impact(vo_id)
+    return ContractImpactResponse(**data)
 
 
 # ── Cost impacts ───────────────────────────────────────────────────────────

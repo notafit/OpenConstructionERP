@@ -21,6 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.changeorders.models import ChangeOrder
 from app.modules.correspondence.models import Correspondence
 from app.modules.projects.models import Project  # noqa: F401 - register ORM
+from app.modules.reconciliation.correlate import (
+    DEFAULT_THRESHOLD,
+    W_SUBJECT,
+    find_links,
+)
 from app.modules.reconciliation.models import (
     STATUS_CONFIRMED,
     STATUS_REJECTED,
@@ -124,11 +129,14 @@ async def test_thread_links_change_order_and_correspondence(session: AsyncSessio
 
     # Exactly one scored link, on the shared reference, still only a suggestion.
     assert len(thread.links) == 1
-    link = thread.links[0]
-    assert "shared_reference" in link.reasons
-    assert link.confidence >= 0.5
-    assert link.status == "suggested"
-    assert link.link_id is None
+    # A ThreadLink is the decision state wrapped AROUND the scored link, so the
+    # score and its reasons live one level down, on ``.link`` - which is how the
+    # router reads them too. ``status`` and ``link_id`` are the wrapper's own.
+    scored = thread.links[0]
+    assert "shared_reference" in scored.link.reasons
+    assert scored.link.confidence >= 0.5
+    assert scored.status == "suggested"
+    assert scored.link_id is None
     assert thread.confirmed_count == 0
     assert thread.rejected_count == 0
 
@@ -158,9 +166,17 @@ async def test_thread_by_subject_key(session: AsyncSession) -> None:
     endpoints = {(tr.record.record_type, tr.record.record_id) for tr in thread.records}
     assert (TYPE_CHANGE_ORDER, str(co_id)) in endpoints
     assert (TYPE_CORRESPONDENCE, str(cor_id)) in endpoints
-    # Same normalized subject -> a subject_match link fires.
-    assert thread.links
-    assert any("subject_match" in tl.reasons for tl in thread.links)
+    # Gathering is one thing, asserting a link is another. These two records
+    # share a normalized subject and nothing else, and a bare subject match is
+    # deliberately calibrated below the bar: W_SUBJECT is under
+    # DEFAULT_THRESHOLD so a shared subject line alone never claims a link -
+    # it has to combine with a second signal. So the thread carries none.
+    assert W_SUBJECT < DEFAULT_THRESHOLD
+    assert thread.links == []
+    # The signal is still live, which is the half worth proving: score the same
+    # gathered records at the subject weight and subject_match is what fires.
+    scored = find_links([tr.record for tr in thread.records], threshold=W_SUBJECT)
+    assert any("subject_match" in link.reasons for link in scored)
 
 
 @pytest.mark.asyncio

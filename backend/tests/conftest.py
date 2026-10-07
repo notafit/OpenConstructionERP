@@ -34,7 +34,12 @@ from pathlib import Path
 if _sys.platform == "win32":
     import asyncio as _asyncio
 
+    from tests import _asyncio_write_send
+
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+    # The selector transport on Windows drops a chunk send() refused, which
+    # lost rows from asyncpg executemany; see tests/_asyncio_write_send.py.
+    _asyncio_write_send.install()
 
 # ── Per-session PostgreSQL isolation (must run before app imports) ──────────
 # The app is PostgreSQL-only at runtime, so the test suite runs on PostgreSQL
@@ -60,6 +65,23 @@ if _sys.platform == "win32":
 #: just created its data dir but whose postmaster has not yet written its pid
 #: file is indistinguishable from a dead one for a second or two.
 _PG_REAP_MIN_AGE_SECONDS = 3600
+
+#: Where a running cluster's pid file sits, relative to its data dir.
+#:
+#: ``embedded_pg.boot`` puts the cluster in ``<data_dir>/pgdata`` and the
+#: postmaster writes its pid file inside that, so ``pgdata/postmaster.pid`` is
+#: the path that exists. The guard below used to test the bare name, one level
+#: too high, and therefore matched nothing on any machine: it counted zero
+#: running clusters where every cluster was running, and the age check above
+#: was left holding alone - which its own comment calls a belt to braces that
+#: were not in fact fastened. Measured on this tree while writing this: of the
+#: data dirs present, none carried a pid file at the bare name and every one
+#: carried it under ``pgdata``.
+#:
+#: The bare name stays in the list. Erring towards leaving a directory alone
+#: costs disk; erring the other way deletes a database somebody is serving out
+#: of.
+_PG_PIDFILE_RELPATHS = ("pgdata/postmaster.pid", "postmaster.pid")
 
 
 def _pg_temp_root() -> Path:
@@ -98,12 +120,37 @@ def _reap_stale_pg_data_dirs() -> None:
     """Remove data dirs left by earlier runs that ended without cleaning up.
 
     Safe to run while other suites are in progress. A cluster writes
-    ``postmaster.pid`` when it starts and removes it on a clean stop, so a dir
-    without one is a cluster that is definitively not running. Any dir that
-    still has a pid file is left alone: it belongs either to a live session or
-    to a killed one whose postmaster is still up, and this is not the place to
-    decide which. Those are warned about rather than removed, because a growing
-    count of them is the leak this function cannot fix.
+    ``pgdata/postmaster.pid`` when it starts and removes it on a clean stop, so
+    a dir without one is a cluster that is definitively not running.
+
+    A dir that still has a pid file used to be left alone on the reasoning that
+    it belongs either to a live session or to a killed one whose postmaster is
+    still up, and that this is not the place to decide which. Both of those
+    cases have a live postmaster. The third does not: a postmaster that was
+    force-killed leaves its pid file behind, and nothing ever comes back to
+    remove it, so that dir was excluded from reaping permanently. Measured on
+    this machine, that is where the leak the old docstring described was coming
+    from, eleven dirs held out of reach by pid files naming processes that no
+    longer existed.
+
+    So the pid file is now read rather than merely counted, and the question is
+    put to ``embedded_pg._pidfile_owner_is_live``, which is the same function
+    the product's own boot and shutdown paths use. That matters more than
+    reusing code: it answers yes when it cannot tell, and it treats a pid that
+    is alive but belongs to something else as gone, which is the distinction a
+    bare liveness check gets wrong on Windows often enough to matter. A dir is
+    removed only on a definite no, and the minimum-age check still applies on
+    top, so the bias the original comment asked for is intact: erring towards
+    leaving a directory alone costs disk, erring the other way deletes a
+    database somebody is serving out of.
+
+    Dirs whose postmaster really is alive are still warned about rather than
+    removed, because a growing count of those is a leak this function cannot
+    fix. The two reasons for keeping a dir are counted apart and reported
+    apart. They are not the same news: a live postmaster is a cluster this
+    machine never shut down, while an unreadable pid file is a dir nothing can
+    currently judge, and reporting the second as the first would describe a
+    half-written file as a running database.
 
     The warning is a ``warnings.warn`` and not a print on purpose. pytest
     captures stdout and stderr from conftest import and shows them only when
@@ -115,17 +162,27 @@ def _reap_stale_pg_data_dirs() -> None:
     import time
     import warnings
 
+    from app.core import embedded_pg
+
     root = _PG_TEMP_ROOT
     now = time.time()
     removed = 0
+    unreadable = 0
     still_running = 0
     for entry in root.glob("oe-tests-pg-*"):
         if not entry.is_dir():
             continue
         try:
-            if (entry / "postmaster.pid").exists():
-                still_running += 1
-                continue
+            holder = next((entry / rel for rel in _PG_PIDFILE_RELPATHS if (entry / rel).exists()), None)
+            if holder is not None:
+                pid = embedded_pg._read_pidfile_pid(holder.parent)
+                # An unreadable pid file says nothing, so it keeps its dir.
+                if pid is None:
+                    unreadable += 1
+                    continue
+                if embedded_pg._pidfile_owner_is_live(holder.parent, pid):
+                    still_running += 1
+                    continue
             if now - entry.stat().st_mtime < _PG_REAP_MIN_AGE_SECONDS:
                 continue
         except OSError:
@@ -133,12 +190,21 @@ def _reap_stale_pg_data_dirs() -> None:
         shutil.rmtree(entry, ignore_errors=True)
         if not entry.exists():
             removed += 1
-    if still_running:
+    if still_running or unreadable:
+        parts = []
+        if still_running:
+            parts.append(
+                f"{still_running} are still served by a live postmaster. Each of those is a "
+                "cluster this machine never shut down; they hold their own disk until the "
+                "process dies"
+            )
+        if unreadable:
+            parts.append(
+                f"{unreadable} carry a pid file this run could not read, so nothing is known "
+                "about them and they were kept"
+            )
         warnings.warn(
-            f"embedded PostgreSQL: reaped {removed} abandoned data dir(s), but "
-            f"{still_running} still hold a postmaster.pid and were left alone. "
-            "Each of those is a cluster this machine never shut down; they hold "
-            "their own disk until the process dies.",
+            f"embedded PostgreSQL: reaped {removed} abandoned data dir(s), but " + "; ".join(parts) + ".",
             stacklevel=2,
         )
 
@@ -208,7 +274,25 @@ _IDLE_IN_TRANSACTION_TIMEOUT_S = 300
 
 
 def _bound_idle_transactions() -> None:
-    """Set it, then READ IT BACK - an unverified guard is not a guard.
+    """Bound idle transactions on the MAINTENANCE database, and read it back.
+
+    Which database this reaches is the whole of its scope, so it is named here
+    rather than left to be inferred. The URL below is ``DATABASE_SYNC_URL`` (or
+    ``DATABASE_URL``), which names the cluster's own database - ``postgres`` on
+    the embedded cluster - and ``ALTER DATABASE ... SET`` binds to that one
+    database alone. It does NOT reach ``oe_test_unit`` or the per-test clones
+    that ``tests/_pg.py`` hands out: per-database settings live in
+    ``pg_db_role_setting`` keyed by database OID, so they are neither inherited
+    by a ``CREATE DATABASE ... TEMPLATE`` clone nor shared between databases.
+    Measured: with this in force, ``oe_test_unit`` and a fresh clone both read
+    ``0`` for it. Those databases carry their own bounds, set in
+    ``tests/_pg.py`` by ``_bound_timeouts``.
+
+    This is still worth doing, because ``app.database.engine`` is built from the
+    same ``DATABASE_URL``, so the application's own sessions live on exactly the
+    database this covers. It is one net of two, not the net for the suite.
+
+    Set it, then READ IT BACK - an unverified guard is not a guard.
 
     ``ALTER DATABASE ... SET`` lands only for sessions opened afterwards, and a
     silent failure here would look exactly like success: nothing raises, nothing
@@ -251,8 +335,9 @@ def _bound_idle_transactions() -> None:
             check.close()
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         warnings.warn(
-            f"could not bound idle transactions on the test database: {exc!r}. "
-            "A leaked transaction will survive until the connection closes.",
+            f"could not bound idle transactions on the maintenance database: {exc!r}. "
+            "A leaked transaction on the application engine will survive until the "
+            "connection closes.",
             stacklevel=2,
         )
         return
@@ -278,6 +363,20 @@ _bound_idle_transactions()
 os.environ.setdefault("LOGIN_RATE_LIMIT", "10000")
 os.environ.setdefault("API_RATE_LIMIT", "100000")
 os.environ.setdefault("AI_RATE_LIMIT", "10000")
+os.environ.setdefault("REGISTER_RATE_LIMIT_PER_HOUR", "100000")
+
+# ── Debug on for the suite ─────────────────────────────────────────────────
+# APP_DEBUG defaults to False so an installed server never echoes request
+# input in 422 bodies. The suite was written against the verbose shape (and
+# path-only validation errors answer 400 instead of 422 without debug), so it
+# keeps running with debug on. Tests that pin the production shape set
+# APP_DEBUG themselves.
+os.environ.setdefault("APP_DEBUG", "true")
+# The field-diary suites drive the magic-link flow from the plaintext token
+# and PIN in the response. Settings are cached for the whole session, so the
+# per-module env line in those files is not enough on its own once another
+# module built the settings first; the flag is set here for the suite.
+os.environ.setdefault("EXPOSE_DEV_AUTH_SECRETS", "true")
 
 # ── Open registration for the suite ────────────────────────────────────────
 # The default registration mode is "admin-approve" (every registrant after the
@@ -318,6 +417,35 @@ os.environ.setdefault("OE_TEST_FAST_STARTUP", "1")
 os.environ.setdefault("OE_TEST_NULLPOOL", "1")
 
 import pytest  # noqa: E402
+
+# ── Keep the developer's own install out of the suite ──────────────────────
+# The applied country pack, the installed packs and the module on/off states
+# fall back to ``~/.openestimate`` when no data dir is named, and that is the
+# directory a developer's desktop install writes. A machine whose own install
+# had the Hungarian pack applied ran every project created in the suite under
+# that pack: an Indian test project carried the ``hungary`` rule set and the
+# national code import tests failed there while CI, with an empty home, passed.
+# Writes went the same way, so a test that applies a pack would have changed
+# the developer's install. Only the default home location is redirected; a
+# test that fakes ``Path.home`` or names its own data dir still gets exactly
+# what it asked for.
+import app.core.module_state as _module_state  # noqa: E402
+import app.core.partner_pack.discovery as _pack_discovery  # noqa: E402
+import app.core.partner_pack.state as _pack_state  # noqa: E402
+
+_REAL_HOME_STATE_DIR = Path.home() / ".openestimate"
+_SUITE_STATE_DIR = Path(tempfile.mkdtemp(prefix="oe-tests-home-state-"))
+_resolve_data_dir_unisolated = _module_state._resolve_data_dir
+
+
+def _resolve_data_dir_for_suite(data_dir: Path | None = None) -> Path:
+    resolved = _resolve_data_dir_unisolated(data_dir)
+    return _SUITE_STATE_DIR if resolved == _REAL_HOME_STATE_DIR else resolved
+
+
+_module_state._resolve_data_dir = _resolve_data_dir_for_suite
+_pack_discovery._resolve_data_dir = _resolve_data_dir_for_suite
+_pack_state._resolve_data_dir = _resolve_data_dir_for_suite
 
 import app.core.audit  # noqa: E402,F401
 
@@ -396,6 +524,9 @@ _unit_test_scope = False
 # collect them mid-flight (which would raise "Task was destroyed but it is
 # pending"). The done-callback drops each task once it finishes.
 _pending_event_tasks: set = set()
+# The shim replaces production publish_detached, so its tasks must remain
+# visible to the same lifespan drain before a later test replaces DB factories.
+_event_bus._extra_task_sets.append(_pending_event_tasks)
 
 
 def _schedule_publish(coro):
@@ -563,13 +694,23 @@ def _no_outbound_http(request, monkeypatch):
     send = httpx.Client.send
     asend = httpx.AsyncClient.send
 
-    def _guarded_send(self, request_, *args, **kwargs):
-        _check(self, request_.url)
-        return send(self, request_, *args, **kwargs)
+    # The first parameter has to keep httpx's own name. ``Client.stream`` and
+    # ``AsyncClient.stream`` call ``self.send(request=request, ...)`` by
+    # keyword, so a replacement that calls it anything else - ``request_``, to
+    # leave this fixture's own ``request`` argument visible - takes the request
+    # through ``**kwargs`` and raises "missing 1 required positional argument"
+    # on every streaming call in the suite. That is what the 2026-09-22 nightly
+    # reported four times in tests/integration/test_issue_138_openrouter_sse_e2e.py,
+    # and it reads like a product bug rather than a guard that renamed an
+    # argument. Shadowing the fixture's ``request`` inside these two functions
+    # costs nothing: the marker it is needed for was read at the top.
+    def _guarded_send(self, request, *args, **kwargs):
+        _check(self, request.url)
+        return send(self, request, *args, **kwargs)
 
-    async def _guarded_asend(self, request_, *args, **kwargs):
-        _check(self, request_.url)
-        return await asend(self, request_, *args, **kwargs)
+    async def _guarded_asend(self, request, *args, **kwargs):
+        _check(self, request.url)
+        return await asend(self, request, *args, **kwargs)
 
     monkeypatch.setattr(httpx.Client, "send", _guarded_send)
     monkeypatch.setattr(httpx.AsyncClient, "send", _guarded_asend)
@@ -689,12 +830,70 @@ def _keep_validation_rules_registered():
     engine = _eng.validation_engine
     registry = engine.registry
     register_builtin_rules()
+    _register_module_rule_sets()
     try:
         yield
     finally:
         _eng.validation_engine = engine
         engine.registry = registry
         register_builtin_rules()
+        _register_module_rule_sets()
+
+
+_MODULE_RULE_REGISTRARS: list | None = None
+
+
+def _module_rule_registrars() -> list:
+    """Every module's synchronous ``register_*rules`` function, found once per process.
+
+    The application registers a module's rule sets from that module's
+    ``on_startup`` (``pay_application`` from contracts, the schedule, funding,
+    payment clock sets and so on). No test process runs ``on_startup``, so before
+    this a module set existed only in the files that happened to call its
+    registrar themselves. Everywhere else the engine reported the set as
+    unsupported and returned a report with no findings, which reads exactly like
+    the rules having run and found nothing. Registering them here keeps each
+    test's registry as complete as the running product's.
+
+    Discovery is by name in each module's ``validators.py``: a module-level
+    function named ``register_...rules`` that takes no arguments and is not a
+    coroutine. That is the shape every module registrar has; anything else
+    (the compliance DSL loader reads a repository) is left alone.
+    """
+    global _MODULE_RULE_REGISTRARS
+    if _MODULE_RULE_REGISTRARS is not None:
+        return _MODULE_RULE_REGISTRARS
+    import importlib
+    import warnings
+    from pathlib import Path
+
+    import app.modules as _modules
+
+    registrars: list = []
+    for validators in sorted(Path(_modules.__file__).parent.glob("*/validators.py")):
+        module_name = f"app.modules.{validators.parent.name}.validators"
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - one broken module must not hide the rest
+            warnings.warn(f"could not import {module_name} to register its rules: {exc!r}", stacklevel=2)
+            continue
+        for name, func in vars(module).items():
+            if not (name.startswith("register_") and name.endswith("rules")):
+                continue
+            if not inspect.isfunction(func) or func.__module__ != module_name:
+                continue
+            if inspect.iscoroutinefunction(func):
+                continue
+            if any(p.default is inspect.Parameter.empty for p in inspect.signature(func).parameters.values()):
+                continue
+            registrars.append(func)
+    _MODULE_RULE_REGISTRARS = registrars
+    return registrars
+
+
+def _register_module_rule_sets() -> None:
+    for register in _module_rule_registrars():
+        register()
 
 
 @pytest.fixture

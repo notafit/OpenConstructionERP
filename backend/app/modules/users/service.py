@@ -19,7 +19,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import bcrypt
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
 from jose import jwt
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -205,6 +205,29 @@ def create_reset_token(user: User, settings: Settings) -> str:
         "jti": _new_jti(),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+async def _send_reset_email(to: str, reset_url: str, recipient_name: str, log_url: bool) -> None:
+    """Deliver a password-reset email; never raises.
+
+    Runs inline or as a background task after the response. Either way the
+    answer to the caller must not depend on whether delivery worked, so SMTP
+    failures are logged, not raised.
+    """
+    try:
+        result = await get_email_service().send_password_reset(
+            to=to,
+            reset_url=reset_url,
+            recipient_name=recipient_name,
+            token_lifetime_minutes=RESET_TOKEN_LIFETIME_MINUTES,
+        )
+    except Exception:
+        logger.exception("Password reset email to %s failed", to)
+        return
+    if not result.ok and log_url:
+        # Dev-only fallback so developers without SMTP can still complete
+        # the reset flow from logs.
+        logger.debug("Reset URL for %s (dev-only log): %s", to, reset_url)
 
 
 # ── API Key utilities ──────────────────────────────────────────────────────
@@ -411,17 +434,30 @@ class UserService:
         _s = _get_settings()
         mode = getattr(_s, "registration_mode", "open") or "open"
 
-        # "First real user becomes admin" bootstrap. Check for any existing
-        # admin rather than any user - a prior `make seed` run may have
-        # inserted demo/viewer rows that would otherwise block the first
-        # real registrant from receiving admin rights.
+        # "First real user becomes admin" bootstrap, only on a genuinely fresh
+        # install: no real user row at all (active or not) and no real active
+        # admin. Seeded demo accounts and the desktop owner are not real users,
+        # so a demo-seeded install still bootstraps; the admin check keeps a
+        # desktop owner (an admin) from being joined by a second one. Asking
+        # only "is there an admin?" made any install without one - operator
+        # never registered, last admin deactivated - hand admin to whoever
+        # reached the public form first.
         admin_exists = await self.user_repo.has_admin()
+        bootstrap = not admin_exists and not await self.user_repo.has_real_user()
+        if not admin_exists and not bootstrap:
+            logger.warning(
+                "Registration on an install with no active administrator: the new account "
+                "gets the default role, not admin. Promote an existing user with "
+                "'openconstructionerp promote-admin <email>' (or 'python -m app.cli "
+                "promote-admin <email>'), or in SQL: UPDATE oe_users_user SET role = 'admin', "
+                "is_active = true WHERE email = '<email>';"
+            )
 
         # ``closed`` mode rejects every self-registration. The bootstrap
         # path is still allowed: an admin must be reachable on a fresh
-        # install or the operator has no way in. Once one admin exists,
+        # install or the operator has no way in. Once any real user exists,
         # closed truly closes the door.
-        if mode == "closed" and admin_exists:
+        if mode == "closed" and not bootstrap:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Self-registration is disabled. Contact an administrator.",
@@ -449,7 +485,7 @@ class UserService:
             # as admin no matter what config says.
             default_role = "viewer"
 
-        if not admin_exists:
+        if bootstrap:
             # Bootstrap path - always active so the operator can actually
             # log in to a fresh install in admin-approve mode.
             role = "admin"
@@ -733,6 +769,17 @@ class UserService:
                 ),
             )
 
+        if user.role == "admin" and await self.user_repo.has_admin():
+            # A password-free admin session is for an install nobody has taken
+            # over yet. Once a real administrator exists it would hand that
+            # role to anyone who can reach the port. See app.core.demo_admin.
+            from app.core.demo_admin import DEMO_ADMIN_SUPERSEDED, DEMO_ADMIN_SUPERSEDED_MESSAGE
+
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error": DEMO_ADMIN_SUPERSEDED, "message": DEMO_ADMIN_SUPERSEDED_MESSAGE},
+            )
+
         user_id = user.id
         prior_last_login = user.last_login_at
         now = datetime.now(UTC)
@@ -873,6 +920,73 @@ class UserService:
 
         return tokens
 
+    async def oidc_login(
+        self,
+        *,
+        oidc_sub: str,
+        oidc_issuer: str,
+        email: str,
+        full_name: str,
+        auto_create: bool = True,
+        role_from_groups: str | None = None,
+    ) -> TokenResponse:
+        """Authenticate via OIDC: find or create user by oidc_sub, issue tokens.
+
+        When *role_from_groups* is set (resolved from the OIDC_GROUP_ROLE_MAP
+        configuration), it is applied to the user on every login so that group
+        membership changes in Keycloak propagate without manual intervention.
+        """
+        from sqlalchemy import select
+
+        from app.modules.users.models import User
+
+        result = await self.session.execute(select(User).where(User.oidc_sub == oidc_sub))
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            # Try matching by email
+            user = await self.user_repo.get_by_email(email)
+            if user is not None:
+                # Link existing account to OIDC
+                user.oidc_sub = oidc_sub
+                user.oidc_issuer = oidc_issuer
+                if role_from_groups:
+                    user.role = role_from_groups
+                await self.session.flush()
+            elif auto_create:
+                # Create new user from OIDC claims
+                import secrets
+
+                user = User(
+                    email=email.lower().strip(),
+                    hashed_password=hash_password(secrets.token_urlsafe(32)),
+                    full_name=full_name,
+                    role=role_from_groups or "editor",
+                    is_active=True,
+                    oidc_sub=oidc_sub,
+                    oidc_issuer=oidc_issuer,
+                )
+                self.session.add(user)
+                await self.session.flush()
+        else:
+            # Existing OIDC user - sync role from groups on every login
+            if role_from_groups and user.role != role_from_groups:
+                user.role = role_from_groups
+                await self.session.flush()
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="No matching account found and auto-creation is disabled.",
+                )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated.",
+            )
+
+        return await self._issue_token_pair(user)
+
     async def refresh_tokens(self, refresh_token: str) -> TokenResponse:
         """Issue new token pair from a valid refresh token.
 
@@ -948,12 +1062,21 @@ class UserService:
 
     # ── Password reset ──────────────────────────────────────────────────
 
-    async def forgot_password(self, data: ForgotPasswordRequest) -> ForgotPasswordResponse:
+    async def forgot_password(
+        self,
+        data: ForgotPasswordRequest,
+        background: BackgroundTasks | None = None,
+    ) -> ForgotPasswordResponse:
         """Generate a password-reset token if the email exists.
 
         Always returns a generic success message to prevent email enumeration.
         The token is NEVER included in the HTTP response - it must be
         delivered only via a secure side-channel (email).
+
+        With ``background`` the email goes out after the response is sent.
+        The SMTP round trip is the one step only a known address pays for,
+        so awaiting it inline made the answer for a real account measurably
+        slower than for an unknown one, which is enumeration by stopwatch.
         """
         user = await self.user_repo.get_by_email(data.email)
 
@@ -976,19 +1099,16 @@ class UserService:
 
         reset_url = f"{self.settings.resolved_frontend_url}/auth/reset?token={token}"
         recipient_name = user.full_name or user.email.split("@", 1)[0]
-        email_service = get_email_service()
-        result = await email_service.send_password_reset(
-            to=user.email,
-            reset_url=reset_url,
-            recipient_name=recipient_name,
-            token_lifetime_minutes=RESET_TOKEN_LIFETIME_MINUTES,
+        # A reset URL is a live credential: logging it follows the same rule as
+        # the field magic-link secrets (explicit dev flag, never production),
+        # not APP_DEBUG, which operators switch on to chase problems.
+        log_url = bool(getattr(self.settings, "expose_dev_auth_secrets", False)) and (
+            getattr(self.settings, "app_env", "development") != "production"
         )
-        # Never raise - the response must stay enumeration-proof even
-        # when SMTP is down. The service already logs failure reasons.
-        if not result.ok and self.settings.app_debug:
-            # Dev-only fallback so developers without SMTP can still
-            # complete the reset flow from logs.
-            logger.debug("Reset URL for %s (dev-only log): %s", user.email, reset_url)
+        if background is not None:
+            background.add_task(_send_reset_email, user.email, reset_url, recipient_name, log_url)
+        else:
+            await _send_reset_email(user.email, reset_url, recipient_name, log_url)
 
         return ForgotPasswordResponse(message=message)
 

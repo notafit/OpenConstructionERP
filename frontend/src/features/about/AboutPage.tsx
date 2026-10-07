@@ -19,7 +19,7 @@ import { Card, Button, Badge, Breadcrumb, DismissibleInfo, IntroRichText } from 
 import { SUPPORTED_LANGUAGES } from '@/app/i18n';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { APP_VERSION } from '@/shared/lib/version';
-import { UpdateNotification } from '@/shared/ui/UpdateChecker';
+import { CheckForUpdatesButton, UpdateInlineNotice } from '@/shared/ui/UpdateChecker';
 import { Changelog, getRecentReleases } from './Changelog';
 import { ThirdPartyLicenses } from './ThirdPartyLicenses';
 import { CONTRIBUTORS, SPONSORS, acknowledgedUrl, type Acknowledged } from './acknowledgments';
@@ -232,11 +232,13 @@ export function AboutPage() {
         </div>
 
         {/* ── Right column — update notification + recent releases ──
-            UpdateNotification renders its own card; the recent-releases
+            UpdateInlineNotice renders one line when an update is on offer
+            and not dismissed; the recent-releases
             mini-list lives below it so the right column visually matches
             the left identity block's height on wide screens. */}
         <div className="flex flex-col gap-3">
-          <UpdateNotification forceShow hideDismiss />
+          <UpdateInlineNotice />
+          <CheckForUpdatesButton />
 
           {/* Recent releases — last 3 published versions with date so
               users can see the cadence at a glance without scrolling
@@ -486,13 +488,13 @@ export function AboutPage() {
                 <p>
                   {t('about.founder_bio_p1', {
                     defaultValue:
-                      'For the past ten years I\'ve worked on resource management for construction projects. Along the way I got curious about how the industry\'s tools came to be - from the first attempts at design automation to today\'s ERP platforms - and that turned into a couple of longer pieces ("The Lobbyists\' Wars and the Development of BIM" and "The History of the BIM Map"). It\'s hard to see where things are heading without a sense of how we got here.',
+                      'For the past decade our team has worked on resource management for construction projects. Along the way we got curious about how the industry\'s tools came to be - from the first attempts at design automation to today\'s ERP platforms - and that turned into a couple of longer pieces ("The Lobbyists\' Wars and the Development of BIM" and "The History of the BIM Map"). It\'s hard to see where things are heading without a sense of how we got here.',
                   })}
                 </p>
                 <p>
                   <Trans
                     i18nKey="about.founder_bio_p2"
-                    defaults='I&rsquo;ve written a fair amount on these topics over the years, and some of it found a wide readership. Alongside the writing, I&rsquo;ve consulted for construction and consulting firms, developers, and software vendors on how they handle project data - treating it as the basis for decisions rather than a byproduct of them. That work let me see the industry from both sides: the people who build the tools, and the people who use them every day. A lot of those observations ended up in my book <book>Data-Driven Construction</book>, now available in 16 languages (<books>datadrivenconstruction.io/books</books>). It is free of charge in every one of them.'
+                    defaults='We&rsquo;ve written a fair amount on these topics over the years, and some of it found a wide readership. Alongside the writing, we&rsquo;ve consulted for construction and consulting firms, developers, and software vendors on how they handle project data - treating it as the basis for decisions rather than a byproduct of them. That work let us see the industry from both sides: the people who build the tools, and the people who use them every day. A lot of those observations ended up in the book <book>Data-Driven Construction</book>, now available in 16 languages (<books>datadrivenconstruction.io/books</books>). It is free of charge in every one of them.'
                     components={{
                       book: (
                         <a
@@ -516,7 +518,7 @@ export function AboutPage() {
                 <p>
                   <Trans
                     i18nKey="about.founder_bio_p3"
-                    defaults='Two other problems kept me busy. One was helping non-developers get into proprietary file formats that were never meant to be opened. The other was finding a cleaner way to describe construction work through a resource model. Both produced free tools: the <cad>DDC CAD/BIM converters</cad> (Revit®, IFC, DWG, DGN → structured data) <gh>on GitHub</gh>, and <cwicr>CWICR</cwicr>, a multilingual database of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>.'
+                    defaults='Two other problems kept us busy. One was helping non-developers get into proprietary file formats that were never meant to be opened. The other was finding a cleaner way to describe construction work through a resource model. Both produced free tools: the <cad>DDC CAD/BIM converters</cad> (Revit®, IFC, DWG, DGN → structured data) <gh>on GitHub</gh>, and <cwicr>CWICR</cwicr>, a multilingual database of construction works and resources - over 55,000 items in 11 languages, published as <cwicr>OpenConstructionEstimate-DDC-CWICR</cwicr>.'
                     components={{
                       cad: (
                         <a
@@ -548,40 +550,40 @@ export function AboutPage() {
                 <blockquote className="my-4 rounded-r-lg border-l-4 border-oe-blue bg-oe-blue/[0.04] py-3 px-4 text-[15px] italic text-content-primary leading-relaxed">
                   {t('about.founder_bio_p4', {
                     defaultValue:
-                      "All of it was groundwork for something I'd wanted to build for a long time: an open, modular ERP for construction. The latest generation of tooling finally made it practical to pull the methodology, data models, and earlier implementations together into one platform. It's now public and open source.",
+                      "All of it was groundwork for something we'd wanted to build for a long time: an open, modular ERP for construction. The latest generation of tooling finally made it practical to pull the methodology, data models, and earlier implementations together into one platform. It's now public and open source.",
                   })}
                 </blockquote>
                 <p className="border-l-2 border-oe-blue/40 pl-3 italic text-content-primary">
                   {t('about.founder_bio_p5', {
                     defaultValue:
-                      'In my experience the best ideas tend to come out of conversation - and out of disagreement. If the questions around construction\'s move toward "Uberization," and toward more transparent cost and time estimation, are interesting to you, I\'d be glad to have you in that discussion.',
+                      'In our experience the best ideas tend to come out of conversation - and out of disagreement. If the questions around construction\'s move toward "Uberization," and toward more transparent cost and time estimation, are interesting to you, we\'d be glad to have you in that discussion.',
                   })}
                 </p>
               </div>
               {/* Author attribution — moved to the bottom of the bio per request. */}
               <div className="mt-5 flex items-center gap-3 border-t border-border-light pt-4">
                 <img
-                  src="/brand/artem-boiko-avatar.png"
-                  alt={t('about.founder_name', { defaultValue: 'Artem Boiko' })}
-                  className="h-12 w-12 shrink-0 rounded-xl object-cover bg-gradient-to-br from-slate-50 to-blue-50 dark:from-slate-800 dark:to-slate-900 ring-1 ring-border-light shadow-sm"
+                  src="/brand/ddc-logo.webp"
+                  alt={t('about.team_name', { defaultValue: 'DataDrivenConstruction' })}
+                  className="h-12 w-12 shrink-0 rounded-xl object-cover bg-gradient-to-br from-slate-50 to-blue-50 dark:from-slate-800 dark:to-slate-900 ring-1 ring-border-light shadow-sm p-1.5"
                   loading="lazy"
                 />
                 <div className="min-w-0 flex-1">
                   <h3 className="flex items-center gap-1.5 text-base font-bold text-content-primary leading-tight">
-                    {t('about.founder_name', { defaultValue: 'Artem Boiko' })}
+                    {t('about.team_name', { defaultValue: 'DataDrivenConstruction' })}
                     <a
-                      href="https://www.linkedin.com/in/boikoartem/"
+                      href="https://www.linkedin.com/company/datadrivenconstruction/"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-oe-blue transition-colors hover:bg-oe-blue/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oe-blue focus-visible:ring-offset-1"
-                      title={t('about.founder_linkedin', { defaultValue: 'Artem Boiko on LinkedIn' })}
-                      aria-label={t('about.founder_linkedin', { defaultValue: 'Artem Boiko on LinkedIn' })}
+                      title={t('about.team_linkedin', { defaultValue: 'DataDrivenConstruction on LinkedIn' })}
+                      aria-label={t('about.team_linkedin', { defaultValue: 'DataDrivenConstruction on LinkedIn' })}
                     >
                       <Linkedin size={15} />
                     </a>
                   </h3>
                   <p className="text-xs text-oe-blue font-medium mt-0.5">
-                    {t('about.founder_role', { defaultValue: 'Consultant for Automation & Data in Construction' })}
+                    {t('about.team_role', { defaultValue: 'Automation, data and open standards for construction' })}
                   </p>
                 </div>
               </div>
@@ -1036,7 +1038,7 @@ export function AboutPage() {
               <Badge variant="blue" size="sm">Free</Badge>
             </div>
             <p className="text-xs text-content-tertiary mb-4">
-              {t('about.book_subtitle', { defaultValue: 'By Artem Boiko · 16 languages · 600+ pages · 10 parts, 173 chapters' })}
+              {t('about.book_subtitle', { defaultValue: 'By the DataDrivenConstruction team · 16 languages · 600+ pages · 10 parts, 173 chapters' })}
             </p>
             <a
               href="https://datadrivenconstruction.io/books/"
@@ -1276,7 +1278,7 @@ export function AboutPage() {
           right before the Changelog so the page moves from gratitude into the
           release history. Sponsors and donors lead the wall when present;
           otherwise a single inviting line asks for the first backer. Kept in
-          sync with /ACKNOWLEDGMENTS.md via acknowledgments.ts. */}
+          sync with /docs/legal/ACKNOWLEDGMENTS.md via acknowledgments.ts. */}
       <Card className="animate-card-in" style={{ animationDelay: '280ms' }}>
         <div className="p-6" data-community-anchor style={{ scrollMarginTop: '80px' }}>
           <div className="flex items-center gap-2.5 mb-2">
@@ -1408,8 +1410,11 @@ export function AboutPage() {
       </Card>
 
       {/* Changelog - collapsed to the latest release by default with a toggle
-          to reveal the full history. Anchored so the header's "View all" jump
-          target lands on the section heading instead of mid-scroll. */}
+          to reveal the full history. maxEntries caps the releases, so while
+          unreleased work is pending the collapsed view shows two cards rather
+          than one: that card is rendered above the list and is deliberately
+          not a member of it. Anchored so the header's "View all" jump target
+          lands on the section heading instead of mid-scroll. */}
       <Card>
         <div className="p-6" data-changelog-anchor>
           <Changelog maxEntries={changelogExpanded ? undefined : 1} />
@@ -1433,10 +1438,28 @@ export function AboutPage() {
         </div>
       </Card>
 
+      {/* Development and Contribution Model */}
+      <Card padding="md" className="mt-6">
+        <h2 className="text-lg font-semibold text-content-primary mb-3">
+          {t('about.dev_model_title', { defaultValue: 'Development and Contribution Model' })}
+        </h2>
+        <div className="space-y-2 text-sm text-content-secondary leading-relaxed">
+          <p>
+            {t('about.dev_model_p1', { defaultValue: 'OpenConstructionERP has been under continuous development for more than six years and has benefited from contributions, feedback, testing, and domain expertise from many different people.' })}
+          </p>
+          <p>
+            {t('about.dev_model_p2', { defaultValue: 'To maintain a consistent architecture and reduce security, dependency, and integration risks, the project follows a centralized integration model. Most production code is ultimately reviewed, consolidated, tested, and published through a single maintainer account. As a result, the GitHub contributor history does not necessarily reflect the actual number of people who have contributed to the project.' })}
+          </p>
+          <p>
+            {t('about.dev_model_p3', { defaultValue: 'Rather than allowing the codebase to evolve into a collection of loosely connected components, changes are integrated into one coherent development line and undergo review and testing before being merged into the main project. A single publishing account represents a controlled integration and release process designed to preserve stability, security, and architectural consistency.' })}
+          </p>
+        </div>
+      </Card>
+
       {/* Credits */}
       <div className="text-center py-4 text-xs text-content-quaternary">
         <p className="flex items-center justify-center gap-1">
-          {t('about.built_by', { defaultValue: 'Created by Artem Boiko' })}
+          {t('about.built_by', { defaultValue: 'Built by the DataDrivenConstruction team' })}
           {' · '}
           <a href="https://datadrivenconstruction.io" target="_blank" rel="noopener noreferrer" className="hover:text-oe-blue transition-colors">
             datadrivenconstruction.io

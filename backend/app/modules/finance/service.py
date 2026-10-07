@@ -9,8 +9,9 @@ import hashlib
 import logging
 import uuid
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
@@ -21,6 +22,7 @@ from app.core.events import event_bus
 from app.core.money import money_quantum
 from app.modules.finance import gaap
 from app.modules.finance.models import (
+    EVM_SNAPSHOT_SOURCE_SCHEDULE_PROGRESS,
     EVMSnapshot,
     Invoice,
     InvoiceLineItem,
@@ -29,6 +31,7 @@ from app.modules.finance.models import (
     Payment,
     ProjectBudget,
 )
+from app.modules.finance.po_link import invoice_po_link
 from app.modules.finance.repository import (
     BudgetRepository,
     EVMSnapshotRepository,
@@ -60,6 +63,29 @@ from app.modules.finance.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Budget category that holds contingency (compared lower-case).
+CONTINGENCY_CATEGORY = "contingency"
+#: Metadata key prefix of a confirmed drawdown on a contingency budget line,
+#: followed by its source (``risk:<uuid>``). Written only by
+#: ``FinanceService.set_contingency_drawdown``.
+CONTINGENCY_DRAWDOWN_PREFIX = "contingency_drawdown:"
+
+
+def _without_drawdowns(metadata: object) -> dict[str, Any]:
+    """Caller-supplied budget metadata minus any contingency drawdown keys.
+
+    A drawdown is money a manager confirmed (``risk.contingency``). The budget
+    create and edit routes need only ``finance.create`` / ``finance.update``,
+    so a key with the drawdown prefix arriving through them would let an
+    editor book a drawdown in a manager's name. Such keys are dropped on the
+    way in, whatever the line's category, so a line created under another
+    category and moved to contingency later cannot carry one either.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    return {k: v for k, v in metadata.items() if not str(k).startswith(CONTINGENCY_DRAWDOWN_PREFIX)}
+
 
 # Upper bound on invoices scanned for the retention ledger (mirrors the invoice
 # Excel-export cap). A read model, so a hard ceiling keeps a pathological
@@ -200,6 +226,52 @@ _INVOICE_STATUS_TRANSITIONS: dict[str, set[str]] = {
 }
 
 _VALID_INVOICE_STATUSES = set(_INVOICE_STATUS_TRANSITIONS.keys())
+
+#: Statuses in which an invoice's figures are still being drawn up. Past them
+#: the invoice has been approved, sent, paid or cancelled, and what it charges,
+#: to whom and in which currency is the record.
+_INVOICE_EDITABLE_STATUSES: frozenset[str] = frozenset({"draft", "pending"})
+
+#: The amounts an issued invoice keeps, compared to the cent so that a form
+#: sending the stored figures back is not read as a change.
+_INVOICE_KEPT_AMOUNTS: tuple[str, ...] = ("amount_subtotal", "tax_amount", "retention_amount", "amount_total")
+
+#: The parties and terms an issued invoice keeps, compared as text.
+_INVOICE_KEPT_TERMS: tuple[str, ...] = ("currency_code", "tax_config_id", "contact_id", "invoice_direction")
+
+
+def _cents(value: Any) -> Decimal | None:
+    """An amount rounded to the cent for comparison, ``None`` when unreadable."""
+    try:
+        return Decimal(str(value if value not in (None, "") else "0")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _issued_invoice_changes(invoice: Any, fields: dict[str, Any], new_lines: Sequence[Any] | None) -> list[str]:
+    """Name what a patch would change about an invoice's figures, parties or lines.
+
+    Only real changes count: a field sent back with the value it already has is
+    not one. Replacement lines count when their number or their amounts differ
+    from the stored ones; a reworded description does not move money.
+    """
+    changed = [
+        name
+        for name in _INVOICE_KEPT_AMOUNTS
+        if name in fields and _cents(fields[name]) != _cents(getattr(invoice, name, None))
+    ]
+    for name in _INVOICE_KEPT_TERMS:
+        if name not in fields:
+            continue
+        new, old = (fields[name] or ""), (getattr(invoice, name, None) or "")
+        if str(new).strip().upper() != str(old).strip().upper():
+            changed.append(name)
+    if new_lines is not None:
+        old_amounts = sorted(_cents(getattr(item, "amount", None)) or Decimal("0") for item in invoice.line_items or [])
+        new_amounts = sorted(_cents(getattr(item, "amount", None)) or Decimal("0") for item in new_lines)
+        if old_amounts != new_amounts:
+            changed.append("line_items")
+    return changed
 
 
 def _parse_decimal(value: str, field_name: str = "value") -> Decimal:
@@ -343,7 +415,12 @@ def compute_payment_withholding(
     return _q2(amount_to_pay), _q2(withheld)
 
 
-def _line_item_from(invoice_id: uuid.UUID, item_data: InvoiceLineItemCreate, idx: int) -> InvoiceLineItem:
+def _line_item_from(
+    invoice_id: uuid.UUID,
+    item_data: InvoiceLineItemCreate,
+    idx: int,
+    default_vat_rate: Decimal | None = None,
+) -> InvoiceLineItem:
     """Build a line item row from its Create schema.
 
     Creating an invoice and replacing its lines persist the same shape, so the
@@ -355,6 +432,8 @@ def _line_item_from(invoice_id: uuid.UUID, item_data: InvoiceLineItemCreate, idx
         invoice_id: the invoice the line belongs to.
         item_data: the validated Create schema for one line.
         idx: position in the submitted list, used when no sort order is given.
+        default_vat_rate: the project country's VAT rate, used only when the
+            line carries none. An explicit rate, zero included, always wins.
 
     Returns:
         An unpersisted :class:`InvoiceLineItem`.
@@ -370,9 +449,44 @@ def _line_item_from(invoice_id: uuid.UUID, item_data: InvoiceLineItemCreate, idx
         cost_category=item_data.cost_category,
         cost_line_id=getattr(item_data, "cost_line_id", None),
         sort_order=item_data.sort_order if item_data.sort_order else idx,
-        vat_rate=item_data.vat_rate,
+        vat_rate=item_data.vat_rate if item_data.vat_rate is not None else default_vat_rate,
         vat_category=item_data.vat_category,
     )
+
+
+def _default_vat_matching_tax(
+    items: Sequence[InvoiceLineItemCreate],
+    tax: object,
+    default_vat_rate: Decimal | None,
+) -> Decimal | None:
+    """The country default, only when it reproduces the invoice's own tax.
+
+    The header tax is what the invoice says it charges. Filling the lines that
+    carry no rate with the country rate is right when that adds up to it, and
+    wrong when the invoice was taxed at another rate or not at all: a header
+    of 0 with lines at 25% is a document that disagrees with itself, and the
+    e-invoice and the VAT return read the lines. So the default is applied
+    only when explicit line VAT plus default line VAT lands on the header tax
+    within the line rounding tolerance; otherwise those lines keep no rate, as
+    they did before the default existed. A create that states no tax at all
+    (``tax`` is ``None``) has nothing to disagree with and takes the default.
+    """
+    if default_vat_rate is None or tax is None:
+        return default_vat_rate
+    header_tax = _safe_decimal(tax)
+    line_vat = Decimal("0")
+    for item in items:
+        rate = _safe_decimal(item.vat_rate) if item.vat_rate is not None else default_vat_rate
+        line_vat += _q2(_safe_decimal(item.amount) * rate / Decimal("100"))
+    if abs(line_vat - header_tax) > _line_sum_tolerance(len(items)):
+        logger.info(
+            "Country VAT %s%% not applied to unrated invoice lines: they would carry %s against a stated tax of %s",
+            default_vat_rate,
+            line_vat,
+            header_tax,
+        )
+        return None
+    return default_vat_rate
 
 
 async def resolve_position_cost_lines(
@@ -414,13 +528,13 @@ async def resolve_position_cost_lines(
             continue
         if position_id not in resolved:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"No bill position {position_id} exists, so this line cannot be attributed to it.",
             )
         cost_line_id = resolved[position_id]
         if cost_line_id is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"Bill position {position_id} is not on the cost spine, so an actual posted "
                     "against it would roll up nowhere. Generate the spine for the project first "
@@ -430,7 +544,7 @@ async def resolve_position_cost_lines(
             )
         if item.cost_line_id is not None and item.cost_line_id != cost_line_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"This line names bill position {position_id}, which belongs to cost line "
                     f"{cost_line_id}, and cost line {item.cost_line_id} as well. Send one of them."
@@ -531,10 +645,19 @@ class FinanceService:
             else _compute_invoice_total(data.amount_subtotal, data.tax_amount)
         )
 
+        if data.purchase_order_id is not None:
+            await self._check_po_link(
+                data.purchase_order_id,
+                project_id=data.project_id,
+                direction=data.invoice_direction,
+                contact_id=data.contact_id,
+            )
+
         invoice = Invoice(
             project_id=data.project_id,
             contact_id=data.contact_id,
             invoice_direction=data.invoice_direction,
+            purchase_order_id=data.purchase_order_id,
             invoice_number=invoice_number,
             invoice_date=data.invoice_date,
             due_date=data.due_date,
@@ -554,8 +677,17 @@ class FinanceService:
 
         # Create line items
         await resolve_position_cost_lines(self.session, data.line_items)
+        default_vat = _default_vat_matching_tax(
+            data.line_items,
+            # Weighed only when the tax is stated and the lines are held to make
+            # up the document: a captured scan's lines need not add up to it.
+            data.tax_amount if enforce_line_sum and "tax_amount" in data.model_fields_set else None,
+            await self._default_vat_rate(invoice.project_id, invoice.invoice_date, data.line_items),
+        )
         for idx, item_data in enumerate(data.line_items):
-            await self.line_items.create(_line_item_from(invoice.id, item_data, idx))
+            await self.line_items.create(_line_item_from(invoice.id, item_data, idx, default_vat))
+        if invoice.invoice_direction == "payable":
+            await self._sync_budget_quietly(invoice.project_id)
 
         # Re-fetch invoice with relationships (line_items, payments) eager-loaded
         refreshed = await self.invoices.get(invoice.id)
@@ -566,6 +698,59 @@ class FinanceService:
             )
         logger.info("Invoice created: %s (%s)", refreshed.invoice_number, refreshed.invoice_direction)
         return refreshed
+
+    async def _check_po_link(
+        self,
+        po_id: uuid.UUID,
+        *,
+        project_id: uuid.UUID,
+        direction: str,
+        contact_id: str | None,
+    ) -> None:
+        """Refuse a purchase-order link the order cannot back.
+
+        The invoice form only offers matching orders, and this is the same rule
+        for every other caller: a supplier invoice, an order on the same
+        project, not a draft or cancelled one, and the same supplier when both
+        name one. The order row is locked for the rest of the transaction, the
+        lock ``create-invoice`` and the order removal path take, so an invoice
+        cannot be linked to an order that another request is deleting.
+        """
+        if direction != "payable":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Only a supplier (payable) invoice can be linked to a purchase order.",
+            )
+        try:
+            from app.modules.procurement.models import PurchaseOrder
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Purchase orders are not available: the procurement module is not installed.",
+            ) from exc
+        row = (
+            await self.session.execute(
+                select(PurchaseOrder.project_id, PurchaseOrder.vendor_contact_id, PurchaseOrder.status)
+                .where(PurchaseOrder.id == po_id)
+                .with_for_update()
+            )
+        ).first()
+        if row is None or row[0] != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The purchase order does not exist on this project.",
+            )
+        po_vendor, po_status = row[1], row[2]
+        if po_status in ("draft", "cancelled"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"A {po_status} purchase order cannot be invoiced; approve it first.",
+            )
+        if contact_id and po_vendor and str(contact_id) != str(po_vendor):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The purchase order was placed with a different supplier than this invoice.",
+            )
 
     async def get_invoice(self, invoice_id: uuid.UUID) -> Invoice:
         """Get invoice by ID. Raises 404 if not found."""
@@ -638,6 +823,22 @@ class FinanceService:
                     ),
                 )
 
+        # An approved, sent, paid or cancelled invoice keeps its figures, its
+        # parties and its lines. The status can still move along the table
+        # above, and a patch that reopens a cancelled invoice as a draft may
+        # correct it in the same write.
+        resulting_status = fields.get("status") or invoice.status
+        if invoice.status not in _INVOICE_EDITABLE_STATUSES and resulting_status not in _INVOICE_EDITABLE_STATUSES:
+            changed = _issued_invoice_changes(invoice, fields, data.line_items)
+            if changed:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"This invoice is {invoice.status}, so its {', '.join(changed)} can no longer change. "
+                        "Cancel it and reopen it as a draft to correct it, or issue a credit note if it is paid."
+                    ),
+                )
+
         # The figures this write leaves the invoice with, whether they come
         # from the patch or from the row it lands on.
         new_subtotal = str(fields.get("amount_subtotal") or invoice.amount_subtotal)
@@ -660,6 +861,33 @@ class FinanceService:
         # comes without a total still has to leave the invoice adding up.
         if asserted_total is None and ("amount_subtotal" in fields or "tax_amount" in fields):
             fields["amount_total"] = _compute_invoice_total(new_subtotal, new_tax)
+
+        # Linking (or relinking) to an order is allowed at any status: it moves
+        # no money, it only says which commitment the money belongs to.
+        if "purchase_order_id" in fields and fields["purchase_order_id"] is None:
+            # Unlinking has to clear the legacy stamp too, or the link reads
+            # straight back from it (``finance.po_link``).
+            meta = dict(fields.get("metadata_", invoice.metadata_) or {})
+            if meta.pop("po_id", None) is not None:
+                fields["metadata_"] = meta
+        # Re-checked when the link moves, and when the vendor or the direction
+        # moves under a link that stays, since either can make it one the
+        # order cannot back.
+        # Compared as text: the patch carries the vendor as a string, the row
+        # holds a UUID, and the form sends it back on every save.
+        parties_moved = (
+            "contact_id" in fields and str(fields["contact_id"] or "").lower() != str(invoice.contact_id or "").lower()
+        ) or ("invoice_direction" in fields and fields["invoice_direction"] != invoice.invoice_direction)
+        if "purchase_order_id" in fields or parties_moved:
+            current_link = invoice_po_link(invoice.purchase_order_id, invoice.metadata_)
+            target_link = fields.get("purchase_order_id", current_link)
+            if target_link is not None and (target_link != current_link or parties_moved):
+                await self._check_po_link(
+                    target_link,
+                    project_id=invoice.project_id,
+                    direction=fields.get("invoice_direction") or invoice.invoice_direction,
+                    contact_id=fields.get("contact_id", invoice.contact_id),
+                )
 
         if fields:
             await self.invoices.update(invoice_id, **fields)
@@ -688,8 +916,17 @@ class FinanceService:
 
             await resolve_position_cost_lines(self.session, data.line_items)
             await self.line_items.delete_by_invoice(invoice_id)
+            default_vat = _default_vat_matching_tax(
+                data.line_items,
+                new_tax,
+                await self._default_vat_rate(
+                    invoice.project_id,
+                    fields.get("invoice_date") or getattr(invoice, "invoice_date", None),
+                    data.line_items,
+                ),
+            )
             for idx, item_data in enumerate(data.line_items):
-                await self.line_items.create(_line_item_from(invoice_id, item_data, idx))
+                await self.line_items.create(_line_item_from(invoice_id, item_data, idx, default_vat))
 
             # Single audit row for the bulk replacement. Best-effort:
             # failures are warned (not rolled back) for the same reason as
@@ -725,6 +962,7 @@ class FinanceService:
                     exc_info=True,
                 )
 
+        await self._sync_budget_quietly(invoice.project_id)
         updated = await self.invoices.get(invoice_id)
         if updated is None:
             raise HTTPException(
@@ -787,6 +1025,7 @@ class FinanceService:
                 exc,
                 exc_info=True,
             )
+        await self._sync_budget_quietly(invoice.project_id)
         updated = await self.invoices.get(invoice_id)
         if updated is None:
             raise HTTPException(
@@ -869,112 +1108,12 @@ class FinanceService:
             )
         logger.info("Invoice paid: %s", invoice.invoice_number)
 
-        # BUG-346: distribute actuals across budget rows by
-        # ``(wbs_id, cost_category)`` instead of writing the whole project
-        # total onto every row. The old behaviour made every budget line
-        # look like it had consumed the full project spend, so the variance
-        # dashboard flagged every category as 500% over-run after a single
-        # paid invoice.
-        #
-        # Strategy:
-        #   1. Walk all paid invoices of the project.
-        #   2. For invoices with line items, bucket each line's ``amount``
-        #      by ``(wbs_id, cost_category)``.
-        #   3. For invoices without line items, attribute the full
-        #      ``amount_total`` to the ``(None, None)`` bucket.
-        #   4. For each ``ProjectBudget`` row, look up its matching bucket
-        #      and set ``actual`` to the summed Decimal; unmatched rows are
-        #      zeroed so a later cost-category removal doesn't leave stale
-        #      actuals hanging.
-        try:
-            from collections import defaultdict
-
-            from sqlalchemy import select
-            from sqlalchemy.orm import selectinload
-
-            paid_result = await self.session.execute(
-                select(Invoice)
-                .options(selectinload(Invoice.line_items))
-                .where(
-                    Invoice.project_id == invoice.project_id,
-                    Invoice.status == "paid",
-                )
-            )
-            paid_invoices = paid_result.scalars().all()
-
-            # key = (wbs_id, cost_category, currency); wbs_id/cost_category both
-            # None means "uncategorized". The currency is part of the key so we
-            # never blend two currencies into one ProjectBudget.actual (FX
-            # never-blend rule): each budget row carries its own currency_code
-            # and only receives the bucket priced in that same currency. A blank
-            # invoice currency is normalised to "" to match a blank budget-row
-            # currency (both treated as base). Mixed-currency invoices on the
-            # same (wbs_id, cost_category) therefore land in separate buckets
-            # and the per-currency dashboard rollup FX-converts them correctly,
-            # instead of summing them as if 1 USD == 1 EUR.
-            bucketed: dict[tuple[str | None, str | None, str], Decimal] = defaultdict(lambda: Decimal("0"))
-            total_actual = Decimal("0")
-
-            for inv in paid_invoices:
-                # getattr keeps this resilient when an invoice row predates the
-                # currency_code column (or a caller passes a lightweight stub):
-                # a missing/blank code means "base currency" and buckets under "".
-                inv_currency = (getattr(inv, "currency_code", "") or "").strip().upper()
-                items = list(inv.line_items or [])
-                if items:
-                    for item in items:
-                        try:
-                            amt = Decimal(str(item.amount))
-                        except (InvalidOperation, ValueError):
-                            continue
-                        bucketed[(item.wbs_id, item.cost_category, inv_currency)] += amt
-                        total_actual += amt
-                else:
-                    # No breakdown - attribute the full invoice total to the
-                    # catch-all bucket for this invoice's currency.
-                    try:
-                        amt = Decimal(str(inv.amount_total))
-                    except (InvalidOperation, ValueError):
-                        continue
-                    bucketed[(None, None, inv_currency)] += amt
-                    total_actual += amt
-
-            budget_result = await self.session.execute(
-                select(ProjectBudget).where(ProjectBudget.project_id == invoice.project_id)
-            )
-            budgets = list(budget_result.scalars().all())
-
-            # Reset every budget row before assignment so removing a
-            # cost_category from future invoices drains the actual back to 0.
-            # Assign Decimal (not str) - MoneyType column expects Decimal on
-            # the ORM side; str assignment works on SQLite but triggers a
-            # type-coercion warning on PostgreSQL (BUG-FINANCE-ACT01).
-            for budget in budgets:
-                # Match the bucket priced in the budget row's own currency only,
-                # so a row stamped EUR never absorbs a USD invoice's amount. A
-                # row without a currency_code (legacy/stub) buckets under "" and
-                # so still matches base-currency invoice amounts as before.
-                budget_currency = (getattr(budget, "currency_code", "") or "").strip().upper()
-                key = (budget.wbs_id, budget.category, budget_currency)
-                # Preserve the goods-receipt-sourced portion of actual (recorded
-                # in metadata by the procurement gr.confirmed handler). Without
-                # this, paying any invoice overwrites actual with only the
-                # invoice-sourced total and silently wipes procurement actuals.
-                gr_actual = _safe_decimal((getattr(budget, "metadata_", None) or {}).get("actual_from_receipts", "0"))
-                budget.actual = bucketed.get(key, Decimal("0")) + gr_actual
-
-            logger.info(
-                "Updated budget actuals for project %s: total_actual=%s across %d budget row(s), %d bucket(s)",
-                invoice.project_id,
-                total_actual,
-                len(budgets),
-                len(bucketed),
-            )
-        except Exception:
-            logger.exception(
-                "Failed to update budget actuals after paying invoice %s",
-                invoice.invoice_number,
-            )
+        # Budget rows follow the paid invoice: each source's committed and
+        # actual lands on ONE budget line, net of VAT (``finance.budget_actuals``
+        # states the rules). BUG-346 fixed the every-line write here once; the
+        # core ``invoice.paid`` handler that kept reintroducing it is no longer
+        # subscribed.
+        await self._sync_budget_quietly(invoice.project_id)
 
         # ── Post to the costmodel.BudgetLine cost spine (Gap B) ─────────────
         # In addition to the legacy ProjectBudget bucketing above, mirror every
@@ -1016,6 +1155,254 @@ class FinanceService:
         )
 
         return updated
+
+    async def budget_wbs_labels(self, wbs_ids: Sequence[str | None]) -> dict[str, str]:
+        """Readable names for budget ``wbs_id`` values that are ids.
+
+        A budget line's ``wbs_id`` is free text: a WBS code such as "02", the
+        id of a project WBS node, or the id of a bill section (what the bill's
+        "Create budget" action groups by). The Budgets table showed the raw
+        UUID for the last two. Codes are left alone; ids resolve to the node's
+        code and name, else to the section's number and description.
+        """
+        ids: dict[str, uuid.UUID] = {}
+        for raw in wbs_ids:
+            text = (raw or "").strip()
+            if not text:
+                continue
+            try:
+                ids[text] = uuid.UUID(text)
+            except ValueError:
+                continue
+        if not ids:
+            return {}
+        from sqlalchemy import select
+
+        labels: dict[str, str] = {}
+        try:
+            from app.modules.projects.models import ProjectWBS
+
+            for node_id, code, name in (
+                await self.session.execute(
+                    select(ProjectWBS.id, ProjectWBS.code, ProjectWBS.name).where(ProjectWBS.id.in_(ids.values()))
+                )
+            ).all():
+                labels[str(node_id)] = " ".join(part for part in ((code or "").strip(), (name or "").strip()) if part)
+        except ImportError:
+            pass
+        rest = [value for key, value in ids.items() if str(value) not in labels]
+        if rest:
+            try:
+                from app.modules.boq.models import Position
+
+                for pos_id, ordinal, description in (
+                    await self.session.execute(
+                        select(Position.id, Position.ordinal, Position.description).where(Position.id.in_(rest))
+                    )
+                ).all():
+                    text = " ".join(part for part in ((ordinal or "").strip(), (description or "").strip()) if part)
+                    labels[str(pos_id)] = text[:120]
+            except ImportError:
+                pass
+        # Keyed by the stored text, which may differ from str(UUID) in case.
+        return {key: labels[str(value)] for key, value in ids.items() if str(value) in labels}
+
+    async def _default_vat_rate(
+        self,
+        project_id: uuid.UUID,
+        invoice_date: object,
+        items: Sequence[InvoiceLineItemCreate],
+    ) -> Decimal | None:
+        """The VAT rate a line without one gets: the project country's, on the invoice date.
+
+        Read from the jurisdiction registry (``I18nFoundationService.resolve_tax_rate``)
+        only when some line actually lacks a rate. ``None`` when the project
+        has no country, the country taxes by subdivision and none is known, or
+        the registry cannot answer; the line then stays without a rate, as it
+        did before, rather than getting a guessed one.
+        """
+        if all(item.vat_rate is not None for item in items):
+            return None
+        try:
+            from app.modules.i18n_foundation.service import I18nFoundationService
+            from app.modules.projects.repository import ProjectRepository
+
+            project = await ProjectRepository(self.session).get_by_id(project_id)
+            country = (getattr(project, "country_code", None) or "").strip().upper() if project else ""
+            if not country:
+                return None
+            on_date = str(invoice_date or "")[:10] or None
+            resolution = await I18nFoundationService(self.session).resolve_tax_rate(country, on_date=on_date)
+        except Exception:
+            logger.warning("VAT default for project %s could not be resolved", project_id, exc_info=True)
+            return None
+        if not resolution.resolved or resolution.combined_rate_pct is None:
+            return None
+        return _safe_decimal(resolution.combined_rate_pct)
+
+    async def sync_project_budget(self, project_id: uuid.UUID) -> None:
+        """Keep the project's budget rows to the committed and actual the dashboard shows.
+
+        The dashboard reads committed (the open part) and actual per source from
+        the records (``finance.cost_position``); this lands each source on one
+        budget row (``finance.budget_actuals``) and applies only the difference
+        from what it put there last time, recorded per source on the row as a
+        ``sync:<kind>:<id>`` marker. So a replay changes nothing, a figure typed
+        onto a row is left alone, and the rows add up to the dashboard.
+
+        Called after every write that moves one of those figures: an invoice or
+        payment in finance, an order approval or goods receipt (the order events),
+        and a subcontract signed or billed (the subcontractors module).
+
+        A row this has never run on in a project that already has a paid invoice
+        carries the actual the old paid-invoice recompute wrote over it; that part
+        is dropped once, keeping what goods receipts moved into it.
+        """
+        from app.modules.finance.budget_actuals import (
+            COMMITTED_FROM_PO_PREFIX,
+            RECEIVED_FROM_GR_PREFIX,
+            SYNC_PREFIX,
+            BudgetLineRow,
+            parse_sync_marker,
+            plan_budget,
+        )
+        from app.modules.finance.cost_position import load_cost_position
+
+        budgets = list(
+            (
+                await self.session.execute(
+                    select(ProjectBudget)
+                    .where(ProjectBudget.project_id == project_id)
+                    # Rows seeded in one flush share a timestamp; the WBS code
+                    # then decides which is "oldest", so the fallback line is
+                    # the same on every run.
+                    .order_by(ProjectBudget.created_at.asc(), ProjectBudget.wbs_id.asc(), ProjectBudget.id.asc())
+                    # This rewrites every row's metadata from what it reads
+                    # here, so it reads under row locks and over any copy the
+                    # session already holds. Otherwise a contingency drawdown
+                    # (or another sync) committed after this read is written
+                    # back out of the row. The lock order matches
+                    # ``list_contingency_lines``, which locks a subset.
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not budgets:
+            return
+        rows = [
+            BudgetLineRow(
+                id=b.id,
+                wbs_id=b.wbs_id,
+                category=b.category,
+                currency=(getattr(b, "currency_code", "") or "").strip().upper(),
+            )
+            for b in budgets
+        ]
+
+        # What the order events already put on the rows, per order.
+        committed_marker: dict[uuid.UUID, Decimal] = {}
+        received_by_gr: dict[uuid.UUID, Decimal] = {}
+        order_rows: dict[uuid.UUID, uuid.UUID] = {}
+        gr_rows: dict[uuid.UUID, uuid.UUID] = {}
+        for b in budgets:
+            for key, value in (getattr(b, "metadata_", None) or {}).items():
+                prefix = next(
+                    (p for p in (COMMITTED_FROM_PO_PREFIX, RECEIVED_FROM_GR_PREFIX) if key.startswith(p)), None
+                )
+                if prefix is None:
+                    continue
+                try:
+                    ref = uuid.UUID(key[len(prefix) :])
+                except ValueError:
+                    continue
+                if prefix == COMMITTED_FROM_PO_PREFIX:
+                    committed_marker[ref] = _safe_decimal(value)
+                    order_rows[ref] = b.id
+                else:
+                    received_by_gr[ref] = _safe_decimal(value)
+                    gr_rows[ref] = b.id
+        received_marker: dict[uuid.UUID, Decimal] = {}
+        if received_by_gr:
+            from app.modules.procurement.models import GoodsReceipt
+
+            for gr_id, po_id in (
+                await self.session.execute(
+                    select(GoodsReceipt.id, GoodsReceipt.po_id).where(GoodsReceipt.id.in_(list(received_by_gr)))
+                )
+            ).all():
+                received_marker[po_id] = received_marker.get(po_id, Decimal("0")) + received_by_gr[gr_id]
+                order_rows.setdefault(po_id, gr_rows[gr_id])
+        # A receipt takes its value off the row's committed whether or not the
+        # order's approval put anything there (an order approved before the
+        # budget existed is committed by this sync instead), so the order
+        # events' net effect on committed can be negative.
+        order_handled = {
+            po_id: (
+                committed_marker.get(po_id, Decimal("0")) - received_marker.get(po_id, Decimal("0")),
+                received_marker.get(po_id, Decimal("0")),
+            )
+            for po_id in set(committed_marker) | set(received_marker)
+        }
+
+        position = await load_cost_position(self.session, project_id=project_id)
+        plan = plan_budget(rows, position.sources, order_rows=order_rows, order_handled=order_handled)
+
+        legacy_actual = None
+        for b in budgets:
+            md = dict(getattr(b, "metadata_", None) or {})
+            if md.get("budget_sync") != "1":
+                if legacy_actual is None:
+                    legacy_actual = await self._project_has_paid_invoice(project_id)
+                if legacy_actual:
+                    b.actual = _safe_decimal(md.get("actual_from_receipts", "0"))
+                for key in [k for k in md if k.startswith("released_by_payment:")]:
+                    md.pop(key)
+                md["budget_sync"] = "1"
+            wanted = plan.per_row.get(b.id, {})
+            delta_c = delta_a = Decimal("0")
+            for key in {k[len(SYNC_PREFIX) :] for k in md if k.startswith(SYNC_PREFIX)} | set(wanted):
+                old_c, old_a = parse_sync_marker(md.get(f"{SYNC_PREFIX}{key}"))
+                new_c, new_a = wanted.get(key, (Decimal("0"), Decimal("0")))
+                delta_c += new_c - old_c
+                delta_a += new_a - old_a
+                if new_c == 0 and new_a == 0:
+                    md.pop(f"{SYNC_PREFIX}{key}", None)
+                else:
+                    md[f"{SYNC_PREFIX}{key}"] = f"{new_c}|{new_a}"
+            if delta_c:
+                b.committed = max(_safe_decimal(b.committed) + delta_c, Decimal("0"))
+            if delta_a:
+                b.actual = _safe_decimal(b.actual) + delta_a
+            if md != (getattr(b, "metadata_", None) or {}):
+                b.metadata_ = md
+        await self.session.flush()
+        if plan.unplaced:
+            logger.warning(
+                "Project %s has committed / actual in a currency no budget line carries: %s",
+                project_id,
+                plan.unplaced,
+            )
+
+    async def _sync_budget_quietly(self, project_id: uuid.UUID | None) -> None:
+        """``sync_project_budget`` for a write that must not fail because of it."""
+        if project_id is None:
+            return
+        try:
+            async with self.session.begin_nested():
+                await self.sync_project_budget(project_id)
+        except Exception:
+            logger.exception("Budget rows not synced for project %s", project_id)
+
+    async def _project_has_paid_invoice(self, project_id: uuid.UUID) -> bool:
+        found = (
+            await self.session.execute(
+                select(Invoice.id).where(Invoice.project_id == project_id, Invoice.status == "paid").limit(1)
+            )
+        ).first()
+        return found is not None
 
     async def _post_paid_invoices_to_spine(self, project_id: uuid.UUID) -> None:
         """Mirror every paid invoice of a project into the costmodel cost spine.
@@ -1065,10 +1452,16 @@ class FinanceService:
             )
             return str(Decimal(str(converted)))
 
+        # Supplier invoices only: a client invoice being paid is income, not a
+        # cost actual on the spine.
         result = await self.session.execute(
             select(Invoice)
             .options(selectinload(Invoice.line_items))
-            .where(Invoice.project_id == project_id, Invoice.status == "paid")
+            .where(
+                Invoice.project_id == project_id,
+                Invoice.status == "paid",
+                Invoice.invoice_direction == "payable",
+            )
         )
         paid_invoices = result.scalars().all()
 
@@ -1120,7 +1513,8 @@ class FinanceService:
                     posting_ref=f"{inv.id}:full",
                     cost_line_id=None,
                     cost_category=None,
-                    amount_base=_to_base(inv.amount_total, inv_currency),
+                    # Net, like the line amounts above: the spine's budget is net.
+                    amount_base=_to_base(inv.amount_subtotal, inv_currency),
                     currency=inv_currency,
                 )
 
@@ -1228,10 +1622,45 @@ class FinanceService:
                 exc_info=True,
             )
 
+        await self._sync_budget_quietly(invoice.project_id)
         logger.info("Payment recorded: %s for invoice %s", data.amount, data.invoice_id)
         return payment
 
     # ── Gap E: certified claim → receivable invoice ──────────────────────────
+
+    async def _claim_invoice_due_date(self, claim: Any, contract: Any, invoice_date: str) -> str | None:
+        """The day a claim's invoice falls due, from the payment terms agreed for it.
+
+        A claim raised on a payment-plan instalment uses the instalment's own
+        terms, else the contract's payment period, counted from the invoice
+        date. ``None`` when neither states one or the invoice has no date:
+        an invented due date would make the client portal call a bill overdue
+        that nobody agreed a deadline for.
+        """
+        from app.modules.contracts.models import ContractMilestone
+        from app.modules.contracts.service import contract_payment_terms
+
+        try:
+            issued = date.fromisoformat(invoice_date)
+        except ValueError:
+            return None
+        days: Any = None
+        milestone_id = getattr(claim, "milestone_id", None)
+        if milestone_id is not None:
+            milestone = await self.session.get(ContractMilestone, milestone_id)
+            # Only an instalment of the claim's own contract: another
+            # contract's terms say nothing about this bill.
+            if milestone is not None and milestone.contract_id == getattr(claim, "contract_id", None):
+                days = milestone.payment_terms_days
+        if days is None:
+            days = contract_payment_terms(contract).get("payment_period_days")
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return None
+        if days < 0:
+            return None
+        return (issued + timedelta(days=days)).isoformat()
 
     async def create_receivable_from_claim(
         self,
@@ -1239,10 +1668,18 @@ class FinanceService:
         *,
         actor_id: str | None = None,
     ) -> Invoice:
-        """Auto-create a receivable invoice from a certified progress claim.
+        """Auto-create the invoice a certified progress claim is billed on.
 
-        Idempotent: if a receivable invoice already carries this ``claim_id`` in
-        its ``source_claim_id`` column it is returned unchanged (event replay /
+        The direction follows the contract's counterparty. A claim on a client
+        contract is money the client owes us, so it is raised as a receivable.
+        A claim on a subcontract is the subcontractor billing us, so it is a
+        payable: booking it as a receivable put a subcontractor's bill into
+        accounts receivable and its retainage into the retention we hold from
+        the client. The name keeps its original wording because the route and
+        its callers use it.
+
+        Idempotent: if an invoice already carries this ``claim_id`` in its
+        ``source_claim_id`` column it is returned unchanged (event replay /
         double certification / concurrent calls all converge on one row).
 
         The claim's contract supplies the project and counterparty; the claim
@@ -1284,7 +1721,10 @@ class FinanceService:
         if existing is not None:
             return existing
 
-        if claim.status != "certified":
+        # A claim marked paid was certified first, so it is invoiceable too;
+        # without that a claim paid before its invoice existed could never
+        # get one.
+        if claim.status not in ("certified", "paid"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(f"Claim must be certified before it can be invoiced (current status: '{claim.status}')."),
@@ -1299,8 +1739,8 @@ class FinanceService:
             )
 
         project_id = contract.project_id
-        # Counterparty (client) on the contract becomes the invoice contact.
-        contact_id = str(contract.counterparty_id) if contract.counterparty_id else None
+        direction = "payable" if getattr(contract, "counterparty_type", "client") == "subcontractor" else "receivable"
+        contact_id = await self._claim_counterparty_contact_id(contract)
         claim_currency = (claim.currency or contract.currency or "").strip().upper()
 
         # ── FX: convert claim figures into the project base currency ─────────
@@ -1370,14 +1810,15 @@ class FinanceService:
             else Decimal("0")
         )
 
-        invoice_number = await self.invoices.next_invoice_number(project_id, "receivable")
+        invoice_date = (claim.claim_date or "")[:10]
+        invoice_number = await self.invoices.next_invoice_number(project_id, direction)
         invoice = Invoice(
             project_id=project_id,
             contact_id=contact_id,
-            invoice_direction="receivable",
+            invoice_direction=direction,
             invoice_number=invoice_number,
-            invoice_date=(claim.claim_date or "")[:10],
-            due_date=None,
+            invoice_date=invoice_date,
+            due_date=await self._claim_invoice_due_date(claim, contract, invoice_date),
             currency_code=invoice_currency,
             amount_subtotal=gross_base,
             tax_amount=tax_base,
@@ -1455,8 +1896,9 @@ class FinanceService:
                 entity_type="invoice",
                 entity_id=str(refreshed.id),
                 action="created_from_claim",
-                reason=f"Receivable auto-created from certified claim {claim.claim_number}",
+                reason=f"{direction.capitalize()} auto-created from certified claim {claim.claim_number}",
                 metadata={
+                    "direction": direction,
                     "claim_id": str(claim_id),
                     "claim_number": claim.claim_number,
                     "gross_base": str(gross_base),
@@ -1479,6 +1921,7 @@ class FinanceService:
             {
                 "project_id": str(project_id),
                 "invoice_id": str(refreshed.id),
+                "invoice_direction": direction,
                 "claim_id": str(claim_id),
                 "amount_total": str(gross_base),
                 "net_due": str(net_base),
@@ -1497,6 +1940,48 @@ class FinanceService:
             invoice_currency,
         )
         return refreshed
+
+    async def _claim_counterparty_contact_id(self, contract: Any) -> str | None:
+        """The contact a claim invoice is addressed to, or None.
+
+        ``Contract.counterparty_id`` is a plain UUID that names a contact on a
+        client contract and usually a subcontractor on a subcontract, whose
+        contact is then ``Subcontractor.contact_id``. Writing the raw id onto
+        the invoice left a subcontract's invoice with an id no contact carries,
+        which every finance view prints as an unspecified counterparty. On a
+        subcontract an id that resolves to neither is dropped rather than
+        stored as if it did; a client contract keeps its id as before.
+
+        A subcontract awarded from a tender names the bidder in
+        ``counterparty_id``, which is neither, and records the contact the
+        award resolved in ``metadata.counterparty_contact_id``. That is the
+        last place looked, and only a contact that exists is taken from it.
+        """
+        from sqlalchemy import select as _select
+
+        from app.modules.contacts.models import Contact
+        from app.modules.subcontractors.models import Subcontractor
+
+        async def _existing_contact(raw: Any) -> str | None:
+            try:
+                wanted = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+            except (ValueError, TypeError):
+                return None
+            found = (await self.session.execute(_select(Contact.id).where(Contact.id == wanted))).scalar_one_or_none()
+            return str(found) if found is not None else None
+
+        cid = getattr(contract, "counterparty_id", None)
+        if cid is not None and getattr(contract, "counterparty_type", "client") != "subcontractor":
+            return str(cid)
+        if cid is not None:
+            sub = await self.session.get(Subcontractor, cid)
+            if sub is not None:
+                return str(sub.contact_id) if sub.contact_id else None
+            direct = await _existing_contact(cid)
+            if direct is not None:
+                return direct
+        recorded = (getattr(contract, "metadata_", None) or {}).get("counterparty_contact_id")
+        return await _existing_contact(recorded) if recorded else None
 
     async def get_receivable_for_claim(self, claim_id: uuid.UUID) -> Invoice | None:
         """Return the receivable invoice raised from *claim_id*, or None.
@@ -1544,7 +2029,7 @@ class FinanceService:
         # rather than mis-post it. Settle in the invoice currency.
         if data.currency_code and invoice.currency_code and data.currency_code != invoice.currency_code:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"Payment currency {data.currency_code} does not match invoice "
                     f"currency {invoice.currency_code}; settle in the invoice currency."
@@ -1585,20 +2070,12 @@ class FinanceService:
         )
         payment = await self.payments_repo.create(payment)
 
-        # ── Post the cash paid out onto the cost spine ───────────────────────
-        # Only the cash leg is a realised actual; withheld retainage is a
-        # liability still owed, not yet spent. Non-fatal.
-        try:
-            await self._post_claim_payment_to_spine(
-                project_id=invoice.project_id,
-                payment=payment,
-                currency=pay_currency,
-            )
-        except Exception:
-            logger.exception(
-                "Spine posting failed for claim payment %s - payment unaffected",
-                payment.id,
-            )
+        # Nothing here reaches the cost spine. A supplier invoice's cost gets
+        # there once, at its net with retention included, when it is marked
+        # paid (``_post_paid_invoices_to_spine``), and a payment on a client
+        # invoice is money received: income, not a cost actual.
+        if invoice.invoice_direction == "payable":
+            await self._sync_budget_quietly(invoice.project_id)
 
         # Audit row - best-effort.
         try:
@@ -1634,51 +2111,6 @@ class FinanceService:
             invoice_id,
         )
         return payment
-
-    async def _post_claim_payment_to_spine(
-        self,
-        *,
-        project_id: uuid.UUID,
-        payment: Payment,
-        currency: str,
-    ) -> None:
-        """Post the cash leg of a claim payment onto the cost spine.
-
-        FX: the payment ``amount`` is converted to the project base currency
-        before posting (spine stores base-currency actuals). A missing rate keeps
-        the foreign value as-is, never zeroed. Idempotent on
-        ``(source_kind, source_ref)`` keyed by the payment id, so a replay of
-        the same payment posts exactly once.
-        """
-        import hashlib
-
-        from app.modules.costmodel.service import CostSpineService
-        from app.modules.projects.repository import ProjectRepository
-
-        project = await ProjectRepository(self.session).get_by_id(project_id)
-        base_currency = (getattr(project, "currency", "") or "").strip().upper() if project else ""
-        fx_map = _project_fx_map(project)
-        converted, _missing = _convert_to_base(
-            # Decimal end to end (no lossy float round-trip) for the posted actual.
-            {(currency or "").strip().upper(): _safe_decimal(payment.amount)},
-            base_currency=base_currency,
-            fx_rates_map=fx_map,
-        )
-        amount_base = str(Decimal(str(converted)))
-
-        posting_ref = f"payment:{payment.id}"
-        idempotency = hashlib.sha256(f"claim_payment:{posting_ref}".encode()).hexdigest()[:16]
-        spine = CostSpineService(self.session)
-        await spine.post_actual_to_budget_line(
-            project_id=project_id,
-            cost_line_id=None,
-            cost_category=None,
-            amount_base=amount_base,
-            currency=currency or "",
-            source_kind="claim_payment",
-            source_ref=posting_ref,
-            idempotency_key=idempotency,
-        )
 
     async def list_payments(
         self,
@@ -1746,7 +2178,9 @@ class FinanceService:
             committed=data.committed,
             actual=data.actual,
             forecast_final=data.forecast_final,
-            metadata_=data.metadata,
+            # A new row holds only what was typed onto it; it never carried the
+            # old paid-invoice recompute (see ``sync_project_budget``).
+            metadata_={**_without_drawdowns(data.metadata), "budget_sync": "1"},
         )
         try:
             budget = await self.budgets.create(budget)
@@ -1772,9 +2206,135 @@ class FinanceService:
         # ``refresh`` rather than ``expire``: expiry defers the load to
         # attribute access during serialisation, and a lazy load at that point
         # is where MissingGreenlet comes from under async SQLAlchemy.
+        await self._sync_budget_quietly(data.project_id)
         await self.session.refresh(budget)
         logger.info("Budget created: project=%s cat=%s", data.project_id, data.category)
         return budget
+
+    async def seed_budget_from_boq(self, project_id: uuid.UUID, boq_id: uuid.UUID) -> list[ProjectBudget]:
+        """Write a locked bill's net total into the project budget, one row per WBS.
+
+        Locking a bill is what makes it the budget. The lock itself fills the
+        cost model's budget lines; this is the finance side of the same step,
+        so the finance dashboard and the Budgets tab stop reading zero after a
+        lock (they read ``ProjectBudget``, which nothing used to fill).
+
+        * Only priced leaves count. A section row carries the subtotal of its
+          children, and summing it as well would count the bill twice.
+        * Rows are keyed ``(wbs_id, category="estimate")``, the category that
+          marks them as generated. Each row records what every bill put into
+          it under ``from_boq:<boq_id>``, so locking the same bill again
+          replaces that bill's share instead of adding it twice, and a second
+          bill on the same WBS adds to the first rather than overwriting it.
+        * A change in the original budget moves the revised budget by the same
+          amount, so revisions already booked against the row survive.
+        * A bill that already has a budget from the "Create Budget" button of
+          18.0 and earlier (rows stamped ``boq_id`` in their metadata) keeps
+          that budget and gets no second one. Those rows may carry revisions
+          and synced figures, so they are neither converted nor replaced.
+
+        This is the only writer of a bill's finance budget: the lock reaches it
+        through ``costmodel.budget.generated`` and the "Create Budget" endpoint
+        calls it directly, so whichever runs first, the other finds the bill's
+        share already there.
+
+        Amounts are net of VAT, as a bill is, in the project currency.
+
+        Args:
+            project_id: Project the bill belongs to.
+            boq_id: The bill that was locked.
+
+        Returns:
+            The bill's budget rows: created or updated, or the earlier rows
+            left as they were.
+        """
+        from app.modules.boq.models import Position
+
+        earlier = list(
+            (
+                await self.session.execute(
+                    select(ProjectBudget).where(
+                        ProjectBudget.project_id == project_id,
+                        ProjectBudget.metadata_["boq_id"].as_string() == str(boq_id),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if earlier:
+            logger.info(
+                "Budget for BOQ %s already created by the earlier endpoint (project=%s rows=%d); not seeding again",
+                boq_id,
+                project_id,
+                len(earlier),
+            )
+            return earlier
+
+        rows = (
+            await self.session.execute(
+                select(Position.id, Position.parent_id, Position.wbs_id, Position.total).where(
+                    Position.boq_id == boq_id
+                )
+            )
+        ).all()
+        parents = {parent_id for _, parent_id, _, _ in rows if parent_id is not None}
+        by_wbs: dict[str | None, Decimal] = {}
+        for pos_id, _, wbs_id, total in rows:
+            if pos_id in parents:
+                continue
+            key = (wbs_id or "").strip() or None
+            by_wbs[key] = by_wbs.get(key, Decimal("0")) + _safe_decimal(total)
+        if not by_wbs:
+            return []
+
+        currency_code = await self._project_currency(project_id)
+        marker = f"from_boq:{boq_id}"
+        touched: list[ProjectBudget] = []
+        # Create the rows in WBS order. The positions come back in whatever
+        # order the table holds them, and the row created first is the one a
+        # cost naming no WBS falls back to, so an unordered walk put that cost
+        # on a different line from one machine or one bill edit to the next.
+        for wbs_id, amount in sorted(by_wbs.items(), key=lambda kv: (kv[0] is not None, kv[0] or "")):
+            stmt = select(ProjectBudget).where(
+                ProjectBudget.project_id == project_id,
+                ProjectBudget.category == "estimate",
+                ProjectBudget.wbs_id.is_(None) if wbs_id is None else ProjectBudget.wbs_id == wbs_id,
+            )
+            budget = (await self.session.execute(stmt)).scalars().first()
+            if budget is None:
+                budget = ProjectBudget(
+                    project_id=project_id,
+                    wbs_id=wbs_id,
+                    category="estimate",
+                    currency_code=currency_code,
+                    original_budget=amount,
+                    revised_budget=amount,
+                    metadata_={marker: str(amount), "budget_sync": "1"},
+                )
+                self.session.add(budget)
+            else:
+                md = dict(budget.metadata_ or {})
+                previous = _safe_decimal(md.get(marker))
+                md[marker] = str(amount)
+                delta = amount - previous
+                budget.original_budget = _safe_decimal(budget.original_budget) + delta
+                budget.revised_budget = _safe_decimal(budget.revised_budget) + delta
+                budget.metadata_ = md
+            touched.append(budget)
+        await self.session.flush()
+        await self._sync_budget_quietly(project_id)
+        logger.info("Budget seeded from BOQ %s: project=%s rows=%d", boq_id, project_id, len(touched))
+        return touched
+
+    async def _project_currency(self, project_id: uuid.UUID) -> str:
+        """The project's currency, or "" when it has none (never a guessed default)."""
+        from app.modules.projects.models import Project
+
+        currency = (
+            await self.session.execute(select(Project.currency).where(Project.id == project_id))
+        ).scalar_one_or_none()
+        return (currency or "").strip().upper()
 
     async def get_budget(self, budget_id: uuid.UUID) -> ProjectBudget:
         """Get budget by ID. Raises 404 if not found."""
@@ -1810,12 +2370,58 @@ class FinanceService:
         budget_id: uuid.UUID,
         data: BudgetUpdate,
     ) -> ProjectBudget:
-        """Update budget fields."""
-        await self.get_budget(budget_id)  # 404 check
+        """Update budget fields.
+
+        Confirmed contingency drawdowns live on the row's metadata under
+        ``contingency_drawdown:`` keys and are written only by
+        :meth:`set_contingency_drawdown`. A PATCH replaces metadata wholesale,
+        and the Budgets tab sends back the metadata it loaded earlier, so an
+        edit saved after someone confirmed (or reversed) a drawdown would
+        silently drop (or resurrect) money. The stored drawdown keys therefore
+        always win over whatever the request carries. A line holding drawdowns
+        also keeps its contingency category: moving it elsewhere would make
+        the drawn money vanish from the contingency position.
+
+        The row is read under a row lock (and over any copy this session
+        already holds, since the router's access check loads it first). An
+        unlocked read let a drawdown confirmed between this read and the
+        write below be overwritten by the metadata read before it.
+        """
+        current = (
+            await self.session.execute(
+                select(ProjectBudget)
+                .where(ProjectBudget.id == budget_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Budget not found",
+            )
 
         fields = data.model_dump(exclude_unset=True)
+        stored_md = dict(getattr(current, "metadata_", None) or {})
+        stored_drawdowns = {k: v for k, v in stored_md.items() if k.startswith(CONTINGENCY_DRAWDOWN_PREFIX)}
         if "metadata" in fields:
-            fields["metadata_"] = fields.pop("metadata")
+            incoming = fields.pop("metadata")
+            merged = _without_drawdowns(incoming)
+            merged.update(stored_drawdowns)
+            # An explicit null on a line without drawdowns still clears it, as before.
+            fields["metadata_"] = merged if (merged or incoming is not None) else None
+        if (
+            stored_drawdowns
+            and "category" in fields
+            and (fields["category"] or "").strip().lower() != CONTINGENCY_CATEGORY
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This contingency line carries confirmed risk drawdowns. "
+                    "Reverse them on the risk register before changing its category."
+                ),
+            )
 
         if fields:
             await self.budgets.update(budget_id, **fields)
@@ -1826,8 +2432,103 @@ class FinanceService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Budget not found",
             )
+        if fields:
+            # The row read above stays in the identity map, so apply_update
+            # wrote the request's values onto it as sent ("350000"). Read the
+            # row back so the response carries the stored form ("350000.00").
+            await self.session.refresh(updated)
         logger.info("Budget updated: %s", budget_id)
         return updated
+
+    # ── Contingency (risk-based drawdowns) ─────────────────────────────────
+
+    async def list_contingency_lines(
+        self,
+        project_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> list[ProjectBudget]:
+        """The project's budget lines in the contingency category.
+
+        The category is compared case-insensitively: the manual budget form
+        writes "Contingency", imports write "contingency". Ordered oldest
+        first so the line a drawdown lands on by default is stable.
+        ``for_update`` row-locks the lines for a read-modify-write of their
+        metadata, so two people confirming drawdowns at once cannot lose one.
+        The order is the one :meth:`sync_project_budget` locks the project's
+        rows in, so two transactions taking overlapping sets of these locks
+        always take them in the same order and cannot deadlock.
+        """
+        from sqlalchemy import func
+
+        stmt = (
+            select(ProjectBudget)
+            .where(
+                ProjectBudget.project_id == project_id,
+                func.lower(func.coalesce(ProjectBudget.category, "")) == CONTINGENCY_CATEGORY,
+            )
+            .order_by(ProjectBudget.created_at.asc(), ProjectBudget.wbs_id.asc(), ProjectBudget.id.asc())
+        )
+        if for_update:
+            # populate_existing: rows this session already loaded (the caller
+            # usually read the position first) must be overwritten with what
+            # the lock returns, or the read-modify-write works on the copy
+            # taken before another request committed its drawdown.
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def set_contingency_drawdown(
+        self,
+        *,
+        project_id: uuid.UUID,
+        source: str,
+        budget_id: uuid.UUID | None,
+        record: dict[str, Any] | None,
+    ) -> ProjectBudget | None:
+        """Record, replace or reverse the one drawdown ``source`` holds.
+
+        A source (``risk:<id>``) holds at most one drawdown across all of the
+        project's contingency lines. Confirming again replaces the amount
+        rather than adding a second one, and confirming onto a different line
+        moves it, so replaying the same confirmation changes nothing.
+        ``record=None`` reverses it.
+
+        Args:
+            project_id: The project whose contingency lines are touched.
+            source: Stable key of what drew the money, e.g. ``risk:<uuid>``.
+            budget_id: The contingency line to draw from; required when
+                recording (``record`` given), ignored when reversing.
+            record: The stored record (amount as a string in the line's
+                currency, plus who confirmed it and when), or None to reverse.
+
+        Returns:
+            The line now holding the drawdown, or None after a reversal.
+
+        Raises:
+            HTTPException: 404 when ``budget_id`` is not a contingency line of
+                this project.
+        """
+        key = f"{CONTINGENCY_DRAWDOWN_PREFIX}{source}"
+        lines = await self.list_contingency_lines(project_id, for_update=True)
+        target: ProjectBudget | None = None
+        if record is not None:
+            target = next((ln for ln in lines if ln.id == budget_id), None)
+            if target is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Contingency budget line not found for this project",
+                )
+        for line in lines:
+            md = dict(line.metadata_ or {})
+            if line is target:
+                md[key] = record
+            elif key in md:
+                md.pop(key)
+            else:
+                continue
+            line.metadata_ = md
+        await self.session.flush()
+        return target
 
     # ── EVM ──────────────────────────────────────────────────────────────────
 
@@ -1953,6 +2654,13 @@ class FinanceService:
         else:
             tcpi = Decimal("0")
 
+        # One figure per project per day. A snapshot a person records replaces
+        # the automatic one the schedule progress subscriber wrote for the same
+        # date, rather than standing beside it as a second point on the S-curve
+        # and a coin toss for whichever "latest snapshot" query reads it.
+        if (data.metadata or {}).get("source") != EVM_SNAPSHOT_SOURCE_SCHEDULE_PROGRESS:
+            await self.evm.delete_automatic_for_date(data.project_id, data.snapshot_date)
+
         snapshot = EVMSnapshot(
             project_id=data.project_id,
             snapshot_date=data.snapshot_date,
@@ -2071,6 +2779,12 @@ class FinanceService:
         payments_by_currency = await self.payments_repo.aggregate_by_currency(
             project_id=project_id, project_ids=project_ids
         )
+        # Committed, invoiced and paid come from the records themselves, not
+        # from the ``committed`` / ``actual`` columns the budget rows carry;
+        # ``cost_position`` explains why and names the basis of each figure.
+        from app.modules.finance.cost_position import load_cost_position
+
+        position = await load_cost_position(self.session, project_id=project_id, project_ids=project_ids)
         overdue_count = inv_agg["overdue_count"]
         status_counts = inv_agg["status_counts"]
 
@@ -2111,7 +2825,7 @@ class FinanceService:
             )
             for c in grp
             if c
-        }
+        } | position.currencies()
         mixed_currencies = len(currencies_in_play) > 1
         missing: set[str] = set()
 
@@ -2128,13 +2842,21 @@ class FinanceService:
         # ── Budgets ────────────────────────────────────────────────────
         total_budget_original = _to_base(budget_agg["original_by_currency"])
         total_budget_revised = _to_base(budget_agg["revised_by_currency"])
-        total_committed = _to_base(budget_agg["committed_by_currency"])
-        total_actual = _to_base(budget_agg["actual_by_currency"])
+        # ── Cost position (net of VAT, except total_paid) ──────────────
+        # Committed is the open part and actual what has been incurred, so the
+        # two add up to the outturn (``cost_position`` states the basis).
+        total_committed = _to_base(position.committed)
+        total_invoiced = _to_base(position.invoiced)
+        total_actual = _to_base(position.actual)
+        total_paid = _to_base(position.paid)
+        total_over_commitment = _to_base(position.over_commitment)
         # Summed per row by the repository, following the rule in `variance.py`,
         # so this header agrees with the column of variances under it. It used
         # to subtract spend alone and report money that was already on order as
-        # headroom still available.
-        total_outturn = _to_base(budget_agg["outturn_by_currency"])
+        # headroom still available. A row can carry a forecast below what the
+        # records show, and money in a currency no row carries reaches no row,
+        # so the outturn never drops below committed plus actual.
+        total_outturn = max(_to_base(budget_agg["outturn_by_currency"]), total_committed + total_actual)
 
         total_variance = total_budget_revised - total_outturn
         # The bar stays on spend and the flag moves to outturn, the same split
@@ -2169,7 +2891,10 @@ class FinanceService:
             total_budget_original=round(total_budget_original, 2),
             total_budget_revised=round(total_budget_revised, 2),
             total_committed=round(total_committed, 2),
+            total_invoiced=round(total_invoiced, 2),
             total_actual=round(total_actual, 2),
+            total_paid=round(total_paid, 2),
+            total_over_commitment=round(total_over_commitment, 2),
             total_variance=round(total_variance, 2),
             budget_consumed_pct=round(budget_consumed_pct, 1),
             budget_warning_level=warning_level,

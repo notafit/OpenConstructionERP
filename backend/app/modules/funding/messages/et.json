@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Töödega alustati {start}, kuid taotlus esitati alles {filed}. Enamik programme ei rahasta pärast tööde algust enam midagi",
+      "unevidenced": "Töödega alustati {start} ehk enne taotluse esitamist ja toimikus on märgitud, et rahastaja lubas seda, kuid kirjalikku luba pole nimetatud",
+      "evidence": "Sisesta tööde varasema alustamise kirjaliku loa viide, et toimik tõendaks seda ise",
+      "suggestion": "Kontrolli enne edasisi kulutusi programmi tingimusi. Kui varasem alustamine on kirjalikult lubatud, sisesta luba; kui mitte, pöördu rahastaja poole enne, kui taotlus edasi liigub"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Väljamakse {draw} sisaldab kulusid ajast enne {period_start}, mil rahastusperiood algab",
+      "after": "Väljamakse {draw} sisaldab kulusid ajast pärast {period_end}, mil rahastusperiood lõpeb",
+      "spans": "Väljamakse {draw} ulatub rahastusperioodist {period_start} kuni {period_end} välja mõlemas otsas",
+      "suggestion": "Tõsta rahastusperioodist välja jäävad kulud eraldi väljamaksesse ja aruta need rahastajaga läbi, et üks väljamakse ei hõlmaks korraga perioodisiseseid ja perioodiväliseid kulusid"
+    },
+    "own_share_is_covered": {
+      "fail": "Programm nõuab omaosalust {rate} protsenti ehk {required}, kuid taotluses on märgitud {recorded}",
+      "suggestion": "Nimeta enne esitamist, kust ülejäänud omaosalus tuleb, sest programm arvutab selle abikõlblikust maksumusest, mitte projekti kogumaksumusest"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Selle projekti taotlusi on {count} ja kokku moodustavad need {intensity} protsenti abikõlblikust maksumusest, mis ületab nende programmidest rangeima sätestatud ülempiiri {cap} protsenti",
+      "suggestion": "Avalik rahastus kumuleerub programmide ja valitsustasandite vahel. Vähenda ühe taotluse summat või uuri, kas rahastatavaid tegevusi saab eristada nii, et igaühel oleksid oma kulud"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Rahastusperiood lõppes {period_end}, kuid lõpliku kasutuse tõendi koostamist pole alustatud",
+      "late": "Lõplik kasutuse tõend tuli esitada hiljemalt {due}, kuid see esitati {submitted}",
+      "overdue": "Lõplik kasutuse tõend tuli esitada hiljemalt {due}, kuid seda pole esitatud",
+      "suggestion": "Esita see, mis on olemas, selle asemel et oodata, kuni see on täielik. Enamik rahastajaid pikendab tähtaega taotluse korral, kuid ükski ei pikenda juba möödunud tähtaega"
+    },
+    "errors": {
+      "application_not_found": "Taotlust ei leitud",
+      "programme_code_taken": "Selles riigis on selle koodiga programm juba olemas",
+      "programme_not_found": "Programmi ei leitud",
+      "programme_has_applications": "Sellel programmil on taotlusi ja seda ei saa kustutada. Sulge programm selle asemel.",
+      "application_code_taken": "Selles projektis on selle koodiga taotlus juba olemas",
+      "approved_application_not_deletable": "Heakskiidetud taotlust ei saa kustutada. Määra selle asemel staatuseks tagasi võetud või suletud.",
+      "approval_needs_period_end": "Heakskiit vajab rahastusperioodi lõppkuupäeva, sest kõik hilisemad tähtajad arvutatakse selle järgi",
+      "draw_needs_approval": "Väljamakseid saab teha ainult heakskiidetud taotluse alusel",
+      "draw_not_found": "Väljamakset ei leitud",
+      "paid_draw_not_deletable": "Makstud väljamakset ei saa kustutada",
+      "proof_not_found": "Kasutuse tõendit ei leitud",
+      "obligation_not_found": "Kohustust ei leitud",
+      "eligible_exceeds_amount": "Abikõlblik summa ei saa olla suurem kui kogusumma",
+      "allocation_not_found": "Kulueraldist ei leitud"
+    }
+  }
+}

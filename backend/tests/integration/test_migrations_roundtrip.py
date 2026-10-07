@@ -210,6 +210,79 @@ PG_DOWNGRADE_BROKEN_REVS: dict[str, str] = {
     ),
 }
 
+# Columns the migration chain creates that ``Base.metadata.create_all`` does not,
+# with the revision that owns each one and why it is dead. A cycle long enough to
+# re-apply the owning revision brings the column back, and it is absent from the
+# head schema because the model retired it - which is a divergence between the
+# chain and the models, not the upgrade/downgrade inconsistency the assertion
+# below is looking for. Repairing it means dropping a column from every
+# alembic-managed deployment, and that is a data decision, so the divergence is
+# recorded here where it can be read rather than converted into an xfail that
+# would stop the whole cycle reporting anything.
+#
+# ``test_the_chain_only_column_exemptions_are_still_earned`` makes an entry that
+# outlives its divergence a failure, so this list cannot quietly become a licence.
+CHAIN_ONLY_COLUMNS: dict[str, tuple[str, str]] = {
+    "oe_boq_boq.tax_rate": (
+        "v3134_boq_tax_rate.py",
+        "Tax is a BOQMarkup row of category 'tax' now, so the model dropped the column. "
+        "BOQTotals in app.modules.boq.schemas still carries tax_rate for wire compatibility "
+        "and says outright that the service never populates it.",
+    ),
+    "oe_projects_project.unit_system": (
+        "v3135_project_unit_system.py",
+        "The measurement system is derived from the project's country and region through "
+        "resolve_measurement_system in app.core.regional_packs, so the model dropped the "
+        "stored column and create_all stopped building it.",
+    ),
+}
+
+
+# ``v41_contract_original_value`` used to sit in the dict above and no longer
+# does. It is worth saying what it taught, because the entry named three
+# different failures over its life and each one was a different class.
+#
+# It is a merge node: ``down_revision`` is the tuple
+# ``(v41_coordination_thresholds, v3324_buyer_selection_currency)``, and the
+# cycle asks for a one-step downgrade to ``parent[0]``. Alembic must also
+# un-apply everything reachable only through the other parent, so the one step
+# walks 222 revisions - measured as ``ancestors(parent[1])`` minus
+# ``ancestors(parent[0])`` over all 359 files, not read off the error. Recognise
+# that class by comparing the two parents' ancestor sets before reading the
+# error, because the error always names a stranger.
+#
+# The three failures, in the order they surfaced, each hidden by the one before:
+#
+# 1. ``cannot drop index uq_oe_service_contract_number because constraint ...
+#    requires it`` in v3101. Repaired;
+#    ``test_no_downgrade_drops_an_index_a_constraint_owns`` is the live guard.
+# 2. ``DatatypeMismatch`` on the way back up, in
+#    v3104_propdev_broker_escrow_pricematrix_hierarchy and fifteen siblings,
+#    which declared identity columns as native PostgreSQL uuid while the parents
+#    they reference render as ``character varying(36)``. Repaired - and then ten
+#    more were repaired that this walk never reaches. Re-running the walk finds
+#    one revision per run; measuring every merge span found the rest at once,
+#    and five of those ten hang the same foreign key onto a varchar parent. The
+#    live guard is ``test_no_revision_inside_a_merge_span_declares_a_native_uuid``
+#    below, and the allowlist in ``tests/pg/test_migration_uuid_convention.py``
+#    shrank from 50 to 24.
+# 3. Two swallowed errors that poisoned the transaction rather than the
+#    statement that met them: v3234's ``CREATE EXTENSION pg_trgm`` on a cluster
+#    that does not ship pg_trgm, and v3273's side connection blocking on a lock
+#    its own migration held. Both repaired in their own bodies.
+# 4. Two columns the chain still creates that the models no longer carry,
+#    ``oe_boq_boq.tax_rate`` and ``oe_projects_project.unit_system``. Not an
+#    upgrade/downgrade fault: both bodies are correct and idempotent, and both
+#    revisions are simply older than the model decision that retired the column.
+#    Only a walk this long reaches that far back. They are recorded in
+#    ``CHAIN_ONLY_COLUMNS`` with the reason each column is dead, because
+#    dropping a column from a deployed database is a data decision rather than
+#    a test fix.
+#
+# The shape to carry away is that an expected failure hides the next one. Each
+# repair moved the error to a revision that had been failing all along and had
+# never been reported, because the walk had never reached it.
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  PostgreSQL helpers (mirrors _pg.py internal pattern)
@@ -296,7 +369,18 @@ def _make_alembic_config(sync_url: str) -> Config:
     # ``script_location`` is normally relative to the .ini file; make it
     # explicit so a temp CWD doesn't break resolution.
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
-    cfg.set_main_option("sqlalchemy.url", sync_url)
+    # Alembic keeps this in a ConfigParser with interpolation enabled, where a
+    # bare ``%`` opens a substitution. A unix-socket URL carries its socket
+    # directory percent-encoded in the query string
+    # (``?host=%2Ftmp%2Foe-tests-pg-...``), so the raw value raises
+    # ``ValueError: invalid interpolation syntax``. Doubling the sign is the
+    # escape ConfigParser defines and the value reads back unchanged. This is
+    # the embedded-cluster path: how the suite runs on macOS, on Linux with no
+    # DATABASE_URL set, and on any developer machine that boots its own
+    # cluster. The lanes that point at a TCP service container never see a
+    # percent sign here, which is why this was macOS-only in CI - it took all
+    # 28 tests in this module down on the 2026-09-22 nightly.
+    cfg.set_main_option("sqlalchemy.url", sync_url.replace("%", "%%"))
     return cfg
 
 
@@ -548,11 +632,17 @@ def test_revision_downgrade_reupgrade_does_not_error(pg_throwaway: str, revision
     # subset divergence is expected, not a bug. What is NOT allowed is the
     # cycle introducing a column the head schema doesn't have - that signals a
     # genuine upgrade/downgrade inconsistency.
-    introduced = {
-        table: sorted(set(snap_after[table]) - set(snap_before[table]))
-        for table in snap_after
-        if set(snap_after[table]) - set(snap_before[table])
-    }
+    #
+    # ``CHAIN_ONLY_COLUMNS`` is subtracted here: those columns are absent from
+    # the head schema because the model retired them and not because a body is
+    # inconsistent, and each entry names the revision that owns it.
+    introduced: dict[str, list[str]] = {}
+    for table, columns in snap_after.items():
+        extra = sorted(
+            column for column in set(columns) - set(snap_before[table]) if f"{table}.{column}" not in CHAIN_ONLY_COLUMNS
+        )
+        if extra:
+            introduced[table] = extra
     assert not introduced, (
         f"Round-tripping {revision} introduced columns absent from the head "
         f"schema (upgrade/downgrade inconsistency): {introduced}"
@@ -629,6 +719,517 @@ def test_recent_migrations_have_real_downgrade_bodies() -> None:
     # of blind spot as the short revision list this guard used to run against.
     print(f"data-only migrations exempt from the downgrade rule: {', '.join(skipped_data_only) or 'none'}")
     assert not bad, "Migrations with non-functional downgrade():\n  " + "\n  ".join(bad)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Static guard: no downgrade may drop an index a constraint owns
+#
+#  PostgreSQL refuses ``DROP INDEX x`` when x is the index backing a
+#  constraint: "cannot drop index x because constraint x on table t requires
+#  it". A migration hits that whenever it creates uniqueness as a plain unique
+#  INDEX - the portable spelling, because SQLite has no
+#  ``ALTER TABLE ADD CONSTRAINT`` - while the model declares the same name as a
+#  ``UniqueConstraint``, so ``Base.metadata.create_all`` builds a real
+#  constraint and the index of that name belongs to it.
+#
+#  The guard below is what replaced an xfail entry. An xfail is a live signal
+#  only while it is failing; once the body is repaired the entry has to go, and
+#  removing it leaves nothing watching the shape. This asserts the condition
+#  PostgreSQL actually enforces, so it also catches the regression from the
+#  other side: a model that later turns a plain ``Index(unique=True)`` into a
+#  ``UniqueConstraint`` puts an existing, untouched migration into the
+#  colliding set and turns this red without anyone editing a migration.
+# ─────────────────────────────────────────────────────────────────────
+
+_INDEX_DROP_CALLS = ("drop_index",)
+_CONSTRAINT_DROP_CALLS = ("drop_constraint",)
+_RAW_DROP_INDEX = re.compile(r"DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?([\w{}.\"]+)", re.IGNORECASE)
+_RAW_DROP_CONSTRAINT = re.compile(r"DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?([\w{}.\"]+)", re.IGNORECASE)
+
+
+def _as_value(node: ast.expr) -> object | None:
+    """Static value of ``node``, unwrapping a one-argument call around a literal.
+
+    Index names are written three ways in this tree and the guard has to see
+    all three, because the one it would miss is the one that broke:
+
+    * a bare literal - ``op.drop_index("uq_x", table_name="t")``;
+    * a row of a module-level table the downgrade loops over - v3101 builds
+      three names from ``_UNIQUES``, and a probe that demands a literal finds
+      none of them;
+    * a literal passed through a local validator - v41_smart_views_share has
+      ``_INDEX = _safe_ident("ix_smart_view_share_token")``, which is not a
+      literal to ``ast.literal_eval`` at all.
+
+    The unwrap is deliberately an over-approximation. A helper that rewrote its
+    argument would make this guard check a name no table carries, which finds
+    nothing; dropping the name instead would make the guard blind, which is the
+    failure mode it exists to prevent.
+    """
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError):
+        pass
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        try:
+            return ast.literal_eval(node.args[0])
+        except (ValueError, TypeError, SyntaxError):
+            return None
+    return None
+
+
+def _module_values(tree: ast.Module) -> dict[str, object]:
+    """Module-level names bound to a static value."""
+    values: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets, value = [node.target.id], node.value
+        else:
+            continue
+        if value is None:
+            continue
+        resolved = _as_value(value)
+        if resolved is None:
+            continue
+        for target in targets:
+            values[target] = resolved
+    return values
+
+
+def _hashable(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_hashable(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(sorted((k, _hashable(v)) for k, v in value.items()))
+    return value
+
+
+class _NameResolver:
+    """Resolves an argument expression to the strings it can hold at runtime.
+
+    Carries module-level constants plus whatever a ``for`` loop binds. Loops
+    are unrolled one row at a time rather than each variable being bound to its
+    whole column, so a row's values stay together.
+    """
+
+    def __init__(self, module_values: dict[str, object], binds: dict[str, object] | None = None) -> None:
+        self._module = module_values
+        self._binds = dict(binds or {})
+
+    def _rows(self, iterable: ast.expr) -> list | None:
+        source: object | None = None
+        if isinstance(iterable, ast.Name):
+            source = self._binds.get(iterable.id, self._module.get(iterable.id))
+        else:
+            source = _as_value(iterable)
+        return list(source) if isinstance(source, (list, tuple, set)) else None
+
+    def unrolled(self, target: ast.expr, iterable: ast.expr) -> list[_NameResolver]:
+        rows = self._rows(iterable)
+        if rows is None:
+            return [_NameResolver(self._module, self._binds)]
+        scopes: list[_NameResolver] = []
+        for row in rows:
+            binds = dict(self._binds)
+            if isinstance(target, ast.Name):
+                binds[target.id] = _hashable(row)
+            elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(row, (tuple, list)):
+                for position, element in enumerate(target.elts):
+                    if isinstance(element, ast.Name) and position < len(row):
+                        binds[element.id] = _hashable(row[position])
+            scopes.append(_NameResolver(self._module, binds))
+        return scopes or [_NameResolver(self._module, self._binds)]
+
+    def strings(self, node: ast.expr | None) -> set[str]:
+        """The string values ``node`` can take, as far as they are knowable."""
+        if node is None:
+            return set()
+        if isinstance(node, ast.Name):
+            value = self._binds.get(node.id, self._module.get(node.id))
+            return {value} if isinstance(value, str) else set()
+        value = _as_value(node)
+        return {value} if isinstance(value, str) else set()
+
+    def sql(self, node: ast.expr | None) -> str | None:
+        """SQL text of ``node``, with f-string slots resolved where possible."""
+        if node is None:
+            return None
+        # ``op.execute(sa.text(f"..."))`` is the same statement as
+        # ``op.execute(f"...")``; unwrap the one-argument call first so the
+        # f-string branch below sees the JoinedStr either way.
+        if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+            return self.sql(node.args[0])
+        if isinstance(node, ast.JoinedStr):
+            out = ""
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    out += part.value
+                elif isinstance(part, ast.FormattedValue):
+                    replacements = self.strings(part.value)
+                    out += next(iter(replacements)) if len(replacements) == 1 else " ? "
+            return out
+        for candidate in (self.strings(node), {_as_value(node)}):
+            for value in candidate:
+                if isinstance(value, str):
+                    return value
+        return None
+
+
+def _drops_in_downgrade(path: Path) -> tuple[set[str], set[str]]:
+    """``(index names dropped, constraint names dropped)`` in one revision's downgrade."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    resolver = _NameResolver(_module_values(tree))
+    indexes: set[str] = set()
+    constraints: set[str] = set()
+
+    def visit(statements: list[ast.stmt], scope: _NameResolver) -> None:
+        for statement in statements:
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                for inner in scope.unrolled(statement.target, statement.iter):
+                    visit(statement.body, inner)
+                    visit(statement.orelse, inner)
+                continue
+            for child in ast.iter_child_nodes(statement):
+                if isinstance(child, ast.stmt):
+                    continue
+                for node in ast.walk(child):
+                    if isinstance(node, ast.Call):
+                        record(node, scope)
+            for field in ("body", "orelse", "finalbody"):
+                visit(getattr(statement, field, []) or [], scope)
+            for handler in getattr(statement, "handlers", []) or []:
+                visit(handler.body, scope)
+
+    def record(call: ast.Call, scope: _NameResolver) -> None:
+        if not isinstance(call.func, ast.Attribute):
+            return
+        attribute = call.func.attr
+        keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+        if attribute in _INDEX_DROP_CALLS:
+            indexes.update(scope.strings(call.args[0] if call.args else keywords.get("index_name")))
+        elif attribute in _CONSTRAINT_DROP_CALLS:
+            constraints.update(scope.strings(call.args[0] if call.args else keywords.get("constraint_name")))
+        elif attribute == "execute":
+            statement = scope.sql(call.args[0] if call.args else None)
+            if not statement:
+                return
+            flat = " ".join(statement.split())
+            indexes.update(match.group(1).strip('"') for match in _RAW_DROP_INDEX.finditer(flat))
+            constraints.update(match.group(1).strip('"') for match in _RAW_DROP_CONSTRAINT.finditer(flat))
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "downgrade":
+            visit(node.body, resolver)
+    return indexes, constraints
+
+
+def _constraint_backed_index_names() -> dict[str, str]:
+    """``{name: "table:ConstraintType"}`` for every constraint create_all names.
+
+    A ``UniqueConstraint`` or ``PrimaryKeyConstraint`` is rendered by
+    ``create_all`` as ``ALTER TABLE ... ADD CONSTRAINT``, and PostgreSQL builds
+    the backing index under the constraint's own name. Those are exactly the
+    names a ``DROP INDEX`` cannot have. A plain ``Index(unique=True)`` of the
+    same name would be droppable, which is why the model, not the migration,
+    decides whether a given name is a problem.
+    """
+    _import_all_models()
+
+    from app.database import Base
+
+    owned: dict[str, str] = {}
+    for table in Base.metadata.tables.values():
+        for constraint in table.constraints:
+            kind = type(constraint).__name__
+            if constraint.name and kind in ("UniqueConstraint", "PrimaryKeyConstraint"):
+                owned[str(constraint.name)] = f"{table.name}:{kind}"
+    return owned
+
+
+def test_no_downgrade_drops_an_index_a_constraint_owns() -> None:
+    """No revision may drop an index that ``create_all`` builds as a constraint.
+
+    This is the positive form of what an xfail on ``v41_contract_original_value``
+    used to report. That entry named the symptom - a merge node whose one-step
+    downgrade walks 222 revisions and dies somewhere inside them - and reported
+    it only as an expected failure, which is a signal that stops existing the
+    moment the body is repaired.
+
+    Measured over every revision on disk, not a window: a revision that has
+    fallen out of the round-trip parametrisation still ships, and v3101 was
+    exactly that, reachable only through a merge node's second parent.
+    """
+    versions_dir = BACKEND_DIR / "alembic" / "versions"
+    revision_files = sorted(versions_dir.glob("*.py"))
+    owned = _constraint_backed_index_names()
+
+    offenders: dict[str, list[str]] = {}
+    droppers = 0
+    for path in revision_files:
+        dropped_indexes, dropped_constraints = _drops_in_downgrade(path)
+        if dropped_indexes:
+            droppers += 1
+        colliding = sorted((dropped_indexes & set(owned)) - dropped_constraints)
+        if colliding:
+            offenders[path.name] = colliding
+
+    # Population beside the verdict. A green gate whose denominator excludes
+    # the place a defect lives is not evidence of anything, and these three
+    # numbers are what say how much of the tree this actually looked at.
+    print(
+        f"revisions scanned: {len(revision_files)}; "
+        f"downgrades that drop an index by name: {droppers}; "
+        f"constraint-backed index names in Base.metadata: {len(owned)}"
+    )
+
+    assert not offenders, (
+        "These downgrades drop an index PostgreSQL will not let them drop, because "
+        "Base.metadata declares that name as a constraint and the index belongs to it. "
+        "Drop the constraint first when the inspector reports one, as v3099 and v3101 do:\n  "
+        + "\n  ".join(f"{name}: {', '.join(f'{n} ({owned[n]})' for n in names)}" for name, names in offenders.items())
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Static gate: native uuid inside a merge node's one-step span
+# ─────────────────────────────────────────────────────────────────────
+
+# ``uuid`` is the standard library module and ``uuid.UUID`` the Python value a
+# data migration builds an id with. Neither says anything about a column type.
+_UUID_TYPE_LEAVES = {"UUID", "Uuid"}
+_STDLIB_UUID_ROOT = "uuid"
+
+# ``existing_type=postgresql.UUID()`` names what a column is being converted
+# away from. That is the repair direction, not a declaration.
+_UUID_EXEMPT_KEYWORD = "existing_type"
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    """Render an attribute chain as ``a.b.c``, or None when it is not one."""
+    parts: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _native_uuid_sites(tree: ast.Module) -> list[str]:
+    """Every native-UUID type reference in one revision, as ``line N: source``."""
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlalchemy"):
+            imported.update(alias.asname or alias.name for alias in node.names if alias.name in _UUID_TYPE_LEAVES)
+
+    exempt: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == _UUID_EXEMPT_KEYWORD:
+                exempt.update(id(child) for child in ast.walk(keyword.value))
+
+    sites: list[str] = []
+    seen: set[int] = set()
+    for node in ast.walk(tree):
+        if id(node) in exempt or id(node) in seen:
+            continue
+        if isinstance(node, ast.Name):
+            hit = node.id in imported
+        else:
+            chain = _dotted_name(node)
+            parts = chain.split(".") if chain else []
+            hit = bool(parts) and parts[-1] in _UUID_TYPE_LEAVES and parts[0] != _STDLIB_UUID_ROOT
+        if not hit:
+            continue
+        # An attribute chain contains its own prefixes; report the outermost.
+        seen.update(id(child) for child in ast.walk(node))
+        sites.append(f"line {node.lineno}: {ast.unparse(node)[:90]}")
+    return sites
+
+
+def _revision_id_of(tree: ast.Module) -> str | None:
+    """The ``revision = "..."`` header value, read without importing the module."""
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target, value = node.targets[0].id, node.value
+        else:
+            continue
+        if target != "revision" or value is None:
+            continue
+        try:
+            found = ast.literal_eval(value)
+        except ValueError:
+            return None
+        if isinstance(found, str):
+            return found
+    return None
+
+
+def _ancestors_of(graph: dict[str, tuple[str, ...]], start: str) -> set[str]:
+    """Every revision reachable downwards from ``start``, ``start`` included."""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        rev = stack.pop()
+        if rev in seen or rev not in graph:
+            continue
+        seen.add(rev)
+        stack.extend(graph[rev])
+    return seen
+
+
+def _merge_span_revisions(graph: dict[str, tuple[str, ...]]) -> tuple[set[str], int]:
+    """Revisions a merge node's one-step downgrade re-applies, over every parent.
+
+    Downgrading a merge node one step is not one step. Alembic has to un-apply
+    everything reachable only through the parents it is not going to, then
+    re-apply all of it on the way back up, which is why the cycle above walks
+    222 revisions for a node whose ``down_revision`` is a two-tuple.
+
+    Every parent is taken, not just ``parent[0]``. The cycle above happens to
+    ask for ``parent[0]``, but that is an implementation detail of one test
+    rather than a property of the graph: over ``parent[0]`` alone the population
+    is 266 revisions and over every parent it is 285, and the nineteen that
+    separate those two numbers held five of the offenders this guard was written
+    for. The merge nodes themselves stay in as well, because a merge node's own
+    ``upgrade()`` re-runs too, which is how the 292 this test prints is reached.
+    """
+    span: set[str] = set()
+    merges = 0
+    for rev, parents in graph.items():
+        if len(parents) < 2:
+            continue
+        merges += 1
+        reachable = _ancestors_of(graph, rev)
+        for parent in parents:
+            # ``rev`` stays in: a merge node's own upgrade() re-runs too.
+            span |= reachable - _ancestors_of(graph, parent)
+    return span, merges
+
+
+def test_no_revision_inside_a_merge_span_declares_a_native_uuid() -> None:
+    """No revision a merge node re-applies may declare a native PostgreSQL uuid column.
+
+    ``GUID`` in ``app.database`` is a ``TypeDecorator`` over ``String(36)`` with
+    no ``load_dialect_impl``, so ``create_all`` renders every identity column as
+    ``character varying(36)`` on PostgreSQL too, and a revision declaring
+    ``postgresql.UUID`` describes a shape our schema never has. Stamped, that
+    divergence is dormant and nothing executes it. Walked, it is fatal: a uuid
+    child pointing at a varchar parent is refused with ``DatatypeMismatch``, the
+    walk dies inside that revision's own ``upgrade()`` at the CREATE TABLE, and
+    no follow-up revision can repair it because nothing after it ever runs.
+
+    The rule is the coarse one - any reference to a native UUID type inside a
+    span, whether or not this test can prove the type reaches a column that
+    carries a foreign key. Three of the offenders hid their foreign key behind
+    an interpolated target string, and a detector that insists on a literal
+    calls those clean. A span holding no native uuid at all cannot produce a
+    mismatch in either direction, and that is provable without resolving a
+    single name.
+
+    The population is the graph, not the round-trip window. Sixteen offenders
+    were inside the one span the cycle above exercises; ten were not, had never
+    been executed by anything, and were found by measuring rather than by
+    running. ``tests/pg/test_migration_uuid_convention.py`` keeps the frozen
+    remainder - the revisions no merge span reaches - from growing.
+    """
+    versions_dir = BACKEND_DIR / "alembic" / "versions"
+    revision_files = sorted(versions_dir.glob("*.py"))
+    span, merges = _merge_span_revisions(_revision_graph())
+
+    declaring: dict[str, list[str]] = {}
+    offenders: dict[str, list[str]] = {}
+    for path in revision_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        sites = _native_uuid_sites(tree)
+        if not sites:
+            continue
+        declaring[path.name] = sites
+        revision = _revision_id_of(tree)
+        # A header this test cannot read is not evidence of safety: it is a
+        # revision that cannot be placed in the graph, so it counts as inside.
+        if revision is None or revision in span:
+            offenders[path.name] = sites
+
+    # Population beside the verdict. A gate is worth its denominator, and this
+    # one is green because the offenders were repaired rather than because the
+    # scan was narrow: every revision on disk is read, not the fourteen in the
+    # round-trip window.
+    print(
+        f"revisions scanned: {len(revision_files)}; merge nodes: {merges}; "
+        f"revisions a merge span re-applies: {len(span)}; "
+        f"revisions declaring a native uuid: {len(declaring)}; "
+        f"of those, inside a merge span: {len(offenders)}"
+    )
+
+    detail = "\n".join(f"  {name}\n    " + "\n    ".join(sites) for name, sites in sorted(offenders.items()))
+    assert not offenders, (
+        "These revisions declare a native PostgreSQL uuid column and sit inside a merge "
+        "node's one-step downgrade span, so a downgrade re-applies them against a schema "
+        f"create_all built as character varying(36):\n{detail}\n\n"
+        "Use sa.String(36), or the GUID type from app.database, to match what create_all "
+        "builds. Adding the file to UUID_COLUMN_ALLOWLIST is not the fix: that list is for "
+        "revisions no walk reaches, and this one is reached."
+    )
+
+
+def test_the_chain_only_column_exemptions_are_still_earned() -> None:
+    """Every ``CHAIN_ONLY_COLUMNS`` entry must still describe a live divergence.
+
+    An exemption that outlives the divergence it records is a permission that
+    protects nothing, and the next genuine inconsistency on that column would be
+    waved through. Two things have to hold, and each fails in its own direction:
+    the models must still not declare the column, and exactly one revision - the
+    one the entry names - may mention it.
+
+    The second check is text rather than AST on purpose. A revision repairing
+    the divergence has to name the column whatever shape it uses to drop it:
+    ``op.drop_column``, a batch operation, or raw SQL. Matching the word means
+    no repair can land without this test noticing, which is more than a
+    resolver-based version could promise.
+    """
+    _import_all_models()
+
+    from app.database import Base
+
+    declared = {f"{table.name}.{column.name}" for table in Base.metadata.tables.values() for column in table.columns}
+    versions_dir = BACKEND_DIR / "alembic" / "versions"
+    revision_files = sorted(versions_dir.glob("*.py"))
+    sources = {path.name: path.read_text(encoding="utf-8") for path in revision_files}
+
+    back_in_the_models = sorted(column for column in CHAIN_ONLY_COLUMNS if column in declared)
+    drifted: dict[str, tuple[str, list[str]]] = {}
+    for qualified, (owner, _reason) in CHAIN_ONLY_COLUMNS.items():
+        word = re.compile(rf"\b{re.escape(qualified.split('.')[-1])}\b")
+        naming = sorted(name for name, text_of in sources.items() if word.search(text_of))
+        if naming != [owner]:
+            drifted[qualified] = (owner, naming)
+
+    print(
+        f"revisions scanned: {len(revision_files)}; columns in Base.metadata: {len(declared)}; "
+        f"chain-only exemptions: {len(CHAIN_ONLY_COLUMNS)}; back in the models: "
+        f"{len(back_in_the_models)}; naming a revision other than their owner: {len(drifted)}"
+    )
+
+    assert not back_in_the_models, (
+        "These columns are exempted in CHAIN_ONLY_COLUMNS but Base.metadata declares them "
+        f"again, so create_all builds them and the exemption is dead: {back_in_the_models}"
+    )
+    assert not drifted, (
+        "These CHAIN_ONLY_COLUMNS entries no longer describe the tree. Each should be named "
+        "by exactly one revision, the one that adds it; a second revision means the chain "
+        "was repaired and the entry has to go:\n  "
+        + "\n  ".join(f"{column}: owner {owner}, named by {naming}" for column, (owner, naming) in drifted.items())
+    )
 
 
 def test_dev_db_is_not_being_targeted(pg_throwaway: str) -> None:

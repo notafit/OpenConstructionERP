@@ -44,10 +44,21 @@ export type ContractStatus =
   | 'completed'
   | 'terminated';
 
+/**
+ * The events a contract releases retention on, as the server stores them.
+ * It reads the older names (practical_completion, final_account, handover,
+ * punch_list_complete...) and answers with these three.
+ */
 export type RetentionReleaseEvent =
-  | 'practical_completion'
-  | 'final_account'
-  | 'handover';
+  | 'substantial_completion'
+  | 'final_completion'
+  | 'defects_period_end';
+
+/** A release row may also carry an event that is not a completion. */
+export type RetentionReleaseRowEvent =
+  | RetentionReleaseEvent
+  | 'rate_step_down'
+  | 'security_substituted';
 
 export type ContractLineType =
   | 'work'
@@ -120,6 +131,12 @@ export interface ContractLine {
   total_value: number | string;
   order_index: number;
   metadata: Record<string, unknown>;
+  /**
+   * A progress claim has billed on this line. The server then refuses to
+   * change or delete it whatever the contract's status, so the editor does
+   * not offer either. Set by the line listing; absent elsewhere.
+   */
+  billed?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -131,10 +148,26 @@ export interface ProgressClaimItem {
   period_start: string | null;
   period_end: string | null;
   claim_date: string | null;
+  /**
+   * The three strings above read as ISO dates (YYYY-MM-DD). Null when the
+   * string is empty or could not be read; the claim's validation report says
+   * which. These are what order a contract's claims, so prefer them for
+   * display and fall back to the string only to show what was typed.
+   */
+  period_from?: string | null;
+  period_to?: string | null;
+  application_date?: string | null;
   gross_amount: number | string;
   retention_amount: number | string;
   prior_claims_total: number | string;
   net_due: number | string;
+  /**
+   * G702 lines 4 and 5 as this claim certified them: work and stored
+   * materials to date, and the retention held after the releases billed on
+   * it. Null on a claim generated before the retention engine.
+   */
+  completed_stored_to_date?: number | string | null;
+  retention_held_to_date?: number | string | null;
   status: ClaimStatus;
   submitted_at: string | null;
   approved_at: string | null;
@@ -153,6 +186,22 @@ export interface ProgressClaimLine {
   period_completed_value: number | string;
   period_completed_pct: number | string;
   cumulative_completed_value: number | string;
+  /**
+   * G703 column D as stored when the line was written: what the claims
+   * before this one billed on the line. Null on a line written before the
+   * column existed.
+   */
+  prior_completed_value?: number | string | null;
+  /** G703 column F: materials delivered and not yet built in. */
+  materials_stored_value?: number | string | null;
+  /**
+   * G703 column I as the retention engine worked it out for this claim: what
+   * is held on the line's work and on its stored materials, and the effective
+   * rate over both. Null on a claim from before the engine.
+   */
+  retention_to_date?: number | string | null;
+  retention_stored_to_date?: number | string | null;
+  retention_rate?: number | string | null;
   created_at: string;
   updated_at: string;
 }
@@ -259,8 +308,18 @@ export interface ContractCreatePayload {
   end_date?: string | null;
   total_value?: number;
   currency?: string;
+  /**
+   * Left out, the server fills it from the usual figure of the project's
+   * country (see {@link getContractCountryDefaults}) and records that it did.
+   * Send only what the person actually set, or every figure reads as theirs.
+   */
   retention_percent?: number;
   retention_release_event?: RetentionReleaseEvent;
+  retention_cap_percent?: number | null;
+  retention_release_split?: ReleaseSplitStep[] | null;
+  payment_period_days?: number | null;
+  valuation_interval?: ValuationInterval | null;
+  certificate_name?: string | null;
   status?: ContractStatus;
   signed_at?: string | null;
   /**
@@ -288,6 +347,12 @@ export interface ContractLineCreatePayload {
   order_index?: number;
   metadata?: Record<string, unknown>;
 }
+
+/** Everything a SoV line can be corrected to. The server takes each field on
+ *  its own, so an untouched one is left out rather than sent back unchanged. */
+export type ContractLineUpdatePayload = Partial<
+  Omit<ContractLineCreatePayload, 'contract_id'>
+>;
 
 export interface ProgressClaimCreatePayload {
   contract_id: string;
@@ -397,6 +462,95 @@ export function createContract(data: ContractCreatePayload): Promise<ContractIte
   return apiPost<ContractItem>('/v1/contracts/contracts/', data);
 }
 
+/* ── Country payment-term defaults ────────────────────────────────────── */
+
+/** How often work is valued for an interim payment. */
+export type ValuationInterval = 'monthly' | 'four_weekly' | 'fortnightly' | 'weekly' | 'milestone';
+
+/**
+ * One step of how retention is paid back. `release_percent_of_held` is the
+ * percent of what is held AT that event, so "half at completion, the rest at
+ * the end of the defects period" is 50 then 100.
+ */
+export interface ReleaseSplitStep {
+  event: RetentionReleaseEvent;
+  release_percent_of_held: string;
+}
+
+/** The payment terms a contract states beside its retention rate (`terms.payment_terms`). */
+export interface ContractPaymentTerms {
+  retention_cap_percent?: string | null;
+  retention_release_split?: ReleaseSplitStep[] | null;
+  payment_period_days?: number | null;
+  valuation_interval?: ValuationInterval | null;
+  certificate_name?: string | null;
+}
+
+/** The fields a country default can fill. */
+export type CountryDefaultField =
+  | 'retention_percent'
+  | 'retention_cap_percent'
+  | 'retention_release_split'
+  | 'payment_period_days'
+  | 'valuation_interval'
+  | 'certificate_name';
+
+/** Where one default figure comes from. */
+export interface CountryDefaultSource {
+  source: 'statute' | 'standard_form' | 'industry_practice' | 'regional_pack' | string;
+  /** A clause, form or law, shown as written. */
+  reference: string;
+  /**
+   * The server's English sentence. Rendered through
+   * `contracts.country_defaults.<CC>.<field>.note` with this as the fallback.
+   */
+  note: string;
+  /** That key, as the server spells it; stamps written before it existed lack it. */
+  note_key?: string;
+}
+
+/** What a new contract on a project starts from. Never another country's row. */
+export interface ContractCountryDefaults {
+  project_id: string;
+  country_code: string | null;
+  has_defaults: boolean;
+  standard_form: string | null;
+  values: Partial<{
+    retention_percent: string | null;
+    retention_cap_percent: string | null;
+    retention_release_split: ReleaseSplitStep[] | null;
+    payment_period_days: number | null;
+    valuation_interval: ValuationInterval | null;
+    certificate_name: string | null;
+  }>;
+  sources: Partial<Record<CountryDefaultField, CountryDefaultSource>>;
+  release_split_source: 'table' | 'regional_pack' | null;
+  /**
+   * The flat rate a subcontract agreement on the project starts from. An
+   * agreement has no retention cap, so where the country's rate runs above
+   * its cap this is the cap, and `subcontract_retention_from` says so.
+   */
+  subcontract_retention_percent?: string | null;
+  subcontract_retention_from?: 'retention_percent' | 'retention_cap_percent' | null;
+}
+
+export function getContractCountryDefaults(projectId: string): Promise<ContractCountryDefaults> {
+  return apiGet<ContractCountryDefaults>(
+    `/v1/contracts/country-defaults/?project_id=${encodeURIComponent(projectId)}`,
+  );
+}
+
+/** What a contract recorded about the defaults it was created from (`metadata.country_defaults`). */
+export interface ContractDefaultsStamp {
+  country_code: string | null;
+  has_country_defaults: boolean;
+  applied: Partial<Record<CountryDefaultField | 'retention_release_event', unknown>>;
+  sources: Partial<Record<CountryDefaultField, CountryDefaultSource>>;
+  release_split_source: 'table' | 'regional_pack' | null;
+  /** Figures that took the platform's historical value because the country has none. */
+  fallback?: string[];
+}
+
 export function updateContract(
   id: string,
   data: ContractUpdatePayload,
@@ -404,8 +558,51 @@ export function updateContract(
   return apiPatch<ContractItem>(`/v1/contracts/contracts/${id}`, data);
 }
 
+/**
+ * Delete a draft contract.
+ *
+ * The server refuses a contract that has left draft (`contract_not_draft`),
+ * one whose claims have left draft (`contract_has_claims_past_draft`) and one
+ * a claim has billed on (`contract_line_billed`), because the delete cascades
+ * to every claim. {@link contractDeleteRefusal} reads the three.
+ */
 export function deleteContract(id: string): Promise<void> {
   return apiDelete(`/v1/contracts/contracts/${id}`);
+}
+
+/** Why the server refused to delete a contract. */
+export type ContractDeleteRefusal =
+  | 'contract_not_draft'
+  | 'contract_has_claims_past_draft'
+  | 'contract_line_billed';
+
+/**
+ * Narrow a thrown ApiError to one of the contract delete refusals, with the
+ * claim numbers it names, or null for anything else, so the caller can say
+ * why in the reader's language instead of passing on the server's English.
+ */
+export function contractDeleteRefusal(
+  err: unknown,
+): { code: ContractDeleteRefusal; claimNumbers: string[] } | null {
+  if (!err || typeof err !== 'object') return null;
+  const body = (err as { body?: unknown }).body;
+  const detail =
+    body && typeof body === 'object'
+      ? (body as { detail?: unknown }).detail
+      : undefined;
+  if (!detail || typeof detail !== 'object') return null;
+  const { error, claim_numbers } = detail as { error?: unknown; claim_numbers?: unknown };
+  if (
+    error !== 'contract_not_draft' &&
+    error !== 'contract_has_claims_past_draft' &&
+    error !== 'contract_line_billed'
+  ) {
+    return null;
+  }
+  const claimNumbers = Array.isArray(claim_numbers)
+    ? claim_numbers.filter((n): n is string => typeof n === 'string' && n.length > 0)
+    : [];
+  return { code: error, claimNumbers };
 }
 
 export function signContract(id: string): Promise<ContractItem> {
@@ -439,6 +636,51 @@ export function createContractLine(
   data: ContractLineCreatePayload,
 ): Promise<ContractLine> {
   return apiPost<ContractLine>(`/v1/contracts/contracts/${contractId}/lines`, data);
+}
+
+/** Correct a line. The route is line-scoped, not contract-scoped: the server
+ *  reads the contract off the line and checks access against that. */
+export function updateContractLine(
+  lineId: string,
+  data: ContractLineUpdatePayload,
+): Promise<ContractLine> {
+  return apiPatch<ContractLine>(`/v1/contracts/contracts/lines/${lineId}`, data);
+}
+
+/**
+ * Remove a line.
+ *
+ * The server refuses with 409 once the contract is signed
+ * (`contract_lines_frozen`) or once a progress claim has billed on the line
+ * (`contract_line_billed`), the second on a draft contract too, because a
+ * draft can carry claims. The claim lines billed on a line would otherwise go
+ * with it: the foreign key cascades. The same two refusals answer
+ * {@link updateContractLine}; {@link sovLineRefusal} reads them.
+ */
+export function deleteContractLine(lineId: string): Promise<void> {
+  return apiDelete(`/v1/contracts/contracts/lines/${lineId}`);
+}
+
+/** Why the server refused to change or remove a schedule of values line. */
+export type SoVLineRefusal = 'contract_line_billed' | 'contract_lines_frozen';
+
+/**
+ * Narrow a thrown ApiError to one of the two schedule line refusals, or null
+ * for anything else, so the caller can say why in the reader's language
+ * instead of passing on the server's English sentence.
+ */
+export function sovLineRefusal(err: unknown): SoVLineRefusal | null {
+  if (!err || typeof err !== 'object') return null;
+  const body = (err as { body?: unknown }).body;
+  const detail =
+    body && typeof body === 'object'
+      ? (body as { detail?: unknown }).detail
+      : undefined;
+  const code =
+    detail && typeof detail === 'object'
+      ? (detail as { error?: unknown }).error
+      : undefined;
+  return code === 'contract_line_billed' || code === 'contract_lines_frozen' ? code : null;
 }
 
 /* ── Progress claims ──────────────────────────────────────────────────── */
@@ -489,8 +731,59 @@ export function markClaimPaid(id: string): Promise<ProgressClaimItem> {
   return apiPost<ProgressClaimItem>(`/v1/contracts/progress-claims/${id}/mark-paid`, {});
 }
 
+/** One finding of the pay_application rules on a claim. */
+export interface ClaimValidationFinding {
+  rule_id: string;
+  rule_name: string;
+  severity: 'error' | 'warning' | 'info';
+  passed: boolean;
+  message: string;
+  element_ref: string | null;
+  suggestion: string | null;
+  details: Record<string, string>;
+}
+
+/**
+ * The pay_application report for one claim. Errors block submission; the
+ * submit endpoint runs the same rules, so this is what the button will do.
+ */
+export interface ClaimValidationReport {
+  claim_id: string;
+  status: string;
+  score: number | null;
+  summary: Record<string, unknown>;
+  rule_sets: string[];
+  unsupported_rule_sets: string[];
+  errors: ClaimValidationFinding[];
+  warnings: ClaimValidationFinding[];
+}
+
+export function getClaimValidation(claimId: string): Promise<ClaimValidationReport> {
+  return apiGet<ClaimValidationReport>(
+    `/v1/contracts/progress-claims/${encodeURIComponent(claimId)}/validation`,
+  );
+}
+
 export function listClaimLines(claimId: string): Promise<ProgressClaimLine[]> {
   return safeGetList<ProgressClaimLine>(`/v1/contracts/progress-claims/${claimId}/lines`);
+}
+
+/**
+ * Bill a schedule-of-values line on this claim by hand.
+ *
+ * The route exists for the contract written by hand rather than measured from
+ * site: "Populate from progress" needs the SoV linked to bid positions and
+ * field observations, and a small job has neither. Column D and the running
+ * total are the server's to work out, so they are not sent.
+ */
+export function createClaimLine(data: {
+  progress_claim_id: string;
+  contract_line_id: string;
+  period_completed_qty?: number;
+  period_completed_value?: number;
+  period_completed_pct?: number;
+}): Promise<ProgressClaimLine> {
+  return apiPost<ProgressClaimLine>('/v1/contracts/progress-claim-lines/', data);
 }
 
 export function updateClaimLine(
@@ -522,8 +815,21 @@ export interface ProgressClaimPopulatePreviewItem {
   period_label: string | null;
   recorded_at: string | null;
   period_completed_qty: number | string;
+  /** What the observed percent to date adds over the earlier claims. */
   period_completed_value: number | string;
+  prior_completed_value?: number | string;
   cumulative_completed_value: number | string;
+  /**
+   * The observed percent is below what earlier claims already billed; the
+   * period value is held at zero and the claim's validation report says so.
+   */
+  percent_regressed?: boolean;
+  /**
+   * Set on a line a change order added beside the line it adjusts. It has no
+   * BOQ position of its own and bills at the percent observed on that line's.
+   */
+  adjusts_contract_line_id?: string | null;
+  adjusts_line_code?: string;
 }
 
 export interface ProgressClaimPopulatePreview {
@@ -575,6 +881,178 @@ export function commitClaimLines(
 export function getRetentionSchedule(scheduleId: string): Promise<RetentionScheduleItem> {
   return apiGet<RetentionScheduleItem>(
     `/v1/contracts/retention-schedules/${scheduleId}`,
+  );
+}
+
+/* ── Retention releases ───────────────────────────────────────────────── */
+//
+// Retention is two ledgers. It accrues on the claims (each claim's
+// retention_amount is what it added, retention_held_to_date what it
+// certified), and it goes back through a release: proposed, approved once
+// the documents the event needs are attached, then billed on a claim, where
+// it lowers G702 line 5 and is paid with that claim.
+
+export type RetentionReleaseStatus = 'proposed' | 'approved' | 'billed' | 'void';
+
+export interface RetentionRelease {
+  id: string;
+  contract_id: string;
+  event: RetentionReleaseRowEvent;
+  status: RetentionReleaseStatus;
+  amount: string;
+  withheld_for_open_items: string;
+  released_on?: string | null;
+  /** The claim that bills it, once it is billed. */
+  progress_claim_id?: string | null;
+  document_ids: string[];
+  created_by?: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RetentionReleasePreview {
+  contract_id: string;
+  event: RetentionReleaseRowEvent;
+  currency: string;
+  /** Held and not already committed to another release. */
+  held: string;
+  percent_of_held?: string | null;
+  open_items_value: string;
+  open_items_count: number;
+  open_items_without_cost: number;
+  /** punch_list, request, or unavailable when the module is not installed. */
+  open_items_source: string;
+  withheld_for_open_items: string;
+  amount: string;
+  remaining: string;
+  /** retention_schedule, regional_pack or default. */
+  rule_source: string;
+  statute_reference?: string | null;
+  required_documents: string[];
+  bonded: boolean;
+  already_released: boolean;
+}
+
+export interface RetentionSummary {
+  contract_id: string;
+  currency: string;
+  accrued: string;
+  released: string;
+  held: string;
+  pending_release: string;
+  available_for_release: string;
+  releases: RetentionRelease[];
+}
+
+export interface RetentionReleaseRequest {
+  event: RetentionReleaseRowEvent;
+  /** For an event the rule gives no percentage for, or a figure agreed by hand. */
+  amount?: string | number;
+  open_items_value?: string | number;
+  released_on?: string;
+  document_ids?: string[];
+  notes?: string;
+}
+
+export function getRetentionSummary(contractId: string): Promise<RetentionSummary> {
+  return apiGet<RetentionSummary>(
+    `/v1/contracts/contracts/${encodeURIComponent(contractId)}/retention`,
+  );
+}
+
+/** What a release would pay; writes nothing. */
+export function previewRetentionRelease(
+  contractId: string,
+  data: RetentionReleaseRequest,
+): Promise<RetentionReleasePreview> {
+  return apiPost<RetentionReleasePreview>(
+    `/v1/contracts/contracts/${encodeURIComponent(contractId)}/retention/releases/preview`,
+    data,
+  );
+}
+
+/** Propose a release. It pays nothing until it is approved and billed. */
+export function createRetentionRelease(
+  contractId: string,
+  data: RetentionReleaseRequest,
+): Promise<RetentionRelease> {
+  return apiPost<RetentionRelease>(
+    `/v1/contracts/contracts/${encodeURIComponent(contractId)}/retention/releases`,
+    data,
+  );
+}
+
+export function approveRetentionRelease(
+  releaseId: string,
+  documentIds: string[] = [],
+): Promise<RetentionRelease> {
+  return apiPost<RetentionRelease>(
+    `/v1/contracts/retention-releases/${encodeURIComponent(releaseId)}/approve`,
+    { document_ids: documentIds },
+  );
+}
+
+/** Bill an approved release on a draft or submitted claim of the contract. */
+export function billRetentionRelease(
+  releaseId: string,
+  progressClaimId: string,
+): Promise<RetentionRelease> {
+  return apiPost<RetentionRelease>(
+    `/v1/contracts/retention-releases/${encodeURIComponent(releaseId)}/bill`,
+    { progress_claim_id: progressClaimId },
+  );
+}
+
+export function voidRetentionRelease(releaseId: string): Promise<RetentionRelease> {
+  return apiPost<RetentionRelease>(
+    `/v1/contracts/retention-releases/${encodeURIComponent(releaseId)}/void`,
+    {},
+  );
+}
+
+/** Work a draft or submitted claim's retention out again from its policy. */
+export function recalculateClaimRetention(claimId: string): Promise<ProgressClaimItem> {
+  return apiPost<ProgressClaimItem>(
+    `/v1/contracts/progress-claims/${encodeURIComponent(claimId)}/retention/recalculate`,
+    {},
+  );
+}
+
+/**
+ * The documents registered against a contract. A release is approved against
+ * these: the certificate of substantial completion, the affidavits, the
+ * surety's consent and the final waivers each sit here under their own role.
+ */
+export interface ContractDocument {
+  id: string;
+  contract_id: string;
+  document_id?: string | null;
+  doc_role: string;
+  title: string;
+  version: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listContractDocuments(
+  contractId: string,
+  docRole?: string,
+): Promise<ContractDocument[]> {
+  const qs = docRole ? `?doc_role=${encodeURIComponent(docRole)}` : '';
+  return apiGet<ContractDocument[]>(
+    `/v1/contracts/contracts/${encodeURIComponent(contractId)}/documents${qs}`,
+  );
+}
+
+export function createContractDocument(
+  contractId: string,
+  data: { doc_role: string; title: string; version?: string },
+): Promise<ContractDocument> {
+  return apiPost<ContractDocument>(
+    `/v1/contracts/contracts/${encodeURIComponent(contractId)}/documents`,
+    { contract_id: contractId, ...data },
   );
 }
 
@@ -832,6 +1310,8 @@ export interface ComplianceViolation {
   severity: 'error' | 'warning' | 'info';
   message: string;
   element_ref: string | null;
+  /** What a person calls the line or contract ``element_ref`` points at. */
+  element_label?: string | null;
   suggestion: string | null;
 }
 
@@ -919,14 +1399,19 @@ export interface AIAG703Line {
   line_number: number;
   item_number: string;
   description: string;
-  scheduled_value: string;
+  /** Null on the row for money no schedule line carries, and so are the
+   *  percent and the balance: there is nothing to measure them against. */
+  scheduled_value: string | null;
   previous_value: string;
   this_period_value: string;
   materials_stored: string;
   total_completed_stored: string;
-  percent_complete: string;
-  balance_to_finish: string;
+  percent_complete: string | null;
+  balance_to_finish: string | null;
   retainage: string;
+  /** Column I split the way G702 lines 5a and 5b split it. */
+  retainage_completed_work?: string;
+  retainage_stored_materials?: string;
 }
 
 export interface AIAG702Summary {
@@ -935,8 +1420,13 @@ export interface AIAG702Summary {
   contract_sum_to_date: string;
   total_completed_stored: string;
   retainage: string;
+  /** Line 5a, retainage on completed work, and 5b, on stored material. */
+  retainage_completed_work?: string;
+  retainage_stored_materials?: string;
   total_earned_less_retainage: string;
   previous_certificates_total: string;
+  /** "reconstructed" while line 7 is rebuilt from the prior claims' stored totals. */
+  previous_certificates_basis?: string | null;
   current_payment_due: string;
   balance_to_finish: string;
 }
@@ -1047,6 +1537,96 @@ export interface SovStatusResponse {
 export function getSovStatus(contractId: string): Promise<SovStatusResponse> {
   return apiGet<SovStatusResponse>(
     `/v1/contracts/contracts/${contractId}/sov-status`,
+  );
+}
+
+/** One approved change that moved the contract sum and has no SoV line yet. */
+export interface SovReconcileItem {
+  source_key: string;
+  source_kind: 'change_order' | 'variation_order';
+  source_id: string;
+  source_code: string;
+  title: string;
+  amount: string;
+  currency: string;
+  approved_on: string | null;
+  /**
+   * How the amount is split over the schedule: one pooled new line, the
+   * items as priced, pro rata to the items, or the items plus a balance line.
+   * Absent on a set-aside change.
+   */
+  allocation_method?: 'pooled' | 'itemized' | 'pro_rata' | 'itemized_with_balance';
+  /** Where each part of the amount lands, the same split the apply posts. */
+  allocation?: SovReconcileAllocationRow[];
+}
+
+/** One share of a change: a line it moves in place, or a line it adds. */
+export interface SovReconcileAllocationRow {
+  /** Null for the change's own new line. */
+  contract_line_id: string | null;
+  code: string;
+  description: string;
+  delta: string;
+  /**
+   * new_line: the change's own line; linked_line: a new line beside the one
+   * it adjusts (a measured line the change does not divide into whole
+   * units); lump_sum / quantity: the line itself moves.
+   */
+  placement: 'new_line' | 'linked_line' | 'lump_sum' | 'quantity';
+  total_before: string | null;
+  total_after: string | null;
+}
+
+export interface SovReconcilePreview {
+  contract_id: string;
+  contract_status: string;
+  can_apply: boolean;
+  currency: string;
+  contract_sum: string;
+  scheduled_total: string;
+  scheduled_total_after: string;
+  items: SovReconcileItem[];
+  /** Changes a person set aside as already on the schedule of values. */
+  excluded?: SovReconcileExcludedItem[];
+  /** Set on the apply response only. */
+  posted?: number;
+}
+
+/** A change set aside from the reconcile, with who did it and why. */
+export interface SovReconcileExcludedItem extends SovReconcileItem {
+  excluded_by: string | null;
+  excluded_at: string | null;
+  reason: string;
+}
+
+/** Changes approved before they reached the schedule of values. */
+export function getSovReconcilePreview(contractId: string): Promise<SovReconcilePreview> {
+  return apiGet<SovReconcilePreview>(
+    `/v1/contracts/contracts/${contractId}/sov/reconcile-change-orders`,
+  );
+}
+
+/** Post the ticked changes; 409 when one of them is no longer on offer. */
+export function applySovReconcile(
+  contractId: string,
+  sourceKeys: string[],
+): Promise<SovReconcilePreview> {
+  return apiPost<SovReconcilePreview>(
+    `/v1/contracts/contracts/${contractId}/sov/reconcile-change-orders`,
+    { source_keys: sourceKeys },
+  );
+}
+
+/** Set a change aside as already on the schedule of values, or take that back. */
+export function setSovReconcileExclusion(
+  contractId: string,
+  sourceKey: string,
+  excluded: boolean,
+  reason = '',
+): Promise<SovReconcilePreview> {
+  return apiPost<SovReconcilePreview>(
+    `/v1/contracts/contracts/${contractId}/sov/reconcile-change-orders/exclusions`,
+    { source_key: sourceKey, excluded, reason },
   );
 }
 
@@ -1392,6 +1972,228 @@ export function getMilestoneSchedule(
 ): Promise<MilestoneSchedule> {
   return apiGet<MilestoneSchedule>(
     `/v1/contracts/contracts/${contractId}/milestone-schedule`,
+  );
+}
+
+/* ── Payment plan: instalments that follow the schedule ───────────────── */
+
+/** What an instalment is for. The statutory deposit limits read `deposit`. */
+export const MILESTONE_KINDS = ['deposit', 'progress', 'final'] as const;
+export type MilestoneKind = (typeof MILESTONE_KINDS)[number];
+
+/** What makes an instalment payable. Only `date` ignores the schedule. */
+export const MILESTONE_TRIGGERS = ['date', 'completion', 'approval'] as const;
+export type MilestoneTrigger = (typeof MILESTONE_TRIGGERS)[number];
+
+export type MilestoneStatus = 'pending' | 'reached' | 'invoiced' | 'paid';
+
+/**
+ * How an instalment reads to the client, decided by the server. The UI never
+ * works out `overdue` itself: the server knows the payment terms and today.
+ */
+export type PaymentPlanClientStatus = 'upcoming' | 'due' | 'invoiced' | 'paid' | 'overdue';
+
+/** One contract milestone as stored (mirror of ContractMilestoneResponse). */
+export interface ContractMilestone {
+  id: string;
+  contract_id: string;
+  code: string;
+  name: string;
+  planned_date: string | null;
+  value: number | string | null;
+  percent_of_contract: number | string | null;
+  trigger: MilestoneTrigger | string;
+  status: MilestoneStatus | string;
+  kind: MilestoneKind | string;
+  activity_id: string | null;
+  schedule_id: string | null;
+  lag_days: number;
+  payment_terms_days: number | null;
+  forecast_reached_date: string | null;
+  forecast_due_date: string | null;
+  reached_at: string | null;
+  client_visible: boolean;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One instalment as the plan reads today, with its live forecast. */
+export interface PaymentPlanLine extends ContractMilestone {
+  forecast_at: string | null;
+  /** When the instalment would fall due on the contract's own date; the baseline the forecast moved from. */
+  planned_due_date?: string | null;
+  /** Resolved amount (Decimal on the wire). */
+  amount: number | string;
+  activity_name: string | null;
+  /** The linked activity no longer exists; the line falls back to its date. */
+  activity_missing: boolean;
+  client_status: PaymentPlanClientStatus | string;
+  /** Days the forecast moved against the contract's own date; null when either is unknown. */
+  days_moved: number | null;
+  claim_id: string | null;
+  claim_status: string | null;
+}
+
+/** A failed `payment_plan` rule. `message` is worded by the server. */
+export interface PaymentPlanFinding {
+  rule_id: string;
+  severity: string;
+  message: string;
+  element_ref: string | null;
+  suggestion: string | null;
+  details: Record<string, string>;
+}
+
+export interface PaymentPlan {
+  contract_id: string;
+  currency: string;
+  contract_total: number | string;
+  scheduled_total: number | string;
+  percent_scheduled: number | string | null;
+  default_payment_terms_days: number | null;
+  lines: PaymentPlanLine[];
+  findings: PaymentPlanFinding[];
+}
+
+export interface ContractMilestoneCreate {
+  contract_id: string;
+  code?: string;
+  name: string;
+  planned_date?: string | null;
+  value?: string | null;
+  percent_of_contract?: string | null;
+  trigger?: MilestoneTrigger;
+  status?: MilestoneStatus;
+  kind?: MilestoneKind;
+  lag_days?: number;
+  payment_terms_days?: number | null;
+  client_visible?: boolean;
+}
+
+/**
+ * The service drops nulls before it writes, so a null here leaves the stored
+ * value alone. The schedule link has its own route for exactly that reason.
+ */
+export type ContractMilestoneUpdate = Partial<Omit<ContractMilestoneCreate, 'contract_id'>>;
+
+/** Codes the link route returns beside the milestone. */
+export type MilestoneLinkWarning = 'date_trigger_ignores_schedule';
+
+export interface ContractMilestoneLinkResult extends ContractMilestone {
+  warnings: (MilestoneLinkWarning | string)[];
+}
+
+export function paymentPlanKey(contractId: string) {
+  return ['contracts', 'payment-plan', contractId] as const;
+}
+
+export function getPaymentPlan(contractId: string): Promise<PaymentPlan> {
+  return apiGet<PaymentPlan>(`/v1/contracts/contracts/${contractId}/payment-plan`);
+}
+
+export function createContractMilestone(
+  contractId: string,
+  body: ContractMilestoneCreate,
+): Promise<ContractMilestone> {
+  return apiPost<ContractMilestone>(`/v1/contracts/contracts/${contractId}/milestones`, body);
+}
+
+export function updateContractMilestone(
+  milestoneId: string,
+  body: ContractMilestoneUpdate,
+): Promise<ContractMilestone> {
+  return apiPatch<ContractMilestone>(`/v1/contracts/contracts/milestones/${milestoneId}`, body);
+}
+
+export function deleteContractMilestone(milestoneId: string): Promise<void> {
+  return apiDelete(`/v1/contracts/contracts/milestones/${milestoneId}`);
+}
+
+/** Link an instalment to a schedule activity, or unlink it with `null`. */
+export function linkMilestoneActivity(
+  milestoneId: string,
+  activityId: string | null,
+): Promise<ContractMilestoneLinkResult> {
+  return apiPut<ContractMilestoneLinkResult>(
+    `/v1/contracts/contracts/milestones/${milestoneId}/activity`,
+    { activity_id: activityId },
+  );
+}
+
+/** Raise the draft claim for a reached instalment. Nothing is submitted. */
+export function raiseMilestoneClaim(milestoneId: string): Promise<ProgressClaimItem> {
+  return apiPost<ProgressClaimItem>(
+    `/v1/contracts/contracts/milestones/${milestoneId}/raise-claim`,
+    {},
+  );
+}
+
+/** A schedule activity an instalment can follow. */
+export interface ScheduleMilestoneCandidate {
+  id: string;
+  name: string;
+  wbs_code: string;
+  end_date: string | null;
+  schedule_id: string;
+  schedule_name: string;
+  /** A milestone type in the schedule; anything else is offered only when already linked. */
+  is_milestone: boolean;
+}
+
+/** The schedule's own milestone types (schedule/milestone_events.py MILESTONE_ACTIVITY_TYPES). */
+const MILESTONE_ACTIVITY_TYPES: ReadonlySet<string> = new Set([
+  'milestone',
+  'start_milestone',
+  'finish_milestone',
+]);
+
+interface ScheduleListPage {
+  items: { id: string; name: string }[];
+  total: number;
+}
+
+interface ScheduleActivityPage {
+  items: {
+    id: string;
+    name: string;
+    wbs_code?: string | null;
+    end_date?: string | null;
+    activity_type?: string | null;
+  }[];
+  total: number;
+}
+
+/**
+ * The activities of a project's schedules an instalment can follow.
+ *
+ * Read from the schedule module's own list routes rather than a contracts
+ * endpoint, so the picker shows what the schedule shows. The milestone test is
+ * the one the link route enforces: the activity's type, not its duration.
+ */
+export async function listScheduleMilestoneCandidates(
+  projectId: string,
+): Promise<ScheduleMilestoneCandidate[]> {
+  const schedules = await apiGet<ScheduleListPage>(
+    `/v1/schedule/schedules/?project_id=${encodeURIComponent(projectId)}&limit=100`,
+  );
+  const pages = await Promise.all(
+    schedules.items.map((s) =>
+      apiGet<ScheduleActivityPage>(
+        `/v1/schedule/schedules/${encodeURIComponent(s.id)}/activities/?limit=5000`,
+      ).then((page) => ({ schedule: s, page })),
+    ),
+  );
+  return pages.flatMap(({ schedule, page }) =>
+    (page.items ?? []).map((a) => ({
+      id: a.id,
+      name: a.name,
+      wbs_code: a.wbs_code ?? '',
+      end_date: a.end_date ?? null,
+      schedule_id: schedule.id,
+      schedule_name: schedule.name,
+      is_milestone: MILESTONE_ACTIVITY_TYPES.has(a.activity_type ?? ''),
+    })),
   );
 }
 

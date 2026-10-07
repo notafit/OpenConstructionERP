@@ -138,6 +138,10 @@ class VariationRequestCreate(BaseModel):
     # NEC4 quotation + assessment deadlines (auto-computed for NEC4 if blank).
     quotation_due_at: str | None = Field(default=None, max_length=40)
     assessment_due_at: str | None = Field(default=None, max_length=40)
+    # OC-06: source document for decision traceability.
+    source_document_id: UUID | None = None
+    source_revision: str | None = Field(default=None, max_length=40)
+    source_page: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -155,6 +159,10 @@ class VariationRequestUpdate(BaseModel):
     decision_notes: str | None = Field(default=None, max_length=10000)
     ball_in_court: str | None = Field(default=None, max_length=36)
     response_due_date: str | None = Field(default=None, max_length=40)
+    # OC-06: source document reference.
+    source_document_id: UUID | None = None
+    source_revision: str | None = Field(default=None, max_length=40)
+    source_page: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] | None = None
 
 
@@ -197,6 +205,10 @@ class VariationRequestResponse(BaseModel):
     assessment_due_at: str | None = None
     ball_in_court: str | None = None
     response_due_date: str | None = None
+    # OC-06: source document for decision traceability.
+    source_document_id: UUID | None = None
+    source_revision: str | None = None
+    source_page: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
     updated_at: datetime
@@ -509,6 +521,27 @@ class VariationOrderResponse(BaseModel):
     updated_at: datetime
 
     @field_serializer("final_cost_impact", when_used="json")
+    @classmethod
+    def _ser_money(cls, v: Decimal) -> str:
+        return _serialize_money_string(v) or "0"
+
+
+# ── Contract impact (for completed VOs) ──────────────────────────────────
+
+
+class ContractImpactResponse(BaseModel):
+    """Summary of a completed VO's impact on its affected contract."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    variation_order_id: UUID
+    affected_contract_id: UUID | None = None
+    original_contract_value: Decimal = Decimal("0")
+    this_variation: Decimal = Decimal("0")
+    current_contract_value: Decimal = Decimal("0")
+    applied: bool = False
+
+    @field_serializer("original_contract_value", "this_variation", "current_contract_value", when_used="json")
     @classmethod
     def _ser_money(cls, v: Decimal) -> str:
         return _serialize_money_string(v) or "0"
@@ -1047,11 +1080,19 @@ class VariationDashboardResponse(BaseModel):
     daywork_value_by_currency: dict[str, str] = Field(default_factory=dict)
     daywork_value_unconverted_by_currency: dict[str, str] = Field(default_factory=dict)
     multi_currency: bool = False
+    # Issue #435 chunk 4: contract value dashboard card aggregates.
+    pending_vr_cost_total: Decimal | None = None
+    agreed_vo_cost_total: Decimal | None = None
 
     @field_serializer("cost_impact_total", "daywork_value_signed", when_used="json")
     @classmethod
     def _ser_money(cls, v: Decimal) -> str:
         return _serialize_money_string(v) or "0"
+
+    @field_serializer("pending_vr_cost_total", "agreed_vo_cost_total", when_used="json")
+    @classmethod
+    def _ser_optional_money(cls, v: Decimal | None) -> str | None:
+        return _serialize_money_string(v)
 
 
 class FinalAccountSummary(BaseModel):

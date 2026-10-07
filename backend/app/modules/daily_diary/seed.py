@@ -8,14 +8,16 @@ Usage::
     await seed_daily_diary_demo(session, project_ids=[uuid1, uuid2, uuid3])
 
 Designed for the demo / QA dataset: produces 90 days of diaries per
-project with realistic weather, entries, photos, videos, drone surveys
-and reality-capture datasets.
+project with realistic weather, entries, photos (drawn from the project's
+real site photos), drone surveys and reality-capture datasets. No videos:
+there is no bundled footage to point them at.
 """
 
 from __future__ import annotations
 
 import logging
 import random
+import re
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -51,9 +53,19 @@ _DAYS = 90
 _WEATHER_PER_DIARY = 5
 _ENTRIES_PER_DIARY = 8
 _PHOTOS_TOTAL = 1000
-_VIDEOS_TOTAL = 30
 _DRONE_SURVEYS = 6
 _REALITY_CAPTURES = 2
+
+# What the seed writes on rows that carry no seed mark of their own. The
+# cleanup of real projects (``seeded_child_ids``) recognises the rows by these,
+# so they are read from here by both sides rather than written twice.
+_SUNRISE = "06:30:00"
+_SUNSET = "20:15:00"
+_DRONE_NOTE = "Seed drone survey"
+_DRONE_URL = "https://seed.local/drone/"
+_SEEDED_PILOT = re.compile(r"Pilot \d+\.\d+")
+_REALITY_NOTE = "Seed reality capture"
+_REALITY_URL = "https://seed.local/reality/"
 
 # Realistic-ish lat/lng centres (Berlin, Frankfurt, Munich)
 _DEFAULT_CENTRES: tuple[tuple[float, float], ...] = (
@@ -185,7 +197,6 @@ async def seed_daily_diary_demo(
     diary_index: dict[tuple[uuid.UUID, str], DailyDiary] = {}
 
     photo_pool_remaining = _PHOTOS_TOTAL
-    video_pool_remaining = _VIDEOS_TOTAL
     drone_pool_remaining = _DRONE_SURVEYS
     reality_pool_remaining = _REALITY_CAPTURES
 
@@ -240,8 +251,8 @@ async def seed_daily_diary_demo(
                         precipitation_mm=Decimal(str(round(rng.uniform(0, 25), 2))),
                         conditions_code=conditions[0],
                         conditions_text=conditions[1],
-                        sunrise="06:30:00",
-                        sunset="20:15:00",
+                        sunrise=_SUNRISE,
+                        sunset=_SUNSET,
                         location_lat=lat0,
                         location_lng=lng0,
                     )
@@ -291,10 +302,26 @@ async def seed_daily_diary_demo(
                     )
 
     # Photos - distribute pool roughly evenly across all diaries.
+    #
+    # Every photo points at a real site photo already on the project, served
+    # by the documents photo routes, exactly as the German showcase diary
+    # does. This used to write ``https://seed.local/photos/<uuid>.jpg``: a
+    # host that does not exist, so each of the thousand demo diary photos
+    # rendered as a broken image and the founder reported the platform's
+    # images as missing. A project with no site photos gets no diary photos,
+    # a thinner frame but never a broken one. The photo seeder therefore runs
+    # before this one (see ``app.core.demo_enrichment``).
     diary_list = list(diary_index.values())
-    if diary_list:
-        for _ in range(photo_pool_remaining):
-            diary = rng.choice(diary_list)
+    photo_pools: dict[uuid.UUID, list[tuple[uuid.UUID, str | None]]] = {}
+    for diary in diary_list:
+        if diary.project_id not in photo_pools:
+            photo_pools[diary.project_id] = await _showcase_photo_pool(session, diary.project_id)
+    photo_diaries = [diary for diary in diary_list if photo_pools.get(diary.project_id)]
+    if photo_diaries:
+        for n in range(photo_pool_remaining):
+            diary = rng.choice(photo_diaries)
+            pool = photo_pools[diary.project_id]
+            source_id, caption = pool[n % len(pool)]
             lat_centre, lng_centre = _DEFAULT_CENTRES[list(project_ids).index(diary.project_id) % len(_DEFAULT_CENTRES)]
             jitter_lat = rng.uniform(-0.001, 0.001)
             jitter_lng = rng.uniform(-0.001, 0.001)
@@ -309,33 +336,21 @@ async def seed_daily_diary_demo(
                     lat=lat_centre + jitter_lat,
                     lng=lng_centre + jitter_lng,
                     location_label=rng.choice(["Block A", "Block B", "Crane Pad", "Site Office"]),
-                    file_url=f"https://seed.local/photos/{uuid.uuid4()}.jpg",
-                    thumbnail_url=None,
+                    file_url=f"/api/v1/documents/photos/{source_id}/file/",
+                    thumbnail_url=f"/api/v1/documents/photos/{source_id}/thumb/",
                     mime_type="image/jpeg",
-                    file_size_bytes=rng.randint(500_000, 8_000_000),
-                    description="Seed photo",
-                    tags=rng.sample(["progress", "safety", "quality", "drone", "concrete"], k=2),
-                    is_360=rng.random() < 0.05,
-                    is_drone=rng.random() < 0.10,
+                    description=caption or "Site photo",
+                    tags=rng.sample(["progress", "safety", "quality", "concrete"], k=2),
+                    # Ordinary flat photos: flagging one as 360 would open it
+                    # in the spherical viewer as a smeared panorama, and
+                    # flagging it as drone would claim an aerial it is not.
+                    is_360=False,
+                    is_drone=False,
                 )
             )
 
-        for _ in range(video_pool_remaining):
-            diary = rng.choice(diary_list)
-            day_dt = datetime.fromisoformat(diary.diary_date + "T12:00:00").replace(tzinfo=UTC)
-            videos.append(
-                DiaryVideo(
-                    id=uuid.uuid4(),
-                    diary_id=diary.id,
-                    project_id=diary.project_id,
-                    recorded_at=day_dt,
-                    file_url=f"https://seed.local/videos/{uuid.uuid4()}.mp4",
-                    duration_seconds=rng.randint(15, 180),
-                    file_size_bytes=rng.randint(5_000_000, 200_000_000),
-                    description="Seed video",
-                    tags=["progress"],
-                )
-            )
+    # No demo videos. There is no bundled footage to point them at, and a
+    # player aimed at an invented URL is a broken control, not a demo.
 
     for project_idx, project_id in enumerate(project_ids):
         if str(project_id) in seeded:
@@ -349,12 +364,14 @@ async def seed_daily_diary_demo(
                     pilot_name=f"Pilot {project_idx}.{d}",
                     drone_model=rng.choice(_DRONE_MODELS),
                     area_m2=Decimal(str(round(rng.uniform(500, 50_000), 2))),
-                    ortho_file_url=f"https://seed.local/drone/{uuid.uuid4()}.tif",
-                    dsm_file_url=f"https://seed.local/drone/{uuid.uuid4()}.tif",
+                    # No bundled orthophoto or elevation model to link, so
+                    # none is claimed; the survey record itself stays.
+                    ortho_file_url=None,
+                    dsm_file_url=None,
                     point_cloud_url=None,
                     elevation_min_m=Decimal(str(round(rng.uniform(0, 50), 2))),
                     elevation_max_m=Decimal(str(round(rng.uniform(50, 150), 2))),
-                    notes="Seed drone survey",
+                    notes=_DRONE_NOTE,
                 )
             )
         for r in range(reality_pool_remaining // max(len(project_ids), 1) + 1):
@@ -364,12 +381,12 @@ async def seed_daily_diary_demo(
                     project_id=project_id,
                     captured_at=base - timedelta(days=rng.randint(0, _DAYS - 1)),
                     capture_type=rng.choice(_CAPTURE_TYPES),
-                    file_url=f"https://seed.local/reality/{uuid.uuid4()}.e57",
+                    file_url=f"{_REALITY_URL}{uuid.uuid4()}.e57",
                     point_count_estimate=rng.randint(1_000_000, 200_000_000),
                     bbox_min={"x": 0.0, "y": 0.0, "z": 0.0},
                     bbox_max={"x": 100.0, "y": 100.0, "z": 25.0},
                     accuracy_mm=Decimal(str(round(rng.uniform(1, 25), 2))),
-                    notes="Seed reality capture",
+                    notes=_REALITY_NOTE,
                 )
             )
 
@@ -393,6 +410,106 @@ async def seed_daily_diary_demo(
         "reality_captures": len(reality_captures),
         "signatures": len(signatures),
     }
+
+
+# ── Repair of media written by earlier versions of the seeder ────────────────
+
+#: The host earlier versions of ``seed_daily_diary_demo`` invented for its
+#: media. Nothing but that seeder ever wrote it, so a row carrying it is a
+#: seeded placeholder and never a user's upload.
+_PLACEHOLDER_MEDIA_PREFIX = "https://seed.local/"
+
+
+async def repair_seeded_diary_media(
+    session: AsyncSession,
+    project_ids: Sequence[uuid.UUID],
+) -> dict[str, int]:
+    """Point earlier demo diary media at real files, or remove what has none.
+
+    Fixing the seeder alone changes nothing on an install that already ran
+    it: the seeder guards per project and never runs twice, so those diaries
+    keep a thousand photos aimed at a host that does not exist. This runs on
+    every boot and touches only rows whose URL starts with
+    ``_PLACEHOLDER_MEDIA_PREFIX``, so once they are repaired it finds nothing
+    and changes nothing; the cost is one project-scoped scan per table.
+
+    Photos are re-pointed at the project's real site photos, the same pool the
+    seeder now draws from; a project without site photos loses the
+    placeholder rows instead. Videos have no real footage to point at and are
+    removed. Drone surveys keep their record and lose the invented file links.
+
+    Args:
+        session: Async SQLAlchemy session, flushed but not committed.
+        project_ids: Projects to repair.
+
+    Returns:
+        Counters for what was re-pointed, removed and cleared.
+    """
+    counts = {"photos_repointed": 0, "photos_removed": 0, "videos_removed": 0, "drone_links_cleared": 0}
+    if not project_ids:
+        return counts
+    pids = list(project_ids)
+    like = f"{_PLACEHOLDER_MEDIA_PREFIX}%"
+
+    placeholder_photos = (
+        (
+            await session.execute(
+                select(DiaryPhoto)
+                .where(DiaryPhoto.project_id.in_(pids), DiaryPhoto.file_url.like(like))
+                .order_by(DiaryPhoto.taken_at, DiaryPhoto.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    pools: dict[uuid.UUID, list[tuple[uuid.UUID, str | None]]] = {}
+    doomed_photos: list[uuid.UUID] = []
+    for n, photo in enumerate(placeholder_photos):
+        if photo.project_id not in pools:
+            pools[photo.project_id] = await _showcase_photo_pool(session, photo.project_id)
+        pool = pools[photo.project_id]
+        if not pool:
+            doomed_photos.append(photo.id)
+            continue
+        source_id, caption = pool[n % len(pool)]
+        photo.file_url = f"/api/v1/documents/photos/{source_id}/file/"
+        photo.thumbnail_url = f"/api/v1/documents/photos/{source_id}/thumb/"
+        photo.mime_type = "image/jpeg"
+        photo.is_360 = False
+        photo.is_drone = False
+        if photo.description == "Seed photo" and caption:
+            photo.description = caption
+        counts["photos_repointed"] += 1
+    if doomed_photos:
+        await session.execute(delete(DiaryPhoto).where(DiaryPhoto.id.in_(doomed_photos)))
+        counts["photos_removed"] = len(doomed_photos)
+
+    videos = await session.execute(
+        delete(DiaryVideo).where(DiaryVideo.project_id.in_(pids), DiaryVideo.file_url.like(like))
+    )
+    counts["videos_removed"] = videos.rowcount or 0
+
+    surveys = (
+        (
+            await session.execute(
+                select(DroneSurvey).where(
+                    DroneSurvey.project_id.in_(pids),
+                    (DroneSurvey.ortho_file_url.like(like)) | (DroneSurvey.dsm_file_url.like(like)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for survey in surveys:
+        if (survey.ortho_file_url or "").startswith(_PLACEHOLDER_MEDIA_PREFIX):
+            survey.ortho_file_url = None
+        if (survey.dsm_file_url or "").startswith(_PLACEHOLDER_MEDIA_PREFIX):
+            survey.dsm_file_url = None
+        counts["drone_links_cleared"] += 1
+
+    await session.flush()
+    return counts
 
 
 # ── German showcase Bautagebuch ──────────────────────────────────────────────
@@ -725,8 +842,8 @@ async def seed_daily_diary_showcase_de(
                         precipitation_mm=Decimal("4.2" if code == "rain" else "0.0"),
                         conditions_code=code,
                         conditions_text=weather_label,
-                        sunrise="06:30:00",
-                        sunset="20:15:00",
+                        sunrise=_SUNRISE,
+                        sunset=_SUNSET,
                         location_lat=None,
                         location_lng=None,
                     )
@@ -823,3 +940,79 @@ async def seed_daily_diary_showcase_de(
 
     logger.info("seed_daily_diary_showcase_de: %s", counts)
     return counts
+
+
+async def seeded_child_ids(
+    session: AsyncSession,
+    project_ids: list[uuid.UUID],
+    diary_ids: list[uuid.UUID],
+) -> list[tuple[type, list, str]]:
+    """Diary-side rows the seed wrote next to the diaries ``diary_ids`` in ``project_ids``.
+
+    Weather records, drone surveys and reality captures hang off the project,
+    not the diary, so removing a seeded diary leaves them behind. A weather
+    record matches when it sits in the same project on the day of a seeded
+    diary (or the morning after, where the four-hourly readings run past
+    midnight) and carries the seed's fixed sunrise and sunset. A drone survey
+    and a reality capture match on the seed's note and its placeholder file
+    address together.
+
+    Returns:
+        ``(model, ids, label)`` groups; ``label`` names the group in reports.
+    """
+    if not project_ids:
+        return []
+    days: set[tuple[uuid.UUID, str]] = set()
+    if diary_ids:
+        for pid, diary_date in (
+            await session.execute(
+                select(DailyDiary.project_id, DailyDiary.diary_date).where(DailyDiary.id.in_(diary_ids))
+            )
+        ).all():
+            start = date.fromisoformat(str(diary_date)[:10])
+            days.add((pid, start.isoformat()))
+            days.add((pid, (start + timedelta(days=1)).isoformat()))
+    weather = [
+        r.id
+        for r in (
+            await session.execute(
+                select(WeatherRecord.id, WeatherRecord.project_id, WeatherRecord.captured_at).where(
+                    WeatherRecord.project_id.in_(project_ids),
+                    WeatherRecord.sunrise == _SUNRISE,
+                    WeatherRecord.sunset == _SUNSET,
+                )
+            )
+        ).all()
+        if (r.project_id, r.captured_at.date().isoformat()) in days
+    ]
+    drones = [
+        r.id
+        for r in (
+            await session.execute(
+                select(DroneSurvey.id, DroneSurvey.ortho_file_url, DroneSurvey.pilot_name).where(
+                    DroneSurvey.project_id.in_(project_ids), DroneSurvey.notes == _DRONE_NOTE
+                )
+            )
+        ).all()
+        # Older seeds linked a placeholder orthophoto; current ones link none,
+        # so the seeded pilot name is what still tells them from a user's survey.
+        if (r.ortho_file_url is None or str(r.ortho_file_url).startswith(_DRONE_URL))
+        and _SEEDED_PILOT.fullmatch(r.pilot_name or "")
+    ]
+    captures = [
+        r.id
+        for r in (
+            await session.execute(
+                select(RealityCaptureDataset.id, RealityCaptureDataset.file_url).where(
+                    RealityCaptureDataset.project_id.in_(project_ids),
+                    RealityCaptureDataset.notes == _REALITY_NOTE,
+                )
+            )
+        ).all()
+        if str(r.file_url or "").startswith(_REALITY_URL)
+    ]
+    return [
+        (WeatherRecord, weather, "daily_diary_weather"),
+        (DroneSurvey, drones, "daily_diary_drone_surveys"),
+        (RealityCaptureDataset, captures, "daily_diary_reality_captures"),
+    ]

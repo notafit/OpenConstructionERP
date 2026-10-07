@@ -145,6 +145,10 @@
     "base_date_readable": {
       "fail": "Base date '{base_date}' is not a date, so the bill is taxed at today's rate rather than its own",
       "suggestion": "State the price base as a day, a month, a quarter or a year ({shapes})"
+    },
+    "tax_date_readable": {
+      "fail": "Tax date '{tax_date}' is not a date, so the bill is taxed at today's rate rather than its own",
+      "suggestion": "State the tax date as a day, a month, a quarter or a year ({shapes}), or clear it to tax the bill on its base date"
     }
   },
   "din276": {
@@ -329,14 +333,67 @@
       "suggestion": "Give each position its own project item number before the bill leaves for the client"
     }
   },
+  "prezzario": {
+    "voce_code_format_valid": {
+      "fail": "Code '{code}' on position {ordinal} does not show which price list it comes from",
+      "suggestion": "An official voce code starts with the region and the edition year of its price list, for example TOS25_01.A03.001.001 (Toscana 2025). Copy the code exactly as the regional list prints it, import the line from the list, or number a new price NP.01"
+    },
+    "voce_reference_present": {
+      "fail": "Position {ordinal} cites no prezzario voce",
+      "suggestion": "Pick the line from an imported regional price list, or mark it as a nuovo prezzo (NP) backed by a price analysis"
+    },
+    "costi_sicurezza_separated": {
+      "fail": "The bill carries no separate line for the safety costs not subject to the tender discount",
+      "suggestion": "Add the oneri della sicurezza as their own section or markup line, priced from the safety chapter of the price list or the safety plan"
+    },
+    "incidenza_manodopera_documented": {
+      "fail": "Position {ordinal} ({code}) does not state its labour share",
+      "suggestion": "Take the incidenza della manodopera from the price list, or add a labour resource, so the labour cost can be stated separately in the tender"
+    },
+    "overheads_not_applied_twice": {
+      "fail": "Regional price-list rates already include general expenses (13-17%) and profit (10%). Applying them again raises the total by about {percent}%.",
+      "suggestion": "Remove the general expenses and profit markups from this bill, or keep them only on lines priced by your own analysis (NP)."
+    }
+  },
+  "romania": {
+    "deviz_chapter_required": {
+      "fail": "Position {ordinal} names no deviz general chapter",
+      "suggestion": "File the line under its HG 907/2016 chapter and subchapter, for example 4.1 for construction and installation works or 5.1 for site organisation"
+    },
+    "deviz_chapter_recognised": {
+      "fail": "Deviz code '{code}' on position {ordinal} is not a chapter or subchapter of the deviz general",
+      "suggestion": "Use a code from chapters 1 to 6 of the HG 907/2016 deviz general, such as 1.2, 2, 3.5, 4.1, 5.1 or 6.2"
+    }
+  },
+  "greece": {
+    "net_article_required": {
+      "fail": "Position {ordinal} carries no unified price list (ΝΕΤ) article",
+      "suggestion": "Name the ΝΕΤ article the line is priced from, for example ΟΙΚ 32.01.06, or ΝΑΟΙΚ for a new article"
+    },
+    "net_article_valid": {
+      "invalid": "Article '{code}' on position {ordinal} does not have the shape of a ΝΕΤ article",
+      "chapter": "Article '{code}' on position {ordinal} opens chapter {chapter}, which the building-works price list does not have",
+      "suggestion": "Write the list prefix and the article number, for example ΟΙΚ 38.20.02, ΟΔΟ Α-2 or ΑΤΗΕ 8151.1"
+    }
+  },
+  "ukraine": {
+    "zkr_chapter_required": {
+      "fail": "Position {ordinal} names no chapter of the summary estimate",
+      "suggestion": "File the line under its chapter of the зведений кошторисний розрахунок, 1 to 12; building works of the main object sit in chapter 2"
+    },
+    "zkr_chapter_recognised": {
+      "fail": "Chapter {chapter} on position {ordinal} is not one of the twelve chapters of the summary estimate",
+      "suggestion": "Use a chapter number from 1 to 12"
+    }
+  },
   "birimfiyat": {
     "code_required": {
       "fail": "Position {ordinal} missing birim fiyat poz number",
       "suggestion": "Assign a Bayındırlık poz number (e.g., 04.013/1)"
     },
     "valid_poz": {
-      "fail": "Poz '{code}' doesn't match format XX.XXX/X",
-      "suggestion": "Use format: NN.NNN or NN.NNN/N (e.g., 04.013/1)"
+      "fail": "Poz '{code}' is neither a current unit-price book number (XX.XXX.XXXX) nor an older one (XX.XXX/X)",
+      "suggestion": "Use the book's number, e.g. 15.140.1002, or 04.013/1 on an older contract; number your own analysed items as ÖZEL-1"
     }
   },
   "sekisan": {
@@ -509,6 +566,18 @@
     "po_line_cost_coded": {
       "fail": "Line {line} has no WBS, cost category or cost line, so it will not appear in the cost breakdown",
       "suggestion": "Assign a cost code so the commitment reports against a budget"
+    },
+    "invoice_within_order": {
+      "fail": "Invoice {invoice} is more than the {remaining} still open on order {po}, by {excess}",
+      "suggestion": "Check the invoice against the order; if the extra was agreed, record it as a change to the order before approving"
+    },
+    "invoice_quantity_received": {
+      "fail": "Line {line} would be invoiced for {invoiced} in total, but only {received} has been received",
+      "suggestion": "Wait for the delivery note or confirm the goods receipt before approving this quantity"
+    },
+    "invoice_value_received": {
+      "fail": "On order {po} the invoices would total {invoiced}, but the goods received are worth only {received} at the order rates",
+      "suggestion": "Wait for the delivery note or confirm the goods receipt before approving this amount"
     }
   },
   "subcontract": {
@@ -543,6 +612,10 @@
     "insurance_valid_at_start": {
       "fail": "The subcontractor's insurance expired on {expiry}, before work starts on {reference}",
       "suggestion": "Collect a current certificate before letting the subcontractor on site"
+    },
+    "unlinked_contract_twin": {
+      "fail": "The subcontract {agreement} and the contract {contract} look like the same subcontract, so the finances may count it twice",
+      "suggestion": "Link them if they are the same subcontract, or mark them as different"
     }
   },
   "submittal": {
@@ -626,10 +699,13 @@
     "boq_not_found": "BOQ not found",
     "session_not_found": "Session not found",
     "document_not_found": "Document not found",
+    "documents_batch_delete_referenced": "Records elsewhere still point at documents in this batch. Review what the delete severs and confirm with acknowledge_references.",
     "invitation_not_found": "Invitation not found",
     "agreement_not_found": "Agreement not found",
     "rejection_not_found": "Rejection not found",
     "claim_not_found": "Progress claim not found",
+    "gaeb_x89_final_account_unsupported": "A final account or part final account cannot be exported as GAEB X89 yet. It has to bill the cumulative work less earlier payments, and only a progress invoice of one period is built from a claim. Export the claim as a progress invoice.",
+    "xpwe_native_file_refused": "This is an estimating program's own project file, which only that program can open. Export the estimate as XPWE from your estimating program and upload the .xpwe file.",
     "plot_not_found": "Plot not found",
     "survey_not_found": "Drone survey not found",
     "diary_video_not_found": "Diary video not found",
@@ -648,7 +724,10 @@
     "estimate_job_not_found": "Estimate job not found",
     "escrow_not_found": "EscrowTransaction not found",
     "commission_accrual_not_found": "CommissionAccrual not found",
-    "baseline_not_found": "Baseline not found"
+    "baseline_not_found": "Baseline not found",
+    "fx_rate_set_locked": "The ECB rates for {date} are locked, so this refresh did not overwrite them. Unlock that rate set first if it should take the new publication.",
+    "boq_locked": "BOQ is locked and cannot be modified. Create a revision to make changes.",
+    "boq_link_owner_locked": "Code '{code}' is defined by a line in the locked bill '{bill}', and linking to it would change that bill. Unlock that bill first, or enter the line under a new code."
   },
   "variations": {
     "boq_lines_are_traced": {
@@ -774,6 +853,16 @@
       "norm_collapsed": "Position {ordinal}: the resource rows lost their catalogue norm and hold the position quantity instead, so the unit rate was not re-derived from them",
       "whole_position_quantities": "Position {ordinal}: the resource rows hold whole-position quantities instead of per-unit norms, so the unit rate was not re-derived from them",
       "suggestion": "Review the buildup - re-derive the position from its catalogue item through the resource norm review, or correct the rows by hand"
+    }
+  },
+  "poland": {
+    "knr_reference_required": {
+      "fail": "Position {ordinal} cites no KNR catalogue table",
+      "suggestion": "Name the catalogue table the norms come from in the podstawa, for example KNR 2-02 0201-01, or write kalkulacja indywidualna for a line priced by own calculation"
+    },
+    "knr_reference_recognised": {
+      "fail": "Reference '{code}' on position {ordinal} names no KNR catalogue family",
+      "suggestion": "Start the reference with its catalogue family, such as KNR, KNNR, KNR-W or KSNR, or mark the line as kalkulacja indywidualna"
     }
   }
 }

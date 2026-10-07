@@ -275,6 +275,10 @@ export interface BIMViewerProps {
   onLinkDocument?: (element: BIMElementData) => void;
   /** User clicked "+ Link" in the Schedule Activities section. */
   onLinkActivity?: (element: BIMElementData) => void;
+  /** User picked "Create quantity rule" in the right-click menu - parent
+   *  opens the Quantity Rules editor pre-filled from this element. Without
+   *  it the menu does not offer the item. */
+  onCreateQuantityRule?: (element: BIMElementData) => void;
   /** User clicked "+ Link" in the Linked Requirements section — parent
    *  opens the LinkRequirementToBIMModal picker. */
   onLinkRequirement?: (element: BIMElementData) => void;
@@ -747,6 +751,7 @@ export function BIMViewer({
   onCreateTask,
   onLinkDocument,
   onLinkActivity,
+  onCreateQuantityRule,
   onLinkRequirement,
   onSmartFilter,
   leftPanelOpen = false,
@@ -772,6 +777,7 @@ export function BIMViewer({
     onCreateTask = undefined;
     onLinkDocument = undefined;
     onLinkActivity = undefined;
+    onCreateQuantityRule = undefined;
     onLinkRequirement = undefined;
     onSmartFilter = undefined;
   }
@@ -2971,6 +2977,12 @@ export function BIMViewer({
     if (el && onCreateTask) onCreateTask(el);
   }, [contextMenu, onCreateTask]);
 
+  const handleCtxCreateQuantityRule = useCallback(() => {
+    if (!contextMenu) return;
+    const el = contextMenu.element ?? contextMenu.selectedElements[0];
+    if (el && onCreateQuantityRule) onCreateQuantityRule(el);
+  }, [contextMenu, onCreateQuantityRule]);
+
   const handleCtxIsolate = useCallback(() => {
     if (!contextMenu || !elementMgrRef.current) return;
     const ids = contextMenu.selectedElements.map((el) => el.id);
@@ -4435,14 +4447,11 @@ export function BIMViewer({
       {selectionCount > 0 && (
         <div className="absolute bottom-3 start-1/2 -translate-x-1/2 z-30 flex items-center gap-2 rounded-lg bg-surface-primary border border-oe-blue/40 shadow-md px-3 py-1.5">
           <span className="text-xs font-semibold text-content-primary whitespace-nowrap">
-            {selectionCount === 1
-              ? t('bim.sel_one', {
-                  defaultValue: '1 selected',
-                })
-              : t('bim.sel_n', {
-                  defaultValue: '{{count}} selected',
-                  count: selectionCount,
-                })}
+            {t('bim.selection_count', {
+              count: selectionCount,
+              defaultValue_one: '{{count}} selected',
+              defaultValue_other: '{{count}} selected',
+            })}
           </span>
           {selectionParts.length > 0 && (
             <span className="text-[10px] text-content-tertiary truncate max-w-[200px]">
@@ -6204,6 +6213,7 @@ export function BIMViewer({
             onLinkDocument: onLinkDocument ? handleCtxLinkDocument : undefined,
             onLinkActivity: onLinkActivity ? handleCtxLinkActivity : undefined,
             onCreateTask: onCreateTask ? handleCtxCreateTask : undefined,
+            onCreateQuantityRule: onCreateQuantityRule ? handleCtxCreateQuantityRule : undefined,
             onIsolate: handleCtxIsolate,
             onHide: handleCtxHide,
             // W6.6 Stream C — Solo Mode: surface "Show all" in the context

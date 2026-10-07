@@ -69,7 +69,7 @@ jobs:
 
       - name: Build frontend bundle into wheel layout
         # The heap ceiling for this build is NOT set here. frontend/package.json
-        # runs both tsc and vite through node --max-old-space-size=9216 on the
+        # runs both tsc and vite through node --max-old-space-size=12288 on the
         # command line, and an explicit flag beats NODE_OPTIONS in both
         # directions: measured, an environment asking for 9999 alongside a flag
         # of 1024 gives a 1216 MB heap. The value below therefore reaches only
@@ -77,7 +77,7 @@ jobs:
         # cannot fix or cause an out of memory in Vite or tsc. Change
         # package.json for that.
         env:
-          NODE_OPTIONS: --max-old-space-size=8192
+          NODE_OPTIONS: --max-old-space-size=12288
         run: |
           cd frontend
           npm ci
@@ -104,6 +104,7 @@ jobs:
         run: |
           python - <<'PY'
           import glob, json, os, sys, urllib.error, urllib.request
+          from datetime import datetime, timezone
 
           # PyPI rejects any single file over 100 MiB, and it rejects it at
           # upload, which here is after the tag is already public. Nothing
@@ -194,11 +195,85 @@ jobs:
                   )
               left = LIMIT_BYTES - after
               print(f"OK: fits, with {left/1048576:,.1f} MiB left after this upload")
-              if left < size:
+
+              # How much warning that headroom is worth depends entirely on how
+              # fast we release, so measure the cadence instead of assuming it.
+              #
+              # This used to warn only when less than one more wheel fit. That is
+              # a true statement but it arrives too late to act on. Freeing space
+              # means deleting old releases, which breaks anyone pinned to them,
+              # or asking PyPI to raise the project limit, which is a support
+              # request answered by a person on their own schedule. Neither is
+              # something to start on the release that fails.
+              #
+              # The threshold is therefore stated in days rather than wheels,
+              # because days are what the remedy needs and wheels only stand in
+              # for them. Fourteen days is the number, and it is chosen against
+              # the slower of the two remedies: a support request is answered by
+              # a volunteer on their own schedule, so a week is optimistic.
+              #
+              # Counting wheels instead would set the lead time by accident. At
+              # 17.8.3 the project had room for 5.8 of them, which is a month if
+              # releases are monthly and under four days at the rate they were
+              # actually going out that week. A wheel count cannot tell those
+              # apart; that is the whole reason the cadence is measured below.
+              #
+              # There is no second threshold on the wheel count, and there was
+              # one until it was checked. It read "under two wheels, warn
+              # whatever the arithmetic says", to cover a quiet spell driving
+              # the measured rate toward zero and the day estimate toward
+              # infinity. That cannot happen. The rate below adds one for the
+              # release being published right now, in every window including
+              # the three day one, so it can never come out below a third of a
+              # release a day. Days are therefore never more than three times
+              # the wheel count, under two wheels is always under six days, and
+              # the day threshold has already fired. A guard that cannot fire,
+              # justified by a paragraph that is false, is worse than no guard.
+              #
+              # Take the fastest rate sustained over any recent window rather
+              # than one average, because the averaging window decides the
+              # answer and a single long one hides exactly the burst that
+              # empties the quota. Measured against the index as it stood when
+              # 17.8.3 published: the last fourteen wheels average 0.6 a day and
+              # put the runway at nine days, while the three day window gives
+              # 1.33 a day and just under four. Understating the rate is the
+              # dangerous direction for a warning about running out, so the
+              # windows disagreeing means take the worst and name which it was.
+              now = datetime.now(timezone.utc)
+              ages = sorted(
+                  (now - datetime.fromisoformat(f["upload_time_iso_8601"].replace("Z", "+00:00"))).total_seconds() / 86400
+                  for fs in meta["releases"].values()
+                  for f in fs
+                  if f["filename"].endswith(".whl")
+              )
+              WARN_DAYS = 14
+
+              fits = left / size
+              runway = f"{fits:.1f} more wheels this size"
+              rates = [
+                  # The +1 is the release being published right now, which is not
+                  # on the index yet when this runs on a tag. Re-running this
+                  # script by hand after a release counts that wheel twice and
+                  # reads high; subtract it if you are checking between tags.
+                  ((sum(1 for a in ages if a <= w) + 1) / w, w)
+                  for w in (3, 7, 14, 30)
+              ]
+              per_day, window = max(rates)
+              days = fits / per_day if per_day > 0 else float("inf")
+              if per_day > 0:
+                  runway += (
+                      f", about {days:.0f} days at {per_day:.2f} releases a "
+                      f"day, the fastest of the last 3, 7, 14 and 30 day windows "
+                      f"(the {window} day one)"
+                  )
+              print(f"room for {runway}")
+              if days < WARN_DAYS:
                   print(
-                      f"::warning::after this release the project has {left/1048576:,.1f} "
-                      f"MiB left, less than one more wheel. The NEXT release will not "
-                      f"publish unless the wheel shrinks or PyPI space is freed."
+                      f"::warning::PyPI project storage is running out: room for {runway}. "
+                      f"The wheel cannot shrink enough to matter here, so this needs "
+                      f"either old releases deleted, which breaks anyone pinned to them, "
+                      f"or a support request to raise the project limit. Both want a "
+                      f"human and neither is instant."
                   )
           PY
 

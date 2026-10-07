@@ -7,7 +7,8 @@
 //     populate affordance only on editable claims.
 //   * PopulatePreviewModal — preview render, select/deselect, empty state,
 //     commit wiring.
-//   * ProgressClaimLineTable — read-only vs editable rows, inline edit/save.
+//   * ProgressClaimLineTable — read-only vs editable rows, inline edit/save,
+//     and the reads a line write makes stale.
 //
 // The contracts API module is fully stubbed so no network is hit.
 
@@ -18,6 +19,7 @@ import {
   waitFor,
   fireEvent,
   within,
+  cleanup as cleanupDetail,
 } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
@@ -67,6 +69,15 @@ vi.mock('./api', () => ({
   populateClaimPreview: vi.fn(),
   commitClaimLines: vi.fn(),
   updateClaimLine: vi.fn(),
+  // Billing a line by hand, and the schedule of values it is picked from.
+  createClaimLine: vi.fn(),
+  listContractLines: vi.fn(),
+  // The contract says which way the claim invoice goes.
+  getContract: vi.fn().mockResolvedValue({ counterparty_type: 'client' }),
+  // The submission check under the header, and the G702 it reads line 7's
+  // basis from on AIA projects.
+  getClaimValidation: vi.fn(),
+  getAiaApplication: vi.fn(),
 }));
 
 vi.mock('@/stores/useToastStore', () => ({
@@ -79,8 +90,15 @@ vi.mock('@/stores/useAuthStore', () => ({
 
 import * as api from './api';
 import { ProgressClaimDetailPage } from './ProgressClaimDetailPage';
+import { ClaimPeriod } from './ClaimPeriod';
 import { PopulatePreviewModal } from './PopulatePreviewModal';
 import { ProgressClaimLineTable } from './ProgressClaimLineTable';
+import {
+  claimKey,
+  claimLinesKey,
+  aiaApplicationKey,
+  CLAIMS_LIST_KEY,
+} from './claimQueries';
 
 const CLAIM_ID = '00000000-0000-0000-0000-0000000000c1';
 const PROJECT_ID = '00000000-0000-0000-0000-0000000000p1';
@@ -128,6 +146,21 @@ function previewItem(overrides = {}) {
   };
 }
 
+function claimLine(overrides = {}) {
+  return {
+    id: 'cl-1',
+    progress_claim_id: CLAIM_ID,
+    contract_line_id: 'line-1',
+    period_completed_qty: '4',
+    period_completed_value: '400',
+    period_completed_pct: '40',
+    cumulative_completed_value: '400',
+    created_at: '2026-05-01T00:00:00Z',
+    updated_at: '2026-05-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
 function renderDetail() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -160,8 +193,45 @@ function renderModal(props = {}) {
   );
 }
 
+function report(overrides = {}) {
+  return {
+    claim_id: CLAIM_ID,
+    status: 'passed',
+    score: 1,
+    summary: {},
+    rule_sets: ['pay_application'],
+    unsupported_rule_sets: [],
+    errors: [],
+    warnings: [],
+    ...overrides,
+  };
+}
+
+function sovLine(overrides = {}) {
+  return {
+    id: 'line-1',
+    contract_id: 'ctr-1',
+    parent_line_id: null,
+    code: 'A1',
+    description: 'Concrete',
+    scope_section: null,
+    line_type: 'work',
+    unit: 'm3',
+    quantity: '10',
+    unit_rate: '100',
+    total_value: '1000',
+    order_index: 0,
+    metadata: {},
+    created_at: '2026-05-01T00:00:00Z',
+    updated_at: '2026-05-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  api.getClaimValidation.mockResolvedValue(report());
+  api.listContractLines.mockResolvedValue([]);
 });
 
 describe('ProgressClaimDetailPage', () => {
@@ -173,6 +243,21 @@ describe('ProgressClaimDetailPage', () => {
     // assert on at least one match rather than a unique element.
     await waitFor(() => expect(screen.getAllByText(/PC-0001/).length).toBeGreaterThan(0));
     expect(screen.getByTestId('progress-claim-detail')).toBeTruthy();
+  });
+
+  it('says a certified client claim is a receivable and a subcontract claim a payable', async () => {
+    api.getProgressClaim.mockResolvedValue(claim());
+    api.listClaimLines.mockResolvedValue([]);
+    renderDetail();
+    const client = await screen.findByTestId('claim-intro-direction');
+    expect(client.textContent).toMatch(/receivable/);
+    expect(client.textContent).not.toMatch(/payable/);
+    cleanupDetail();
+
+    api.getContract.mockResolvedValueOnce({ counterparty_type: 'subcontractor' });
+    renderDetail();
+    const sub = await screen.findByTestId('claim-intro-direction');
+    expect(sub.textContent).toMatch(/a payable/);
   });
 
   it('shows the Populate button on a draft claim', async () => {
@@ -223,6 +308,160 @@ describe('ProgressClaimDetailPage', () => {
     await waitFor(() =>
       expect(screen.getByTestId('populate-preview-table')).toBeTruthy(),
     );
+  });
+
+  it('shows the submission check and leaves Submit to the server gate', async () => {
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'draft' }));
+    api.listClaimLines.mockResolvedValue([]);
+    api.getClaimValidation.mockResolvedValue(
+      report({
+        status: 'errors',
+        errors: [
+          {
+            rule_id: 'pay_application.line_overbilled',
+            rule_name: 'No line is billed beyond its scheduled value',
+            severity: 'error',
+            passed: false,
+            message: 'Line L1 is billed 1,200.00 USD to date against a scheduled value of 1,000.00 USD.',
+            element_ref: 'line-1',
+            suggestion: 'Reduce the billed amount on the line.',
+            details: {},
+          },
+        ],
+      }),
+    );
+    renderDetail();
+
+    const panel = await screen.findByTestId('claim-validation-panel');
+    await waitFor(() =>
+      expect(within(panel).getByText(/Line L1 is billed/)).toBeTruthy(),
+    );
+    // The panel reports; it does not decide. Submit stays pressable, and the
+    // server refuses it with the same report.
+    const submit = screen.getByRole('button', { name: /^Submit$/i });
+    expect(submit.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('links back to the claims tab, from the arrow and from the breadcrumb', async () => {
+    api.getProgressClaim.mockResolvedValue(claim());
+    api.listClaimLines.mockResolvedValue([]);
+    renderDetail();
+
+    // The bare register opens on its Contracts tab, one click away from the
+    // list the claim was opened from.
+    const claimsTab = `/projects/${PROJECT_ID}/contracts?tab=claims`;
+    const back = await screen.findByRole('link', { name: 'Back' });
+    expect(back.getAttribute('href')).toBe(claimsTab);
+    expect(screen.getByRole('link', { name: 'Contracts' }).getAttribute('href')).toBe(claimsTab);
+  });
+
+  it('prints the parsed period in the header, as the claims list does', async () => {
+    const period = {
+      period_start: 'first of May',
+      period_end: 'end of May',
+      period_from: '2026-05-01',
+      period_to: '2026-05-31',
+    };
+    api.getProgressClaim.mockResolvedValue(claim(period));
+    api.listClaimLines.mockResolvedValue([]);
+    renderDetail();
+
+    const header = await screen.findByTestId('claim-period');
+    const { container } = render(<ClaimPeriod claim={period} />);
+    expect(header.textContent).toBe(container.textContent);
+    expect(header.textContent).not.toContain('first of May');
+  });
+
+  it('offers no line edits once the claim has left draft', async () => {
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'submitted' }));
+    api.listClaimLines.mockResolvedValue([claimLine()]);
+    renderDetail();
+
+    // The breakdown a submitted claim was billed on is not the screen's to
+    // change. The claim's stored gross, retention and net were computed from
+    // it, the AR invoice is booked on those, and the next claim's "previous"
+    // column is read from them.
+    await waitFor(() => expect(screen.getByTestId('claim-lines-locked')).toBeTruthy());
+    expect(screen.queryByTestId('populate-button')).toBeNull();
+    expect(screen.queryByText(/^Edit$/i)).toBeNull();
+    // A rejected claim stays rejected, so the way to corrected figures is a
+    // new draft claim; say so rather than leave the reader looking for it.
+    expect(screen.getByTestId('claim-lines-locked').textContent).toMatch(/new draft claim/i);
+  });
+
+  it.each(['paid', 'rejected', 'certified'])(
+    'does not tell a %s claim to get itself rejected',
+    async (status) => {
+      api.getProgressClaim.mockResolvedValue(claim({ status }));
+      api.listClaimLines.mockResolvedValue([claimLine()]);
+      renderDetail();
+
+      // Reject is offered on a submitted claim and nowhere else, so on these
+      // the hint would be an instruction nobody can follow - and on a claim
+      // already rejected it would be nonsense.
+      const note = await screen.findByTestId('claim-lines-locked');
+      expect(note.textContent).not.toMatch(/new draft claim/i);
+    },
+  );
+
+  it('lets a hand-written contract be billed, with no progress to populate from', async () => {
+    // "Populate from progress" needs the schedule of values tied to bid
+    // positions and observations from site. A contract typed in by hand has
+    // neither, and until now that left its claim with no lines and no way to
+    // add one - the small job could not raise a payment application at all.
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'draft' }));
+    api.listClaimLines.mockResolvedValue([]);
+    api.listContractLines.mockResolvedValue([sovLine()]);
+    api.createClaimLine.mockResolvedValue(claimLine());
+    renderDetail();
+
+    fireEvent.click(await screen.findByTestId('claim-add-line'));
+    fireEvent.change(screen.getByLabelText('Line'), { target: { value: 'line-1' } });
+    fireEvent.change(screen.getByLabelText('% complete'), { target: { value: '40' } });
+    fireEvent.change(screen.getByLabelText('Period value'), { target: { value: '400' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(api.createClaimLine).toHaveBeenCalledTimes(1));
+    expect(api.createClaimLine).toHaveBeenCalledWith({
+      progress_claim_id: CLAIM_ID,
+      contract_line_id: 'line-1',
+      period_completed_pct: 40,
+      period_completed_value: 400,
+    });
+  });
+
+  it('says where to start when the contract has no lines to bill', async () => {
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'draft' }));
+    api.listClaimLines.mockResolvedValue([]);
+    api.listContractLines.mockResolvedValue([]);
+    renderDetail();
+
+    // Nothing to pick from is a different problem from nothing to populate
+    // from, and it is fixed on the contract, not here.
+    await waitFor(() => expect(screen.getAllByText(/PC-0001/).length).toBeGreaterThan(0));
+    expect(screen.queryByTestId('claim-add-line')).toBeNull();
+    expect(screen.getByText(/no schedule of values/i)).toBeTruthy();
+  });
+
+  it('does not offer to bill a line the claim already carries', async () => {
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'draft' }));
+    api.listClaimLines.mockResolvedValue([claimLine({ contract_line_id: 'line-1' })]);
+    api.listContractLines.mockResolvedValue([sovLine()]);
+    renderDetail();
+
+    // One claim line per schedule-of-values line; the row already there is
+    // edited instead, which is what the inline editor is for.
+    await waitFor(() => expect(screen.getByTestId('claim-line-table')).toBeTruthy());
+    expect(screen.queryByTestId('claim-add-line')).toBeNull();
+  });
+
+  it('does not run the submission check on a certified claim', async () => {
+    api.getProgressClaim.mockResolvedValue(claim({ status: 'certified' }));
+    api.listClaimLines.mockResolvedValue([]);
+    renderDetail();
+    await waitFor(() => expect(screen.getAllByText(/PC-0001/).length).toBeGreaterThan(0));
+    expect(screen.queryByTestId('claim-validation-panel')).toBeNull();
+    expect(api.getClaimValidation).not.toHaveBeenCalled();
   });
 });
 
@@ -288,6 +527,19 @@ describe('PopulatePreviewModal', () => {
     expect(commit?.disabled).toBe(true);
   });
 
+  it('says why a contract its payment plan bills has no preview, instead of calling it empty', async () => {
+    const { ApiError } = await import('@/shared/lib/api');
+    api.populateClaimPreview.mockRejectedValue(
+      new ApiError(409, 'Conflict', {
+        detail: { error: 'contract_billed_by_payment_plan', message: 'Billed by its payment plan.' },
+      }),
+    );
+    renderModal();
+    const alert = await screen.findByTestId('populate-error');
+    expect(alert.textContent).toContain('Claim the next instalment instead of measured progress');
+    expect(screen.queryByTestId('populate-empty')).toBeNull();
+  });
+
   it('commits the selected lines and closes', async () => {
     const onClose = vi.fn();
     const onCommitted = vi.fn();
@@ -309,8 +561,10 @@ describe('PopulatePreviewModal', () => {
     await waitFor(() => expect(screen.getByTestId('populate-preview-table')).toBeTruthy());
     fireEvent.click(screen.getByText(/Commit lines/i));
     await waitFor(() => expect(api.commitClaimLines).toHaveBeenCalledTimes(1));
+    // Field progress commits the percent to date; the server bills it over
+    // what the earlier claims billed when it writes.
     expect(api.commitClaimLines).toHaveBeenCalledWith(CLAIM_ID, [
-      { contract_line_id: 'line-1', period_completed_pct: 40, period_completed_value: 400 },
+      { contract_line_id: 'line-1', period_completed_pct: 40 },
     ]);
     await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
@@ -361,5 +615,34 @@ describe('ProgressClaimLineTable', () => {
       'cl-1',
       expect.objectContaining({ period_completed_pct: 55 }),
     );
+  });
+
+  it('re-reads the claim, its lines, the G702 and the register after a save', async () => {
+    api.updateClaimLine.mockResolvedValue(line);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidated = vi.spyOn(client, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={client}>
+        <ProgressClaimLineTable
+          claimId={CLAIM_ID}
+          lines={[line]}
+          currency="USD"
+          editable
+        />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByText(/^Edit$/i));
+    fireEvent.click(screen.getByText(/^Save$/i));
+    await waitFor(() => expect(api.updateClaimLine).toHaveBeenCalledTimes(1));
+
+    // A line write moves the claim's stored gross, retention and net, the
+    // G702 face drawn from the same lines, and the amount in the register's
+    // row. Keeping any of them on screen is showing money from before the
+    // write - which is the figure an AR invoice would be booked from.
+    const keys = invalidated.mock.calls.map((c) => JSON.stringify(c[0].queryKey));
+    expect(keys).toContain(JSON.stringify(claimKey(CLAIM_ID)));
+    expect(keys).toContain(JSON.stringify(claimLinesKey(CLAIM_ID)));
+    expect(keys).toContain(JSON.stringify(aiaApplicationKey(CLAIM_ID)));
+    expect(keys).toContain(JSON.stringify(CLAIMS_LIST_KEY));
   });
 });

@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "prawo_budowlane",
+  "name": "Prawo budowlane — Construction Law",
+  "standard": "Prawo budowlane (Ustawa z dnia 7 lipca 1994 r., Dz.U. 1994 nr 89 poz. 414)",
+  "jurisdiction": "PL",
+  "description": "Validates project documentation against the Polish Construction Law (Prawo budowlane). Checks building category classification, pozwolenie na budowe (building permit) documentation, kierownik budowy (site manager) designation, nadzor inwestorski (investor supervision) requirements, dziennik budowy (construction diary) provisions, and odbiory (acceptance inspection) documentation.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "pb.building_category_classified",
+    "pb.pozwolenie_na_budowe_referenced",
+    "pb.zgloszenie_if_applicable",
+    "pb.kierownik_budowy_designated",
+    "pb.inspektor_nadzoru_if_required",
+    "pb.projektant_designated",
+    "pb.projekt_budowlany_present",
+    "pb.projekt_techniczny_present",
+    "pb.dziennik_budowy_provisions_present",
+    "pb.odbiory_inspection_plan_present",
+    "pb.warunki_techniczne_referenced",
+    "pb.energy_performance_certificate_if_applicable"
+  ],
+  "regulator": "GUNB (Glowny Urzad Nadzoru Budowlanego)",
+  "publication_year": 2024
+}

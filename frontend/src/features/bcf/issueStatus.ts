@@ -9,6 +9,7 @@
  */
 
 import type { Topic, Viewpoint } from './api';
+import { parseDateUTC } from '@/shared/lib/dates';
 
 export type BadgeVariant = 'neutral' | 'blue' | 'success' | 'warning' | 'error';
 
@@ -41,7 +42,9 @@ export function isDone(status: string): boolean {
 
 export function isOverdue(topic: Topic, now: number = Date.now()): boolean {
   if (!topic.due_date || isDone(topic.topic_status)) return false;
-  const due = new Date(topic.due_date).getTime();
+  // Pin date-only due dates to UTC midnight so the overdue check is not
+  // shifted by the browser's local timezone offset.
+  const due = parseDateUTC(topic.due_date).getTime();
   return Number.isFinite(due) && due < now;
 }
 

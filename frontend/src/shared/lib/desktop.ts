@@ -349,6 +349,35 @@ export async function setDesktopServerChoice(
 }
 
 /**
+ * Set the zoom factor of the webview this page runs in (desktop only).
+ *
+ * This is the native zoom the browser applies for Ctrl +, not CSS `zoom`: the
+ * CSS viewport shrinks and `devicePixelRatio` grows, so every rect, pointer
+ * coordinate, breakpoint and canvas stays in one coordinate space. See
+ * `uiScale.ts` for why the app cannot scale itself any other way.
+ *
+ * It calls Tauri's own `set_webview_zoom` command, the one `setZoom` in
+ * `@tauri-apps/api/webview` wraps, without a label, which the command reads as
+ * "the calling webview". The application window reaches it through the
+ * `core:webview:allow-set-webview-zoom` grant in capabilities/app-window.json.
+ * A window served by a server the user chose is granted nothing and is refused
+ * here, which resolves to false rather than throwing: the caller decides what
+ * to tell the user.
+ */
+export async function setDesktopWebviewZoom(factor: number): Promise<boolean> {
+  if (!isTauri || !Number.isFinite(factor) || factor <= 0) return false;
+  const invoke = getTauriInvoke();
+  if (!invoke) return false;
+  try {
+    await invoke('plugin:webview|set_webview_zoom', { value: factor });
+    return true;
+  } catch (err) {
+    console.warn('set_webview_zoom failed:', err);
+    return false;
+  }
+}
+
+/**
  * Open a URL in a genuinely new browser tab, never a chrome-less popup.
  *
  * Clicks a hidden anchor carrying rel="noopener" rather than passing a features

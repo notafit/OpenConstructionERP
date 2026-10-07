@@ -32,7 +32,8 @@ Two named sets each have a named caller.
 Like ``procurement/validators.py`` the checks themselves are deliberately
 **dependency-free**: standard library plus :class:`~decimal.Decimal`, no ORM, no
 FastAPI, no session. The rule classes at the end of the file import the core
-validation engine and nothing else.
+validation engine, and the core money renderer they quote amounts with, and
+nothing else.
 
 The clock is data, never ``date.today()``
 -----------------------------------------
@@ -69,6 +70,13 @@ from app.core.validation.engine import (
     ValidationRule,
     rule_registry,
 )
+
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, so two findings on one screen cannot disagree
+# about what an amount looks like. Only the rule classes below use it; the
+# check functions stay dependency-free. Importing it registers nothing.
+from app.core.validation.rules import _fmt_money
 
 logger = logging.getLogger(__name__)
 
@@ -543,6 +551,28 @@ def _quote_ref(row: dict[str, Any]) -> str:
     return str(row.get("bidder_contact_id") or row.get("bid_id") or "?")
 
 
+def _basis_currency(comparison: dict[str, Any]) -> str:
+    """The currency the comparison normalised every quote into, or empty.
+
+    ``basis_currency`` is nullable, and the sentences below used to write the
+    word ``None`` straight into the message when it was. Empty is rendered as
+    no code at all rather than as a guess.
+    """
+    return str(comparison.get("basis_currency") or "").strip()
+
+
+def _quoted(raw: Any, currency: str) -> str:
+    """Render a comparison amount for a sentence, tolerating what it holds.
+
+    The comparison serialises money as a Decimal *string*, and leaves it
+    ``None`` where a quote states none. The renderer is therefore reached
+    through a parse: handing a string to a format spec raises, and a rule that
+    raises turns the warning it was trying to show into a failed request.
+    """
+    amount = parse_money(raw)
+    return "an unstated amount" if amount is None else _fmt_money(amount, currency)
+
+
 class RFQScopeLinesMeasurable(ValidationRule):
     """Every scope line must carry a unit and a quantity somebody can price."""
 
@@ -737,13 +767,15 @@ class RFQQuoteLinesMatchTotal(ValidationRule):
         ]
         if not mismatched:
             return [_result(self, True, "Every quote's lines add up to the amount offered.")]
+        currency = _basis_currency(comparison)
         return [
             _result(
                 self,
                 False,
                 (
-                    f"Quote from {_quote_ref(row)} offers {row.get('headline_amount')} but its lines add up to "
-                    f"{row.get('line_total')}, so the ranking and the detail behind it disagree."
+                    f"Quote from {_quote_ref(row)} offers {_quoted(row.get('headline_amount'), currency)} "
+                    f"but its lines add up to {_quoted(row.get('line_total'), currency)}, "
+                    "so the ranking and the detail behind it disagree."
                 ),
                 element_ref=_quote_ref(row),
                 suggestion="Ask the supplier which number stands, and correct the other before ranking the field.",
@@ -815,15 +847,16 @@ class RFQAwardFollowsRanking(ValidationRule):
         rows = {str(row.get("bid_id")): row for row in _comparison_quotes(comparison)}
         chosen = rows.get(candidate, {})
         best = rows.get(recommended, {})
-        currency = comparison.get("basis_currency")
+        currency = _basis_currency(comparison)
         return [
             _result(
                 self,
                 False,
                 (
-                    f"The award goes to {_quote_ref(chosen)} at {chosen.get('normalised_amount')} {currency}, "
+                    f"The award goes to {_quote_ref(chosen)} at "
+                    f"{_quoted(chosen.get('normalised_amount'), currency)}, "
                     f"while the comparison ranks {_quote_ref(best)} first at "
-                    f"{best.get('normalised_amount')} {currency}."
+                    f"{_quoted(best.get('normalised_amount'), currency)}."
                 ),
                 element_ref=_quote_ref(chosen),
                 suggestion="Record why this quote was preferred; the award keeps the ranked table it departed from.",

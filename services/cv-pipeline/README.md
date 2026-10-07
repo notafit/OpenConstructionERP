@@ -20,7 +20,8 @@ detector returns many boxes, most of them nearly right, and checking them costs
 the estimator more than counting by hand would have. Shipping that would break
 the rule that a proposal has to be cheaper to verify than to redo. Running it
 as a separate service also breaks the lightweight deployment promise, since the
-core is meant to run on a 2 GB VPS with PostgreSQL as the only hard dependency.
+core is meant to run on a 3 GB dedicated server with PostgreSQL as the only
+hard dependency.
 
 So this is a deliberate hold rather than an oversight. The match-elements
 module describes raster symbol detection as a roadmap item, and that is

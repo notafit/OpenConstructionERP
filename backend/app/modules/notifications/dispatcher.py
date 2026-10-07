@@ -99,7 +99,8 @@ async def close_http_client() -> None:
 async def _resolve_user_email(user_id: str) -> tuple[str | None, str | None]:
     """Look up the user's email + display name.  Returns ``(None, None)``
     when the user has been hard-deleted between the dispatch decision
-    and the actual send.
+    and the actual send, or is deactivated or erased: those keep their
+    in-app notifications but get no mail.
     """
     try:
         uid = uuid.UUID(str(user_id))
@@ -111,6 +112,9 @@ async def _resolve_user_email(user_id: str) -> tuple[str | None, str | None]:
 
             user = await session.get(User, uid)
             if user is None:
+                return None, None
+            if not user.is_active or user.deleted_at is not None:
+                logger.debug("dispatcher: user=%s is deactivated, email skipped", user_id)
                 return None, None
             return user.email, user.full_name
     except Exception:  # noqa: BLE001
@@ -385,7 +389,7 @@ def register_dispatchers() -> None:
     for event_name, handler in handlers_to_register:
         if handler in event_bus._handlers.get(event_name, []):
             continue
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info("Notifications dispatchers wired (email/webhook/ws)")
 
 

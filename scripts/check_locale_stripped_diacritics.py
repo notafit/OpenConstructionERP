@@ -282,7 +282,14 @@ def _untracked_locales() -> set[str]:
     """
     try:
         done = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "--", str(LOCALES_DIR)],
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--",
+                str(LOCALES_DIR),
+            ],
             cwd=REPO_ROOT,
             capture_output=True,
             encoding="utf-8",

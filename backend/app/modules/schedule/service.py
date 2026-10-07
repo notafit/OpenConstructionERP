@@ -13,18 +13,22 @@ Stateless service layer. Handles:
 - Event publishing for inter-module communication
 """
 
+import asyncio
 import logging
 import math
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from typing import Any, Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
-from app.core.cpm import readable_exception_dates, readable_work_days
-from app.core.events import event_bus
+from app.core.calendar import _holidays_cn
+from app.core.cpm import normalise_exception_date, readable_exception_dates, readable_work_days
+from app.core.events import event_bus, publish_after_commit
 from app.core.json_merge import merge_metadata
 
 _logger_ev = __import__("logging").getLogger(__name__ + ".events")
@@ -35,6 +39,25 @@ async def _safe_publish(name: str, data: dict, source_module: str = "") -> None:
         event_bus.publish_detached(name, data, source_module=source_module)
     except Exception:
         _logger_ev.debug("Event publish skipped: %s", name)
+
+
+def coded_http_error(status_code: int, code: str, message: str, **params: object) -> HTTPException:
+    """An HTTP error the screen can translate.
+
+    The detail is ``{"error": code, "message": message, **params}``: the client
+    looks the code up in its own language and fills in ``params``, while API
+    clients keep the English ``message``.
+
+    Args:
+        status_code: HTTP status.
+        code: Stable machine-readable code, e.g. ``schedule_has_activities``.
+        message: English sentence for API clients and logs.
+        **params: Values the translated text needs (counts, dates).
+
+    Returns:
+        The exception to raise.
+    """
+    return HTTPException(status_code=status_code, detail={"error": code, "message": message, **params})
 
 
 def _normalize_deps(deps: list | None) -> list[dict]:
@@ -56,6 +79,8 @@ def _normalize_deps(deps: list | None) -> list[dict]:
     return result
 
 
+from app.modules.schedule.boq_plan import PlanFit
+from app.modules.schedule.milestone_events import announce_if_milestone_reached
 from app.modules.schedule.models import Activity, Schedule, ScheduleRelationship, WorkOrder
 from app.modules.schedule.ordering import activity_order_terms
 from app.modules.schedule.repository import (
@@ -78,12 +103,21 @@ from app.modules.schedule.schemas import (
     WorkOrderCreate,
     WorkOrderUpdate,
 )
+from app.modules.schedule.wbs_numbering import (
+    order_with_block_under,
+    sort_order_changes,
+    subtree_ids,
+    suggest_code,
+)
 
 # PERT distribution factors (from DDC_Toolkit reference)
 _PERT_OPTIMISTIC = 0.75
 _PERT_PESSIMISTIC = 1.60
 
 logger = logging.getLogger(__name__)
+
+# Placeholder sort order for a row being placed; any value past the real ones.
+_INT32_LAST = 2**31 - 1
 
 
 def _str_to_float(value: str | None) -> float:
@@ -111,7 +145,36 @@ _FALLBACK_PRODUCTION_RATES: dict[str, float] = {
     "pcs": 1.0,
     "stk": 1.0,
     "t": 8.0,
+    # Quintal (100 kg), as Italian bills measure steel and lime.
+    "q": 2.0,
 }
+
+# People working one task together, by kind of unit: a gang of four on a
+# concrete pour, three on plaster or flooring, two on linear work and pieces.
+# Not to be confused with the crews a section gets side by side
+# (``boq_plan.MAX_CREWS``): a gang of four on one pour is still one crew.
+_FALLBACK_GANG_SIZE: dict[str, int] = {
+    "m3": 4,
+    "m2": 3,
+    "m": 2,
+    "kg": 4,
+    "t": 4,
+    "q": 4,
+    "pcs": 2,
+    "stk": 2,
+    "lsum": 1,
+}
+_FALLBACK_DEFAULT_GANG = 2
+
+# A duration guessed from the unit table may claim at most this many times the
+# position's share of the bill's money in the bill's guessed hours. The table
+# reads 6,252 m2 of scaffold hire (1,250 m2 for five months) as 5,000 hours of
+# work for a position worth 4 % of the bill; the price says otherwise.
+_FALLBACK_PRICE_SHARE_CAP = 3.0
+
+# The most workers per position the generator assumes on its own when a bill
+# gives hours but no crew. A person may ask for any number in the same range.
+MAX_ASSUMED_WORKERS = 20
 
 # Lump-sum positions get a flat labor-hour allowance regardless of quantity.
 _FALLBACK_LUMP_SUM_HOURS = 8.0
@@ -141,13 +204,52 @@ _UNIT_ALIASES: dict[str, str] = {
     "lump sum": "lsum",
     "psch": "lsum",
     "pauschal": "lsum",
+    # Italian and other bills of quantities.
+    "mq": "m2",
+    "m.q.": "m2",
+    "mc": "m3",
+    "m.c.": "m3",
+    "ml": "m",
+    "m.l.": "m",
+    "cad": "pcs",
+    "cad.": "pcs",
+    "nr": "pcs",
+    "nr.": "pcs",
+    "n": "pcs",
+    "n.": "pcs",
+    "no": "pcs",
+    "pz": "pcs",
+    "q.li": "q",
+    "ql": "q",
 }
 
 
 def _normalize_unit(unit: str | None) -> str:
-    """Normalize a BOQ unit string to a production-rate key."""
+    """Normalize a BOQ unit string to a production-rate key.
+
+    The table above first, on the unit as written; then the bill's own
+    lump-sum test, which knows "a corpo", "kpl", "forfait" and the rest.
+    """
     u = (unit or "").strip().lower()
-    return _UNIT_ALIASES.get(u, u)
+    if u in _UNIT_ALIASES:
+        return _UNIT_ALIASES[u]
+    if u in _FALLBACK_PRODUCTION_RATES:
+        return u
+    try:
+        from app.modules.boq.units import is_lump_sum_unit
+    except ImportError:  # the bill module is a plugin like any other
+        return u
+    return "lsum" if is_lump_sum_unit(u) else u
+
+
+def fallback_gang_size(unit: str | None) -> int:
+    """People working one task together, by the kind of unit it is measured in."""
+    return _FALLBACK_GANG_SIZE.get(_normalize_unit(unit), _FALLBACK_DEFAULT_GANG)
+
+
+def fallback_production_rate(unit: str | None) -> float:
+    """Labour-hours per unit the fallback table assumes."""
+    return _FALLBACK_PRODUCTION_RATES.get(_normalize_unit(unit), _FALLBACK_DEFAULT_RATE)
 
 
 def fallback_labor_hours(unit: str | None, quantity: float) -> float:
@@ -174,6 +276,7 @@ def estimate_fallback_duration_days(
     unit: str | None,
     quantity: float,
     hours_per_day: float = 8.0,
+    gang_size: int | None = None,
 ) -> int:
     """Derive an activity duration from unit-based production rates.
 
@@ -184,14 +287,18 @@ def estimate_fallback_duration_days(
     Args:
         unit: BOQ position unit (normalized internally).
         quantity: Position quantity (callers guard quantity > 0).
-        hours_per_day: Crew hours per working day (regional calendar).
+        hours_per_day: Hours one person works per working day (regional calendar).
+        gang_size: People on the task; by default :func:`fallback_gang_size`.
 
     Returns:
-        ``ceil(total_hours / hours_per_day)`` with a minimum of 1 day.
+        Working days, ``ceil(total_hours / (gang_size * hours_per_day))``,
+        at least 1. 850 m3 at 4 h/m3 is 3,400 hours; a gang of four at 8 hours
+        a day does it in 107 days.
     """
     total_hours = fallback_labor_hours(unit, quantity)
     hpd = hours_per_day if hours_per_day > 0 else 8.0
-    return max(1, math.ceil(total_hours / hpd))
+    gang = gang_size if gang_size and gang_size > 0 else fallback_gang_size(unit)
+    return max(1, math.ceil(total_hours / (gang * hpd)))
 
 
 def _meta_number(meta: dict, key: str) -> float:
@@ -200,6 +307,57 @@ def _meta_number(meta: dict, key: str) -> float:
         return float(meta.get(key, 0) or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# Hour spellings already used by BOQ/assembly resources, cost translations
+# ("Std."), and the GESN labour-unit reader. No day/week conversion: a time
+# allowance in another dimension is not an hourly productivity norm.
+_RESOURCE_HOUR_UNITS = frozenset(
+    {
+        "h",
+        "hr",
+        "hrs",
+        "hour",
+        "hours",
+        "std",
+        "std.",
+        "stunde",
+        "stunden",
+        "person-hour",
+        "person-hours",
+        "man-hour",
+        "man-hours",
+        "чел.-ч",
+        "чел-ч",
+        "чел.ч",
+        "человеко-час",
+        "chel.-ch",
+        "chel-ch",
+        "ч",
+        "hod",
+        "jam",
+        "ora",
+        "uur",
+        "시간",
+        "時間",
+        "godz",
+        "tim",
+        "ชั่วโมง",
+        "saat",
+        "giờ",
+    }
+)
+# Preserve the pre-existing untyped/plant path for explicit hrs/hours labels.
+# Do not start adding equipment "hr" to labour: demo buildups carry both, and
+# summing them would change every such norm. Substring matches like hours/m2
+# and hours-allowance, however, are not quantities measured in hours.
+_LEGACY_RESOURCE_HOUR_UNITS = frozenset({"hrs", "hours", "person-hours", "man-hours", "machine-hours", "machine-hrs"})
+
+
+def _resource_is_hourly(resource: dict) -> bool:
+    unit = str(resource.get("unit") or "").strip().lower()
+    kind = str(resource.get("type") or "").strip().lower()
+    return unit in _LEGACY_RESOURCE_HOUR_UNITS or (kind in ("labor", "operator") and unit in _RESOURCE_HOUR_UNITS)
 
 
 def _calc_duration_from_resources(
@@ -212,13 +370,14 @@ def _calc_duration_from_resources(
     *,
     hours_per_day: float,
     work_days_per_week: int,
+    assumed_workers: int = 1,
 ) -> tuple[int, str]:
     """Calculate the calendar-day duration for a BOQ-generated activity.
 
     Priority:
         1. Explicit ``labor_hours`` (+ ``workers_per_unit``) in position
            metadata - the primary, data-driven path.
-        2. Sum of labor-type resources stored in position metadata.
+        2. Sum of hourly labor resources stored in position metadata.
         3. Unit-based fallback production rates when the position has a
            nonzero quantity but no labor metadata at all. Lump-sum units
            are the exception: their quantity carries no production-rate
@@ -233,9 +392,14 @@ def _calc_duration_from_resources(
         unit: Position unit (for the fallback production-rate table).
         total_cost: Position total cost.
         grand_total: Grand total across all sections (cost-proportional path).
-        total_days: Total project duration cap in calendar days.
+        total_days: The project window in calendar days. Only the
+            cost-proportional path uses it, as the scale its share is taken
+            of. The other paths are not cut to it: a position longer than the
+            window keeps its length, so fitting the plan sees the overrun.
         hours_per_day: Crew hours per working day (regional calendar).
         work_days_per_week: Working days per week (regional calendar).
+        assumed_workers: Workers on the position when its metadata names no
+            ``workers_per_unit``; a count of labour rows above it wins.
 
     Returns:
         ``(duration_days, source)`` where ``source`` is one of
@@ -249,33 +413,38 @@ def _calc_duration_from_resources(
 
     if labor_hours > 0 and quantity > 0:
         total_hours = quantity * labor_hours
-        crew_hours_per_day = max(workers, 1) * hours_per_day
+        crew = max(workers, 1) if workers > 0 else max(assumed_workers, 1)
+        crew_hours_per_day = crew * hours_per_day
         working_days = total_hours / crew_hours_per_day
         # Add 10% for mobilization / demobilization
         cal_days = working_days * 1.1
         # Convert working days -> calendar days
         cal_days = cal_days * 7 / work_days_per_week
-        return max(1, min(int(round(cal_days)), total_days)), "labor_hours"
+        return max(1, int(round(cal_days))), "labor_hours"
 
     # ── Try 2: sum labor-type resources stored in metadata ──────────────
-    resources = pos_meta.get("resources", [])
+    # The bill tolerates resource rows that are not mappings (and a resources
+    # value that is not a list), so they are skipped here rather than crashing
+    # the whole generation.
+    raw_resources = pos_meta.get("resources", []) if isinstance(pos_meta, dict) else []
+    resources = [r for r in raw_resources if isinstance(r, dict)] if isinstance(raw_resources, list) else []
     if resources and quantity > 0:
         labor_hrs_per_unit = 0.0
+        labor_rows = 0
         for res in resources:
-            res_type = (res.get("type") or "").lower()
-            res_unit = (res.get("unit") or "").lower()
-            if res_type in ("labor", "operator") or "hrs" in res_unit or "hours" in res_unit:
-                labor_hrs_per_unit += _meta_number(res, "quantity")
+            if not _resource_is_hourly(res):
+                continue
+            res_type = str(res.get("type") or "").strip().lower()
+            if res_type in ("labor", "operator"):
+                labor_rows += 1
+            labor_hrs_per_unit += _meta_number(res, "quantity")
         if labor_hrs_per_unit > 0:
             total_hours = quantity * labor_hrs_per_unit
-            crew_size = max(
-                sum(1 for r in resources if (r.get("type") or "").lower() in ("labor", "operator")),
-                1,
-            )
+            crew_size = max(labor_rows, assumed_workers, 1)
             crew_hours_per_day = crew_size * hours_per_day
             working_days = total_hours / crew_hours_per_day
             cal_days = working_days * 1.1 * 7 / work_days_per_week
-            return max(1, min(int(round(cal_days)), total_days)), "resource_sum"
+            return max(1, int(round(cal_days))), "resource_sum"
 
     # ── Try 3: unit-based fallback production rates ──────────────────────
     # No labor metadata at all but a real quantity - estimate from the
@@ -289,7 +458,7 @@ def _calc_duration_from_resources(
         lump_sum_with_cost_data = _normalize_unit(unit) == "lsum" and total_cost > 0 and grand_total > 0
         if not lump_sum_with_cost_data:
             days = estimate_fallback_duration_days(unit, quantity, hours_per_day)
-            return max(1, min(days, total_days)), "estimated_fallback"
+            return max(1, days), "estimated_fallback"
 
     # ── Try 4: cost-proportional fallback ────────────────────────────────
     if total_cost > 0 and grand_total > 0:
@@ -301,8 +470,8 @@ def _calc_duration_from_resources(
 
 # ── Regional work calendar configuration ─────────────────────────────────
 # Each entry defines hours_per_day, work_days (weekday indices) and label.
-# There are no holidays here and never have been: compute_duration counts
-# every non-weekend day as a working day, for every region in this table.
+# An entry may carry a ``holidays`` callable (year -> set[date]).
+# compute_duration skips those dates in addition to weekends.
 # weekday(): Monday=0, Tuesday=1, ... Saturday=5, Sunday=6
 #
 # WHAT THIS TABLE IS. The week the planner schedules against, which is not the
@@ -440,14 +609,15 @@ WORK_CALENDARS: dict[str, dict] = {
     # been invented for it. core.calendar._WORKING_WEEK carries Monday-Friday for
     # CN, also uncited, so the two are not evidence for one another.
     #
-    # China's holidays are modelled, but not here: see core.calendar._holidays_cn,
-    # which cites the State Council national holiday measures. That function also
-    # documents the annual arrangement that turns particular weekends into working
-    # days, which neither this table nor the seeded calendar can express.
+    # China's holidays come from core.calendar._holidays_cn, which cites the
+    # State Council national holiday measures. That function also documents the
+    # annual arrangement that turns particular weekends into working days, which
+    # neither this table nor the seeded calendar can express.
     "CHINA": {
         "hours_per_day": 8,
         "work_days": {0, 1, 2, 3, 4, 5},  # Mon-Sat (common in construction)
         "label": "China (Mon-Sat, 8h)",
+        "holidays": _holidays_cn,  # year -> set[date]; Spring Festival et al.
     },
     # 11. India - HI_MUMBAI
     #
@@ -549,7 +719,8 @@ _CALENDAR_BY_PICKER_REGION: dict[str, str] = {
     # "MIDDLE EAST" label below has always answered. The UAE is the one GCC
     # state that does not work it, and it stays reachable by "AE", "AE_DUBAI"
     # and "United Arab Emirates"; a UAE project stored under a region naming the
-    # group rather than the country still gets Sunday-Thursday.
+    # group rather than the country gets Sunday-Thursday from this table, unless
+    # its country column says AE, which calendar_region_for prefers to a group.
     "GULFSTATES": "GULF",
     "MIDDLEEAST": "GULF",
     # Not a week change: RU is Monday-Friday and eight hours, exactly DEFAULT.
@@ -627,7 +798,65 @@ def get_work_calendar(region: str | None = None) -> dict:
     return WORK_CALENDARS["DEFAULT"]
 
 
-def compute_duration(start_date: str, end_date: str, region: str | None = None) -> int:
+def calendar_region_for(region: str | None, country_code: str | None) -> str | None:
+    """The string a project's working week is resolved from: its region, or its country.
+
+    A project carries two statements of where it is. ``region`` is free text
+    (a city, a picker token, a group label) and ``country_code`` is ISO 3166-1
+    alpha-2, filled by the creator, the address, or the country pack active at
+    creation. The week used to be read off ``region`` alone, so a project
+    created under the Saudi pack with "Riyadh" or nothing in its region was
+    planned Monday to Friday while its country column said SA, and every date
+    landed on the wrong side of a Sunday-Thursday week.
+
+    The country is decided the way ``_build_rule_sets`` in the BOQ router
+    decides it, so the week and the rule sets cannot name two countries for
+    one project. A region that names one country wins, whether or not that
+    country has a week of its own: "QA" and "DE_BERLIN" keep their weeks, and
+    "PL_WARSAW" keeps the standard week even when the country column, filled
+    from a Saudi or Indian pack, says otherwise. Only a region that names no
+    country ("Riyadh", nothing at all) or a group of countries ("GulfStates",
+    "DACH", "Middle East") gives way to the country column, which is then the
+    more precise statement: a UAE project filed under the Gulf group works the
+    UAE week.
+
+    Args:
+        region: ``project.region`` as stored.
+        country_code: ``project.country_code`` as stored.
+
+    Returns:
+        The string to hand :func:`get_work_calendar`: the region as stored, or
+        the ISO code of the country it names when only the code reaches that
+        country's week, or the country column.
+    """
+    country = (country_code or "").strip().upper()
+    if len(country) != 2 or not country.isalpha():
+        return region
+    from app.core.classification_registry import is_macro_region, normalise_region
+
+    if is_macro_region(region):
+        return country
+    own = get_work_calendar(region)
+    if own is not WORK_CALENDARS["DEFAULT"]:
+        return region
+    named = normalise_region(region)
+    if named:
+        # The region names a country. Its own spelling is kept where it
+        # already reaches that country's week, which is also what the
+        # /work-calendar badge echoes back; a spelling only the registry reads
+        # ("United_States") is handed on as the code it names.
+        return region if get_work_calendar(named) is own else named
+    return country
+
+
+def compute_duration(
+    start_date: str,
+    end_date: str,
+    region: str | None = None,
+    *,
+    work_weekdays: frozenset[int] | None = None,
+    extra_holidays: frozenset[date] | None = None,
+) -> int:
     """Calculate working days between two ISO date strings, inclusive.
 
     ``region`` selects the working week from :data:`WORK_CALENDARS` through
@@ -639,8 +868,15 @@ def compute_duration(start_date: str, end_date: str, region: str | None = None) 
     Monday-to-Friday week and is the right answer only when there is no project
     to ask, which is why no caller in the product passes it any more.
 
-    Holidays are not counted here and never have been: every day of the working
-    week between the two dates is a working day.
+    When ``work_weekdays`` or ``extra_holidays`` are supplied (typically from an
+    activity-level custom calendar resolved by the progress service), they
+    override the region-based working week and supplement the region holidays
+    respectively.
+
+    When the resolved calendar carries a ``holidays`` callable (year ->
+    set[date]), those dates are skipped even if they fall on a working weekday.
+    Currently only CHINA carries one (Spring Festival, Qingming, Dragon Boat,
+    Mid-Autumn and the fixed Gregorian holidays).
 
     Args:
         start_date: ISO date string (e.g. "2026-04-01").
@@ -649,6 +885,8 @@ def compute_duration(start_date: str, end_date: str, region: str | None = None) 
             :func:`get_work_calendar` accepts: a calendar key ("GULF"), an ISO
             country code ("QA"), a catalogue region id ("DE_BERLIN"), a picker
             token ("GulfStates") or a label ("Saudi Arabia").
+        work_weekdays: Override weekday set (0=Mon..6=Sun) from a custom calendar.
+        extra_holidays: Additional holiday dates from a custom calendar.
 
     Returns:
         Number of working days between start and end, inclusive. 0 when either
@@ -664,15 +902,53 @@ def compute_duration(start_date: str, end_date: str, region: str | None = None) 
         return 0
 
     cal = get_work_calendar(region)
-    work_days_set = cal["work_days"]
+    work_days_set = work_weekdays if work_weekdays is not None else cal["work_days"]
+
+    # Collect holiday dates when the calendar provides a holidays callable.
+    holiday_func = cal.get("holidays")
+    holiday_dates: set[date] = set()
+    if holiday_func is not None:
+        for y in range(start.year, end.year + 1):
+            holiday_dates.update(holiday_func(y))
+    if extra_holidays:
+        holiday_dates.update(extra_holidays)
 
     working_days = 0
     current = start
     while current <= end:
-        if current.weekday() in work_days_set:
+        if current.weekday() in work_days_set and current not in holiday_dates:
             working_days += 1
         current += timedelta(days=1)
 
+    return working_days
+
+
+def _compute_duration_from_cal(start_date: str, end_date: str, cal_data: dict) -> int:
+    """Working days between two dates using a resolved calendar dict.
+
+    ``cal_data`` is the ``{"work_days": [int, ...], "exceptions": [str, ...]}``
+    shape returned by ``_resolve_activity_calendars``.
+    """
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except (ValueError, TypeError):
+        return 0
+    if end < start:
+        return 0
+    work_days_set = set(cal_data.get("work_days", [0, 1, 2, 3, 4]))
+    exception_dates = set()
+    for d in cal_data.get("exceptions", []):
+        try:
+            exception_dates.add(date.fromisoformat(d) if isinstance(d, str) else d)
+        except (ValueError, TypeError):
+            pass
+    working_days = 0
+    current = start
+    while current <= end:
+        if current.weekday() in work_days_set and current not in exception_dates:
+            working_days += 1
+        current += timedelta(days=1)
     return working_days
 
 
@@ -701,6 +977,39 @@ def resolve_calendar(schedule: Schedule) -> dict:
         exceptions = readable_exception_dates(cal.get("exceptions"), source="schedule metadata calendar exceptions")
         return {"work_days": work_days or list(default_work_days), "exceptions": exceptions}
     return {"work_days": list(default_work_days), "exceptions": []}
+
+
+def inclusive_end_from_cpm(early_start: int, early_finish: int, calendar: dict, project_start: date) -> str:
+    """Turn a CPM finish offset into the inclusive end date an activity shows.
+
+    The engine's ``early_finish`` is the first day an FS successor may start,
+    that is the day after the work. An activity of N working days ends on its
+    Nth working day, so the end date is the last working day before that
+    offset on the activity's own calendar. Writing ``early_finish`` itself made
+    every linked activity end one working day late and put its successor's
+    start on the predecessor's end day. A zero-duration activity ends where it
+    starts.
+
+    Args:
+        early_start: CPM early start, a day offset from ``project_start``.
+        early_finish: CPM early finish, a day offset from ``project_start``.
+        calendar: ``{"work_days": [...], "exceptions": [...]}``, the calendar
+            the engine measured this activity on.
+        project_start: The CPM origin date.
+
+    Returns:
+        The inclusive end date as an ISO string.
+    """
+    start = project_start + timedelta(days=int(early_start))
+    finish = project_start + timedelta(days=int(early_finish))
+    if finish <= start:
+        return start.isoformat()
+    work_days = set(calendar.get("work_days") or [0, 1, 2, 3, 4])
+    exceptions = {d for d in (normalise_exception_date(e) for e in calendar.get("exceptions") or []) if d}
+    current = finish - timedelta(days=1)
+    while current > start and (current.weekday() not in work_days or current in exceptions):
+        current -= timedelta(days=1)
+    return current.isoformat()
 
 
 def _effective_activity_status(
@@ -752,6 +1061,104 @@ def _effective_activity_status(
     return stored_status
 
 
+# What a generated task's note says about its duration, by where it came from.
+_DURATION_NOTE: dict[str, str] = {
+    "labor_hours": "from_labor_norm",
+    "resource_sum": "from_labor_norm",
+    "estimated_fallback": "estimated_from_unit",
+    "cost_proportional": "cost_share",
+    "default_minimum": "default_duration",
+    "spans_works": "spans_works",
+}
+
+
+def _parse_day(value: object) -> date | None:
+    """Read the day off an ISO date or timestamp string; ``None`` when there is none."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+# The English of the names and descriptions a generation writes, as in
+# backend/locales/en.json under schedule.generated. Used when the catalogue has
+# not been loaded (a script, a worker started without the app), so a missing
+# catalogue writes English rather than the raw key onto the plan.
+_GENERATED_ENGLISH: dict[str, str] = {
+    "position_label": "Position {ordinal}",
+    "section_label": "Section {ordinal}",
+    "task_description": "Auto-generated from BOQ position {ordinal} ({quantity} {unit})",
+    "section_description": "Summary: BOQ section {ordinal}",
+    "start_milestone": "Project Start",
+    "start_milestone_description": "Project kick-off milestone",
+    "completion_milestone": "Project Completion",
+    "completion_milestone_description": "Project completion milestone",
+}
+
+
+def _generated_text(name: str, **params: object) -> str:
+    """A generated name or description in the reader's language (the request locale)."""
+    from app.core.i18n import t
+
+    key = f"schedule.generated.{name}"
+    text = t(key, **params)
+    return _GENERATED_ENGLISH[name].format(**params) if text == key else text
+
+
+def _format_quantity(quantity: float) -> str:
+    """850.0 as "850", 1250.4 as "1250.4": the quantity as the bill shows it."""
+    return f"{quantity:.3f}".rstrip("0").rstrip(".")
+
+
+# The generated milestones a regenerated plan has again, by WBS code.
+_GENERATED_MILESTONE_CODES = frozenset({"MS-001", "MS-999"})
+
+
+def _relink_key(activity: Any) -> tuple | None:
+    """What makes an activity "the same one" in a regenerated plan, if anything."""
+    meta = activity.metadata_ if isinstance(activity.metadata_, dict) else {}
+    if (
+        activity.activity_type == "milestone"
+        and meta.get("source") == "boq_generation"
+        and activity.wbs_code in _GENERATED_MILESTONE_CODES
+    ):
+        return ("milestone", activity.wbs_code)
+    positions = activity.boq_position_ids or []
+    if positions:
+        return (activity.activity_type, tuple(sorted(str(p) for p in positions)))
+    return None
+
+
+@dataclass
+class _BoqGenerationPlan:
+    """Everything a generation from a bill writes, worked out before writing."""
+
+    schedule_meta: dict[str, Any]
+    boq_name: str
+    boq_estimate_type: str | None
+    schedule_start: date
+    planned_end: str
+    requested_end: str | None
+    fit: PlanFit
+    activities: list[Activity]
+    relationships: list[ScheduleRelationship]
+    created: list[dict]
+    positions_scheduled: int
+    workers_per_position: int
+    workers_assumed: bool
+    # The window the workers were fitted to: the end date asked for, or the
+    # default one when none was (``{"days", "end", "default"}``).
+    fitted_window: dict[str, Any]
+    positions_without_workers: int
+    lump_sum_positions: int
+    rows_skipped: int
+    notes: list[dict[str, Any]]
+    note_counts: dict[str, int]
+    warnings: list[dict]
+
+
 class ScheduleService:
     """Business logic for Schedule, Activity, and WorkOrder operations."""
 
@@ -782,7 +1189,9 @@ class ScheduleService:
                 project to ask, which nothing the product creates is.
 
         Returns:
-            ``project.region`` as stored, or ``None`` when the project is gone
+            ``project.region`` as stored, or the project's country code when
+            the region names no calendar of its own (see
+            :func:`calendar_region_for`), or ``None`` when the project is gone
             or was never given, which :func:`get_work_calendar` reads as the
             DEFAULT Monday-to-Friday week.
         """
@@ -791,7 +1200,9 @@ class ScheduleService:
         from app.modules.projects.repository import ProjectRepository
 
         project = await ProjectRepository(self.session).get_by_id(project_id)
-        return project.region if project else None
+        if project is None:
+            return None
+        return calendar_region_for(project.region, getattr(project, "country_code", None))
 
     # ── Schedule operations ────────────────────────────────────────────────
 
@@ -843,11 +1254,21 @@ class ScheduleService:
         *,
         offset: int = 0,
         limit: int = 50,
+        archive_state: Literal["current", "archived", "all"] = "current",
     ) -> tuple[list[Schedule], int]:
         """List schedules for a given project with pagination."""
-        return await self.schedule_repo.list_for_project(project_id, offset=offset, limit=limit)
+        return await self.schedule_repo.list_for_project(
+            project_id, offset=offset, limit=limit, archive_state=archive_state
+        )
 
-    async def update_schedule(self, schedule_id: uuid.UUID, data: ScheduleUpdate) -> Schedule:
+    async def update_schedule(
+        self,
+        schedule_id: uuid.UUID,
+        data: ScheduleUpdate,
+        *,
+        actor_payload: dict[str, Any] | None = None,
+        restore: bool = False,
+    ) -> Schedule:
         """Update schedule metadata fields.
 
         Args:
@@ -860,9 +1281,35 @@ class ScheduleService:
         Raises:
             HTTPException 404 if schedule not found.
         """
-        schedule = await self.get_schedule(schedule_id)
+        schedule = await self.schedule_repo.get_for_update(schedule_id)
+        if schedule is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
 
         fields = data.model_dump(exclude_unset=True)
+        metadata = dict(schedule.metadata_ or {})
+        archive = metadata.get("_schedule_archive")
+        archive = archive if isinstance(archive, dict) else {}
+        prior = archive.get("previous_status")
+        valid_prior = prior in ("draft", "active", "completed", "frozen")
+        restore_status = prior if valid_prior else "draft"
+        target_status = fields.get("status")
+        if restore or target_status == "archived" or (schedule.status == "archived" and "status" in fields):
+            from app.dependencies import RequirePermission
+
+            await RequirePermission("schedule.delete")(actor_payload or {})
+        if restore:
+            # A repeated restore must not reset a subsequently edited status.
+            if schedule.status != "archived":
+                return schedule
+            target_status = restore_status
+            fields["status"] = target_status
+        if schedule.status == "archived" and target_status not in (None, "archived", restore_status):
+            raise coded_http_error(
+                409,
+                "schedule_restore_status_mismatch",
+                "Restore the schedule to its previous status first.",
+                restore_status=restore_status,
+            )
         # Map 'metadata' key to the model's 'metadata_' column. Merge the
         # incoming dict over the stored value so a partial PATCH never drops
         # keys the caller did not resend (json_overwrite data-loss guard).
@@ -871,8 +1318,26 @@ class ScheduleService:
             fields["metadata_"] = (
                 merge_metadata(getattr(schedule, "metadata_", None), _incoming)
                 if isinstance(_incoming, dict)
-                else _incoming
+                else metadata
             )
+
+        if target_status == "archived" and schedule.status != "archived":
+            metadata = dict(fields.get("metadata_", metadata))
+            metadata["_schedule_archive"] = {
+                "previous_status": schedule.status,
+                "archived_at": datetime.now(UTC).isoformat(),
+                "archived_by": (actor_payload or {}).get("sub"),
+            }
+            fields["metadata_"] = metadata
+        elif schedule.status == "archived" and target_status not in (None, "archived"):
+            metadata = dict(fields.get("metadata_", metadata))
+            metadata["_schedule_archive"] = {
+                **archive,
+                "previous_status": restore_status,
+                "restored_at": datetime.now(UTC).isoformat(),
+                "restore_used_fallback": not valid_prior,
+            }
+            fields["metadata_"] = metadata
 
         # When this update advances the data (status) date, freeze an EVM
         # snapshot at the new date so the cost / schedule performance trend
@@ -883,9 +1348,14 @@ class ScheduleService:
         if fields:
             await self.schedule_repo.update_fields(schedule_id, **fields)
 
-            await _safe_publish(
+            publish_after_commit(
+                self.session,
                 "schedule.schedule.updated",
-                {"schedule_id": str(schedule_id), "fields": list(fields.keys())},
+                {
+                    "schedule_id": str(schedule_id),
+                    "project_id": str(schedule.project_id),
+                    "fields": list(fields.keys()),
+                },
                 source_module="oe_schedule",
             )
 
@@ -901,17 +1371,74 @@ class ScheduleService:
         # Re-fetch to return fresh data
         return await self.get_schedule(schedule_id)
 
-    async def delete_schedule(self, schedule_id: uuid.UUID) -> None:
-        """Delete a schedule and all its activities and work orders.
+    async def delete_impact(self, schedule_id: uuid.UUID) -> dict[str, int]:
+        """Count what deleting a schedule takes with it.
+
+        Payment instalments linked to its activities are counted when the
+        contracts module is installed; they are not deleted, they lose the
+        link and fall back to their contract dates.
+        """
+        await self.get_schedule(schedule_id)
+        activity_count = (await self.activity_repo.list_for_schedule(schedule_id, limit=1))[1]
+        baseline_count = await self.schedule_repo.count_baselines(schedule_id)
+        payment_milestone_count = 0
+        try:
+            from app.modules.contracts.models import ContractMilestone
+        except ImportError:  # contracts is a module like any other and may be absent
+            ContractMilestone = None  # noqa: N806
+        if ContractMilestone is not None:
+            stmt = select(func.count()).where(ContractMilestone.schedule_id == schedule_id)
+            payment_milestone_count = int((await self.session.execute(stmt)).scalar_one())
+        return {
+            "activity_count": activity_count,
+            "baseline_count": baseline_count,
+            "payment_milestone_count": payment_milestone_count,
+        }
+
+    async def delete_schedule(self, schedule_id: uuid.UUID, *, actor_payload: dict[str, Any]) -> None:
+        """Archive through the same guarded path as PATCH; preserve all links."""
+        await self.update_schedule(schedule_id, ScheduleUpdate(status="archived"), actor_payload=actor_payload)
+
+    async def restore_schedule(self, schedule_id: uuid.UUID, *, actor_payload: dict[str, Any]) -> Schedule:
+        """Restore the recorded status, or explicitly draft for legacy archives."""
+        return await self.update_schedule(schedule_id, ScheduleUpdate(), actor_payload=actor_payload, restore=True)
+
+    async def purge_schedule(self, schedule_id: uuid.UUID, *, actor_payload: dict[str, Any]) -> None:
+        """Permanently delete an archived schedule; administrator only.
 
         Raises HTTPException 404 if not found.
         """
-        schedule = await self.get_schedule(schedule_id)
+        from app.dependencies import RequirePermission, RequireRole
+
+        await RequireRole("admin")(actor_payload)
+        await RequirePermission("schedule.purge")(actor_payload)
+        schedule = await self.schedule_repo.get_for_update(schedule_id)
+        if schedule is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        if schedule.status != "archived":
+            raise coded_http_error(409, "schedule_not_archived", "Archive the schedule before permanently deleting it.")
         project_id = str(schedule.project_id)
 
+        # Baselines hold the schedule id without a foreign key, so nothing
+        # cascades to them; without this they outlive the schedule.
+        await self.schedule_repo.delete_baselines(schedule_id)
+        activity_count = (await self.activity_repo.list_for_schedule(schedule_id, limit=1))[1]
         await self.schedule_repo.delete(schedule_id)
 
-        await _safe_publish(
+        # The activities go with the schedule; followers of a cleared schedule
+        # (payment plan forecasts tied to its milestones) refresh on this.
+        publish_after_commit(
+            self.session,
+            "schedule.activities.cleared",
+            {"schedule_id": str(schedule_id), "count": activity_count},
+            source_module="oe_schedule",
+        )
+
+        # After commit, like the activity deletes: a subscriber that reads the
+        # schedule back must not see it still there, nor see an event for a
+        # delete that rolled back.
+        publish_after_commit(
+            self.session,
             "schedule.schedule.deleted",
             {"schedule_id": str(schedule_id), "project_id": project_id},
             source_module="oe_schedule",
@@ -921,7 +1448,7 @@ class ScheduleService:
 
     # ── Activity operations ────────────────────────────────────────────────
 
-    async def create_activity(self, data: ActivityCreate) -> Activity:
+    async def create_activity(self, data: ActivityCreate, actor_id: str | None = None) -> Activity:
         """Add a new activity to a schedule.
 
         Auto-calculates duration_days if start_date and end_date are provided.
@@ -929,6 +1456,8 @@ class ScheduleService:
 
         Args:
             data: Activity creation payload.
+            actor_id: The caller. When given, an assignee must be a contact
+                the caller can see (admins see all).
 
         Returns:
             The newly created activity.
@@ -951,11 +1480,37 @@ class ScheduleService:
         if duration is None:
             duration = 0
 
-        # Determine sort_order
+        outline = await self.activity_repo.list_outline(data.schedule_id)
+        if data.parent_id is not None:
+            self._assert_parent_in_outline(data.parent_id, outline)
+        if data.assignee_id is not None:
+            await self._assert_assignee_exists(data.assignee_id, actor_id)
+
+        # A blank code continues the numbering of the section the activity
+        # goes into, or the top-level numbering; a typed code is kept as typed
+        # but may not repeat one already in use.
+        wbs_code = data.wbs_code or suggest_code(data.parent_id, outline)
+        if wbs_code:
+            self._assert_wbs_code_free(wbs_code, outline)
+
+        # Determine sort_order. Without a section the activity goes last, as
+        # before. Under a section it goes right after the section's last
+        # descendant, so the flat order every list and export reads keeps the
+        # child inside its section instead of at the bottom of the schedule.
+        # The id is minted here so the new row can take its place in that
+        # order before it exists.
+        new_id = uuid.uuid4()
         sort_order = data.sort_order
+        reorder: dict[uuid.UUID, int] = {}
         if sort_order == 0:
-            max_order = await self.activity_repo.get_max_sort_order(data.schedule_id)
-            sort_order = max_order + 1
+            if data.parent_id is not None:
+                planned = [*outline, (new_id, data.parent_id, _INT32_LAST, wbs_code)]
+                changes = sort_order_changes(order_with_block_under(new_id, data.parent_id, planned), planned)
+                sort_order = changes.pop(new_id)
+                reorder = changes
+            else:
+                max_order = await self.activity_repo.get_max_sort_order(data.schedule_id)
+                sort_order = max_order + 1
 
         # Auto-generate activity_code if not provided
         activity_code = data.activity_code
@@ -969,13 +1524,21 @@ class ScheduleService:
             dep["activity_id"] = str(dep["activity_id"])
         resources_data = [res.model_dump() for res in data.resources]
         boq_ids = [str(pid) for pid in data.boq_position_ids]
+        await self._assert_positions_in_project(data.schedule_id, boq_ids)
+        await self._assert_activities_in_schedule(data.schedule_id, [d["activity_id"] for d in dependencies_data])
+
+        # Move the other rows only once every check has passed, so a rejected
+        # create leaves the order of the schedule alone.
+        if reorder:
+            await self.activity_repo.bulk_update_fields([{"id": aid, "sort_order": o} for aid, o in reorder.items()])
 
         activity = Activity(
+            id=new_id,
             schedule_id=data.schedule_id,
             parent_id=data.parent_id,
             name=data.name,
             description=data.description,
-            wbs_code=data.wbs_code,
+            wbs_code=wbs_code,
             start_date=data.start_date,
             end_date=data.end_date,
             duration_days=duration,
@@ -998,6 +1561,7 @@ class ScheduleService:
             remaining_duration=data.remaining_duration,
             budgeted_units=data.budgeted_units,
             installed_units=data.installed_units,
+            assignee_id=data.assignee_id,
         )
         activity = await self.activity_repo.create(activity)
         activity_id = activity.id  # snapshot before update_fields() expires the instance
@@ -1020,13 +1584,114 @@ class ScheduleService:
             {
                 "activity_id": str(activity_id),
                 "schedule_id": str(data.schedule_id),
-                "wbs_code": data.wbs_code,
+                "wbs_code": wbs_code,
             },
             source_module="oe_schedule",
         )
 
         logger.info("Activity added: %s to schedule %s", data.name, data.schedule_id)
         return await self.get_activity(activity_id)
+
+    @staticmethod
+    def _assert_parent_in_outline(
+        parent_id: uuid.UUID,
+        outline: list[tuple[uuid.UUID, uuid.UUID | None, int, str]],
+    ) -> None:
+        """Reject a parent that is not an activity of the same schedule.
+
+        ``parent_id`` has no foreign key, so without this a section of another
+        schedule (or another project) could be named. Answers 404 for a foreign
+        id exactly as for a missing one.
+        """
+        if not any(act_id == parent_id for act_id, _p, _o, _c in outline):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Parent activity not found in this schedule",
+            )
+
+    @staticmethod
+    def _assert_wbs_code_free(
+        wbs_code: str,
+        outline: list[tuple[uuid.UUID, uuid.UUID | None, int, str]],
+        exclude_id: uuid.UUID | None = None,
+    ) -> None:
+        """Reject a WBS code that another activity of the schedule already uses.
+
+        Enforced here and not as a database constraint on purpose: schedules
+        imported or generated before this check can already hold duplicates,
+        and a constraint would fail every one of them. Only a code being
+        written is checked, so those schedules keep working.
+        """
+        code = wbs_code.strip()
+        if not code:
+            return
+        for act_id, _p, _o, other in outline:
+            if act_id != exclude_id and (other or "").strip() == code:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"WBS code '{code}' is already used by another activity in this schedule",
+                )
+
+    async def suggest_wbs_code(self, schedule_id: uuid.UUID, parent_id: uuid.UUID | None) -> str:
+        """Suggest the WBS code for a new activity under ``parent_id``.
+
+        Args:
+            schedule_id: Target schedule.
+            parent_id: The section the activity goes into, or None for the top
+                level.
+
+        Returns:
+            The next code in that section's sequence, or ``""`` when the
+            section has no code of its own to continue.
+
+        Raises:
+            HTTPException 404 if the schedule or the parent is not found.
+        """
+        await self.get_schedule(schedule_id)
+        outline = await self.activity_repo.list_outline(schedule_id)
+        if parent_id is not None:
+            self._assert_parent_in_outline(parent_id, outline)
+        return suggest_code(parent_id, outline)
+
+    async def _assert_assignee_exists(self, assignee_id: uuid.UUID, actor_id: str | None = None) -> None:
+        """Reject an assignee that is not a live contact the caller can see.
+
+        The activity keeps the id without a foreign key (the contacts module is
+        a plugin), so without this a typo or a deleted contact would be stored
+        and render as an empty cell forever, and a contact of another tenant
+        could be named. The rule is the contacts list's own, shared with the
+        task assignee in :mod:`app.modules.contacts.lookup`.
+
+        Raises:
+            HTTPException 404 if the contact does not exist or is not the
+            caller's; 422 if it has been deactivated.
+        """
+        from app.modules.contacts.lookup import assignable_contact
+
+        await assignable_contact(self.session, assignee_id, actor_id)
+
+    async def resolve_assignee_names(self, assignee_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+        """Map contact ids to display names in one query.
+
+        The table shows the name from here rather than looking the id up in
+        the viewer's own contact list, which holds only that viewer's
+        contacts (and only the first page of them), so a colleague's pick
+        would otherwise read as unassigned.
+        """
+        if not assignee_ids:
+            return {}
+        from app.modules.contacts.models import Contact
+
+        rows = await self.session.execute(
+            select(
+                Contact.id, Contact.first_name, Contact.last_name, Contact.company_name, Contact.primary_email
+            ).where(Contact.id.in_(assignee_ids))
+        )
+        names: dict[uuid.UUID, str] = {}
+        for cid, first, last, company, email in rows.all():
+            person = " ".join(p for p in (first, last) if p)
+            names[cid] = person or company or email or ""
+        return names
 
     async def get_activity(self, activity_id: uuid.UUID) -> Activity:
         """Get activity by ID. Raises 404 if not found."""
@@ -1330,12 +1995,20 @@ class ScheduleService:
         )
         return {"edges_created": edges_created, "activities_resynced": activities_resynced}
 
-    async def update_activity(self, activity_id: uuid.UUID, data: ActivityUpdate) -> Activity:
+    async def update_activity(
+        self, activity_id: uuid.UUID, data: ActivityUpdate, actor_id: str | None = None
+    ) -> Activity:
         """Update an activity and recalculate duration if dates changed.
+
+        Moving the activity to another section (``parent_id``, or an explicit
+        null for the top level) also moves it, with its own children, to the
+        end of that section in the flat order, unless ``sort_order`` is sent.
 
         Args:
             activity_id: Target activity identifier.
             data: Partial update payload.
+            actor_id: The caller. When given, a new assignee must be a
+                contact the caller can see (admins see all).
 
         Returns:
             Updated activity.
@@ -1354,6 +2027,34 @@ class ScheduleService:
         current_status = activity.status
 
         fields = data.model_dump(exclude_unset=True)
+
+        # The assignee is checked only when it changes to a new contact, and
+        # the code only when it changes to a new value: clients resend
+        # unchanged fields, and schedules from before the uniqueness check can
+        # hold duplicate codes that must stay editable.
+        if fields.get("assignee_id") is not None and fields["assignee_id"] != activity.assignee_id:
+            await self._assert_assignee_exists(fields["assignee_id"], actor_id)
+        new_code = (fields.get("wbs_code") or "").strip()
+        new_parent = fields.get("parent_id")
+        code_changes = bool(new_code) and new_code != (activity.wbs_code or "").strip()
+        parent_changes = "parent_id" in fields and new_parent != activity.parent_id
+        reorder: dict[uuid.UUID, int] = {}
+        if code_changes or parent_changes:
+            outline = await self.activity_repo.list_outline(schedule_id)
+            if parent_changes and new_parent is not None:
+                self._assert_parent_in_outline(new_parent, outline)
+                if new_parent in subtree_ids(activity_id, outline):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail="An activity cannot be moved under itself or one of its own children",
+                    )
+            if code_changes:
+                self._assert_wbs_code_free(new_code, outline, exclude_id=activity_id)
+            if parent_changes and "sort_order" not in fields:
+                planned = [
+                    (aid, new_parent if aid == activity_id else pid, order, code) for aid, pid, order, code in outline
+                ]
+                reorder = sort_order_changes(order_with_block_under(activity_id, new_parent, planned), planned)
 
         # Convert float values to strings for storage
         if "progress_pct" in fields:
@@ -1386,6 +2087,7 @@ class ScheduleService:
             # the typed-relationship table; the activity-embedded JSON
             # ``dependencies`` field used to bypass it. Both writers must
             # apply the same guard or one path becomes a back door.
+            await self._assert_activities_in_schedule(schedule_id, [d["activity_id"] for d in serialized])
             await self._reject_dependency_cycles(
                 activity_id=activity_id,
                 schedule_id=schedule_id,
@@ -1398,6 +2100,12 @@ class ScheduleService:
 
         if "boq_position_ids" in fields and fields["boq_position_ids"] is not None:
             fields["boq_position_ids"] = [str(pid) for pid in fields["boq_position_ids"]]
+            # Only ids this write adds are checked, so resending a list that
+            # already holds an older link does not fail on it.
+            already = {str(pid) for pid in (activity.boq_position_ids or [])}
+            await self._assert_positions_in_project(
+                schedule_id, [pid for pid in fields["boq_position_ids"] if pid not in already]
+            )
 
         # Map 'metadata' key to the model's 'metadata_' column. Merge the
         # incoming dict over the stored value so a partial PATCH never drops
@@ -1410,16 +2118,23 @@ class ScheduleService:
                 else _incoming
             )
 
-        # Recalculate duration if dates changed, on the project's working week.
-        # A duration persisted on another week (every recompute before the
-        # region was threaded through counted Monday to Friday) is corrected
-        # here, the first time its dates are saved again, and not before.
+        # Recalculate duration if dates changed. Use the activity's own
+        # calendar when assigned, falling back to the project's regional week.
         new_start = fields.get("start_date", activity.start_date)
         new_end = fields.get("end_date", activity.end_date)
         if "start_date" in fields or "end_date" in fields:
             schedule = await self.get_schedule(schedule_id)
-            region = await self.resolve_project_region(schedule.project_id)
-            fields["duration_days"] = compute_duration(new_start, new_end, region)
+            cal_id = getattr(activity, "calendar_id", None)
+            if cal_id:
+                cal_map = await self._resolve_activity_calendars([activity], schedule.project_id)
+                cal_data = cal_map.get(str(activity_id))
+            else:
+                cal_data = None
+            if cal_data:
+                fields["duration_days"] = _compute_duration_from_cal(new_start, new_end, cal_data)
+            else:
+                region = await self.resolve_project_region(schedule.project_id)
+                fields["duration_days"] = compute_duration(new_start, new_end, region)
 
         # Completion guard (mirrors tasks.complete_task): reject the transition
         # to completed while any canonical predecessor is still open. Skipped
@@ -1431,7 +2146,10 @@ class ScheduleService:
         if fields:
             await self.activity_repo.update_fields(activity_id, **fields)
 
-            await _safe_publish(
+            # After the commit: the payment plan recomputes forecasts from the
+            # new dates in its own session, which cannot see them before then.
+            publish_after_commit(
+                self.session,
                 "schedule.activity.updated",
                 {
                     "activity_id": str(activity_id),
@@ -1453,11 +2171,25 @@ class ScheduleService:
             derived = await self._derive_dependencies_json(activity_id)
             await self.activity_repo.update_fields(activity_id, dependencies=derived)
 
-        # Re-fetch to return fresh data
-        return await self.get_activity(activity_id)
+        # Last, because the bulk write expires every loaded instance and the
+        # code above still reads ``activity``.
+        if reorder:
+            await self.activity_repo.bulk_update_fields([{"id": aid, "sort_order": o} for aid, o in reorder.items()])
 
-    async def delete_activity(self, activity_id: uuid.UUID) -> None:
+        # Re-fetch to return fresh data
+        refreshed = await self.get_activity(activity_id)
+        await announce_if_milestone_reached(self.session, refreshed, was_completed=was_completed, actor_id=actor_id)
+        return refreshed
+
+    async def delete_activity(self, activity_id: uuid.UUID, *, cascade: bool = False) -> int:
         """Delete an activity.
+
+        A summary's children move up one level by default. With ``cascade``
+        they go too, at every depth. One activity is announced on its own; a
+        branch is announced once for the activity deleted and once for the
+        schedule, so whatever follows any of it (a payment instalment linked to
+        a milestone inside the summary) lets go of it without one event per
+        activity.
 
         The activity's inbound/outbound canonical :class:`ScheduleRelationship`
         rows are removed by the ON DELETE CASCADE FKs, but the derived
@@ -1468,40 +2200,54 @@ class ScheduleService:
         JSON mirror so the two stores stay consistent without waiting for a later
         ``reconcile_dependency_sources`` pass.
 
+        Returns:
+            How many activities were removed.
+
         Raises HTTPException 404 if not found.
         """
         activity = await self.get_activity(activity_id)
         schedule_uuid = activity.schedule_id
         schedule_id = str(schedule_uuid)
-        deleted_str = str(activity_id)
+        parent_of_deleted = activity.parent_id
 
-        # Collect the successors that reference this activity in their JSON
-        # mirror *before* the delete, while the rows are still readable.
-        siblings, _ = await self.activity_repo.list_for_schedule(schedule_uuid, limit=10_000)
-        successors_to_clean: list[tuple[uuid.UUID, list[dict]]] = []
-        for sib in siblings:
-            if sib.id == activity_id:
-                continue
-            deps = sib.dependencies or []
-            pruned = [dep for dep in deps if not (isinstance(dep, dict) and str(dep.get("activity_id")) == deleted_str)]
-            if len(pruned) != len(deps):
-                successors_to_clean.append((sib.id, pruned))
-
-        await self.activity_repo.delete(activity_id)
+        if cascade:
+            doomed = await self.activity_repo.delete_subtree(schedule_uuid, activity_id)
+        else:
+            # A deleted summary's children move up one level, under its own
+            # parent, rather than falling to the top of the plan (the FK alone
+            # would null their parent).
+            await self.activity_repo.reparent_children(activity_id, parent_of_deleted)
+            await self.activity_repo.delete(activity_id)
+            doomed = [activity_id]
+        doomed_str = {str(d) for d in doomed}
 
         # Rebuild the JSON mirror on each affected successor. The canonical edge
         # is already gone via the relationship CASCADE; here we keep the derived
         # copy in lockstep.
-        for succ_id, pruned in successors_to_clean:
-            await self.activity_repo.update_fields(succ_id, dependencies=pruned)
+        for succ_id, deps in await self.activity_repo.dependency_mirrors(schedule_uuid):
+            pruned = [d for d in deps if not (isinstance(d, dict) and str(d.get("activity_id")) in doomed_str)]
+            if len(pruned) != len(deps):
+                await self.activity_repo.update_fields(succ_id, dependencies=pruned)
 
-        await _safe_publish(
+        publish_after_commit(
+            self.session,
             "schedule.activity.deleted",
-            {"activity_id": str(activity_id), "schedule_id": schedule_id},
+            {"activity_id": str(activity_id), "schedule_id": schedule_id, "removed_count": len(doomed)},
             source_module="oe_schedule",
         )
+        if len(doomed) > 1:
+            # What was under it goes in the same breath: one schedule-level
+            # event, on which contracts refreshes every instalment of the
+            # schedule and unlinks those whose milestone went with the branch.
+            publish_after_commit(
+                self.session,
+                "schedule.activities.cleared",
+                {"schedule_id": schedule_id, "count": len(doomed), "root_activity_id": str(activity_id)},
+                source_module="oe_schedule",
+            )
 
-        logger.info("Activity deleted: %s from schedule %s", activity_id, schedule_id)
+        logger.info("Activity deleted: %s from schedule %s (%d removed)", activity_id, schedule_id, len(doomed))
+        return len(doomed)
 
     async def clear_activities(self, schedule_id: uuid.UUID) -> int:
         """Delete every activity (and its work orders) of a schedule at once.
@@ -1522,7 +2268,8 @@ class ScheduleService:
 
         deleted = await self.activity_repo.delete_for_schedule(schedule_id)
 
-        await _safe_publish(
+        publish_after_commit(
+            self.session,
             "schedule.activities.cleared",
             {"schedule_id": str(schedule_id), "count": deleted},
             source_module="oe_schedule",
@@ -1530,6 +2277,70 @@ class ScheduleService:
 
         logger.info("Cleared %d activity(ies) from schedule %s", deleted, schedule_id)
         return deleted
+
+    async def _assert_activities_in_schedule(self, schedule_id: uuid.UUID, activity_ids: list[str]) -> None:
+        """Reject dependency ids that are not activities of this schedule.
+
+        A predecessor named in an activity's ``dependencies`` becomes a
+        canonical edge, and the edge feeds CPM and the Gantt. An id from
+        another schedule (another project, another tenant) would join two
+        plans that share no access rule, so it answers 404 exactly like an
+        unknown id, and nothing is written.
+        """
+        wanted: set[uuid.UUID] = set()
+        for raw in activity_ids:
+            try:
+                wanted.add(uuid.UUID(str(raw)))
+            except (TypeError, ValueError):
+                wanted.add(uuid.uuid5(uuid.NAMESPACE_OID, str(raw)))  # matches no row
+        if not wanted:
+            return
+        if await self.activity_repo.ids_in_schedule(schedule_id, wanted) != wanted:
+            raise coded_http_error(
+                status.HTTP_404_NOT_FOUND,
+                "schedule_activity_not_in_schedule",
+                "Both activities of a dependency must belong to this schedule.",
+            )
+
+    async def _assert_positions_in_project(self, schedule_id: uuid.UUID, position_ids: list[str]) -> None:
+        """Reject BOQ positions that are not in the schedule's own project.
+
+        The activity keeps position ids as a JSON list with no foreign key, so
+        without this a link could name a position of another project, and the
+        schedule would then read that project's quantities and money. Answers
+        404 for a foreign id exactly as for a missing one, so a caller cannot
+        probe which ids exist elsewhere.
+
+        Args:
+            schedule_id: The schedule the activity belongs to.
+            position_ids: Position ids about to be linked.
+
+        Raises:
+            HTTPException 404 if any id is not a position of that project.
+        """
+        if not position_ids:
+            return
+        from app.modules.boq.models import BOQ, Position
+
+        schedule = await self.get_schedule(schedule_id)
+        wanted: set[uuid.UUID] = set()
+        for pid in position_ids:
+            try:
+                wanted.add(uuid.UUID(str(pid)))
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BOQ position not found") from exc
+        rows = await self.session.execute(
+            select(Position.id)
+            .join(BOQ, BOQ.id == Position.boq_id)
+            .where(Position.id.in_(wanted))
+            .where(BOQ.project_id == schedule.project_id)
+        )
+        found = set(rows.scalars().all())
+        if wanted - found:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="BOQ position not found in this project",
+            )
 
     async def link_boq_position(self, activity_id: uuid.UUID, boq_position_id: uuid.UUID) -> Activity:
         """Link a BOQ position to an activity.
@@ -1556,6 +2367,7 @@ class ScheduleService:
                 detail="BOQ position is already linked to this activity",
             )
 
+        await self._assert_positions_in_project(activity.schedule_id, [position_str])
         current_ids.append(position_str)
         await self.activity_repo.update_fields(activity_id, boq_position_ids=current_ids)
 
@@ -1610,12 +2422,15 @@ class ScheduleService:
         logger.info("BOQ position %s unlinked from activity %s", boq_position_id, activity_id)
         return await self.get_activity(activity_id)
 
-    async def update_progress(self, activity_id: uuid.UUID, progress_pct: float) -> Activity:
+    async def update_progress(
+        self, activity_id: uuid.UUID, progress_pct: float, actor_id: str | None = None
+    ) -> Activity:
         """Update activity progress and auto-adjust status.
 
         Args:
             activity_id: Target activity identifier.
             progress_pct: New progress percentage (0.0 - 100.0).
+            actor_id: The caller, named in a milestone-reached event.
 
         Returns:
             Updated activity.
@@ -1647,7 +2462,11 @@ class ScheduleService:
             status=new_status,
         )
 
-        await _safe_publish(
+        # Deferred to the commit: the EVM snapshot subscriber reads this
+        # activity's schedule and its siblings from its own session, and a
+        # save that fails after this point must not leave a snapshot behind.
+        publish_after_commit(
+            self.session,
             "schedule.activity.progress_updated",
             {
                 "activity_id": str(activity_id),
@@ -1658,7 +2477,60 @@ class ScheduleService:
         )
 
         logger.info("Activity %s progress updated to %.1f%%", activity_id, progress_pct)
-        return await self.get_activity(activity_id)
+
+        # Roll up progress to parent summary if this activity has one.
+        if activity.parent_id:
+            await self._rollup_summary_progress(activity.parent_id)
+
+        refreshed = await self.get_activity(activity_id)
+        await announce_if_milestone_reached(self.session, refreshed, was_completed=was_completed, actor_id=actor_id)
+        return refreshed
+
+    async def _rollup_summary_progress(self, summary_id: uuid.UUID, _depth: int = 0) -> None:
+        """Recompute a summary activity's progress as the duration-weighted mean of its children.
+
+        Recurses up the ancestor chain so that updating a leaf under a
+        nested summary propagates all the way to the root.  Depth is
+        capped at 20 to prevent infinite loops if the data has a cycle.
+        """
+        if _depth > 20:
+            return
+
+        children = (
+            await self.session.execute(
+                select(Activity.progress_pct, Activity.duration_days).where(Activity.parent_id == summary_id)
+            )
+        ).all()
+        if not children:
+            return
+
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for pct_str, dur in children:
+            weight = max(dur, 1)
+            weighted_sum += _str_to_float(pct_str) * weight
+            total_weight += weight
+        rolled_up = weighted_sum / total_weight if total_weight > 0 else 0.0
+
+        if rolled_up >= 100.0:
+            new_status = "completed"
+        elif rolled_up > 0:
+            new_status = "in_progress"
+        else:
+            new_status = "not_started"
+
+        await self.activity_repo.update_fields(
+            summary_id,
+            progress_pct=str(round(rolled_up, 1)),
+            status=new_status,
+        )
+
+        # Recurse to grandparent if this summary itself has a parent.
+        parent_row = (
+            await self.session.execute(select(Activity.parent_id).where(Activity.id == summary_id))
+        ).scalar_one_or_none()
+        if parent_row:
+            await self._rollup_summary_progress(parent_row, _depth + 1)
 
     # ── BIM ↔ Activity linking ─────────────────────────────────────────────
 
@@ -1666,14 +2538,17 @@ class ScheduleService:
         self,
         activity_id: uuid.UUID,
         bim_element_ids: list[str],
+        *,
+        add: bool = False,
     ) -> Activity:
-        """Replace the BIM element link set on an activity.
+        """Replace, or add to, the BIM element link set on an activity.
 
         Args:
             activity_id: Target activity identifier.
-            bim_element_ids: Full list of BIM element UUIDs (as strings) to
-                store on the activity. The existing list is replaced, not
-                merged.
+            bim_element_ids: BIM element UUIDs (as strings). Without ``add``
+                they become the whole stored list.
+            add: Merge the ids into the stored list instead, keeping its
+                order and skipping ids already there.
 
         Returns:
             The updated activity (re-fetched from the database).
@@ -1687,6 +2562,10 @@ class ScheduleService:
         # Normalise to a list of plain strings so we never write a dict to
         # the JSON column (legacy values may have been dict-shaped).
         normalised = [str(eid) for eid in bim_element_ids]
+        if add:
+            stored = [str(eid) for eid in (activity.bim_element_ids or []) if not isinstance(eid, dict)]
+            known = set(stored)
+            normalised = stored + [eid for eid in dict.fromkeys(normalised) if eid not in known]
 
         await self.activity_repo.update_fields(
             activity_id,
@@ -1949,6 +2828,7 @@ class ScheduleService:
         today = datetime.now(UTC).date()
 
         activities, _ = await self.activity_repo.list_for_schedule(schedule_id)
+        assignee_names = await self.resolve_assignee_names({a.assignee_id for a in activities if a.assignee_id})
 
         gantt_activities: list[GanttActivity] = []
         completed = 0
@@ -1996,6 +2876,9 @@ class ScheduleService:
                     activity_type=act.activity_type,
                     status=effective_status,
                     calendar_id=act.calendar_id,
+                    assignee_id=act.assignee_id,
+                    assignee_name=assignee_names.get(act.assignee_id) if act.assignee_id else None,
+                    client_visible=bool(act.client_visible),
                     metadata=act.metadata_ or {},
                 )
             )
@@ -2138,22 +3021,51 @@ class ScheduleService:
 
         project_id = getattr(schedule, "project_id", None)
         if project_id is not None:
-            from app.modules.schedule_advanced.models import Calendar
-
-            rows = await self.session.execute(
-                select(Calendar).where(Calendar.project_id == project_id).where(Calendar.is_default.is_(True)).limit(1)
-            )
-            default_cal = rows.scalars().first()
+            default_cal = await self._project_default_calendar(project_id)
             if default_cal is not None:
-                work_days = readable_work_days(
-                    default_cal.work_days, source=f"default calendar {default_cal.id} work days"
-                )
-                exceptions = readable_exception_dates(
-                    default_cal.holidays, source=f"default calendar {default_cal.id} holidays"
-                )
-                return {"work_days": work_days or [0, 1, 2, 3, 4], "exceptions": exceptions}
+                return default_cal
 
         return resolve_calendar(schedule)
+
+    async def _project_default_calendar(self, project_id: uuid.UUID) -> dict | None:
+        """The project's default named calendar as ``{work_days, exceptions}``, if it has one."""
+        from app.modules.schedule_advanced.models import Calendar
+
+        rows = await self.session.execute(
+            select(Calendar).where(Calendar.project_id == project_id).where(Calendar.is_default.is_(True)).limit(1)
+        )
+        default_cal = rows.scalars().first()
+        if default_cal is None:
+            return None
+        work_days = readable_work_days(default_cal.work_days, source=f"default calendar {default_cal.id} work days")
+        exceptions = readable_exception_dates(
+            default_cal.holidays, source=f"default calendar {default_cal.id} holidays"
+        )
+        return {"work_days": work_days or [0, 1, 2, 3, 4], "exceptions": exceptions}
+
+    async def _generation_calendar(self, schedule: Schedule, region_week: set[int]) -> tuple[dict, dict | None]:
+        """The calendar a generated plan is drawn on, and the one to record on the schedule.
+
+        The plan is drawn on the calendar :meth:`reschedule` will recount it
+        on, holidays included, so the first reschedule moves no bar: the
+        schedule's own calendar, else the project's default calendar. Without
+        either, the project region's week is used, and recorded on the
+        schedule when it is not Monday to Friday, which is what reschedule
+        would otherwise fall back to.
+
+        Returns:
+            ``(calendar, calendar_to_record)``; the second is ``None`` when
+            nothing needs recording.
+        """
+        meta = schedule.metadata_ if isinstance(schedule.metadata_, dict) else {}
+        own = meta.get("calendar")
+        if isinstance(own, dict) and own.get("work_days"):
+            return resolve_calendar(schedule), None
+        default_cal = await self._project_default_calendar(schedule.project_id)
+        if default_cal is not None:
+            return default_cal, None
+        week = {"work_days": sorted(region_week), "exceptions": []}
+        return week, (week if set(region_week) != {0, 1, 2, 3, 4} else None)
 
     async def reschedule(self, schedule_id: uuid.UUID) -> list[Activity]:
         """Recompute activity dates from the dependency network via CPM.
@@ -2244,7 +3156,12 @@ class ScheduleService:
                 continue
             if str(act.id) in has_predecessor:
                 new_start = offset_to_iso(cpm["early_start"], project_start)
-                new_end = offset_to_iso(cpm["early_finish"], project_start)
+                new_end = inclusive_end_from_cpm(
+                    cpm["early_start"],
+                    cpm["early_finish"],
+                    activity_calendars.get(str(act.id), calendar),
+                    project_start,
+                )
             else:
                 new_start = act.start_date
                 new_end = act.end_date
@@ -2267,7 +3184,8 @@ class ScheduleService:
 
         await self.activity_repo.bulk_update_fields(updates)
 
-        await _safe_publish(
+        publish_after_commit(
+            self.session,
             "schedule.rescheduled",
             {"schedule_id": str(schedule_id), "count": len(updates)},
             source_module="oe_schedule",
@@ -2280,388 +3198,387 @@ class ScheduleService:
 
     # ── Generate from BOQ ─────────────────────────────────────────────────
 
-    async def generate_from_boq(
+    async def _plan_from_boq(
         self,
         schedule_id: uuid.UUID,
         boq_id: uuid.UUID,
-        total_project_days: int | None = None,
-    ) -> list[Activity]:
-        """Generate hierarchical schedule activities from BOQ sections.
+        total_project_days: int | None,
+        start_date: date | None,
+        *,
+        workers_per_position: int | None = None,
+    ) -> _BoqGenerationPlan:
+        """Work out everything a generation would write, and write nothing.
 
-        Reads all positions from the specified BOQ, creates SUMMARY activities
-        for top-level sections and TASK activities for child positions. Uses
-        quantity-based production rates for duration calculation, working-day
-        calendar (excludes weekends), smart dependencies (sequential within
-        section, overlapping between sections), and milestone markers.
-
-        Args:
-            schedule_id: Target schedule to populate.
-            boq_id: Source BOQ to read sections from.
-            total_project_days: Override total project duration in calendar days.
-                If None, defaults to 365 (residential) or 540 (office).
-
-        Returns:
-            List of created Activity ORM objects.
+        Shared by :meth:`generate_from_boq` and :meth:`preview_generation`, so
+        the preview a person confirms is the plan that gets written.
 
         Raises:
-            HTTPException 404 if schedule or BOQ not found.
-            HTTPException 409 if schedule already has activities.
+            HTTPException: 404 ``boq_not_found`` (also for a bill of another
+                project), 422 ``boq_has_no_positions``.
         """
-        schedule = await self.get_schedule(schedule_id)
-        schedule_project_id = schedule.project_id  # Save before expire
-        schedule_start_date = schedule.start_date
-
-        # Check schedule doesn't already have activities
-        existing, count = await self.activity_repo.list_for_schedule(schedule_id, limit=1)
-        if count > 0:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Schedule already has activities. Delete them first to regenerate.",
-            )
-
-        # Fetch BOQ with positions
         from app.modules.boq.repository import BOQRepository, PositionRepository
+        from app.modules.boq.service import _is_section, is_empty_position
+        from app.modules.schedule.boq_plan import (
+            MAX_CREWS,
+            BoqRow,
+            Task,
+            build_plan_tree,
+            fit_plan,
+            iter_items,
+            iter_tasks,
+            layout_plan,
+        )
 
-        boq_repo = BOQRepository(self.session)
-        pos_repo = PositionRepository(self.session)
+        schedule = await self.get_schedule(schedule_id)
+        schedule_project_id = schedule.project_id
 
-        boq = await boq_repo.get_by_id(boq_id)
-        if boq is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="BOQ not found",
-            )
+        boq = await BOQRepository(self.session).get_by_id(boq_id)
+        if boq is None or boq.project_id != schedule_project_id:
+            # A bill of another project answers like a missing one, so the
+            # endpoint cannot be used to probe which bills exist elsewhere.
+            raise coded_http_error(status.HTTP_404_NOT_FOUND, "boq_not_found", "BOQ not found.")
+        boq_meta = dict(boq.metadata_ or {})
 
-        raw_positions, _ = await pos_repo.list_for_boq(boq_id, limit=5000)
-        # Force-load all attributes in session context to prevent MissingGreenlet
-        for p in raw_positions:
-            _ = p.id, p.parent_id, p.ordinal, p.description, p.unit
-            _ = p.quantity, p.unit_rate, p.total, p.metadata_
-        if not raw_positions:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="BOQ has no positions",
-            )
-
-        # Eagerly snapshot all needed fields to avoid lazy-loading / greenlet issues.
-        # Access every attribute while still inside the async session context.
-        positions = []
-        for p in raw_positions:
-            # metadata_ uses SQL alias "metadata" - access carefully
+        positions = await PositionRepository(self.session).list_all_for_boq(boq_id)
+        rows: list[BoqRow] = []
+        for p in positions:
             try:
-                meta = dict(p.metadata_) if p.metadata_ else {}
+                meta = dict(p.metadata_) if isinstance(p.metadata_, dict) else {}
             except Exception:
                 meta = {}
-            positions.append(
-                {
-                    "id": p.id,
-                    "parent_id": p.parent_id,
-                    "ordinal": p.ordinal or "",
-                    "description": p.description or "",
-                    "unit": p.unit or "",
-                    "quantity": p.quantity or "0",
-                    "unit_rate": p.unit_rate or "0",
-                    "total": p.total or "0",
-                    "metadata_": meta,
-                }
+            quantity = _str_to_float(p.quantity)
+            total = _str_to_float(p.total)
+            lump_sum = _normalize_unit(p.unit) == "lsum"
+            rows.append(
+                BoqRow(
+                    id=str(p.id),
+                    parent_id=str(p.parent_id) if p.parent_id is not None else None,
+                    is_section=_is_section(p),
+                    is_placeholder=is_empty_position(p),
+                    data={
+                        "ordinal": (p.ordinal or "").strip(),
+                        "description": (p.description or "").strip(),
+                        "unit": p.unit or "",
+                        "quantity": quantity,
+                        "total": total,
+                        "metadata": meta,
+                    },
+                    # A lump sum is often priced by its total alone, with the
+                    # quantity left empty: it is work all the same.
+                    has_work=quantity > 0 or (lump_sum and total > 0),
+                    lump_sum=lump_sum,
+                )
+            )
+        tree = build_plan_tree(rows)
+        tasks = list(iter_tasks(tree.roots))
+        if not tasks:
+            raise coded_http_error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "boq_has_no_positions",
+                "This BOQ has no positions with work to schedule. Add positions to its sections first.",
             )
 
-        # Determine project duration
+        window_is_explicit = total_project_days is not None
         if total_project_days is None:
-            boq_meta = boq.metadata_ or {}
             building_type = boq_meta.get("building_type", "residential")
             total_project_days = 540 if building_type == "office" else 365
 
-        # ── Get regional work calendar from project ──────────────────────
         # The same resolver compute_duration's callers use, so the week the
         # dates are drawn on here is the week they are recounted on later.
         project_region = await self.resolve_project_region(schedule_project_id)
         cal = get_work_calendar(project_region)
         hours_per_day = cal["hours_per_day"]
-        work_days_set = cal["work_days"]
+        plan_calendar, calendar_to_record = await self._generation_calendar(schedule, set(cal["work_days"]))
+        work_days_set = set(plan_calendar["work_days"])
+        holidays = {d for d in (normalise_exception_date(e) for e in plan_calendar.get("exceptions") or []) if d}
         work_days_per_week = len(work_days_set)
-        logger.info(
-            "Using work calendar: %s (%.1fh/day, %d days/week)", cal["label"], hours_per_day, work_days_per_week
-        )
 
-        # ── Duration calculation from real labor data ──────────────────
-        # Priority (see module-level _calc_duration_from_resources):
-        #   1. labor_hours & workers_per_unit from position metadata
-        #   2. Sum labor-type resources from position metadata
-        #   3. Unit-based fallback production rates (quantity > 0)
-        #   4. Cost-proportional fallback
+        def _works(day: date) -> bool:
+            return day.weekday() in work_days_set and day not in holidays
 
-        def _add_working_days(start: date, working_days: int) -> date:
-            """Advance a date by N working days, using regional calendar."""
-            current = start
-            added = 0
-            while added < working_days:
-                current += timedelta(days=1)
-                if current.weekday() in work_days_set:
-                    added += 1
-            return current
-
-        def _working_days_between(start: date, end: date) -> int:
-            """Count working days between two dates, using regional calendar."""
-            count = 0
-            current = start
-            while current < end:
-                current += timedelta(days=1)
-                if current.weekday() in work_days_set:
-                    count += 1
-            return count
-
-        # ── Identify section headers and children ────────────────────────
-        top_level = [p for p in positions if p["parent_id"] is None]
-
-        # Build child map: parent_id_str -> list of child position dicts
-        child_map: dict[str, list[dict]] = {}
-        for p in positions:
-            if p["parent_id"] is not None:
-                parent_str = str(p["parent_id"])
-                if parent_str not in child_map:
-                    child_map[parent_str] = []
-                child_map[parent_str].append(p)
-
-        # Build sections with their children
-        sections: list[dict] = []
-        for pos in top_level:
-            pos_id_str = str(pos["id"])
-            children = child_map.get(pos_id_str, [])
-            if children:
-                section_total = sum(_str_to_float(c["total"]) for c in children)
-            else:
-                section_total = _str_to_float(pos["total"])
-
-            sections.append(
-                {
-                    "name": pos["description"][:255] if pos["description"] else f"Section {pos['ordinal']}",
-                    "ordinal": pos["ordinal"],
-                    "total": section_total,
-                    "parent_position": pos,
-                    "children": children if children else [pos],
-                }
-            )
-
-        if not sections:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No sections found in BOQ",
-            )
-
-        # Compute grand total for cost-proportional fallback
-        grand_total = sum(s["total"] for s in sections)
+        grand_total = sum(float(task.row.data["total"]) for task in tasks)
         if grand_total <= 0:
-            grand_total = 1.0  # avoid division by zero
+            grand_total = 1.0
 
-        # ── Determine schedule start date ────────────────────────────────
-        schedule_start_str = schedule.start_date
-        if schedule_start_str:
-            try:
-                schedule_start = date.fromisoformat(schedule_start_str)
-            except (ValueError, TypeError):
-                schedule_start = date.today()
-        else:
-            schedule_start = date.today()
-
-        # ── Create hierarchical activities ───────────────────────────────
-        created_activities: list[Activity] = []
-        sort_counter = 0
-
-        # Track previous section for inter-section SS dependencies
-        prev_section_summary_id: uuid.UUID | None = None
-        prev_section_duration_work_days: int = 0
-
-        # Track per-section data for summary rollup
-        summary_activity_map: dict[uuid.UUID, list[Activity]] = {}
-
-        # Current date cursor for section starts
-        section_start = schedule_start
-
-        for section_idx, section in enumerate(sections):
-            # ── Create SUMMARY activity (placeholder dates, updated later) ──
-            sort_counter += 1
-            summary = Activity(
-                schedule_id=schedule_id,
-                parent_id=None,
-                name=section["name"],
-                description=f"Summary: BOQ section {section['ordinal']}",
-                wbs_code=section["ordinal"],
-                start_date=section_start.isoformat(),
-                end_date=section_start.isoformat(),  # placeholder
-                duration_days=0,  # placeholder - computed from children
-                progress_pct="0",
-                status="not_started",
-                activity_type="summary",
-                dependencies=[],
-                resources=[],
-                boq_position_ids=[],
-                color="#1e40af",
-                sort_order=sort_counter,
-                metadata_={"source": "boq_generation", "boq_id": str(boq_id)},
+        def _from_resources(data: dict[str, Any], workers: int) -> tuple[int, str]:
+            return _calc_duration_from_resources(
+                data["metadata"],
+                data["quantity"],
+                data["unit"],
+                data["total"],
+                grand_total,
+                total_project_days,
+                hours_per_day=hours_per_day,
+                work_days_per_week=work_days_per_week,
+                assumed_workers=workers,
             )
-            summary = await self.activity_repo.create(summary)
-            summary_id = summary.id  # Stable once the create above has flushed
-            created_activities.append(
-                {
-                    "activity_type": "summary",
-                    "end_date": summary.end_date,
-                    "id": summary_id,
+
+        sources: dict[str, str] = {}
+        basis: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            data = task.row.data
+            _, source = _from_resources(data, 1)
+            sources[task.row.id] = source
+            if source == "estimated_fallback":
+                # Worked in working days straight from the hours, so the
+                # numbers on the note add up: hours / (gang x hours a day).
+                unit_key = _normalize_unit(data["unit"])
+                rate = fallback_production_rate(data["unit"])
+                basis[task.row.id] = {
+                    "unit": unit_key,
+                    "rate": rate,
+                    "hours": fallback_labor_hours(data["unit"], data["quantity"]),
+                    "gang": fallback_gang_size(data["unit"]),
+                    "hours_per_day": hours_per_day,
                 }
+
+        # Hold every guess from the unit table to the price: a position may not
+        # take more than _FALLBACK_PRICE_SHARE_CAP times its share of the
+        # guessed positions' money in their guessed hours.
+        guessed_cost = sum(float(task.row.data["total"]) for task in tasks if task.row.id in basis)
+        guessed_hours = sum(b["hours"] for b in basis.values())
+        for task in tasks:
+            b = basis.get(task.row.id)
+            if b is None:
+                continue
+            cost = float(task.row.data["total"])
+            if guessed_cost > 0 and guessed_hours > 0 and cost > 0:
+                cap = _FALLBACK_PRICE_SHARE_CAP * cost / guessed_cost * guessed_hours
+                if b["hours"] > cap:
+                    b["hours_from_unit"] = b["hours"]
+                    b["hours"] = cap
+                    b["capped_by_price"] = True
+            b["hours"] = round(b["hours"], 1)
+
+        # Positions whose bill gives hours but no crew: one labour row in hours
+        # per unit, or no labour data at all. They are worked by at least the
+        # assumed number of workers; a crew the bill states is kept as it is,
+        # and a position priced by its cost share has no crew to assume.
+        without_workers = {
+            task.row.id
+            for task in tasks
+            if sources[task.row.id] in ("resource_sum", "estimated_fallback")
+            or (
+                sources[task.row.id] == "labor_hours"
+                and _meta_number(task.row.data["metadata"], "workers_per_unit") <= 0
             )
-            summary_activity_map[summary_id] = []
+        }
 
-            # Inter-section dependency: SS with lag = 50% of previous section
-            if prev_section_summary_id is not None:
-                lag = max(3, prev_section_duration_work_days // 2)
-                summary_deps = [
-                    {
-                        "activity_id": str(prev_section_summary_id),
-                        "type": "SS",
-                        "lag_days": lag,
-                    }
-                ]
-                await self.activity_repo.update_fields(
-                    summary_id,
-                    dependencies=summary_deps,
-                )
+        def _durations_for(workers: int) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for task in tasks:
+                b = basis.get(task.row.id)
+                if b is not None:
+                    out[task.row.id] = max(1, math.ceil(b["hours"] / (max(b["gang"], workers) * hours_per_day)))
+                else:
+                    duration_cal, _ = _from_resources(task.row.data, workers)
+                    # Calendar days to working days on the project's own week.
+                    out[task.row.id] = max(1, math.ceil(duration_cal * work_days_per_week / 7))
+            return out
 
-            # ── Create TASK activities for each child position ───────────
-            child_start = section_start
-            prev_child_id: uuid.UUID | None = None
-            section_work_days_total = 0
+        schedule_start = (
+            start_date
+            or _parse_day(schedule.start_date)
+            or await self._project_planned_start(schedule_project_id)
+            or date.today()
+        )
+        plan_start = schedule_start
+        while not _works(plan_start):
+            plan_start += timedelta(days=1)
 
-            for child_idx, child_pos in enumerate(section["children"]):
-                child_quantity = _str_to_float(child_pos["quantity"])
-                child_unit = child_pos["unit"] or ""
-                child_total = _str_to_float(child_pos["total"])
-                child_meta = child_pos.get("metadata_", {}) or {}
+        # Working days inside the window, one held back for the completion
+        # milestone, which CPM puts on the day after the work.
+        window_end = schedule_start + timedelta(days=total_project_days - 1)
+        budget = 0
+        cursor = plan_start
+        while cursor <= window_end:
+            if _works(cursor):
+                budget += 1
+            cursor += timedelta(days=1)
+        budget = max(1, budget - 1)
 
-                duration_cal, duration_source = _calc_duration_from_resources(
-                    child_meta,
-                    child_quantity,
-                    child_unit,
-                    child_total,
-                    grand_total,
-                    total_project_days,
-                    hours_per_day=hours_per_day,
-                    work_days_per_week=work_days_per_week,
-                )
-                # Convert calendar days to working days for date arithmetic.
-                # Use the project's regional work-week (not a hardcoded 5/7)
-                # so 6-day-week regions (GULF, BRAZIL, CHINA, INDIA) get
-                # working-day counts consistent with the stored duration.
-                work_days = max(1, math.ceil(duration_cal * work_days_per_week / 7))
-                section_work_days_total += work_days
-
-                child_end = _add_working_days(child_start, work_days)
-
-                # Within-section dependency: sequential FS
-                child_deps: list[dict] = []
-                if prev_child_id is not None:
-                    child_deps = [
-                        {
-                            "activity_id": str(prev_child_id),
-                            "type": "FS",
-                            "lag_days": 0,
-                        }
-                    ]
-
-                sort_counter += 1
-                child_name = (
-                    child_pos["description"][:255] if child_pos["description"] else f"Position {child_pos['ordinal']}"
-                )
-                child_activity = Activity(
-                    schedule_id=schedule_id,
-                    parent_id=summary_id,
-                    name=child_name,
-                    description=(
-                        f"Auto-generated from BOQ position {child_pos['ordinal']} ({child_quantity} {child_unit})"
-                    ),
-                    wbs_code=child_pos["ordinal"] or f"{section['ordinal']}.{child_idx + 1:03d}",
-                    start_date=child_start.isoformat(),
-                    end_date=child_end.isoformat(),
-                    duration_days=duration_cal,
-                    progress_pct="0",
-                    status="not_started",
-                    activity_type="task",
-                    dependencies=child_deps,
-                    resources=[],
-                    boq_position_ids=[str(child_pos["id"])],
-                    color="#0071e3",
-                    sort_order=sort_counter,
-                    metadata_={
-                        "source": "boq_generation",
-                        "boq_id": str(boq_id),
-                        "quantity": child_quantity,
-                        "unit": child_unit,
-                        "labor_hours": child_meta.get("labor_hours", 0),
-                        "workers_per_unit": child_meta.get("workers_per_unit", 0),
-                        # Both keys carry the actual branch taken by the
-                        # duration calculator; "estimated_fallback" marks
-                        # durations derived from the unit production-rate
-                        # table so the UI can flag them as estimates.
-                        "duration_method": duration_source,
-                        "duration_source": duration_source,
-                    },
-                )
-                child_activity = await self.activity_repo.create(child_activity)
-                child_activity_id = child_activity.id  # Save before expire
-                child_activity_start = child_activity.start_date
-                child_activity_end = child_activity.end_date
-                created_activities.append(
-                    {
-                        "activity_type": "task",
-                        "end_date": child_activity_end,
-                        "id": child_activity_id,
-                    }
-                )
-                # Store as dict to avoid ORM lazy-loading issues
-                summary_activity_map[summary_id].append(
-                    {
-                        "id": child_activity_id,
-                        "start_date": child_activity_start,
-                        "end_date": child_activity_end,
-                    }
-                )
-
-                prev_child_id = child_activity_id
-                child_start = child_end  # next child starts after this one ends
-
-            # ── Update SUMMARY dates from children (rollup) ─────────────
-            children_data = summary_activity_map[summary_id]
-            if children_data:
-                earliest_start = min(date.fromisoformat(a["start_date"]) for a in children_data)
-                latest_end = max(date.fromisoformat(a["end_date"]) for a in children_data)
-                summary_duration = (latest_end - earliest_start).days
-                await self.activity_repo.update_fields(
-                    summary_id,
-                    start_date=earliest_start.isoformat(),
-                    end_date=latest_end.isoformat(),
-                    duration_days=max(1, summary_duration),
-                    boq_position_ids=[str(c["id"]) for c in section["children"]],
-                )
-
-            prev_section_summary_id = summary_id
-            prev_section_duration_work_days = section_work_days_total
-
-            # Next section start: overlap via SS - section_start advances by
-            # half the previous section's working days for partial overlap
-            if children_data:
-                latest_end = max(date.fromisoformat(a["end_date"]) for a in children_data)
-                half_work_days = max(3, section_work_days_total // 2)
-                section_start = _add_working_days(section_start, half_work_days)
+        def _choose_workers() -> tuple[int, PlanFit]:
+            if workers_per_position is not None:
+                workers = workers_per_position
+            elif not without_workers:
+                # Every crew is in the bill: nothing to assume.
+                workers = 1
             else:
-                section_start = child_start
+                # The fewest workers per position that fit the window at the
+                # estimates themselves, so no duration is squeezed. Without an
+                # end date that is the default window, which the preview names
+                # as such: one worker on thousands of hours is no plan either. Tried one
+                # by one: the layout is greedy, and more workers do not always
+                # make it shorter, so a bisection could skip the fewest. Each
+                # try is one layout with every crew; when even the most
+                # workers do not fit, none is tried.
+                def _fits(workers: int) -> bool:
+                    return layout_plan(tree.roots, _durations_for(workers), MAX_CREWS).span <= budget
 
-        # ── Add project milestones ───────────────────────────────────────
-        # Milestone: Project Start
-        sort_counter += 1
-        ms_start = Activity(
+                workers = MAX_ASSUMED_WORKERS
+                if _fits(MAX_ASSUMED_WORKERS):
+                    workers = next(n for n in range(1, MAX_ASSUMED_WORKERS + 1) if _fits(n))
+            return workers, fit_plan(tree.roots, _durations_for(workers), budget, allow_compress=window_is_explicit)
+
+        # Pure and CPU-bound: off the event loop, so a big bill does not stall
+        # every other request while it is laid out.
+        workers, fit = await asyncio.to_thread(_choose_workers)
+        durations = _durations_for(workers)
+        for b in basis.values():
+            b["gang"] = max(b["gang"], workers)
+        layout = fit.layout
+        # A loose lump sum runs for the whole works; whatever its own estimate
+        # said is not what the chart shows, so neither is the note.
+        for position_id in layout.spanning:
+            sources[position_id] = "spans_works"
+            basis.pop(position_id, None)
+
+        work_dates: list[date] = []
+        cursor = plan_start
+        while len(work_dates) < layout.span + 1:
+            if _works(cursor):
+                work_dates.append(cursor)
+            cursor += timedelta(days=1)
+
+        def _start(offset: int) -> str:
+            return work_dates[offset].isoformat()
+
+        def _end(finish: int) -> str:
+            return work_dates[max(finish - 1, 0)].isoformat()
+
+        ids: dict[str, uuid.UUID] = {}
+        wbs_of: dict[str, str] = {}
+        root_links = {succ: (pred, lag) for pred, succ, lag in layout.root_links}
+        activities: list[Activity] = []
+        relationships: list[ScheduleRelationship] = []
+        created: list[dict] = []
+        child_counter: dict[str | None, int] = {}
+
+        def _link(pred_key: str, succ_id: uuid.UUID, dep_type: str, lag: int) -> dict:
+            relationships.append(
+                ScheduleRelationship(
+                    schedule_id=schedule_id,
+                    predecessor_id=ids[pred_key],
+                    successor_id=succ_id,
+                    relationship_type=dep_type,
+                    lag_days=lag,
+                )
+            )
+            return {"activity_id": str(ids[pred_key]), "type": dep_type, "lag_days": lag}
+
+        sort_counter = 0
+        for item, parent in iter_items(tree.roots):
+            slot = layout.slots[item.key]
+            data = item.row.data
+            activity_id = uuid.uuid4()
+            ids[item.key] = activity_id
+            parent_key = parent.key if parent is not None else None
+            child_counter[parent_key] = child_counter.get(parent_key, 0) + 1
+            ordinal = data["ordinal"]
+            if not ordinal:
+                prefix = wbs_of.get(parent_key, "") if parent_key else ""
+                ordinal = f"{prefix}.{child_counter[parent_key]:03d}" if prefix else f"{child_counter[parent_key]:03d}"
+            wbs = ordinal[:50]
+            wbs_of[item.key] = wbs
+
+            deps: list[dict] = []
+            if slot.predecessor is not None:
+                deps.append(_link(slot.predecessor, activity_id, "FS", 0))
+            elif parent is not None:
+                # The first item of each crew starts with its section, so the
+                # section moving on a reschedule takes its work along.
+                deps.append(_link(parent.key, activity_id, "SS", 0))
+            if item.key in root_links:
+                pred_key, _working_days = root_links[item.key]
+                # CPM counts a lag in calendar days from the predecessor's
+                # start; written that way it lands on the day drawn here.
+                lag = (work_dates[slot.start] - work_dates[layout.slots[pred_key].start]).days
+                deps.append(_link(pred_key, activity_id, "SS", lag))
+
+            sort_counter += 1
+            if isinstance(item, Task):
+                quantity = data["quantity"]
+                unit = data["unit"]
+                meta = data["metadata"]
+                label = data["description"] or _generated_text("position_label", ordinal=ordinal)
+                task_meta: dict[str, Any] = {
+                    "source": "boq_generation",
+                    "boq_id": str(boq_id),
+                    "quantity": quantity,
+                    "unit": unit,
+                    "labor_hours": meta.get("labor_hours", 0),
+                    "workers_per_unit": meta.get("workers_per_unit", 0),
+                    # "estimated_fallback" marks durations derived from the unit
+                    # production-rate table so the UI can flag them as estimates.
+                    "duration_method": sources[item.row.id],
+                    "duration_source": sources[item.row.id],
+                }
+                if item.row.id in basis:
+                    task_meta["duration_basis"] = basis[item.row.id]
+                activities.append(
+                    Activity(
+                        id=activity_id,
+                        schedule_id=schedule_id,
+                        parent_id=ids[parent_key] if parent_key else None,
+                        name=label[:255],
+                        description=_generated_text(
+                            "task_description",
+                            ordinal=ordinal,
+                            # A lump sum priced by its total reads as one of it.
+                            quantity=_format_quantity(quantity if quantity > 0 else 1),
+                            unit=unit,
+                        ),
+                        wbs_code=wbs,
+                        start_date=_start(slot.start),
+                        end_date=_end(slot.finish),
+                        duration_days=slot.finish - slot.start,
+                        progress_pct="0",
+                        status="not_started",
+                        activity_type="task",
+                        dependencies=deps,
+                        resources=[],
+                        boq_position_ids=[item.row.id],
+                        color="#0071e3",
+                        sort_order=sort_counter,
+                        metadata_=task_meta,
+                    )
+                )
+                created.append({"id": activity_id, "activity_type": "task", "end_date": _end(slot.finish)})
+            else:
+                label = data["description"] or _generated_text("section_label", ordinal=ordinal)
+                activities.append(
+                    Activity(
+                        id=activity_id,
+                        schedule_id=schedule_id,
+                        parent_id=ids[parent_key] if parent_key else None,
+                        name=label[:255],
+                        description=_generated_text("section_description", ordinal=ordinal),
+                        wbs_code=wbs,
+                        start_date=_start(slot.start),
+                        end_date=_end(slot.finish),
+                        duration_days=max(1, slot.finish - slot.start),
+                        progress_pct="0",
+                        status="not_started",
+                        activity_type="summary",
+                        dependencies=deps,
+                        resources=[],
+                        boq_position_ids=[],
+                        color="#1e40af",
+                        sort_order=sort_counter,
+                        metadata_={"source": "boq_generation", "boq_id": str(boq_id)},
+                    )
+                )
+                created.append({"id": activity_id, "activity_type": "summary", "end_date": _end(slot.finish)})
+
+        # The completion milestone sits where CPM puts it: the working day
+        # after the work, which the window kept a day for.
+        planned_end = _start(layout.span)
+        start_ms = Activity(
+            id=uuid.uuid4(),
             schedule_id=schedule_id,
             parent_id=None,
-            name="Project Start",
-            description="Project kick-off milestone",
+            name=_generated_text("start_milestone"),
+            description=_generated_text("start_milestone_description"),
             wbs_code="MS-001",
             start_date=schedule_start.isoformat(),
             end_date=schedule_start.isoformat(),
@@ -2673,102 +3590,394 @@ class ScheduleService:
             resources=[],
             boq_position_ids=[],
             color="#f59e0b",
-            sort_order=0,  # first item
+            sort_order=0,
             metadata_={"source": "boq_generation", "boq_id": str(boq_id)},
         )
-        ms_start = await self.activity_repo.create(ms_start)
-        ms_start_end = ms_start.end_date
-        created_activities.append(
-            {
-                "activity_type": "milestone",
-                "end_date": ms_start_end,
-            }
-        )
+        activities.append(start_ms)
+        created.append({"id": start_ms.id, "activity_type": "milestone", "end_date": start_ms.end_date})
 
-        # Milestone: Project Completion (depends on last section finishing)
-        if prev_section_summary_id is not None:
-            # Find the latest end date across all activities
-            all_end_dates = []
-            for act_info in created_activities:
-                atype = act_info.get("activity_type", "task") if isinstance(act_info, dict) else "task"
-                aend = act_info.get("end_date", "") if isinstance(act_info, dict) else ""
-                if atype != "milestone" and aend:
-                    try:
-                        all_end_dates.append(date.fromisoformat(aend))
-                    except (ValueError, TypeError):
-                        pass
-            project_end = max(all_end_dates) if all_end_dates else schedule_start
-
-            sort_counter += 1
-            ms_end = Activity(
+        # Completion waits for every task nothing else waits for: the last item
+        # of each crew in each section, and a loose position on its own. One
+        # link from the latest-finishing section alone let CPM draw the
+        # milestone before work that finishes later elsewhere.
+        followed = {slot.predecessor for slot in layout.slots.values() if slot.predecessor is not None}
+        terminal = [task for task in tasks if task.key not in followed]
+        end_ms_id = uuid.uuid4()
+        end_deps = [_link(task.key, end_ms_id, "FS", 0) for task in terminal]
+        activities.append(
+            Activity(
+                id=end_ms_id,
                 schedule_id=schedule_id,
                 parent_id=None,
-                name="Project Completion",
-                description="Project completion milestone",
+                name=_generated_text("completion_milestone"),
+                description=_generated_text("completion_milestone_description"),
                 wbs_code="MS-999",
-                start_date=project_end.isoformat(),
-                end_date=project_end.isoformat(),
+                start_date=planned_end,
+                end_date=planned_end,
                 duration_days=0,
                 progress_pct="0",
                 status="not_started",
                 activity_type="milestone",
-                dependencies=[
-                    {
-                        "activity_id": str(prev_section_summary_id),
-                        "type": "FS",
-                        "lag_days": 0,
-                    }
-                ],
+                dependencies=end_deps,
                 resources=[],
                 boq_position_ids=[],
                 color="#f59e0b",
-                sort_order=sort_counter,
+                sort_order=sort_counter + 1,
                 metadata_={"source": "boq_generation", "boq_id": str(boq_id)},
             )
-            ms_end = await self.activity_repo.create(ms_end)
-            ms_end_date = ms_end.end_date
-            created_activities.append({"activity_type": "milestone", "end_date": ms_end_date})
+        )
+        created.append({"id": end_ms_id, "activity_type": "milestone", "end_date": planned_end})
 
-        # ── Update schedule dates ────────────────────────────────────────
-        if created_activities:
-            all_end_dates = []
-            for act_info in created_activities:
-                aend = act_info.get("end_date", "") if isinstance(act_info, dict) else ""
-                if aend:
-                    try:
-                        all_end_dates.append(date.fromisoformat(aend))
-                    except (ValueError, TypeError):
-                        pass
-            if all_end_dates:
-                final_end = max(all_end_dates).isoformat()
-                await self.schedule_repo.update_fields(schedule_id, end_date=final_end)
-            # Always set start_date (schedule object may be expired by now)
-            await self.schedule_repo.update_fields(schedule_id, start_date=schedule_start.isoformat())
+        notes: list[dict[str, Any]] = []
+        note_counts: dict[str, int] = {}
+        for task in tasks:
+            code = _DURATION_NOTE[sources[task.row.id]]
+            note_counts[code] = note_counts.get(code, 0) + 1
+            if code == "from_labor_norm":
+                continue
+            note: dict[str, Any] = {
+                "position_id": task.row.id,
+                "ordinal": task.row.data["ordinal"],
+                "description": task.row.data["description"][:160],
+                "note": code,
+                "days": (
+                    layout.slots[task.key].finish - layout.slots[task.key].start
+                    if task.row.id in layout.spanning
+                    else fit.durations.get(task.row.id, durations[task.row.id])
+                ),
+            }
+            if task.row.id in basis:
+                note["basis"] = basis[task.row.id]
+            notes.append(note)
+        for row, reason in tree.skipped_rows:
+            note_counts[reason] = note_counts.get(reason, 0) + 1
+            notes.append(
+                {
+                    "position_id": row.id,
+                    "ordinal": row.data["ordinal"],
+                    "description": row.data["description"][:160],
+                    "note": reason,
+                }
+            )
 
-        # Generation writes dependency edges directly into each activity's JSON
-        # ``dependencies`` field. Promote them into the canonical
-        # ScheduleRelationship table (and resync the JSON mirror) so the
-        # generated schedule has the same single source of truth as one built
-        # edge-by-edge through the relationship endpoints.
-        await self.reconcile_dependency_sources(schedule_id)
+        requested_end = window_end.isoformat() if window_is_explicit else None
+        fitted_window = {
+            "days": total_project_days,
+            "end": window_end.isoformat(),
+            "default": not window_is_explicit,
+            # Whether the plan fits that window at its estimates. False when
+            # even the most workers assumed leave it too long, so the preview
+            # never calls the number "the fewest that fit".
+            "fits": fit.fits and fit.compressed_pct is None,
+        }
+        warnings: list[dict] = []
+        if window_is_explicit and not fit.fits:
+            exceeds: dict[str, Any] = {
+                "code": "plan_exceeds_window",
+                "planned_end": planned_end,
+                "requested_end": requested_end,
+            }
+            if fit.compressed_pct is not None:
+                exceeds["percent"] = fit.compressed_pct
+            warnings.append(exceeds)
+        elif window_is_explicit and fit.compressed_pct is not None:
+            warnings.append({"code": "durations_shortened", "percent": fit.compressed_pct})
 
-        await _safe_publish(
+        return _BoqGenerationPlan(
+            schedule_meta=(
+                {**(schedule.metadata_ or {}), "calendar": calendar_to_record}
+                if calendar_to_record is not None
+                else dict(schedule.metadata_ or {})
+            ),
+            boq_name=getattr(boq, "name", None) or "",
+            boq_estimate_type=getattr(boq, "estimate_type", None),
+            schedule_start=schedule_start,
+            planned_end=planned_end,
+            requested_end=requested_end,
+            fit=fit,
+            activities=activities,
+            relationships=relationships,
+            created=created,
+            positions_scheduled=len(tasks),
+            workers_per_position=workers,
+            workers_assumed=workers_per_position is None,
+            fitted_window=fitted_window,
+            positions_without_workers=len(without_workers),
+            lump_sum_positions=sum(1 for task in tasks if _normalize_unit(task.row.data["unit"]) == "lsum"),
+            rows_skipped=tree.skipped,
+            notes=notes,
+            note_counts=note_counts,
+            warnings=warnings,
+        )
+
+    async def _instalment_relinks(
+        self, schedule_id: uuid.UUID, new_activities: list[Activity]
+    ) -> tuple[list[tuple[uuid.UUID, uuid.UUID]], int]:
+        """Which contract payment instalments a regenerated plan can carry over.
+
+        An instalment waits for a milestone of this schedule. Replacing the
+        plan deletes that milestone; when the new plan has the same one (the
+        generated start or completion, or an activity built from the same bill
+        positions) a pending instalment moves to it. The rest lose their link
+        and go back to their contract dates, as on any delete.
+
+        Returns:
+            ``(instalment_id, new_activity_id)`` pairs, and how many linked
+            instalments cannot be carried over.
+        """
+        try:
+            from app.modules.contracts.models import ContractMilestone
+        except ImportError:  # contracts not installed
+            return [], 0
+        linked = (
+            await self.session.execute(
+                select(ContractMilestone.id, ContractMilestone.activity_id, ContractMilestone.status)
+                .where(ContractMilestone.schedule_id == schedule_id)
+                .where(ContractMilestone.activity_id.is_not(None))
+            )
+        ).all()
+        if not linked:
+            return [], 0
+        old = (
+            await self.session.execute(
+                select(
+                    Activity.id,
+                    Activity.activity_type,
+                    Activity.wbs_code,
+                    Activity.boq_position_ids,
+                    Activity.metadata_,
+                ).where(Activity.id.in_({row.activity_id for row in linked}))
+            )
+        ).all()
+        old_key = {row.id: _relink_key(row) for row in old}
+        new_by_key: dict[tuple, uuid.UUID] = {}
+        for activity in new_activities:
+            key = _relink_key(activity)
+            if key is not None:
+                new_by_key.setdefault(key, activity.id)
+        relinks: list[tuple[uuid.UUID, uuid.UUID]] = []
+        lost = 0
+        for row in linked:
+            key = old_key.get(row.activity_id)
+            # Only an instalment still waiting: one already reached, claimed
+            # or paid stays with the milestone it was settled against.
+            target = new_by_key.get(key) if key is not None and row.status == "pending" else None
+            if target is None:
+                lost += 1
+            else:
+                relinks.append((row.id, target))
+        return relinks, lost
+
+    async def _apply_instalment_relinks(self, relinks: list[tuple[uuid.UUID, uuid.UUID]]) -> None:
+        """Point each instalment at its milestone in the new plan."""
+        from sqlalchemy import update
+
+        from app.modules.contracts.models import ContractMilestone
+
+        for instalment_id, activity_id in relinks:
+            await self.session.execute(
+                update(ContractMilestone).where(ContractMilestone.id == instalment_id).values(activity_id=activity_id)
+            )
+
+    async def _project_planned_start(self, project_id: uuid.UUID) -> date | None:
+        """The project's planned start, when it has one."""
+        from app.modules.projects.repository import ProjectRepository
+
+        project = await ProjectRepository(self.session).get_by_id(project_id)
+        return _parse_day(getattr(project, "planned_start_date", None)) if project is not None else None
+
+    async def preview_generation(
+        self,
+        schedule_id: uuid.UUID,
+        boq_id: uuid.UUID,
+        total_project_days: int | None = None,
+        *,
+        start_date: date | None = None,
+        workers_per_position: int | None = None,
+    ) -> dict[str, Any]:
+        """What :meth:`generate_from_boq` would write, for a person to confirm.
+
+        Writes nothing, deletes nothing and leaves the schedule's start alone.
+        Returns the counts, the planned start and end against the window, the
+        activities already on the schedule (a confirmed generation replaces
+        them) and one note per position whose duration is an estimate or that
+        is left out, with the numbers behind the estimate.
+        """
+        plan = await self._plan_from_boq(
+            schedule_id, boq_id, total_project_days, start_date, workers_per_position=workers_per_position
+        )
+        existing = (await self.activity_repo.list_for_schedule(schedule_id, limit=1))[1]
+        started = await self.activity_repo.count_started(schedule_id) if existing else 0
+        relinks, lost = await self._instalment_relinks(schedule_id, plan.activities) if existing else ([], 0)
+        estimated = sum(
+            plan.note_counts.get(code, 0) for code in ("estimated_from_unit", "cost_share", "default_duration")
+        )
+        return {
+            "boq_id": str(boq_id),
+            "boq_name": plan.boq_name,
+            "boq_estimate_type": plan.boq_estimate_type,
+            "activity_count": len(plan.activities),
+            "positions_scheduled": plan.positions_scheduled,
+            "lump_sum_positions": plan.lump_sum_positions,
+            "summary_count": sum(1 for a in plan.activities if a.activity_type == "summary"),
+            "estimated_count": estimated,
+            "skipped_count": plan.rows_skipped,
+            "note_counts": plan.note_counts,
+            "crews": plan.fit.crews,
+            "workers_per_position": plan.workers_per_position,
+            "workers_assumed": plan.workers_assumed,
+            "positions_without_workers": plan.positions_without_workers,
+            "fitted_window": plan.fitted_window,
+            "compressed_pct": plan.fit.compressed_pct,
+            "fits": plan.fit.fits or plan.requested_end is None,
+            "planned_start": plan.schedule_start.isoformat(),
+            "planned_end": plan.planned_end,
+            "requested_end": plan.requested_end,
+            "warnings": plan.warnings,
+            "existing_activity_count": existing,
+            "existing_started_count": started,
+            "instalments_relinked": len(relinks),
+            "instalments_unlinked": lost,
+            "notes": plan.notes,
+        }
+
+    async def generate_from_boq(
+        self,
+        schedule_id: uuid.UUID,
+        boq_id: uuid.UUID,
+        total_project_days: int | None = None,
+        *,
+        replace: bool = False,
+        start_date: date | None = None,
+        workers_per_position: int | None = None,
+    ) -> list[dict]:
+        """Generate a schedule from a BOQ, at every depth of the bill.
+
+        Every section becomes a summary and every priced position exactly one
+        task under it; the layout rules (crews per section, overlap between
+        top-level sections, fitting to the window) live in
+        :mod:`app.modules.schedule.boq_plan`. Durations come from labour data
+        on the position, else unit production rates and a gang per kind of
+        unit (held to the position's price), else the cost share.
+
+        The outcome is recorded on the schedule under
+        ``metadata["boq_generation"]``: how many positions were scheduled, the
+        crews used, whether durations were shortened, the requested and the
+        planned end, and ``warnings`` such as ``plan_exceeds_window`` when the
+        plan cannot fit the window the caller gave.
+
+        Args:
+            schedule_id: Target schedule to populate.
+            boq_id: Source BOQ; it must belong to the schedule's project.
+            total_project_days: The project window in calendar days, counted
+                from the start. When omitted, 365 (540 for office buildings)
+                is used as a target that crews may be added for, but no
+                duration is shortened.
+            replace: Delete the schedule's activities and links first, in the
+                same transaction. Without it a populated schedule is refused.
+            start_date: The day the plan starts. Written to the schedule with
+                the plan, in the same transaction. When omitted: the
+                schedule's start, else the project's planned start, else today.
+            workers_per_position: Workers on a position whose bill gives hours
+                but no crew, at least (a gang the unit table or the labour rows
+                give is never cut). When omitted, the fewest from 1 to
+                :data:`MAX_ASSUMED_WORKERS` that fit the window without
+                shortening any duration; without an end date, the default
+                window, which the preview names as such.
+
+        Returns:
+            One ``{"id", "activity_type", "end_date"}`` dict per created activity.
+
+        Raises:
+            HTTPException: 404 ``boq_not_found``, 422 ``boq_has_no_positions``,
+                409 ``schedule_has_activities``. Each detail carries ``error``
+                (the code) and ``message`` (English, for API clients).
+        """
+        # Two generations at once would both find the schedule empty and both
+        # write a plan. Hold the schedule row until this one commits; the
+        # other then finds the activities and answers 409, or replaces them.
+        await self.session.execute(select(Schedule.id).where(Schedule.id == schedule_id).with_for_update())
+        plan = await self._plan_from_boq(
+            schedule_id, boq_id, total_project_days, start_date, workers_per_position=workers_per_position
+        )
+
+        relinks: list[tuple[uuid.UUID, uuid.UUID]] = []
+        existing_count = (await self.activity_repo.list_for_schedule(schedule_id, limit=1))[1]
+        if existing_count > 0:
+            relinks, lost = await self._instalment_relinks(schedule_id, plan.activities)
+            if not replace:
+                started = await self.activity_repo.count_started(schedule_id)
+                raise coded_http_error(
+                    status.HTTP_409_CONFLICT,
+                    "schedule_has_activities",
+                    "Schedule already has activities. Generate again with replace=true to replace them.",
+                    activity_count=existing_count,
+                    started_count=started,
+                    instalments_relinked=len(relinks),
+                    instalments_unlinked=lost,
+                )
+            # Same transaction: if anything below fails, the old plan comes back.
+            await self.relationship_repo.delete_for_schedule(schedule_id)
+            await self.activity_repo.delete_for_schedule(schedule_id)
+            publish_after_commit(
+                self.session,
+                "schedule.activities.cleared",
+                {"schedule_id": str(schedule_id), "count": existing_count},
+                source_module="oe_schedule",
+            )
+
+        await self.activity_repo.create_many(plan.activities)
+        await self.relationship_repo.create_many(plan.relationships)
+        if relinks:
+            # Before the commit, so the cleared event finds them on the new
+            # milestones and only refreshes their forecasts.
+            await self._apply_instalment_relinks(relinks)
+
+        schedule_meta = plan.schedule_meta
+        schedule_meta["boq_generation"] = {
+            "boq_id": str(boq_id),
+            "generated_at": datetime.now(UTC).isoformat(),
+            "positions_scheduled": plan.positions_scheduled,
+            "rows_skipped": plan.rows_skipped,
+            "note_counts": plan.note_counts,
+            "crews": plan.fit.crews,
+            "workers_per_position": plan.workers_per_position,
+            "workers_assumed": plan.workers_assumed,
+            "positions_without_workers": plan.positions_without_workers,
+            "fitted_window": plan.fitted_window,
+            "compressed_pct": plan.fit.compressed_pct,
+            "requested_end": plan.requested_end,
+            "planned_end": plan.planned_end,
+            "replaced_activities": existing_count if replace else 0,
+            "warnings": plan.warnings,
+        }
+        await self.schedule_repo.update_fields(
+            schedule_id,
+            start_date=plan.schedule_start.isoformat(),
+            end_date=plan.planned_end,
+            metadata_=schedule_meta,
+        )
+
+        publish_after_commit(
+            self.session,
             "schedule.generated_from_boq",
             {
                 "schedule_id": str(schedule_id),
                 "boq_id": str(boq_id),
-                "activities_created": len(created_activities),
+                "activities_created": len(plan.created),
             },
             source_module="oe_schedule",
         )
 
         logger.info(
-            "Generated %d activities from BOQ %s for schedule %s",
-            len(created_activities),
+            "Generated %d activities from BOQ %s for schedule %s (%d crews, fits=%s)",
+            len(plan.created),
             boq_id,
             schedule_id,
+            plan.fit.crews,
+            plan.fit.fits,
         )
-        return created_activities
+        return plan.created
 
     # ── Critical Path Method ──────────────────────────────────────────────
 
@@ -2815,6 +4024,10 @@ class ScheduleService:
                     "activity_type": a.activity_type or "task",
                     "dependencies": _normalize_deps(a.dependencies),
                     "color": a.color or "#0071e3",
+                    # The CPM write below merges into this, so every other
+                    # key (a milestone's reached marker, import provenance,
+                    # links to sales contracts) survives a recalculation.
+                    "metadata_": dict(a.metadata_) if isinstance(a.metadata_, dict) else {},
                 }
             )
 

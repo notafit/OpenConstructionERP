@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "통과"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "공사가 {start}에 착수되어 신청서 제출일인 {filed}보다 앞섭니다. 대부분의 사업은 공사가 이미 착수된 경우 전혀 지원하지 않습니다",
+      "unevidenced": "공사가 {start}에 조기 착수되었습니다. 기록에는 지원기관이 이를 허용했다고 되어 있지만 서면 허가가 명시되어 있지 않습니다",
+      "evidence": "조기 착수를 허용한 서면 허가의 문서번호를 기록하세요. 그래야 기록만으로 소명할 수 있습니다",
+      "suggestion": "더 지출하기 전에 사업 요건을 확인하세요. 조기 착수가 서면으로 허가되었다면 이를 기록하고, 그렇지 않다면 신청을 더 진행하기 전에 지원기관에 문의하세요"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "교부금 청구 {draw}에 사업기간 시작일인 {period_start} 이전의 비용이 포함되어 있습니다",
+      "after": "교부금 청구 {draw}에 사업기간 종료일인 {period_end} 이후의 비용이 포함되어 있습니다",
+      "spans": "교부금 청구 {draw}의 비용이 사업기간({period_start} ~ {period_end})의 앞뒤를 모두 벗어납니다",
+      "suggestion": "하나의 청구에 두 가지를 함께 담지 말고, 사업기간을 벗어난 비용은 별도의 교부금 청구로 분리해 지원기관과 협의하세요"
+    },
+    "own_share_is_covered": {
+      "fail": "이 사업은 자기부담 비율 {rate}%에 해당하는 자기부담금 {required}의 부담을 요구하지만, 신청서에 기록된 자기부담금은 {recorded}에 그칩니다",
+      "suggestion": "사업은 자기부담금을 프로젝트 총액이 아니라 대상경비 기준액으로 산정하므로, 제출하기 전에 부족한 자기부담금을 어디에서 조달할지 명시하세요"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "이 프로젝트의 신청 {count}건을 합산한 보조강도는 대상경비의 {intensity}%로, 해당 사업들 중 가장 엄격한 사업이 정한 상한 {cap}%를 초과합니다",
+      "suggestion": "공공 자금 지원은 사업 간에, 그리고 중앙과 지방 등 정부 단계 간에 합산됩니다. 신청 금액 하나를 줄이거나, 공사를 나누어 각 공사가 자체 비용을 부담하도록 할 수 있는지 지원기관에 문의하세요"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "사업기간이 {period_end}에 종료되었으나 최종 정산보고가 아직 시작되지 않았습니다",
+      "late": "최종 정산보고는 {due}까지 제출해야 했으나 {submitted}에 제출되었습니다",
+      "overdue": "최종 정산보고는 {due}까지 제출해야 했으나 아직 제출되지 않았습니다",
+      "suggestion": "완벽해질 때까지 기다리지 말고 있는 자료를 제출하세요. 대부분의 지원기관은 요청하면 기한을 연장해 주지만, 이미 지난 기한을 연장해 주는 곳은 없습니다"
+    },
+    "errors": {
+      "application_not_found": "신청서를 찾을 수 없습니다",
+      "programme_code_taken": "이 국가에 같은 관리번호의 사업이 이미 있습니다",
+      "programme_not_found": "사업을 찾을 수 없습니다",
+      "programme_has_applications": "이 사업에는 신청서가 있어 삭제할 수 없습니다. 대신 상태를 \"종료\"로 바꾸세요.",
+      "application_code_taken": "이 프로젝트에 같은 관리번호의 신청서가 이미 있습니다",
+      "approved_application_not_deletable": "승인된 신청서는 삭제할 수 없습니다. 대신 상태를 \"철회됨\" 또는 \"종료됨\"으로 바꾸세요.",
+      "approval_needs_period_end": "이후의 모든 기한은 사업기간 종료일부터 계산되므로 교부 결정에는 이 날짜가 필요합니다",
+      "draw_needs_approval": "교부금 청구는 승인된 신청서에 대해서만 할 수 있습니다",
+      "draw_not_found": "교부금 청구를 찾을 수 없습니다",
+      "paid_draw_not_deletable": "지급완료된 교부금 청구는 삭제할 수 없습니다",
+      "proof_not_found": "정산보고를 찾을 수 없습니다",
+      "obligation_not_found": "의무를 찾을 수 없습니다",
+      "eligible_exceeds_amount": "대상경비 금액은 전체 금액을 초과할 수 없습니다",
+      "allocation_not_found": "경비 배분 항목을 찾을 수 없습니다"
+    }
+  }
+}

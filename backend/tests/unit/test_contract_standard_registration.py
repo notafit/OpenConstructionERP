@@ -71,6 +71,11 @@ NO_VARIATION_CLAUSE_ON_PURPOSE: dict[str, str] = {
         "default_clause_for_standard returns an empty string for any AIA code, so an AIA "
         "variation record carries no default clause stamp and shows only whatever the user typed."
     ),
+    "CCDC": (
+        "No default clause stamp on a CCDC variation record; the user enters the clause reference "
+        "manually. CCDC 2-2020 GC 6.1 and GC 6.3 are the relevant variation clauses but have not "
+        "been registered in the variation clause table yet."
+    ),
     "CONSENSUSDOCS": ("Same as AIA: no default clause stamp on a ConsensusDocs variation record."),
 }
 
@@ -135,15 +140,13 @@ def test_a_family_added_to_one_table_only_is_named_rather_than_ignored() -> None
     """The gate is not vacuous: give it a half-registered family and it reports it.
 
     Without this, the tests above prove only that a list comprehension can
-    return an empty list. ``CCDC`` is the case they exist for, and it is no
-    longer hypothetical: the family is now recognised by the bridge and holds
-    no periods, and neither outer table has a row for it. A ``ccdc_2_2020``
-    landing in one of them has to be reported, because the bridge answering is
-    not the notice engine being able to time it.
+    return an empty list. The synthetic code below normalises to UNKNOWN and
+    has no row in NOTICE_PERIODS, so the gate reports it - exactly what would
+    happen if someone added a contract template without configuring periods.
     """
-    reported = _unregistered_notice_families({"ccdc_2_2020": {}}, {})
+    reported = _unregistered_notice_families({"acme_contract_2025": {}}, {})
 
-    assert reported == ["ccdc_2_2020"]
+    assert reported == ["acme_contract_2025"]
 
 
 def test_a_deliberately_absent_code_carries_the_consequence_of_leaving_it_absent() -> None:

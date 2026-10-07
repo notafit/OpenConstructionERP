@@ -5,13 +5,19 @@
 Wires real cross-module side-effects emitted by the wave-5 deep-dive:
 
 * ``resources.cert_expiring`` → notification per expiring certification.
-* ``contracts.claim.certified`` → finance Invoice (AR direction, project-scoped).
 * ``contracts.retention.released`` → notification for project owner.
 * ``crm.opportunity.won`` → bid_management BidPackage (draft, pre-populated).
 * ``crm.opportunity.scored`` → notification for opportunity owner.
 * ``carbon.boq_position.assigned`` → notification for project sustainability lead.
 * ``changeorder.approved`` → revise the linked contract's total_value (when
   the CO carries ``metadata.contract_id``).
+
+``contracts.claim.certified`` used to raise an invoice here as well. The
+finance module already raises exactly one per claim, linked through
+``source_claim_id`` and in the direction the contract calls for, so this
+second, unlinked receivable (numbered ``PC-<claim>``) doubled every certified
+claim and booked a subcontractor's bill as money owed to us. It was removed
+rather than deduplicated: two writers for one invoice is the defect.
 
 All handlers are best-effort, and the bus is what makes them so:
 ``EventBus.publish`` runs each handler in its own ``try``, logs a failure
@@ -92,100 +98,6 @@ async def _on_cert_expiring(event: Event) -> None:
             action_url=f"/resources/{resource_id}",
         )
         await session.commit()
-
-
-# ── Contracts: claim certified → finance invoice ─────────────────────────
-
-
-async def _on_claim_certified(event: Event) -> None:
-    """``contracts.claim.certified`` → create a draft Invoice (AR direction).
-
-    Reads the claim's net_due + contract's currency + counterparty, and
-    spawns an Invoice referencing back to the claim through metadata.
-    """
-    if not await _can_open_isolated_session():
-        return
-    data = event.data or {}
-    claim_id = data.get("claim_id")
-    contract_id = data.get("contract_id")
-    if not (claim_id and contract_id):
-        return
-    async with async_session_factory() as session:
-        from app.modules.contracts.repository import (
-            ContractRepository,
-            ProgressClaimRepository,
-        )
-        from app.modules.finance.models import Invoice
-
-        claim_repo = ProgressClaimRepository(session)
-        contract_repo = ContractRepository(session)
-        try:
-            claim = await claim_repo.get_by_id(uuid.UUID(str(claim_id)))
-            contract = await contract_repo.get_by_id(uuid.UUID(str(contract_id)))
-        except (ValueError, TypeError):
-            return
-        if claim is None or contract is None:
-            return
-        # Dedupe: skip if metadata already records an auto-invoice.
-        meta = dict(claim.metadata_ or {})
-        if meta.get("auto_invoice_id"):
-            logger.debug(
-                "claim %s already auto-invoiced (%s)",
-                claim_id,
-                meta["auto_invoice_id"],
-            )
-            return
-        net_due = Decimal(str(claim.net_due or 0))
-        if net_due <= 0:
-            return
-        from datetime import UTC, datetime, timedelta
-
-        invoice = Invoice(
-            project_id=contract.project_id,
-            contact_id=str(contract.counterparty_id) if contract.counterparty_id else None,
-            invoice_direction="receivable",
-            invoice_number=f"PC-{claim.claim_number or claim.id}",
-            invoice_date=datetime.now(UTC).date().isoformat(),
-            due_date=(datetime.now(UTC).date() + timedelta(days=30)).isoformat(),
-            currency_code=contract.currency or "",
-            amount_subtotal=Decimal(str(claim.gross_amount or 0)) - Decimal(str(claim.retention_amount or 0)),
-            tax_amount=Decimal("0"),
-            retention_amount=Decimal(str(claim.retention_amount or 0)),
-            amount_total=net_due,
-            status="draft",
-            payment_terms_days="30",
-            notes=(f"Auto-generated from certified progress claim {claim.claim_number} on contract {contract.code}"),
-        )
-        invoice.metadata_ = {
-            "source": "contracts.claim.certified",
-            "contract_id": str(contract.id),
-            "claim_id": str(claim.id),
-            "claim_number": claim.claim_number,
-        }
-        session.add(invoice)
-        await session.flush()
-        # Stash the invoice id back into the claim metadata so we don't
-        # double-issue on subsequent events.
-        meta["auto_invoice_id"] = str(invoice.id)
-        await claim_repo.update_fields(claim.id, metadata_=meta)
-        await session.commit()
-        event_bus.publish_detached(
-            "finance.invoice.created",
-            {
-                "invoice_id": str(invoice.id),
-                "source": "contracts.claim.certified",
-                "claim_id": str(claim.id),
-                "amount_total": str(net_due),
-                "currency": contract.currency or "",
-            },
-            source_module="finance",
-        )
-        logger.info(
-            "Auto-created invoice %s from claim %s (net_due=%s)",
-            invoice.id,
-            claim.id,
-            net_due,
-        )
 
 
 # ── Contracts: retention released → notification ─────────────────────────
@@ -415,6 +327,13 @@ async def _on_bid_package_awarded(event: Event) -> None:
     schedule-of-values lines mirroring the winning bid submission lines.
     The contract.metadata back-references the bid package + award so the
     audit trail is unbroken.
+
+    Idempotency is keyed on ``metadata.bid_package_id`` and, when the package
+    is linked to a tender package, ``metadata.tender_package_id``, which the
+    tender award path writes too, so one logical award drafts one contract
+    whichever path fires first. The contract code is only a label: a
+    hand-made contract that already uses ``CONTRACT-{code}`` gets a warning
+    and the draft a free code, where it used to swallow the award silently.
     """
     if not await _can_open_isolated_session():
         return
@@ -431,6 +350,12 @@ async def _on_bid_package_awarded(event: Event) -> None:
     async with async_session_factory() as session:
         from sqlalchemy import select
 
+        from app.modules.bid_management.award_contract import (
+            add_award_party,
+            find_award_contract,
+            free_contract_code,
+            resolve_award_counterparty,
+        )
         from app.modules.bid_management.award_selection import select_awarded_submission
         from app.modules.bid_management.models import (
             Bidder,
@@ -447,13 +372,33 @@ async def _on_bid_package_awarded(event: Event) -> None:
         if bidder is None:
             return
 
-        # Don't double-create: deterministic code keyed on package id.
-        code = f"CONTRACT-{package.code}"
-        existing = await session.execute(
-            select(Contract).where(Contract.code == code),
+        # Don't double-create. The key is the award, not the code: a person
+        # may have typed CONTRACT-{code} on a contract of their own.
+        tender_package_id = str(package.tender_id) if package.tender_id else None
+        existing = await find_award_contract(
+            session,
+            package.project_id,
+            keys={"bid_package_id": str(package.id), "tender_package_id": tender_package_id},
         )
-        if existing.scalar_one_or_none() is not None:
+        if existing is not None:
+            logger.info(
+                "bid_management.awarded: contract %s already drafted for package %s (idempotent skip)",
+                existing.code,
+                package.code,
+            )
             return
+        code = await free_contract_code(session, f"CONTRACT-{package.code}")
+
+        # The bidder row is a snapshot nobody else can resolve, so it is
+        # never the counterparty. The directory entry it was invited from
+        # is, and a bidder typed in by hand has none: the contract then
+        # names no counterparty and its party carries the company name.
+        counterparty = await resolve_award_counterparty(
+            session,
+            subcontractor_id=bidder.subcontractor_id,
+            contact_id=bidder.contact_id,
+            company_name=bidder.company_name,
+        )
 
         # Locate the awarded submission so we can mirror lines.
         #
@@ -474,7 +419,7 @@ async def _on_bid_package_awarded(event: Event) -> None:
             title=package.title or f"Contract - {package.code}",
             contract_type="lump_sum",
             counterparty_type="subcontractor",
-            counterparty_id=awarded_bidder_id,
+            counterparty_id=counterparty.counterparty_id,
             project_id=package.project_id,
             total_value=Decimal(str(data.get("awarded_amount", "0"))),
             currency=str(data.get("currency", "")) or package.currency,
@@ -489,8 +434,13 @@ async def _on_bid_package_awarded(event: Event) -> None:
             "awarded_bidder_id": str(awarded_bidder_id),
             "awarded_bidder_name": bidder.company_name,
         }
+        if tender_package_id:
+            contract.metadata_["tender_package_id"] = tender_package_id
+        if counterparty.contact_id is not None:
+            contract.metadata_["counterparty_contact_id"] = str(counterparty.contact_id)
         session.add(contract)
         await session.flush()
+        add_award_party(session, contract.id, counterparty)
 
         # Mirror the package's line items → contract lines, copying
         # the awarded bidder's priced totals when present.
@@ -534,6 +484,10 @@ async def _on_bid_package_awarded(event: Event) -> None:
                 order_index=pkg_line.order_index,
             )
             cl.metadata_ = {"bid_package_line_id": str(pkg_line.id)}
+            if pkg_line.boq_position_id is not None:
+                # The key the contracts progress bridge reads, see
+                # contracts.service.BOQ_POSITION_META_KEY.
+                cl.metadata_["boq_position_id"] = str(pkg_line.boq_position_id)
             session.add(cl)
 
         await session.commit()
@@ -654,6 +608,35 @@ def _record_mirror_skip(
     )
     md["skipped_variation_mirror"] = entries
     return True
+
+
+async def _post_to_sov(session, contract, source_key: str, kind: str, source_id: object, data: dict, delta) -> None:
+    """Put the change on the schedule of values in the transaction that moved the sum.
+
+    See ``app.modules.contracts.sov_posting``: one pooled line and one
+    adjustment under the same source key, nothing on a replay.
+    """
+    from datetime import UTC, datetime
+
+    from app.modules.contracts.sov_posting import post_source_to_sov
+
+    try:
+        parsed_id = uuid.UUID(str(source_id))
+    except (ValueError, TypeError):
+        parsed_id = None
+    code = str(data.get("code") or "")
+    await post_source_to_sov(
+        session,
+        contract,
+        key=source_key,
+        kind=kind,
+        source_id=parsed_id,
+        code=code,
+        title=code,
+        amount=delta,
+        currency=str(data.get("currency") or contract.currency or ""),
+        approved_on=datetime.now(UTC).date(),
+    )
 
 
 # ── Variations: VO completed → contract sum bump ─────────────────────────
@@ -795,6 +778,7 @@ async def _on_variation_completed(event: Event) -> None:
         await session.execute(
             sa_update(Contract).where(Contract.id == contract_id).values(total_value=Contract.total_value + delta)
         )
+        await _post_to_sov(session, contract, source_key, "variation_order", vo_id_raw, data, delta)
         await session.commit()
         logger.info(
             "Contract %s total_value bumped by %s (VO=%s)",
@@ -971,6 +955,7 @@ async def _on_changeorder_approved_contract(event: Event) -> None:
         await session.execute(
             sa_update(Contract).where(Contract.id == contract_id).values(total_value=Contract.total_value + delta)
         )
+        await _post_to_sov(session, contract, source_key, "change_order", co_id_raw, data, delta)
         await session.commit()
         logger.info(
             "Contract %s total_value bumped by %s (CO=%s)",
@@ -1065,12 +1050,67 @@ async def _on_qms_ncr_mirrored_from_hse(event: Event) -> None:
         await session.commit()
 
 
+# ── Change orders: CO approved → extend master schedule ────────────────
+
+
+async def _on_changeorder_approved_schedule(event: Event) -> None:
+    """``changeorder.approved`` → extend the master schedule end date.
+
+    When a CO carries ``schedule_impact_days > 0``, the project's master
+    schedule end date is pushed forward by that many calendar days (OC-33).
+    """
+    if not await _can_open_isolated_session():
+        return
+    data = event.data or {}
+    days = int(data.get("schedule_impact_days") or 0)
+    project_id_raw = data.get("project_id")
+    if days <= 0 or not project_id_raw:
+        return
+    try:
+        from datetime import date, timedelta
+        from uuid import UUID
+
+        from sqlalchemy import select
+
+        pid = UUID(str(project_id_raw))
+        async with async_session_factory() as session:
+            from app.modules.schedule.models import Schedule
+
+            rows = (
+                (
+                    await session.execute(
+                        select(Schedule).where(Schedule.project_id == pid, Schedule.schedule_type == "master")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                return
+            sched = rows[0]
+            if not sched.end_date:
+                return
+            old_end = date.fromisoformat(str(sched.end_date)[:10])
+            new_end = old_end + timedelta(days=days)
+            sched.end_date = new_end.isoformat()
+            await session.commit()
+            logger.info(
+                "CO %s extended master schedule %s end date by %d days: %s -> %s",
+                data.get("change_order_id"),
+                sched.id,
+                days,
+                old_end.isoformat(),
+                new_end.isoformat(),
+            )
+    except Exception:
+        logger.warning("Schedule extension failed for CO %s", data.get("change_order_id"), exc_info=True)
+
+
 # ── Registration ─────────────────────────────────────────────────────────
 
 
 _SUBSCRIPTIONS: tuple[tuple[str, Callable[[Event], object]], ...] = (
     ("resources.cert_expiring", _on_cert_expiring),
-    ("contracts.claim.certified", _on_claim_certified),
     ("contracts.retention.released", _on_retention_released),
     ("crm.opportunity.won", _on_opportunity_won),
     ("crm.opportunity.scored", _on_opportunity_scored),
@@ -1078,6 +1118,7 @@ _SUBSCRIPTIONS: tuple[tuple[str, Callable[[Event], object]], ...] = (
     ("bid_management.package.awarded", _on_bid_package_awarded),
     ("variations.contract_sum.updated", _on_variation_completed),
     ("changeorder.approved", _on_changeorder_approved_contract),
+    ("changeorder.approved", _on_changeorder_approved_schedule),
     ("qms.ncr.mirrored_from_hse", _on_qms_ncr_mirrored_from_hse),
 )
 
@@ -1085,7 +1126,7 @@ _SUBSCRIPTIONS: tuple[tuple[str, Callable[[Event], object]], ...] = (
 def register_wave5_notification_subscribers() -> None:
     """Idempotently register every wave-5 cross-module subscriber."""
     for event_name, handler in _SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications: subscribed to %d wave-5 cross-module event(s)",
         len(_SUBSCRIPTIONS),

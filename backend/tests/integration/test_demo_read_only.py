@@ -281,17 +281,18 @@ _MUTATING_ROUTE_FLOOR = 1000
 #: Every WebSocket the application mounts, spelled out rather than counted.
 #:
 #: The HTTP sweep gets a floor because its population is in the thousands and
-#: moves with every feature. The socket population is three, so it gets the
+#: moves with every feature. The socket population is five, so it gets the
 #: stronger thing: the exact set. A floor would only catch the sweep going to
 #: nothing, and the failure worth catching here is the sweep coming back with
-#: SOME of them - two out of three still satisfies "every socket I found
-#: carries the guard" while saying nothing about the one that went missing.
+#: SOME of them - three out of five still satisfies "every socket I found
+#: carries the guard" while saying nothing about the two that went missing.
 #:
-#: Three entries for two declarations because the module loader mounts each
+#: Five entries for three declarations because the module loader mounts each
 #: module twice when its directory name is not already kebab-case, once at the
 #: canonical prefix and once at the legacy underscore mirror. ``notifications``
 #: is spelled the same either way and so appears once; ``collaboration_locks``
-#: becomes ``collaboration-locks`` and so appears twice. Adding a socket is
+#: becomes ``collaboration-locks`` and ``global_presence`` becomes
+#: ``global-presence``, so each appears twice. Adding a socket is
 #: meant to fail here: it is a line in this set, and a moment's thought about
 #: whether it belongs in the demo allowlist.
 _EXPECTED_SOCKET_PATHS = frozenset(
@@ -299,6 +300,8 @@ _EXPECTED_SOCKET_PATHS = frozenset(
         "/api/v1/notifications/ws/",
         "/api/v1/collaboration-locks/presence/",
         "/api/v1/collaboration_locks/presence/",
+        "/api/v1/global-presence/ws/",
+        "/api/v1/global_presence/ws/",
     }
 )
 

@@ -63,7 +63,7 @@ _TAKEOFF = ["takeoff", "dwg_takeoff", "cad"]
 _BIM = ["bim_hub", "bim_requirements", "match_elements", "opencde_api"]
 _AI = ["ai", "erp_chat", "compliance_ai", "ai_agents"]
 _PLANNING = ["schedule", "schedule_advanced", "tasks", "costmodel", "eac"]
-_FINANCE = ["finance", "procurement", "tendering", "changeorders"]
+_FINANCE = ["finance", "funding", "procurement", "tendering", "changeorders"]
 _COMMERCIAL = [
     "bid_management",
     "contracts",
@@ -85,15 +85,36 @@ _ENTERPRISE = ["enterprise_workflows", "full_evm", "rfq_bidding", "integrations"
 
 # Region-specific packs are chosen on the onboarding region step / via partner
 # packs, not by a company profile, so they are not part of any profile's set.
+#
+# That sentence was true of the presets and false of the code beneath them.
+# ``modules_for`` iterated ``_ALL_MODULES``, which includes these, and wrote
+# ``False`` for every one of them under every profile including Full
+# Enterprise - so a company profile did decide them, and decided them off.
+# They carry no sidebar row (see the note at the foot of ``navCatalog.ts``),
+# so the only thing that flag reached was the toggle on ``/modules``, which
+# then read "off" for a pack ``regional_packs.py`` imports unconditionally and
+# consults on every BOQ validation. A switch reporting off about a module that
+# is on is worse than no switch.
+#
+# The list also stood at eight while thirteen packs sit in
+# ``backend/app/modules/*_pack``, so five of them were already absent from the
+# map and read as on, and which half of the thirteen a reader saw depended on
+# nothing they could see. ``test_regional_list_matches_the_packs_on_disk``
+# fails when a pack is added without a line here.
 _REGIONAL = [
-    "dach_pack",
-    "uk_pack",
-    "us_pack",
-    "india_pack",
-    "middle_east_pack",
-    "latam_pack",
     "asia_pac_pack",
+    "china_pack",
+    "dach_pack",
+    "india_pack",
+    "latam_pack",
+    "mexico_pack",
+    "middle_east_pack",
     "russia_pack",
+    "sa_pack",
+    "uk_pack",
+    "us_ca_pack",
+    "us_pack",
+    "us_tx_pack",
 ]
 
 # Every functional module, in display order (used by Full Enterprise).
@@ -178,6 +199,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "tasks",
             "costmodel",
             "finance",
+            "funding",
             "procurement",
             "changeorders",
             "contracts",
@@ -205,6 +227,9 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "fieldreports",
             "reporting",
             "project_controls",
+            "bi_dashboards",  # project_controls depends on it
+            "bim_hub",  # reporting depends on it
+            "cad",  # takeoff depends on it
         ],
     ),
     "estimator": CompanyPreset(
@@ -226,9 +251,13 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "match_elements",
             "ai",
             "tendering",
+            "funding",
             "supplier_catalogs",
             "documents",
             "reporting",
+            "bim_hub",  # measuring from the model
+            "cad",  # measuring from drawings
+            "procurement",  # supplier_catalogs depends on it
         ],
     ),
     "architecture_engineering": CompanyPreset(
@@ -258,6 +287,9 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "compliance_docs",
             "carbon",
             "reporting",
+            "funding",
+            "cad",  # takeoff depends on it
+            "collaboration",  # opencde_api depends on it
         ],
     ),
     "construction_manager": CompanyPreset(
@@ -287,6 +319,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "qms",
             "moc",
             "finance",
+            "funding",
             "procurement",
             "changeorders",
             "contracts",
@@ -301,6 +334,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "reporting",
             "bi_dashboards",
             "project_controls",
+            "bim_hub",  # reporting depends on it
+            "resources",  # payroll depends on it
         ],
     ),
     "real_estate_developer": CompanyPreset(
@@ -316,6 +351,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "contracts",
             "variations",
             "finance",
+            "funding",
             "procurement",
             "changeorders",
             "tendering",
@@ -333,6 +369,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "carbon",
             "reporting",
             "bi_dashboards",
+            "bim_hub",  # reporting depends on it
         ],
     ),
     "subcontractor": CompanyPreset(
@@ -364,7 +401,10 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "changeorders",
             "variations",
             "documents",
+            "funding",
             "markups",
+            "contracts",  # pay applications to the main contractor
+            "cad",  # takeoff depends on it
         ],
     ),
     "owner_client": CompanyPreset(
@@ -387,10 +427,14 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "requirements",
             "compliance",
             "finance",
+            "funding",
             "schedule",
             "boq",
             "costs",
             "risk",
+            "contracts",  # the owner signs the contract
+            "changeorders",  # and approves every change to it
+            "bim_hub",  # reporting depends on it
         ],
     ),
     "bim_vdc": CompanyPreset(
@@ -416,6 +460,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "boq",
             "costs",
             "reporting",
+            "funding",
         ],
     ),
     "civil_infrastructure": CompanyPreset(
@@ -436,6 +481,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "costmodel",
             "eac",
             "finance",
+            "funding",
             "procurement",
             "changeorders",
             "contracts",
@@ -459,6 +505,11 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "project_controls",
             "reporting",
             "carbon",
+            "rfi",  # same RFI cycle as a building site
+            "submittals",  # same submittal cycle
+            "meetings",  # same site meetings
+            "bi_dashboards",  # project_controls depends on it
+            "bim_hub",  # reporting depends on it
         ],
     ),
     "mep_contractor": CompanyPreset(
@@ -477,6 +528,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "schedule",
             "tasks",
             "procurement",
+            "funding",
             "supplier_catalogs",
             "submittals",
             "rfi",
@@ -495,6 +547,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "variations",
             "contracts",
             "reporting",
+            "safety",  # live electrical, hot work, work at height
+            "cad",  # takeoff depends on it
         ],
     ),
     "design_build": CompanyPreset(
@@ -516,6 +570,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "tasks",
             "costmodel",
             "finance",
+            "funding",
             "procurement",
             "contracts",
             "changeorders",
@@ -532,6 +587,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "safety",
             "carbon",
             "reporting",
+            "cad",  # takeoff depends on it
+            "collaboration",  # opencde_api depends on it
         ],
     ),
     "homebuilder": CompanyPreset(
@@ -550,6 +607,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "schedule",
             "tasks",
             "procurement",
+            "funding",
             "subcontractors",
             "contracts",
             "changeorders",
@@ -562,6 +620,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "documents",
             "markups",
             "reporting",
+            "bim_hub",  # reporting depends on it
+            "cad",  # takeoff depends on it
         ],
     ),
     "commercial_manager": CompanyPreset(
@@ -589,6 +649,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "reporting",
             "bi_dashboards",
             "project_controls",
+            "bim_hub",  # reporting depends on it
         ],
     ),
     "procurement_manager": CompanyPreset(
@@ -612,6 +673,7 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "correspondence",
             "reporting",
             "bi_dashboards",
+            "bim_hub",  # reporting depends on it
         ],
     ),
     "scheduler_planner": CompanyPreset(
@@ -632,7 +694,11 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "resources",
             "equipment",
             "reporting",
+            "funding",
             "bi_dashboards",
+            "bim_hub",  # reporting depends on it
+            "boq",  # bim_hub, costmodel, reporting, schedule depends on it
+            "finance",  # full_evm depends on it
         ],
     ),
     "site_supervisor": CompanyPreset(
@@ -658,8 +724,11 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "rfi",
             "meetings",
             "documents",
+            "funding",
             "markups",
             "collaboration",
+            "boq",  # schedule depends on it
+            "contracts",  # subcontractors depends on it
         ],
     ),
     "quality_manager": CompanyPreset(
@@ -684,6 +753,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "fieldreports",
             "meetings",
             "reporting",
+            "bim_hub",  # reporting depends on it
+            "boq",  # bim_hub, reporting, validation depends on it
         ],
     ),
     "hse_manager": CompanyPreset(
@@ -709,6 +780,8 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "meetings",
             "reporting",
             "carbon",
+            "bim_hub",  # reporting depends on it
+            "boq",  # bim_hub, reporting depends on it
         ],
     ),
     "sustainability_esg": CompanyPreset(
@@ -727,7 +800,9 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "bim_requirements",
             "bi_dashboards",
             "reporting",
+            "funding",
             "documents",
+            "boq",  # bim_hub, reporting, validation depends on it
         ],
     ),
     "facility_manager": CompanyPreset(
@@ -752,11 +827,14 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "schedule",
             "tasks",
             "finance",
+            "funding",
             "procurement",
             "portal",
             "reporting",
             "bi_dashboards",
             "carbon",
+            "bim_hub",  # reporting depends on it
+            "boq",  # bim_hub, reporting, schedule depends on it
         ],
     ),
     "government_agency": CompanyPreset(
@@ -779,12 +857,15 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
             "correspondence",
             "meetings",
             "finance",
+            "funding",
             "boq",
             "risk",
             "inspections",
             "reporting",
             "bi_dashboards",
             "project_controls",
+            "bim_hub",  # reporting depends on it
+            "procurement",  # rfq_bidding depends on it
         ],
     ),
     "full_enterprise": CompanyPreset(
@@ -800,8 +881,12 @@ COMPANY_PRESETS: dict[str, CompanyPreset] = {
 
 # ── Company-size presets ──────────────────────────────────────────────────────
 # A parallel dimension to the role grid above. Where ``COMPANY_PRESETS`` answers
-# "what kind of work do you do", these answer "how big is your team" - a much
-# quicker first cut for a new user who does not want to scan the full role list.
+# "what kind of work do you do", these answer "how big is your team". The
+# onboarding wizard no longer offers them: team size says how many people use
+# the tool, not which tools they use, so the wizard asks what the company does.
+# They stay served and saveable because accounts that picked one keep its key
+# as their ``company_type`` (and ``company_size``), and a stored answer has to
+# read back and save again unchanged.
 #
 # They reuse the exact same machinery: a size maps to a functional-module set
 # which ``modules_for`` turns into the ``module_preferences`` map the sidebar
@@ -817,7 +902,15 @@ SIZE_PRESETS: dict[str, CompanyPreset] = {
         description="Just me - quick takeoff, a priced BoQ and a clean report, without the overhead.",
         icon="HardHat",
         tags=["Takeoff", "BOQ", "Reports"],
-        enabled_modules=["boq", "takeoff", "validation", "ai", "reporting"],
+        enabled_modules=[
+            "boq",
+            "takeoff",
+            "validation",
+            "ai",
+            "reporting",
+            "bim_hub",  # reporting depends on it
+            "cad",  # takeoff depends on it
+        ],
     ),
     "size_small": CompanyPreset(
         key="size_small",
@@ -842,6 +935,8 @@ SIZE_PRESETS: dict[str, CompanyPreset] = {
             "documents",
             "markups",
             "reporting",
+            "bim_hub",  # reporting depends on it
+            "cad",  # takeoff depends on it
         ],
     ),
     "size_medium": CompanyPreset(
@@ -876,6 +971,23 @@ def get_size_preset(company_size: str) -> CompanyPreset | None:
     return SIZE_PRESETS.get(company_size)
 
 
+def is_saveable_company_type(key: str) -> bool:
+    """Whether ``key`` may be saved as a user's ``company_type``.
+
+    Both catalogues count. The onboarding wizard offers only the company
+    profiles now, but accounts that chose a team size in an earlier release
+    carry a ``size_*`` key as their ``company_type``, and a client built
+    before that change still sends one. Refusing those would turn an answer
+    the user already gave into an error on their next save.
+    """
+    return key in COMPANY_PRESETS or key in SIZE_PRESETS
+
+
+def is_saveable_company_size(key: str) -> bool:
+    """Whether ``key`` may be saved as a user's ``company_size``."""
+    return key in SIZE_PRESETS
+
+
 def get_all_presets() -> list[dict[str, Any]]:
     """Return all presets as serialisable dicts (for the GET endpoint)."""
     return [p.to_dict() for p in COMPANY_PRESETS.values()]
@@ -891,15 +1003,37 @@ def is_core_module(key: str) -> bool:
     return key in _CORE_MODULES
 
 
+def get_core_modules() -> list[str]:
+    """The always-on module keys, in the order they are declared.
+
+    The profile picker needs this to tell a reader the truth about a switch.
+    Every preset's ``enabled_modules`` is the *functional* set, and some of
+    them re-list a core key, so a screen that subtracts one profile from
+    another without knowing which keys are core reports modules as lost that
+    nothing can lose. Returns a copy, because the caller is a serialiser and a
+    handed-out module-level list is one mutation away from a profile that can
+    hide Projects.
+    """
+    return list(_CORE_MODULES)
+
+
 def modules_for(enabled_modules: list[str]) -> dict[str, bool]:
     """Build the full ``module_preferences`` map for a chosen module set.
 
-    Every known module key is given an explicit ``True``/``False`` so the
-    sidebar can hide what the profile leaves out. Core modules are forced on,
-    so a profile can never hide Projects, Settings, the admin area, etc.
+    Every module a profile governs is given an explicit ``True``/``False`` so
+    the sidebar can hide what the profile leaves out. Core modules are forced
+    on, so a profile can never hide Projects, Settings, the admin area, etc.
+
+    Regional packs are governed by the market, not the role, so they get no
+    entry at all and keep whatever the region step or the applied partner pack
+    decided. Writing ``False`` for them, which is what iterating the whole
+    registry used to do, told every reader their country pack was switched off.
     """
     chosen = set(enabled_modules)
+    regional = set(_REGIONAL)
     prefs: dict[str, bool] = {}
     for key in _ALL_MODULES:
+        if key in regional:
+            continue
         prefs[key] = True if key in _CORE_MODULES else key in chosen
     return prefs

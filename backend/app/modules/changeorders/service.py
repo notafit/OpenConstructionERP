@@ -609,6 +609,15 @@ class ChangeOrderService:
         the current max ordinal from the DB and bumping from there. After
         ``_MAX_RETRIES`` collisions we surface the error rather than looping
         forever.
+
+        Each insert runs inside a SAVEPOINT, so a collision rolls back that one
+        insert and nothing else. Callers create orders in the middle of their
+        own work: the variation subscriber holds a row lock on the RFI or NCR
+        from its "already has an order?" check until it writes the back link,
+        and the VR -> VO conversion has already written the VO. A full
+        ``session.rollback()`` here released that lock and threw that work
+        away, so a concurrent "create variation" could slip in and the same
+        source ended up with two change orders.
         """
         from sqlalchemy.exc import IntegrityError
 
@@ -653,20 +662,21 @@ class ChangeOrderService:
                 metadata_=data.metadata,
             )
             try:
-                order = await self.repo.create(order)
-                logger.info(
-                    "Change order created: %s for project %s (attempt %d)",
-                    code,
-                    data.project_id,
-                    attempt + 1,
-                )
-                return order
+                async with self.session.begin_nested():
+                    order = await self.repo.create(order)
             except IntegrityError as exc:
-                # Another transaction picked the same code. Roll back and
-                # retry with a bumped ordinal.
+                # Another transaction picked the same code. Only the savepoint
+                # is rolled back; retry with a bumped ordinal.
                 last_exc = exc
-                await self.session.rollback()
                 continue
+            await self._warn_standalone_overlap(order)
+            logger.info(
+                "Change order created: %s for project %s (attempt %d)",
+                code,
+                data.project_id,
+                attempt + 1,
+            )
+            return order
 
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -675,6 +685,47 @@ class ChangeOrderService:
                 f"{_MAX_RETRIES} attempts (concurrent contention). Please retry."
             ),
         ) from last_exc
+
+    async def _warn_standalone_overlap(
+        self,
+        order: ChangeOrder,
+    ) -> None:
+        """Tag a standalone CO when active Variation Orders exist on the project.
+
+        Issue #435 lifecycle enforcement. A standalone CO created alongside
+        active VOs risks duplicating scope and commercial values. We attach a
+        warning to the order's metadata so the UI can surface it. This is
+        deliberately a warning, not a block: construction workflows are diverse
+        and the estimator may have a valid reason to raise a standalone CO.
+        """
+        if mirrored_variation_order_id(order):
+            return  # This CO was created by VO conversion - no overlap concern.
+
+        from sqlalchemy import func, select
+
+        try:
+            from app.modules.variations.models import VariationOrder
+        except ImportError:
+            return  # Variations module not installed.
+
+        stmt = (
+            select(func.count())
+            .select_from(VariationOrder)
+            .where(
+                VariationOrder.project_id == order.project_id,
+                VariationOrder.status.notin_(["rejected", "cancelled", "voided"]),
+            )
+        )
+        active_vo_count = (await self.session.execute(stmt)).scalar_one_or_none() or 0
+        if active_vo_count > 0:
+            metadata = dict(order.metadata_) if order.metadata_ else {}
+            metadata["standalone_overlap_warning"] = (
+                f"This project has {active_vo_count} active variation order(s). "
+                "If this change order covers scope already handled by a variation, "
+                "consider linking it to the variation order instead to avoid "
+                "duplicate commercial values."
+            )
+            order.metadata_ = metadata
 
     async def _resolve_currency(
         self,
@@ -1438,6 +1489,14 @@ class ChangeOrderService:
         except (InvalidOperation, ValueError):
             delta = Decimal("0")
         project_updated = False
+        # Bound before the branch so both are defined on every path. An order
+        # with no cost impact, or one whose project row is gone, never enters
+        # the branch, and when the budget delta row below still read them that
+        # approval raised UnboundLocalError instead of completing. The row no
+        # longer reads either, but a later reader should not have to find that
+        # out again.
+        delta_base: Decimal | None = None
+        current = Decimal("0")
         if delta != 0:
             # Use the snapshot captured before the status write so the lookup
             # keys off the project the order was approved against without
@@ -1457,7 +1516,7 @@ class ChangeOrderService:
 
                 base_ccy = (getattr(project, "currency", "") or "").strip().upper()
                 co_ccy = (currency_s or "").strip().upper()
-                delta_base: Decimal | None = delta
+                delta_base = delta
                 if co_ccy and base_ccy and co_ccy != base_ccy:
                     converted, missing = _convert_to_base(
                         {co_ccy: delta},
@@ -1504,6 +1563,12 @@ class ChangeOrderService:
             currency=currency_s,
         )
 
+        # Record on the order where the approval landed, so the order can link
+        # to the bill section and the budget row it wrote. Until now those ids
+        # reached only the event payload and a log line, and the change-order
+        # screen could say "applied to the project budget" but not where.
+        await self._stamp_writeback(order_id, _md, boq_result, budget_writeback)
+
         await _safe_publish(
             "changeorder.approved",
             {
@@ -1529,6 +1594,7 @@ class ChangeOrderService:
                 "boq_positions_added": boq_result.get("positions_added", 0),
                 "budget_row_id": budget_writeback.get("budget_id"),
                 "budget_row_action": budget_writeback.get("action"),
+                "schedule_impact_days": getattr(order, "schedule_impact_days", 0) or 0,
             },
             source_module="oe_changeorders",
         )
@@ -1542,6 +1608,37 @@ class ChangeOrderService:
             boq_result,
         )
         return fresh or order
+
+    async def _stamp_writeback(
+        self,
+        order_id: uuid.UUID,
+        metadata: dict[str, Any],
+        boq_result: dict[str, Any],
+        budget_writeback: dict[str, Any],
+    ) -> None:
+        """Write ``metadata.writeback`` naming the bill section and budget row.
+
+        Only ids that point at rows are written: a skipped BOQ writeback (no
+        bill, no items) leaves the BOQ keys out rather than null-filling them,
+        and a failed budget write leaves ``budget_row_id`` out. When nothing
+        landed the stamp is not written at all, so the absence of the key keeps
+        meaning "this order does not say where it went".
+
+        ``already_applied`` reports the section that an earlier pass wrote; it
+        is the right target to link to, so it is stamped like a fresh write.
+        """
+        stamp: dict[str, str] = {}
+        section_id = boq_result.get("section_id")
+        boq_id = boq_result.get("boq_id")
+        if section_id and boq_id:
+            stamp["boq_id"] = str(boq_id)
+            stamp["boq_section_id"] = str(section_id)
+        budget_row_id = budget_writeback.get("budget_id")
+        if budget_row_id:
+            stamp["budget_row_id"] = str(budget_row_id)
+        if not stamp:
+            return
+        await self.repo.update_fields(order_id, metadata_={**metadata, "writeback": stamp})
 
     async def _write_budget_delta_row(
         self,
@@ -1559,6 +1656,17 @@ class ChangeOrderService:
         Keyed idempotently by ``metadata_->>'change_order_id' == order_id``
         so re-approving (or a second pass on the same CO) updates the
         existing row instead of inserting duplicates.
+
+        The row carries the change and nothing else: the create path writes
+        ``original_budget`` 0 and ``revised_budget`` the order's effect, and the
+        update path rewrites ``revised_budget`` only. Every reader sums all of a project's rows, so a row
+        that also carried the project budget forward as its ``original`` (as
+        17.7.0 and 17.7.1 wrote it) added that budget once more per change
+        order. A project whose only rows are delta rows gets its original
+        budget from ``BudgetRepository.aggregate_for_dashboard``, which reads
+        it off the project, not from here. Rows already written in the
+        carried-forward shape are put back by the boot repair in
+        ``app.modules.changeorders.budget_delta_repair``.
 
         Returns ``{"action": "created"|"updated"|"skipped", "budget_id": str|None}``
         - the ``action`` value flows into the ``changeorder.approved`` event
@@ -1947,6 +2055,7 @@ class ChangeOrderService:
                 return {
                     "applied": False,
                     "reason": "already_applied",
+                    "boq_id": str(boq.id),
                     "section_id": str(sec.id),
                 }
 

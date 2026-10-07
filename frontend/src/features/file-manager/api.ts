@@ -4,6 +4,7 @@
 
 import { apiDelete, apiGet, apiPatch, apiPost, extractErrorMessageFromBody } from '@/shared/lib/api';
 import { useAuthStore } from '@/stores/useAuthStore';
+import type { DocumentBatchReferences } from '@/features/documents/api';
 import type {
   EmailLinkResponse,
   ExportOptions,
@@ -486,10 +487,14 @@ export async function splitPdfIntoSheets(
 
 /* ── Per-kind delete helpers (bulk-delete dispatcher) ────────────────── */
 
-/** Bulk-delete response shape returned by /v1/documents/batch/delete/. */
+/** Bulk-delete response shape returned by /v1/documents/batch/delete/.
+ *
+ *  `references` reports what the delete severed, the same shape the batch
+ *  references endpoint returns. */
 export interface BulkDeleteResponse {
   requested: number;
   deleted: number;
+  references?: DocumentBatchReferences;
 }
 
 /** Outcome of a single per-kind delete pass. */
@@ -509,11 +514,19 @@ export async function deleteByKind(kind: FileKind, fileId: string): Promise<void
   await apiDelete(path);
 }
 
-/** Bulk-delete documents through the existing module-side batch endpoint. */
-export async function bulkDeleteDocuments(ids: string[]): Promise<BulkDeleteResponse> {
-  return apiPost<BulkDeleteResponse, { ids: string[] }>(
+/** Bulk-delete documents through the existing module-side batch endpoint.
+ *
+ *  The server answers 409 (and deletes nothing) while any selected document is
+ *  still pointed at by a row the delete would strand or unlink. Pass
+ *  `acknowledgeReferences` only after the person has been shown that report,
+ *  e.g. through `BulkDeleteReferencesWarning`. */
+export async function bulkDeleteDocuments(
+  ids: string[],
+  acknowledgeReferences = false,
+): Promise<BulkDeleteResponse> {
+  return apiPost<BulkDeleteResponse, { ids: string[]; acknowledge_references: boolean }>(
     '/v1/documents/batch/delete/',
-    { ids },
+    { ids, acknowledge_references: acknowledgeReferences },
   );
 }
 
@@ -540,4 +553,50 @@ export function deletePathForKind(kind: FileKind, fileId: string): string {
     case 'markup':
       return `/v1/markups/${enc}`;
   }
+}
+
+/** The fields of a sheet the detail panel can correct. Mirrors `SheetUpdate`;
+ *  `null` clears a field, an absent key leaves it alone. */
+export interface SheetPatch {
+  sheet_number?: string | null;
+  sheet_title?: string | null;
+  discipline?: string | null;
+  revision?: string | null;
+  revision_date?: string | null;
+  scale?: string | null;
+}
+
+/**
+ * Correct a sheet's title block fields.
+ *
+ * Backed by ``PATCH /v1/documents/sheets/{id}``. A changed number or revision
+ * makes the backend restack the sheet, which can flip ``is_current`` on this
+ * row and on its neighbours, so the caller refetches the register rather than
+ * patching its cache by hand.
+ */
+export async function updateSheet(sheetId: string, patch: SheetPatch): Promise<SheetRow> {
+  return apiPatch<SheetRow, SheetPatch>(`${DOCUMENTS_BASE}/sheets/${sheetId}`, patch);
+}
+
+/** What re-reading a project's title blocks changed. Mirrors `SheetRereadSummary`. */
+export interface SheetRereadSummary {
+  sheets_checked: number;
+  sheets_updated: number;
+  fields_updated: number;
+  files_missing: number;
+  /** Sheets whose current state was set by hand against the revision order; the hand setting was kept. */
+  current_conflicts: string[];
+}
+
+/**
+ * Read every sheet's title block again from the PDF the register already holds.
+ *
+ * Backed by ``POST /v1/documents/sheets/reread-title-blocks/``. Fields corrected
+ * by hand are left alone; the revision stacks are rebuilt, so the caller
+ * refetches the register.
+ */
+export async function rereadTitleBlocks(projectId: string): Promise<SheetRereadSummary> {
+  return apiPost<SheetRereadSummary, void>(
+    `${DOCUMENTS_BASE}/sheets/reread-title-blocks/?project_id=${encodeURIComponent(projectId)}`,
+  );
 }

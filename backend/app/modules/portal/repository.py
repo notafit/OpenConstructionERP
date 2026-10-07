@@ -259,6 +259,34 @@ class PortalMagicLinkRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def last_issued_at(self, portal_user_id: uuid.UUID, *, purpose: str = "login") -> datetime | None:
+        """When the newest link of ``purpose`` was minted for this user."""
+        stmt = select(func.max(PortalMagicLink.created_at)).where(
+            PortalMagicLink.portal_user_id == portal_user_id,
+            PortalMagicLink.purpose == purpose,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def expire_open(self, portal_user_id: uuid.UUID, *, purpose: str, now: datetime) -> None:
+        """End every unused link of ``purpose`` for this user as of ``now``.
+
+        Called before a new link is minted, so a user holds one live link at a
+        time instead of one per request for a whole day.
+        """
+        stmt = (
+            update(PortalMagicLink)
+            .where(
+                and_(
+                    PortalMagicLink.portal_user_id == portal_user_id,
+                    PortalMagicLink.purpose == purpose,
+                    PortalMagicLink.consumed_at.is_(None),
+                )
+            )
+            .values(expires_at=now)
+        )
+        await self.session.execute(stmt)
+        await self.session.flush()
+
     async def update_fields(self, link_id: uuid.UUID, **fields: Any) -> None:
         stmt = update(PortalMagicLink).where(PortalMagicLink.id == link_id).values(**fields)
         await self.session.execute(stmt)
@@ -402,8 +430,55 @@ class PortalDocumentAccessLogRepository:
         return list(result.scalars().all()), total
 
 
+class PortalClientContractRepository:
+    """Read-only lookups of the contracts a portal client may be shown.
+
+    The contracts module is imported where it is used, as the portal does for
+    every other module it reads, so the portal keeps loading without it.
+    """
+
+    #: Contract statuses whose payment plan a client may see: signed and in
+    #: force, or finished. A draft is still being negotiated and a terminated
+    #: or suspended one is not a plan anybody is paying against.
+    VISIBLE_STATUSES: tuple[str, ...] = ("active", "completed")
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def client_contracts(
+        self,
+        project_id: uuid.UUID,
+        *,
+        contract_ids: list[uuid.UUID] | None = None,
+    ) -> list[Any]:
+        """The project's client contracts in force, limited to ``contract_ids`` when given."""
+        from app.modules.contracts.models import Contract  # noqa: PLC0415
+
+        stmt = select(Contract).where(
+            Contract.project_id == project_id,
+            Contract.counterparty_type == "client",
+            Contract.status.in_(self.VISIBLE_STATUSES),
+        )
+        if contract_ids is not None:
+            if not contract_ids:
+                return []
+            stmt = stmt.where(Contract.id.in_(contract_ids))
+        result = await self.session.execute(stmt.order_by(Contract.code, Contract.id))
+        return list(result.scalars().all())
+
+    async def contracts_in_project(self, project_id: uuid.UUID, contract_ids: list[uuid.UUID]) -> list[uuid.UUID]:
+        """Which of ``contract_ids`` belong to the project, whatever their type or status."""
+        from app.modules.contracts.models import Contract  # noqa: PLC0415
+
+        if not contract_ids:
+            return []
+        stmt = select(Contract.id).where(Contract.project_id == project_id, Contract.id.in_(contract_ids))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+
 __all__ = [
     "PortalAccessRuleRepository",
+    "PortalClientContractRepository",
     "PortalDocumentAccessLogRepository",
     "PortalMagicLinkRepository",
     "PortalNotificationRepository",

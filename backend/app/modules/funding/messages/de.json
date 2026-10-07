@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Der Maßnahmenbeginn liegt am {start} und damit vor der Antragstellung am {filed} - bei vorzeitigem Maßnahmenbeginn entfällt die Förderung in der Regel vollständig",
+      "unevidenced": "Die Maßnahme begann vorzeitig am {start}. Die Akte vermerkt eine Zustimmung der Bewilligungsbehörde, nennt aber kein Aktenzeichen",
+      "evidence": "Aktenzeichen der schriftlichen Zustimmung zum vorzeitigen Maßnahmenbeginn eintragen, damit die Akte für sich selbst spricht",
+      "suggestion": "Vor weiteren Ausgaben die Förderbedingungen prüfen. Liegt eine schriftliche Zustimmung vor, diese eintragen; liegt keine vor, die Bewilligungsbehörde fragen, bevor das Antragsverfahren weitergeht"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Mittelabruf {draw} umfasst Kosten vor dem {period_start}, dem Beginn des Bewilligungszeitraums",
+      "after": "Mittelabruf {draw} umfasst Kosten nach dem {period_end}, dem Ende des Bewilligungszeitraums",
+      "spans": "Mittelabruf {draw} reicht an beiden Enden über den Bewilligungszeitraum vom {period_start} bis {period_end} hinaus",
+      "suggestion": "Die außerhalb des Zeitraums liegenden Kosten in einen eigenen Mittelabruf nehmen und mit der Bewilligungsbehörde klären, statt beides in einem Abruf zu führen"
+    },
+    "own_share_is_covered": {
+      "fail": "Das Programm verlangt einen Eigenanteil von {rate} Prozent, also {required}, im Antrag sind jedoch {recorded} ausgewiesen",
+      "suggestion": "Vor der Einreichung belegen, woher der restliche Eigenanteil stammt. Das Programm bemisst ihn an den zuwendungsfähigen Kosten, nicht an den Gesamtkosten des Projekts"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Die {count} Anträge dieses Projekts ergeben zusammen eine Beihilfeintensität von {intensity} Prozent der zuwendungsfähigen Kosten und überschreiten damit die Obergrenze von {cap} Prozent, die das strengste ihrer Programme nennt",
+      "suggestion": "Öffentliche Mittel werden über Programme und Verwaltungsebenen hinweg kumuliert. Einen Antrag reduzieren oder prüfen, ob die Maßnahmen getrennt mit je eigenen Kosten geführt werden können"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Der Bewilligungszeitraum endete am {period_end}; ein abschließender Verwendungsnachweis wurde noch nicht begonnen",
+      "late": "Der abschließende Verwendungsnachweis war am {due} fällig und wurde erst am {submitted} eingereicht",
+      "overdue": "Der abschließende Verwendungsnachweis war am {due} fällig und wurde noch nicht eingereicht",
+      "suggestion": "Lieber den vorhandenen Stand einreichen als auf Vollständigkeit warten. Eine Fristverlängerung wird auf Antrag meist gewährt, nach Ablauf der Frist jedoch nie"
+    },
+    "errors": {
+      "application_not_found": "Antrag nicht gefunden",
+      "programme_code_taken": "In diesem Land gibt es bereits ein Programm mit dieser Referenz",
+      "programme_not_found": "Programm nicht gefunden",
+      "programme_has_applications": "Zu diesem Programm gibt es Anträge, daher kann es nicht gelöscht werden. Schließen Sie es stattdessen.",
+      "application_code_taken": "In diesem Projekt gibt es bereits einen Antrag mit dieser Referenz",
+      "approved_application_not_deletable": "Ein bewilligter Antrag kann nicht gelöscht werden. Setzen Sie den Status stattdessen auf Zurückgezogen oder Abgeschlossen.",
+      "approval_needs_period_end": "Eine Bewilligung braucht das Ende des Bewilligungszeitraums, weil alle späteren Fristen ab diesem Datum berechnet werden",
+      "draw_needs_approval": "Mittel können nur für einen bewilligten Antrag abgerufen werden",
+      "draw_not_found": "Mittelabruf nicht gefunden",
+      "paid_draw_not_deletable": "Ein ausgezahlter Mittelabruf kann nicht gelöscht werden",
+      "proof_not_found": "Verwendungsnachweis nicht gefunden",
+      "obligation_not_found": "Frist nicht gefunden",
+      "eligible_exceeds_amount": "Der zuwendungsfähige Anteil darf den Betrag nicht übersteigen",
+      "allocation_not_found": "Kostenposten nicht gefunden"
+    }
+  }
+}

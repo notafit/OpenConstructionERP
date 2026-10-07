@@ -24,8 +24,13 @@ deployments are still expected to manage their schema with Alembic
 step, so an upgrade that added a column leaves the live table missing it and
 every ORM read 500s. Every statement here is idempotent and non-destructive, so
 it is safe to run as a belt-and-braces heal regardless of who owns the schema.
-The call site wraps it non-fatally so a DB role without DDL rights simply skips
-it.
+
+A DB role without DDL rights does not make the heal raise. Each statement is
+refused on its own and caught, so the heal returns normally having changed
+nothing. Those refusals are collected as :class:`SkippedStatement` records, the
+heal ends with one ERROR line naming them and carrying the SQL an owner has to
+run, and the call site publishes that the heal was incomplete. The call site
+also wraps the whole heal non-fatally for anything that does raise.
 
 Almost all of that is additive: ``ADD COLUMN`` / ``CREATE INDEX IF NOT EXISTS``
 / ``ADD CONSTRAINT``. The one alteration of an existing column is
@@ -44,7 +49,11 @@ open transaction, and wraps every statement in its own SAVEPOINT so a single
 failure cannot poison the rest of the heal.
 """
 
+import asyncio
 import logging
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import CheckConstraint, Column, Sequence, UniqueConstraint, inspect, text
@@ -58,6 +67,149 @@ logger = logging.getLogger(__name__)
 # database so they never issue concurrent ALTER / CREATE INDEX against the same
 # table. The value is arbitrary but must stay constant across releases.
 _HEAL_ADVISORY_LOCK_KEY = 826340271
+
+# How long a worker that finds the heal lock taken waits for it before giving
+# up, and how often it asks. The holder's heal is about ten seconds on a
+# 626-table schema, so a minute covers a slow one with room to spare while
+# staying well inside any supervisor's patience for a start.
+_HEAL_LOCK_WAIT_SECONDS = 60.0
+_HEAL_LOCK_POLL_SECONDS = 0.5
+
+
+class HealLockUnavailable(RuntimeError):
+    """Another worker held the heal lock for longer than this one would wait.
+
+    Raised instead of returning, because a return means "the heal ran here and
+    this is what it did", and a worker that never got the lock did not run it.
+    The call site records that as a heal nobody on this worker verified, which
+    is neither a failure nor a clean pass.
+    """
+
+
+@dataclass(frozen=True)
+class SkippedStatement:
+    """One heal statement the database refused, kept so someone who may can run it.
+
+    The heal catches every refusal so that one cannot stop the rest. The price
+    was that a role allowed to read and write rows but not to change the schema
+    had every statement refused while the heal as a whole succeeded: a WARNING
+    per statement, ``schema_heal_failed: false``, ``/api/health`` healthy, and a
+    500 on the first read of the column that was never added. Measured on a
+    17.8.3 database started by 18.0 under such a role.
+
+    Attributes:
+        kind: ``sequence``, ``column``, ``not_null``, ``index``, ``unique``,
+            ``check`` or ``foreign_key``.
+        table: The table the statement alters, ``None`` for a sequence.
+        name: The column, index, constraint or sequence.
+        sql: The statement exactly as the heal issued it, unterminated.
+        error: Class name of the innermost exception, for example
+            ``InsufficientPrivilegeError``.
+        reason: First line of the database's own message, for example
+            ``must be owner of table oe_contracts_progress_claim``.
+        sqlstate: The SQLSTATE when the driver reported one: ``42501`` for a
+            missing privilege, ``55P03`` for a lock the heal would not wait for.
+    """
+
+    kind: str
+    table: str | None
+    name: str
+    sql: str
+    error: str
+    reason: str
+    sqlstate: str | None
+
+    @property
+    def label(self) -> str:
+        """What was skipped, in the words the boot log uses."""
+        if self.kind == "sequence":
+            return f"sequence {self.name}"
+        if self.kind == "column":
+            return f"column {self.table}.{self.name}"
+        if self.kind == "not_null":
+            return f"DROP NOT NULL on {self.table}.{self.name}"
+        return f"{self.kind.replace('_', ' ')} {self.name} on {self.table}"
+
+    def as_dict(self) -> dict[str, str | None]:
+        """The record for an authenticated reader, with the statement ready to paste."""
+        return {
+            "kind": self.kind,
+            "table": self.table,
+            "name": self.name,
+            "sql": f"{self.sql};",
+            "error": self.error,
+            "reason": self.reason,
+            "sqlstate": self.sqlstate,
+        }
+
+
+def heal_is_incomplete(skipped: Iterable[SkippedStatement], *, raised: bool) -> bool:
+    """Whether this start's heal left undone something it set out to do.
+
+    True when the heal raised, and true when it returned normally with
+    statements the database refused. The second is the case ``schema_heal_failed``
+    cannot see, because the refusals are caught one by one.
+    """
+    return raised or next(iter(skipped), None) is not None
+
+
+def _failure_parts(exc: BaseException) -> tuple[str, str, str | None]:
+    """Class name, one-line reason and SQLSTATE of a refused statement.
+
+    Read from the innermost exception, not from ``str(exc)``. SQLAlchemy's
+    wrapper runs over several lines with the statement and a documentation link
+    appended, and the asyncpg adapter under it prefixes the driver's class; the
+    driver's own message is the database's words and nothing else. The SQLSTATE
+    is taken from whichever layer carries it.
+    """
+    chain: list[BaseException] = [exc]
+    while True:
+        nxt = getattr(chain[-1], "orig", None) or chain[-1].__cause__
+        if not isinstance(nxt, BaseException) or any(nxt is seen for seen in chain):
+            break
+        chain.append(nxt)
+
+    innermost = chain[-1]
+    sqlstate = next(
+        (str(code) for e in chain for code in (getattr(e, "sqlstate", None), getattr(e, "pgcode", None)) if code),
+        None,
+    )
+    lines = str(innermost).strip().splitlines()
+    reason = lines[0].strip() if lines else ""
+    return type(innermost).__name__, reason or type(innermost).__name__, sqlstate
+
+
+def _skip(
+    skipped: list[SkippedStatement] | None, *, kind: str, table: str | None, name: str, sql: str, exc: BaseException
+) -> None:
+    """Record a refused statement, when the caller is collecting them."""
+    if skipped is None:
+        return
+    error, reason, sqlstate = _failure_parts(exc)
+    skipped.append(
+        SkippedStatement(kind=kind, table=table, name=name, sql=sql, error=error, reason=reason, sqlstate=sqlstate)
+    )
+
+
+def _log_skipped(skipped: list[SkippedStatement]) -> None:
+    """The one line an operator needs: what was refused, and what to run instead.
+
+    One line on purpose, SQL included, so a log shipper that splits on newlines
+    cannot separate the statements from the reason. They are listed in the order
+    the heal tried them, which is the order they depend on each other in:
+    sequences before the columns that default from them, columns before their
+    indexes and constraints.
+    """
+    logger.error(
+        "PostgreSQL schema heal INCOMPLETE: the database refused %d statement(s) this release needs and the "
+        "application keeps starting without them. Until they are applied, a request that reads a missing "
+        "column fails and one that filters on a missing index is slower. /api/health reports "
+        "schema_heal_incomplete=true until the next start and does not degrade status, since a restart "
+        "cannot fix this. Refused: %s. Run as a role that owns these tables, no restart needed afterwards: %s",
+        len(skipped),
+        "; ".join(f"{s.label} ({s.reason})" for s in skipped),
+        " ".join(" ".join(s.sql.splitlines()) + ";" for s in skipped),
+    )
 
 
 def _literal_default(col: Column) -> str:
@@ -87,7 +239,7 @@ def _literal_default(col: Column) -> str:
     return ""
 
 
-async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
+async def postgres_auto_migrate(engine: AsyncEngine, base, *, skipped: list[SkippedStatement] | None = None) -> int:
     """Compare SQLAlchemy models against the PostgreSQL schema and heal it.
 
     Adds missing sequences that a column defaults from (``CREATE SEQUENCE IF NOT
@@ -103,14 +255,24 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
     alteration of an existing column that no existing row can refuse. See
     :func:`_relax_not_null`.
 
+    A statement the database refuses is caught, so the rest still run, and
+    recorded. When any were refused the heal ends with one ERROR line naming them
+    with the SQL to run as the owner of the tables. That line is written whether
+    or not the caller passes ``skipped``, because ``init-db`` calls this without
+    one and its operator needs the SQL just as much.
+
     Args:
         engine: The async SQLAlchemy engine (must be PostgreSQL).
         base: The declarative ``Base`` whose metadata holds every model.
+        skipped: Optional list the refused statements are appended to, as
+            :class:`SkippedStatement` records, for the caller to publish.
 
     Returns:
         Total number of schema repairs made (sequences + columns + indexes +
         constraints added, plus columns relaxed to accept NULL).
     """
+    refused: list[SkippedStatement] = skipped if skipped is not None else []
+    first_refusal = len(refused)
     sequences_added = 0
     columns_added = 0
     indexes_added = 0
@@ -119,20 +281,26 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
 
     async with engine.begin() as conn:
         # Serialise the heal across processes: on a shared external database
-        # several app workers (or replicas) can boot at once. Only one should
-        # run the idempotent DDL; the others skip and rely on the holder. The
+        # several app workers (or replicas) can boot at once, and only one at a
+        # time should run the idempotent DDL against the same tables. The
         # xact-scoped advisory lock auto-releases when this transaction ends, so
         # there is nothing to unlock by hand. On the single-process embedded
         # server the lock is always free, so this is a no-op there.
-        got_lock = (
-            await conn.execute(
-                text("SELECT pg_try_advisory_xact_lock(:k)"),
-                {"k": _HEAL_ADVISORY_LOCK_KEY},
-            )
-        ).scalar()
+        #
+        # A worker that finds the lock taken waits for it and then runs the heal
+        # itself. It used to return 0 at once, which read exactly like a heal
+        # that ran and found nothing to do: that worker published
+        # ``schema_heal_incomplete: false`` for a heal it never ran, whatever
+        # the holder's own heal had refused. Running it after the holder is its
+        # own verification, because every statement is idempotent: on a schema
+        # the holder completed it changes nothing, and on one the holder could
+        # not complete it collects the same refusals the holder did.
+        got_lock = await _take_heal_lock(conn)
         if not got_lock:
-            logger.info("PostgreSQL auto-migration: another worker holds the heal lock - skipping")
-            return 0
+            raise HealLockUnavailable(
+                f"another worker held the schema heal lock for more than {_HEAL_LOCK_WAIT_SECONDS:.0f}s, "
+                "so this worker could not run or verify the heal"
+            )
 
         # Never stall live traffic on a busy external database: cap how long any
         # single DDL waits to acquire its table lock. If the table is busy the
@@ -145,7 +313,7 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
 
         # Sequences first: a column added below may default from one, and the
         # ADD COLUMN fails outright if the sequence is not there yet.
-        sequences_added = await _heal_sequences(conn, base)
+        sequences_added = await _heal_sequences(conn, base, skipped=refused)
 
         for table in base.metadata.sorted_tables:
             if table.name not in existing_tables:
@@ -176,7 +344,12 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
             for col in table.columns:
                 if col.name in existing_cols:
                     nulls_relaxed += await _relax_not_null(
-                        conn, table, col, db_nullable=existing_cols[col.name], live_pk_cols=live_pk_cols
+                        conn,
+                        table,
+                        col,
+                        db_nullable=existing_cols[col.name],
+                        live_pk_cols=live_pk_cols,
+                        skipped=refused,
                     )
                     continue
 
@@ -288,6 +461,10 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
                         col.name,
                         exc,
                     )
+                    # The full form, not the plain fallback: it is what the
+                    # heal would have applied, and run by an owner it gives
+                    # the column the shape the models declare.
+                    _skip(refused, kind="column", table=table.name, name=col.name, sql=sql, exc=exc)
 
             # ── Index healing ────────────────────────────────────────────
             # Upgraded embedded-PG installs stamp alembic instead of running
@@ -358,8 +535,14 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
                         table.name,
                         exc,
                     )
+                    _skip(refused, kind="index", table=table.name, name=index.name, sql=sql, exc=exc)
 
-            constraints_added += await _heal_constraints(conn, table, existing_names, existing_col_tuples)
+            constraints_added += await _heal_constraints(
+                conn, table, existing_names, existing_col_tuples, skipped=refused
+            )
+
+    if len(refused) > first_refusal:
+        _log_skipped(refused[first_refusal:])
 
     if sequences_added > 0 or columns_added > 0 or indexes_added > 0 or constraints_added > 0 or nulls_relaxed > 0:
         logger.info(
@@ -373,6 +556,32 @@ async def postgres_auto_migrate(engine: AsyncEngine, base) -> int:
         )
 
     return sequences_added + columns_added + indexes_added + constraints_added + nulls_relaxed
+
+
+async def _take_heal_lock(conn) -> bool:
+    """Take the heal lock, waiting up to ``_HEAL_LOCK_WAIT_SECONDS`` for its holder.
+
+    Polls the non-blocking form rather than waiting in ``pg_advisory_xact_lock``,
+    so the wait is bounded by this function and not by whatever ``lock_timeout``
+    the role or the database carries, which may be none at all.
+    """
+    deadline = time.monotonic() + _HEAL_LOCK_WAIT_SECONDS
+    announced = False
+    while True:
+        got_lock = (
+            await conn.execute(
+                text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": _HEAL_ADVISORY_LOCK_KEY},
+            )
+        ).scalar()
+        if got_lock:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if not announced:
+            logger.info("PostgreSQL auto-migration: another worker holds the heal lock - waiting to verify after it")
+            announced = True
+        await asyncio.sleep(_HEAL_LOCK_POLL_SECONDS)
 
 
 async def not_null_divergences(engine: AsyncEngine, base) -> tuple[str, ...]:
@@ -438,7 +647,15 @@ async def not_null_divergences(engine: AsyncEngine, base) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
-async def _relax_not_null(conn, table, col: Column, *, db_nullable: bool, live_pk_cols: set) -> int:
+async def _relax_not_null(
+    conn,
+    table,
+    col: Column,
+    *,
+    db_nullable: bool,
+    live_pk_cols: set,
+    skipped: list[SkippedStatement] | None = None,
+) -> int:
     """Drop a NOT NULL the database still holds and the models no longer declare.
 
     This is the one schema alteration that can never fail against the rows
@@ -482,6 +699,7 @@ async def _relax_not_null(conn, table, col: Column, *, db_nullable: bool, live_p
             col.name,
             exc,
         )
+        _skip(skipped, kind="not_null", table=table.name, name=col.name, sql=sql, exc=exc)
         return 0
 
     logger.info(
@@ -492,7 +710,7 @@ async def _relax_not_null(conn, table, col: Column, *, db_nullable: bool, live_p
     return 1
 
 
-async def _heal_sequences(conn, base) -> int:
+async def _heal_sequences(conn, base, *, skipped: list[SkippedStatement] | None = None) -> int:
     """Create the sequences that model columns default from, before the column heal.
 
     ``oe_progress_entry.seq`` is a BIGINT whose server default is
@@ -526,6 +744,7 @@ async def _heal_sequences(conn, base) -> int:
     Args:
         conn: The open async connection running inside the heal transaction.
         base: The declarative ``Base`` whose metadata holds every model.
+        skipped: Where a refused ``CREATE SEQUENCE`` is recorded, if anywhere.
 
     Returns:
         Number of sequences created.
@@ -547,7 +766,14 @@ async def _heal_sequences(conn, base) -> int:
 
         for name in sorted(names - live):
             qualified = f'"{schema}"."{name}"' if schema else f'"{name}"'
-            if await _run_ddl(conn, f"CREATE SEQUENCE IF NOT EXISTS {qualified}", f"sequence {name}"):
+            if await _run_ddl(
+                conn,
+                f"CREATE SEQUENCE IF NOT EXISTS {qualified}",
+                f"sequence {name}",
+                skipped=skipped,
+                kind="sequence",
+                name=name,
+            ):
                 added += 1
 
     return added
@@ -585,7 +811,14 @@ def _effective_name(constraint) -> str:
     return _PREPARER.format_constraint(constraint)
 
 
-async def _heal_constraints(conn, table, existing_names: set[str], existing_col_tuples: set[tuple[str, ...]]) -> int:
+async def _heal_constraints(
+    conn,
+    table,
+    existing_names: set[str],
+    existing_col_tuples: set[tuple[str, ...]],
+    *,
+    skipped: list[SkippedStatement] | None = None,
+) -> int:
     """Add unique, check and foreign-key constraints the live table is missing.
 
     ``create_all`` builds a brand-new table with every constraint it declares, so
@@ -654,6 +887,7 @@ async def _heal_constraints(conn, table, existing_names: set[str], existing_col_
         existing_col_tuples: Column tuples already covered by a live index or
             unique constraint, used to recognise a constraint whose name was
             truncated or mangled.
+        skipped: Where a refused ``ADD CONSTRAINT`` is recorded, if anywhere.
 
     Returns:
         Number of constraints added.
@@ -737,7 +971,15 @@ async def _heal_constraints(conn, table, existing_names: set[str], existing_col_
             continue
 
         sql = f'ALTER TABLE "{table.name}" ADD CONSTRAINT {name} UNIQUE ({cols_sql})'
-        if await _run_ddl(conn, sql, f"unique constraint {name} on {table.name}"):
+        if await _run_ddl(
+            conn,
+            sql,
+            f"unique constraint {name} on {table.name}",
+            skipped=skipped,
+            kind="unique",
+            table=table.name,
+            name=name,
+        ):
             added += 1
 
     for constraint in table.constraints:
@@ -764,7 +1006,15 @@ async def _heal_constraints(conn, table, existing_names: set[str], existing_col_
             continue
 
         sql = f'ALTER TABLE "{table.name}" ADD CONSTRAINT {name} CHECK ({expression}) NOT VALID'
-        if await _run_ddl(conn, sql, f"check constraint {name} on {table.name}"):
+        if await _run_ddl(
+            conn,
+            sql,
+            f"check constraint {name} on {table.name}",
+            skipped=skipped,
+            kind="check",
+            table=table.name,
+            name=name,
+        ):
             added += 1
 
     for fk in table.foreign_key_constraints:
@@ -796,23 +1046,42 @@ async def _heal_constraints(conn, table, existing_names: set[str], existing_col_
             f'ALTER TABLE "{table.name}" ADD CONSTRAINT "{fk.name}" '
             f'FOREIGN KEY ({cols_sql}) REFERENCES "{referred_table}" ({ref_sql}){actions} NOT VALID'
         )
-        if await _run_ddl(conn, sql, f"foreign key {fk.name} on {table.name}"):
+        if await _run_ddl(
+            conn,
+            sql,
+            f"foreign key {fk.name} on {table.name}",
+            skipped=skipped,
+            kind="foreign_key",
+            table=table.name,
+            name=fk.name,
+        ):
             added += 1
 
     return added
 
 
-async def _run_ddl(conn, sql: str, description: str) -> bool:
+async def _run_ddl(
+    conn,
+    sql: str,
+    description: str,
+    *,
+    skipped: list[SkippedStatement] | None = None,
+    kind: str = "ddl",
+    table: str | None = None,
+    name: str | None = None,
+) -> bool:
     """Run one DDL statement inside its own SAVEPOINT. Never raises.
 
     A failure here must not stop the boot. The heal is best effort by design, and
-    every install that reaches this code is already running.
+    every install that reaches this code is already running. It is recorded in
+    ``skipped`` instead, so the heal can say what it could not do.
     """
     try:
         async with conn.begin_nested():
             await conn.execute(text(sql))
     except Exception as exc:  # noqa: BLE001
         logger.warning("PostgreSQL migration: failed to add %s: %s", description, exc)
+        _skip(skipped, kind=kind, table=table, name=name or description, sql=sql, exc=exc)
         return False
     logger.info("PostgreSQL migration: added %s", description)
     return True

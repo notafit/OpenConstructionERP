@@ -32,6 +32,7 @@ import { useToastStore } from '@/stores/useToastStore';
 import { REGION_MAP } from '@/stores/useCostDatabaseStore';
 import { localizedUnitCode } from '@/shared/lib/unitLabels';
 import { highlightMatch } from './highlightMatch';
+import { catalogComponentAmounts } from './boqHelpers';
 import { VariantPicker } from '@/features/costs/VariantPicker';
 import {
   MultiVariantPicker,
@@ -51,6 +52,7 @@ import { CostCategoryTree } from './CostCategoryTree';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 import { formatCurrency } from '@/shared/lib/money';
 import { fmtList } from '@/shared/lib/formatters';
+import { parseDecimalInput } from '@/shared/lib/parseDecimal';
 
 /* ── Types ───────────────────────────────────────────────────────────── */
 
@@ -124,6 +126,42 @@ interface BOQSectionOption {
   childCount: number;
 }
 
+/**
+ * Read the picked cost items in full before the add flow uses them.
+ *
+ * The search list arrives slim (``fetchCostSearch`` sends ``lite=1``): its
+ * rows carry ``components: []`` and only the small ``metadata_`` keys, because
+ * a CWICR row's component breakdown and variant catalogues are tens of
+ * kilobytes each and the list renders neither. The add flow is the one place
+ * that needs them, to build the position's resources and to offer the variant
+ * pickers. Each list row keeps its own fields and takes only those two from
+ * ``GET /v1/costs/{id}``, which is the row the unslimmed list used to carry.
+ *
+ * All or nothing: when any read fails the promise rejects and the caller adds
+ * nothing, rather than posting positions that silently lost their resources.
+ */
+async function loadCostItemsForAdd(listItems: CostSearchItem[]): Promise<CostSearchItem[]> {
+  return Promise.all(
+    listItems.map(async (item) => {
+      const full = await apiGet<ApiCostSearchItem>(`/v1/costs/${encodeURIComponent(item.id)}`);
+      return {
+        ...item,
+        components: Array.isArray(full?.components) ? full.components : item.components ?? [],
+        metadata_: (full?.metadata_ ?? item.metadata_) as CostSearchItem['metadata_'],
+      };
+    }),
+  );
+}
+
+/** The unit rate the bill line receives when this row is added. An item
+ *  with a component breakdown is priced from its components, which is a
+ *  different figure from its catalogue rate in most imported databases; the
+ *  server states it as ``buildup_rate``. Without one (no components, or a
+ *  variant still to pick) the catalogue rate is what lands. */
+function landingRate(item: CostSearchItem): number {
+  return typeof item.buildup_rate === 'number' ? item.buildup_rate : item.rate;
+}
+
 /* ── AssemblyPickerModal ─────────────────────────────────────────────── */
 
 export function AssemblyPickerModal({
@@ -139,7 +177,7 @@ export function AssemblyPickerModal({
   const navigate = useNavigate();
   const [search, setSearch] = useState('');
   const [applying, setApplying] = useState<string | null>(null);
-  const [quantity, setQuantity] = useState<Record<string, number>>({});
+  const [quantity, setQuantity] = useState<Record<string, string>>({});
   const addToast = useToastStore((s) => s.addToast);
 
   // The sibling picker in this issue (AutocompleteInput) waits 300ms before it
@@ -169,7 +207,7 @@ export function AssemblyPickerModal({
   });
 
   const handleApply = useCallback(async (assemblyId: string) => {
-    const qty = quantity[assemblyId] || 1;
+    const qty = parseDecimalInput(quantity[assemblyId] ?? '') ?? 1;
     setApplying(assemblyId);
     try {
       await apiPost(`/v1/assemblies/${assemblyId}/apply-to-boq/`, {
@@ -201,7 +239,7 @@ export function AssemblyPickerModal({
     new Intl.NumberFormat(getNumberLocale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 animate-fade-in" onClick={onClose} aria-hidden="true">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 animate-fade-in" onClick={onClose} role="presentation">
       <div
         role="dialog"
         aria-modal="true"
@@ -301,11 +339,11 @@ export function AssemblyPickerModal({
                         <div className="flex items-center gap-1">
                           <label className="text-2xs text-content-quaternary">{t('boq.quantity_abbr', { defaultValue: 'Qty:' })}</label>
                           <input
-                            type="number"
-                            min="0.01"
-                            step="0.01"
-                            value={quantity[asm.id] ?? 1}
-                            onChange={(e) => setQuantity((prev) => ({ ...prev, [asm.id]: parseFloat(e.target.value) || 1 }))}
+                            type="text"
+                            inputMode="decimal"
+                            value={quantity[asm.id] ?? ''}
+                            placeholder="1"
+                            onChange={(e) => setQuantity((prev) => ({ ...prev, [asm.id]: e.target.value }))}
                             className="w-16 h-7 rounded border border-border-light bg-surface-elevated px-1.5 text-xs text-content-primary text-right tabular-nums focus:outline-none focus:ring-1 focus:ring-purple-400"
                           />
                         </div>
@@ -407,7 +445,7 @@ export function CostDatabaseSearchModal({
   /** Per-row quantity overrides, keyed by item id. Items absent from the
    *  map ship as quantity=1 (the legacy default). Editing the input here
    *  saves the user from 20 cell edits after a 20-item batch add. */
-  const [rowQuantity, setRowQuantity] = useState<Record<string, number>>({});
+  const [rowQuantity, setRowQuantity] = useState<Record<string, string>>({});
   /** Keyboard-navigation cursor over the current results list. -1 means
    *  the user hasn't engaged the keyboard yet — clicks won't render a
    *  highlight ring then.  ↓/↑ moves; Space toggles; Enter adds. */
@@ -712,7 +750,21 @@ export function CostDatabaseSearchModal({
     // stamp `metadata.resources[i].variant`/`variant_default` for backend
     // snapshotting via `_stamp_resource_variant_snapshots`.
     if (onSelectForResources) {
-      const selectedItems = items.filter((i) => selected.has(i.id));
+      let selectedItems: CostSearchItem[];
+      setIsAdding(true);
+      try {
+        selectedItems = await loadCostItemsForAdd(items.filter((i) => selected.has(i.id)));
+      } catch (err) {
+        if (import.meta.env.DEV) console.error('Add-from-cost-DB item read failed:', err);
+        addToast({
+          type: 'error',
+          title: t('boq.add_failed', { defaultValue: 'Failed to add positions' }),
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      } finally {
+        setIsAdding(false);
+      }
 
       const pickVariantForResource = (
         item: CostSearchItem,
@@ -739,6 +791,10 @@ export function CostDatabaseSearchModal({
     setIsAdding(true);
 
     try {
+      // Full rows first, before anything is posted: a failed read lands in
+      // the outer catch below with nothing added.
+      const selectedItems = await loadCostItemsForAdd(items.filter((i) => selected.has(i.id)));
+
       // Resolve the parent context. When the user chose a section in the
       // footer dropdown, new positions land under that section with
       // section-relative ordinals (`<section>.<NNN+1>`). Otherwise we fall
@@ -777,8 +833,6 @@ export function CostDatabaseSearchModal({
           /* ignore — start at 1 */
         }
       }
-
-      const selectedItems = items.filter((i) => selected.has(i.id));
 
       // Promise wrapper around the single-slot variant picker — used when
       // a cost item has exactly one top-level variant slot. Cancelling
@@ -1015,14 +1069,15 @@ export function CostDatabaseSearchModal({
             compStats != null;
 
           if (!hasCompVariants) {
+            // Quantity, rate and total made to agree (see
+            // ``catalogComponentAmounts``): the line is priced from the
+            // totals, and a later edit re-prices it from quantity x rate.
             return {
               name: c.name,
               code: c.code || '',
               type: c.type || 'other',
               unit: c.unit || 'pcs',
-              quantity: c.quantity ?? 1,
-              unit_rate: c.unit_rate ?? 0,
-              total: c.cost || (c.quantity ?? 1) * (c.unit_rate ?? 0),
+              ...catalogComponentAmounts(c),
             };
           }
 
@@ -1264,7 +1319,7 @@ export function CostDatabaseSearchModal({
         // Empty / cleared input falls back to 1 (the legacy default) — that
         // mirror's the previous hardcoded value so existing tests / UX stay
         // intact when the user doesn't engage the input.
-        const positionQty = rowQuantity[item.id] ?? 1;
+        const positionQty = parseDecimalInput(rowQuantity[item.id] ?? '') ?? 1;
 
         try {
           await apiPost(`/v1/boq/boqs/${boqId}/positions/`, {
@@ -1579,17 +1634,17 @@ export function CostDatabaseSearchModal({
   /** Live projected sum for the current selection — Σ(rate × qty) across
    *  the items the user has selected (qty falls back to 1). Surfaces the
    *  cumulative cost impact in the modal footer so a 5-item batch isn't
-   *  committed blind. Variant rates aren't projected here yet — the picker
-   *  will negotiate them at apply-time; this is the catalog-rate baseline. */
+   *  committed blind. Each row counts at the rate its line will receive
+   *  (``landingRate``). Variant rates aren't projected here yet: the picker
+   *  negotiates them at apply-time. */
   const selectionPreview = useMemo(() => {
     if (selected.size === 0) return null;
     let sum = 0;
     let currency: string | null = null;
     for (const item of items) {
       if (!selected.has(item.id)) continue;
-      const qty = rowQuantity[item.id] ?? 1;
-      const rate = typeof item.rate === 'number' ? item.rate : 0;
-      sum += rate * qty;
+      const qty = parseDecimalInput(rowQuantity[item.id] ?? '') ?? 1;
+      sum += landingRate(item) * qty;
       if (!currency) {
         currency =
           (item.currency && item.currency.trim()) ||
@@ -1601,7 +1656,7 @@ export function CostDatabaseSearchModal({
   }, [selected, items, rowQuantity]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose} aria-hidden="true">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose} role="presentation">
       <div
         role="dialog"
         aria-modal="true"
@@ -1997,6 +2052,23 @@ export function CostDatabaseSearchModal({
                                     </span>
                                   )}
                                   <span className="text-2xs text-content-quaternary font-mono">{item.code}</span>
+                                  {(item.hazards ?? []).map((hazard) => (
+                                    <span
+                                      key={hazard}
+                                      className="ms-1.5 inline-flex align-middle"
+                                      title={t('costs.hazard_hint', {
+                                        defaultValue:
+                                          'Contains a hazardous material. It stays listed for removal and refurbishment work; check the rules that apply where you build.',
+                                      })}
+                                      data-testid={`cost-row-hazard-${item.id}`}
+                                    >
+                                      <Badge variant="error" size="sm" className="text-2xs">
+                                        {hazard === 'asbestos'
+                                          ? t('costs.hazard_asbestos', { defaultValue: 'Asbestos' })
+                                          : t('costs.hazard_other', { defaultValue: 'Hazardous material' })}
+                                      </Badge>
+                                    </span>
+                                  ))}
                                 </>
                               );
                             })()}
@@ -2011,15 +2083,14 @@ export function CostDatabaseSearchModal({
                             onClick={(e) => e.stopPropagation()}
                           >
                             <input
-                              type="number"
-                              min="0"
-                              step="0.01"
+                              type="text"
+                              inputMode="decimal"
                               value={rowQuantity[item.id] ?? ''}
                               placeholder="1"
                               onChange={(e) => {
                                 const raw = e.target.value;
                                 if (raw === '') {
-                                  // Empty input → clear override so the POST falls back to 1.
+                                  // Empty input -> clear override so the POST falls back to 1.
                                   setRowQuantity((cur) => {
                                     const next = { ...cur };
                                     delete next[item.id];
@@ -2027,10 +2098,7 @@ export function CostDatabaseSearchModal({
                                   });
                                   return;
                                 }
-                                const parsed = parseFloat(raw);
-                                if (!isNaN(parsed) && parsed >= 0) {
-                                  setRowQuantity((cur) => ({ ...cur, [item.id]: parsed }));
-                                }
+                                setRowQuantity((cur) => ({ ...cur, [item.id]: raw }));
                               }}
                               onFocus={(e) => {
                                 // Auto-select selects this row so the user sees their qty
@@ -2055,7 +2123,51 @@ export function CostDatabaseSearchModal({
                           </td>
                           <td className="px-3 py-2.5 text-end font-semibold tabular-nums text-content-primary">
                             <div className="inline-flex items-center gap-1.5">
-                              <span>{fmtRate(item.rate)}</span>
+                              {(() => {
+                                // The rate the line lands at comes first. When
+                                // the catalogue quotes a different figure it is
+                                // shown underneath, named, so the two are never
+                                // mistaken for each other.
+                                const landing = landingRate(item);
+                                const differs = Math.abs(landing - item.rate) >= 0.005;
+                                // A breakdown with a variant still to pick has no
+                                // landing rate yet: the figure is the catalogue's,
+                                // and is named as such.
+                                const variantPending =
+                                  item.buildup_rate == null &&
+                                  ((item.components_count ?? item.components?.length ?? 0) > 0 ||
+                                    (item.metadata_?.variant_stats?.count ?? 0) >= 2);
+                                if (!differs && variantPending) {
+                                  return (
+                                    <span data-testid={`cost-row-rate-${item.id}`}>
+                                      {t('boq.cost_db_catalogue_rate', {
+                                        defaultValue: 'Catalogue {{rate}}',
+                                        rate: fmtRate(item.rate),
+                                      })}
+                                    </span>
+                                  );
+                                }
+                                if (!differs) return <span>{fmtRate(landing)}</span>;
+                                return (
+                                  <span
+                                    className="inline-flex flex-col items-end leading-tight"
+                                    title={t('boq.cost_db_buildup_hint', {
+                                      defaultValue:
+                                        "The bill line is priced from this item's resources. The catalogue quotes {{rate}} for the item as a whole.",
+                                      rate: fmtRate(item.rate),
+                                    })}
+                                    data-testid={`cost-row-rate-${item.id}`}
+                                  >
+                                    <span>{fmtRate(landing)}</span>
+                                    <span className="text-2xs font-normal text-content-tertiary">
+                                      {t('boq.cost_db_catalogue_rate', {
+                                        defaultValue: 'Catalogue {{rate}}',
+                                        rate: fmtRate(item.rate),
+                                      })}
+                                    </span>
+                                  </span>
+                                );
+                              })()}
                               {(() => {
                                 const vc = item.metadata_?.variant_stats?.count ?? 0;
                                 const vs = item.metadata_?.variant_stats;
@@ -2075,7 +2187,7 @@ export function CostDatabaseSearchModal({
                                 // entry whose price never landed (CWICR rows with
                                 // empty rate column); ``lump_sum`` is high-risk
                                 // because qty × rate becomes ambiguous.
-                                const lowRate = !(typeof item.rate === 'number' && item.rate > 0);
+                                const lowRate = !(landingRate(item) > 0);
                                 const lumpSum = (item.unit || '').toLowerCase() === 'lump_sum';
                                 if (!lowRate && !lumpSum) return null;
                                 return (
@@ -2166,7 +2278,7 @@ export function CostDatabaseSearchModal({
                   data-testid="cost-modal-selection-preview"
                   title={t('boq.preview_total_hint', {
                     defaultValue:
-                      'Catalog-rate × quantity for the selection. Variant picks may adjust this.',
+                      'Rate × quantity for the selection, at the rate each line will receive. Variant picks may adjust this.',
                   })}
                 >
                   {/* Through the shared formatter rather than a bare `Intl`

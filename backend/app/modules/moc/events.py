@@ -247,8 +247,8 @@ def register_subscribers() -> None:
     """Idempotently subscribe MoC cross-module handlers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("moc.candidate_from_ncr", _on_moc_candidate_from_ncr)
-    event_bus.subscribe("moc.entry.accepted", _on_moc_accepted)
-    event_bus.subscribe("moc.entry.implemented", _on_moc_implemented)
+    event_bus.subscribe_once("moc.candidate_from_ncr", _on_moc_candidate_from_ncr)
+    event_bus.subscribe_once("moc.entry.accepted", _on_moc_accepted)
+    event_bus.subscribe_once("moc.entry.implemented", _on_moc_implemented)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("MoC: 3 cross-module subscriber(s) registered")

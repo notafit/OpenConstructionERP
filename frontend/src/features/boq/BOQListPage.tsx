@@ -7,17 +7,25 @@ import { useNavigate, useLocation, useParams, useSearchParams } from 'react-rout
 import {
   Table, Table2, ArrowRight, Copy, Trash2, Plus,
   Search, ArrowUpDown, ChevronDown, GitCompareArrows, X, Loader2,
-  CalendarDays,
+  CalendarDays, LayoutGrid, List,
 } from 'lucide-react';
 import { Card, Badge, EmptyState, Skeleton, Button, Breadcrumb, FileTypeChips, DismissibleInfo, IntroRichText, RecoveryCard } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { apiGet } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fmtCompact, fmtNumber, fmtPercent } from '@/shared/lib/formatters';
 import { useNameCollator } from '@/shared/lib/collator';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
-import { boqApi, type BOQWithPositions, groupPositionsIntoSections, type SectionGroup } from './api';
+import {
+  boqApi,
+  type BOQWithPositions,
+  groupPositionsIntoSections,
+  type SectionGroup,
+  skippedBoqListProjectIds,
+} from './api';
 import { resourceAwareTotalInBase, getCurrencyCode } from './boqHelpers';
+import { BOQListLoadError, BOQListSkippedNotice } from './BOQListLoadError';
 import { projectsApi, type ProjectFxRate } from '@/features/projects/api';
 import { useToastStore } from '@/stores/useToastStore';
 import { useModuleStore } from '@/stores/useModuleStore';
@@ -25,6 +33,7 @@ import { PresenceAvatars } from '@/modules/collaboration/components/PresenceAvat
 import { usePresenceStore } from '@/modules/collaboration/hooks/usePresence';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { CreateBOQModal } from './CreateBOQPage';
+import { projectFilterOptions } from './projectFilterOptions';
 
 interface Project {
   id: string;
@@ -519,6 +528,15 @@ export function BOQListPage() {
   });
   const [page, setPage] = useState(1);
 
+  // Grid vs table view — persisted so power users keep their preference.
+  const [viewMode, setViewMode] = useState<'grid' | 'table'>(() => {
+    try { return (localStorage.getItem('oe_boq_list_view') as 'grid' | 'table') || 'grid'; }
+    catch { return 'grid'; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('oe_boq_list_view', viewMode); } catch { /* ignore */ }
+  }, [viewMode]);
+
   // Switching the active project in the header while this page is open is a
   // choice made with the page in view, so the filter follows it. The project
   // that was already active when the page mounted is not: it used to be copied
@@ -590,7 +608,7 @@ export function BOQListPage() {
     refetch: refetchProjects,
   } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -607,45 +625,58 @@ export function BOQListPage() {
     ? projects?.filter((p) => p.id === projectIdFromUrl)
     : projects;
 
-  const { data: allBoqs, isLoading: boqLoading } = useQuery({
+  const {
+    data: boqData,
+    isLoading: boqLoading,
+    isError: boqError,
+    error: boqErrorValue,
+  } = useQuery({
     queryKey: ['all-boqs', scopedProjects?.map((p) => p.id).join(',')],
-    queryFn: async () => {
-      if (!scopedProjects || scopedProjects.length === 0) return [];
+    queryFn: async (): Promise<{ rows: BOQWithProject[]; skippedProjectIds: string[] }> => {
+      if (!scopedProjects || scopedProjects.length === 0) return { rows: [], skippedProjectIds: [] };
 
-      // Fetch all BOQs in parallel (one request per project, no N+1 for grand_total)
-      const fetches = scopedProjects.map(async (p) => {
-        try {
-          const boqs = await apiGet<BOQ[]>(`/v1/boq/boqs/?project_id=${p.id}`);
-          return boqs.map((b) => {
-            // v3 §10 contract: money fields arrive as Decimal-as-string. The
-            // TypeScript `number` annotation lies — reducing across them
-            // string-concatenates ("634204086.52" + "528523" → "634…528…"),
-            // and `Number(multi-dot-string)` → NaN. Coerce once at the
-            // boundary so every downstream consumer (reduce, comparator,
-            // `currencyFmt.format`, threshold checks) sees a finite number.
-            const gtRaw = b.grand_total;
-            const gtNum =
-              typeof gtRaw === 'number' ? gtRaw : Number(gtRaw ?? 0);
-            return {
-              ...b,
-              projectName: p.name,
-              currency: p.currency,
-              positionCount: b.position_count ?? 0,
-              grandTotal: Number.isFinite(gtNum) ? gtNum : 0,
-              classificationStandard: p.classification_standard,
-            } as BOQWithProject;
-          });
-        } catch (err) {
-          if (import.meta.env.DEV) console.error(`Failed to fetch BOQs for project ${p.id}:`, err);
-          return [] as BOQWithProject[];
-        }
-      });
-
-      const results = await Promise.all(fetches);
-      return results.flat();
+      // One request for every project's bills. The page used to send one per
+      // project, and HTTP/1.1 runs six at a time to a host, so on forty
+      // projects most of the wait was queueing. A project archived or
+      // unshared since the project list loaded comes back as no key at all,
+      // and the page names it above the list, because a list with one
+      // project quietly missing puts a total on screen that looks complete
+      // and is not.
+      const requested = scopedProjects.map((p) => p.id);
+      const byProject = await boqApi.listForProjects(requested);
+      const rows = scopedProjects.flatMap((p) =>
+        (byProject[p.id] ?? []).map((b) => {
+          // v3 §10 contract: money fields arrive as Decimal-as-string. The
+          // TypeScript `number` annotation lies — reducing across them
+          // string-concatenates ("634204086.52" + "528523" → "634…528…"),
+          // and `Number(multi-dot-string)` → NaN. Coerce once at the
+          // boundary so every downstream consumer (reduce, comparator,
+          // `currencyFmt.format`, threshold checks) sees a finite number.
+          const gtRaw = b.grand_total;
+          const gtNum =
+            typeof gtRaw === 'number' ? gtRaw : Number(gtRaw ?? 0);
+          return {
+            ...b,
+            projectName: p.name,
+            currency: p.currency,
+            positionCount: b.position_count ?? 0,
+            grandTotal: Number.isFinite(gtNum) ? gtNum : 0,
+            classificationStandard: p.classification_standard,
+          } as BOQWithProject;
+        }),
+      );
+      return { rows, skippedProjectIds: skippedBoqListProjectIds(requested, byProject) };
     },
     enabled: !!scopedProjects && scopedProjects.length > 0,
   });
+  // A failed refetch keeps the previous answer in `data`. Nothing on this page
+  // may go on showing it, the stat cards included, once the list is known to
+  // be out of date, so the page reads no data at all while the query is in error.
+  const allBoqs = boqError ? undefined : boqData?.rows;
+  const skippedProjects = useMemo(() => {
+    const ids = boqError ? [] : (boqData?.skippedProjectIds ?? []);
+    return ids.map((id) => ({ id, name: scopedProjects?.find((p) => p.id === id)?.name || id }));
+  }, [boqError, boqData, scopedProjects]);
 
   // Seed demo presence when collaboration module is enabled and BOQs load
   const isCollabEnabled = useModuleStore((s) => s.isModuleEnabled('collaboration'));
@@ -833,9 +864,7 @@ export function BOQListPage() {
   }
 
   const isLoading = projLoading || boqLoading;
-  const uniqueProjects = Array.from(
-    new Map((projects ?? []).map((p) => [p.name, p])).values(),
-  );
+  const uniqueProjects = projectFilterOptions(projects ?? []);
   const uniqueStatuses = [...new Set((allBoqs ?? []).map((b) => b.status))];
 
   function valueBorderColor(value: number): string {
@@ -866,11 +895,15 @@ export function BOQListPage() {
           */
           isLoading
             ? t('common.loading')
-            : t('boq.list_subtitle_count', {
-                defaultValue: '{{boqCount}} estimates across {{projectCount}} projects',
-                boqCount: allBoqs?.length ?? 0,
-                projectCount: scopedProjects?.length ?? 0,
-              })
+            : boqError
+              ? // No count when the bills could not be read: "0 estimates"
+                // over the error card below would be a figure, and a wrong one.
+                undefined
+              : t('boq.list_subtitle_count', {
+                  defaultValue: '{{boqCount}} estimates across {{projectCount}} projects',
+                  boqCount: allBoqs?.length ?? 0,
+                  projectCount: (scopedProjects?.length ?? 0) - skippedProjects.length,
+                })
         }
         actions={
           <>
@@ -943,6 +976,19 @@ export function BOQListPage() {
             'List the work items, quantities and unit rates for a project and watch them roll up to a live total. Rates come from the cost database and quantities from BIM or PDF takeoff, and the finished estimate feeds validation, the budget and tender packages.',
         })}
       </DismissibleInfo>
+
+      {/* Projects the register left out because they were archived or
+          unshared after the project list loaded. Named above the totals, so
+          no total below reads as covering them. Refresh reloads the project
+          list, which no longer carries them, and the notice goes away. */}
+      {skippedProjects.length > 0 && (
+        <BOQListSkippedNotice
+          projects={skippedProjects}
+          onRefresh={() => {
+            void refetchProjects().then(() => queryClient.invalidateQueries({ queryKey: ['all-boqs'] }));
+          }}
+        />
+      )}
 
       {/* Stats cards — scoped to the SAME filtered set the list renders.
           When a filter narrows the set, an inline scope label says so.
@@ -1036,7 +1082,7 @@ export function BOQListPage() {
                 >
                   <option value="">{t('boq.all_projects', { defaultValue: 'All projects' })}</option>
                   {uniqueProjects.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
+                    <option key={p.id} value={p.id}>{p.label}</option>
                   ))}
                 </select>
                 <div className="pointer-events-none absolute inset-y-0 end-0 flex items-center pe-2.5 text-content-tertiary">
@@ -1090,6 +1136,36 @@ export function BOQListPage() {
                 </button>
               ))}
             </div>
+
+            {/* Grid / table view toggle */}
+            <div className="inline-flex h-10 rounded-lg border border-border bg-surface-primary p-0.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setViewMode('grid')}
+                aria-pressed={viewMode === 'grid'}
+                title={t('boq.view_grid', { defaultValue: 'Card grid' })}
+                className={`flex items-center justify-center px-2.5 rounded-md transition-colors ${
+                  viewMode === 'grid'
+                    ? 'bg-oe-blue text-white shadow-sm'
+                    : 'text-content-tertiary hover:text-content-primary'
+                }`}
+              >
+                <LayoutGrid size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('table')}
+                aria-pressed={viewMode === 'table'}
+                title={t('boq.view_table', { defaultValue: 'Compact table' })}
+                className={`flex items-center justify-center px-2.5 rounded-md transition-colors ${
+                  viewMode === 'table'
+                    ? 'bg-oe-blue text-white shadow-sm'
+                    : 'text-content-tertiary hover:text-content-primary'
+                }`}
+              >
+                <List size={14} />
+              </button>
+            </div>
           </div>
         </Card>
       )}
@@ -1117,6 +1193,18 @@ export function BOQListPage() {
         // yet", hiding the real auth/permission/server error — surface a
         // recovery affordance instead.
         <RecoveryCard error={projErrorValue} onRetry={() => refetchProjects()} />
+      ) : boqError ? (
+        // The bills could not be read. Retry asks for the projects first,
+        // because the usual cause is a project archived or unshared since
+        // this page loaded its project list: a fresh list leaves it out and
+        // the bills are then asked for under the new set of projects.
+        <BOQListLoadError
+          error={boqErrorValue}
+          projects={scopedProjects}
+          onRetry={() => {
+            void refetchProjects().then(() => queryClient.invalidateQueries({ queryKey: ['all-boqs'] }));
+          }}
+        />
       ) : filtered.length === 0 && (searchQuery || statusFilter || userProjectFilter) ? (
         <EmptyState
           icon={<Search size={28} strokeWidth={1.5} />}
@@ -1135,6 +1223,121 @@ export function BOQListPage() {
         />
       ) : (
         <div className="space-y-6">
+          {viewMode === 'table' ? (
+          /* ── Compact table view ──────────────────────────────────── */
+          <div className="rounded-xl border border-border-light bg-surface-primary overflow-hidden">
+            {/* Header row */}
+            <div className="hidden sm:flex items-center gap-2 px-4 py-2.5 text-2xs font-semibold uppercase tracking-wider text-content-tertiary border-b border-border-light bg-surface-secondary/50">
+              <span className="w-5 shrink-0" />
+              <span className="flex-1 min-w-0">{t('boq.name', { defaultValue: 'Name' })}</span>
+              <span className="w-36 shrink-0 hidden md:block">{t('boq.project', { defaultValue: 'Project' })}</span>
+              <span className="w-16 shrink-0 text-right">{t('boq.positions_short', { defaultValue: 'Pos.' })}</span>
+              <span className="w-32 shrink-0 text-right">{t('boq.total_value', { defaultValue: 'Total' })}</span>
+              <span className="w-24 shrink-0 text-right hidden lg:block">{t('boq.date', { defaultValue: 'Date' })}</span>
+              <span className="w-28 shrink-0" />
+            </div>
+            {paginatedBoqs.map((boq, i) => (
+              <div
+                key={boq.id}
+                role="button"
+                tabIndex={0}
+                className={`group flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2 px-4 py-3 cursor-pointer border-b border-border-light last:border-b-0 transition-colors hover:bg-surface-secondary/60 ${
+                  selectedForCompare?.id === boq.id ? 'bg-oe-blue-subtle/40' : ''
+                }`}
+                style={{ animationDelay: `${50 + i * 20}ms` }}
+                onClick={() => {
+                  if (compareMode && selectedForCompare && selectedForCompare.id !== boq.id) {
+                    handleCompareClick(boq.id, boq.currency);
+                  } else if (!compareMode) {
+                    navigate(`/boq/${boq.id}`);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    if (!compareMode) navigate(`/boq/${boq.id}`);
+                  }
+                }}
+              >
+                {/* Status dot */}
+                <span className="hidden sm:flex w-5 shrink-0 items-center justify-center">
+                  <span className={`h-2 w-2 rounded-full ${
+                    boq.status === 'final' || boq.status === 'approved' ? 'bg-semantic-success' :
+                    boq.status === 'draft' ? 'bg-oe-blue' :
+                    boq.status === 'in_review' ? 'bg-semantic-warning' :
+                    'bg-content-quaternary'
+                  }`} title={statusLabel(boq.status)} />
+                </span>
+
+                {/* Name (mobile: full width with status badge) */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-content-primary truncate">{boq.name}</span>
+                    <Badge variant={statusVariant(boq.status)} size="sm" dot className="sm:hidden shrink-0">{statusLabel(boq.status)}</Badge>
+                  </div>
+                  {/* Mobile-only: project + positions on second line */}
+                  <div className="flex items-center gap-2 text-2xs text-content-tertiary sm:hidden mt-0.5">
+                    <span className="truncate">{boq.projectName}</span>
+                    <span aria-hidden>·</span>
+                    <span className="tabular-nums">{boq.positionCount} {t('boq.positions_short', { defaultValue: 'pos.' })}</span>
+                    <span aria-hidden>·</span>
+                    <span className="tabular-nums font-medium text-content-secondary">{currencyFmt.format(boq.grandTotal)} {boq.currency}</span>
+                  </div>
+                </div>
+
+                {/* Project */}
+                <span className="w-36 shrink-0 text-sm text-content-tertiary truncate hidden md:block">{boq.projectName}</span>
+
+                {/* Position count */}
+                <span className="w-16 shrink-0 text-sm text-content-secondary text-right tabular-nums hidden sm:block">{boq.positionCount}</span>
+
+                {/* Total value */}
+                <span className="w-32 shrink-0 text-sm font-medium text-content-primary text-right tabular-nums hidden sm:block">
+                  {currencyFmt.format(boq.grandTotal)} <span className="text-2xs text-content-tertiary">{boq.currency}</span>
+                </span>
+
+                {/* Date */}
+                <span className="w-24 shrink-0 text-2xs text-content-tertiary text-right hidden lg:block">
+                  <DateDisplay value={boq.created_at} format="numeric" />
+                </span>
+
+                {/* Actions */}
+                <div className="w-28 shrink-0 flex items-center justify-end gap-0.5" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => handleCompareClick(boq.id, boq.currency)}
+                    className={`flex h-7 w-7 items-center justify-center rounded-md transition-all ${
+                      selectedForCompare?.id === boq.id
+                        ? 'text-oe-blue-text bg-oe-blue-subtle'
+                        : 'text-content-tertiary hover:text-oe-blue-text hover:bg-oe-blue-subtle'
+                    }`}
+                    title={t('boq.compare', { defaultValue: 'Compare' })}
+                  >
+                    <GitCompareArrows size={13} />
+                  </button>
+                  <button
+                    onClick={() => duplicateMutation.mutate(boq.id)}
+                    disabled={duplicateMutation.isPending}
+                    className="flex h-7 w-7 items-center justify-center rounded-md text-content-tertiary hover:text-oe-blue-text hover:bg-oe-blue-subtle transition-all disabled:opacity-40"
+                    title={t('boq.duplicate', { defaultValue: 'Duplicate' })}
+                  >
+                    <Copy size={13} />
+                  </button>
+                  <button
+                    onClick={() => setConfirmDeleteId(boq.id)}
+                    className="flex h-7 w-7 items-center justify-center rounded-md text-content-tertiary hover:text-semantic-error hover:bg-semantic-error-bg transition-all"
+                    title={t('common.delete')}
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                  <span className="inline-flex items-center text-2xs font-semibold text-oe-blue-text opacity-0 transition-opacity group-hover:opacity-100">
+                    <ArrowRight size={13} />
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+          ) : (
+          /* ── Card grid view ─────────────────────────────────────── */
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {paginatedBoqs.map((boq, i) => (
             <Card
@@ -1288,6 +1491,7 @@ export function BOQListPage() {
             </Card>
           ))}
           </div>
+          )}
 
           {/* Pagination */}
           <div className="flex flex-col items-center gap-3">

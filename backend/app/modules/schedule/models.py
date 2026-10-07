@@ -155,6 +155,9 @@ class Activity(Base):
     total_float: Mapped[int | None] = mapped_column(Integer, nullable=True)
     free_float: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_critical: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    # Shown to the client in the portal's upcoming milestones. Off by default:
+    # an internal milestone reaches the client only when a person marks it.
+    client_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
 
     # ── Constraints ──────────────────────────────────────────────────────────
     constraint_type: Mapped[str | None] = mapped_column(
@@ -234,6 +237,8 @@ class Activity(Base):
     # rejected (409 with the current state) instead of silently clobbering a
     # concurrent edit. See ``schedule.realtime_math`` / ``realtime_service``.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Contact-based assignee (plain GUID, no DB FK - same pattern as calendar_id)
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(GUID(), nullable=True, index=True)
 
     # Relationships
     schedule: Mapped[Schedule] = relationship(back_populates="activities")

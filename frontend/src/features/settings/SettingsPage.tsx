@@ -10,8 +10,10 @@ import { RegionalSettings } from './RegionalSettings';
 import { EInvoiceSettings } from './EInvoiceSettings';
 import { ModulesSettings } from './ModulesSettings';
 import { SettingsTeamPanel } from './SettingsTeamPanel';
+import { CompanyDocumentsSettings } from './CompanyDocumentsSettings';
 import { WebhookLeads } from './WebhookLeads';
 import { DesktopServerCard } from './DesktopServerCard';
+import { TextSizeSetting } from './TextSizeSetting';
 import VectorStatusCard from './VectorStatusCard';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -46,23 +48,35 @@ import {
   LayoutGrid,
   Users,
   ScrollText,
+  Building2,
 } from 'lucide-react';
 import { Card, CardHeader, CardContent, CardFooter, Button, Badge, InfoHint, Skeleton, Breadcrumb, DismissibleInfo, IntroRichText, ConfirmDialog, ModuleGuideButton, CountryFlag } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { settingsGuide } from './settingsGuide';
 import { useTabKeyboardNav } from '@/shared/hooks/useTabKeyboardNav';
 import { DashboardLayoutManager } from '@/features/dashboard/DashboardLayoutManager';
-import { UpdateNotification } from '@/shared/ui/UpdateChecker';
+import { UpdateInlineNotice } from '@/shared/ui/UpdateChecker';
 import { apiGet, apiPatch, apiPost, apiPut, apiDelete } from '@/shared/lib/api';
 import { SUPPORTED_LANGUAGES } from '@/app/i18n';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useThemeStore } from '@/stores/useThemeStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { useViewModeStore } from '@/stores/useViewModeStore';
-import { aiApi, type AIProvider, type AIConnectionStatus, type AISettings } from '@/features/ai/api';
+import {
+  aiApi,
+  AI_TIMEOUT_MAX_S,
+  AI_TIMEOUT_MIN_S,
+  type AIProvider,
+  type AIConnectionStatus,
+  type AISettings,
+  type ToolCallingMode,
+} from '@/features/ai/api';
 import { BIMConverterStatusBanner } from '@/features/bim/BIMConverterStatusBanner';
 import { DataSecurityPanel } from '@/features/data-security';
 import { DeleteAccountDialog } from './DeleteAccountDialog';
+import { DemoLeftoversPanel } from './DemoLeftoversPanel';
+import { ReferenceDataPanel } from './ReferenceDataPanel';
+import { invalidateProjectLists } from '@/features/projects/invalidateProjectLists';
 
 // Audit log now lives as a Settings section (moved out of the sidebar admin
 // grid). We reuse the exact same page component - lazy-loaded so its filter /
@@ -88,6 +102,8 @@ interface UserProfile {
 interface ProviderInfo {
   id: AIProvider;
   name: string;
+  /** Translation key for a name that is a description rather than a brand. */
+  nameKey?: string;
   description: string;
   descriptionDefault: string;
   keyPrefix: string;
@@ -244,15 +260,23 @@ const AI_PROVIDERS: ProviderInfo[] = [
     region: 'global',
   },
   { id: 'ollama', region: 'global', name: 'Ollama (Local)',
+    nameKey: 'settings.ai_name_ollama',
     keyPrefix: '', docsUrl: 'https://ollama.ai/', description: 'settings.ai_desc_ollama',
     descriptionDefault: 'Ollama - run local LLMs via OpenAI-compatible API. No API key required.' },
   { id: 'kimi', region: 'global', name: 'Kimi (Moonshot AI)', keyPrefix: 'sk-',
     docsUrl: 'https://platform.moonshot.cn/console/api-keys', description: 'settings.ai_desc_kimi',
     descriptionDefault: 'Kimi 2.6 - Moonshot AI with strong reasoning and long context for construction documents.' },
-  { id: 'vllm', region: 'global', name: 'vLLM (Local)',
+  // The generic OpenAI-compatible endpoint (issue #499). Its id stays 'vllm'
+  // so saved settings keep working; the servers it fits are named only in
+  // the description.
+  { id: 'vllm', region: 'global', name: 'OpenAI-compatible endpoint',
+    nameKey: 'settings.ai_name_openai_compatible',
     keyPrefix: '', docsUrl: 'https://docs.vllm.ai/', description: 'settings.ai_desc_vllm',
-    descriptionDefault: 'vLLM - high-throughput local LLM inference server with OpenAI-compatible API. No API key required by default.' },
+    descriptionDefault: 'Any server or gateway that speaks the OpenAI chat API, such as vLLM or an Ollama-style server. Base URL, optional key and model name.' },
 ];
+
+// Self-hosted endpoints: a server URL of their own, and a tool calling mode.
+const SELF_HOSTED_PROVIDERS: AIProvider[] = ['ollama', 'vllm'];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -328,7 +352,7 @@ function useFormatTimeAgo() {
 
 // ── AI Configuration Card ────────────────────────────────────────────────────
 
-function AIConfigurationCard() {
+export function AIConfigurationCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
@@ -345,6 +369,12 @@ function AIConfigurationCard() {
   // tracks whether the user edited it so we know to persist it.
   const [baseUrlInput, setBaseUrlInput] = useState<string>('');
   const [baseUrlTouched, setBaseUrlTouched] = useState<boolean>(false);
+  // Tool calling mode of a self-hosted endpoint; '' means the server default.
+  const [toolModeInput, setToolModeInput] = useState<ToolCallingMode | ''>('');
+  const [toolModeTouched, setToolModeTouched] = useState(false);
+  // Per-provider timeout in seconds as typed; '' means the default.
+  const [timeoutInput, setTimeoutInput] = useState('');
+  const [timeoutTouched, setTimeoutTouched] = useState(false);
 
   // Fetch current settings
   const { data: settings } = useQuery({
@@ -406,36 +436,81 @@ function AIConfigurationCard() {
     },
     [selectedProvider, ollamaUrl, vllmUrl],
   );
+  // Load the saved tool calling mode and timeout of the selected provider.
+  const savedToolModes = settings?.tool_calling;
+  const savedTimeouts = settings?.timeouts;
+  useEffect(
+    function syncSavedEndpointOptions() {
+      setToolModeInput(savedToolModes?.[selectedProvider] ?? '');
+      setToolModeTouched(false);
+      const savedTimeout = savedTimeouts?.[selectedProvider];
+      setTimeoutInput(savedTimeout ? String(savedTimeout) : '');
+      setTimeoutTouched(false);
+    },
+    [selectedProvider, savedToolModes, savedTimeouts],
+  );
   // Derived values for the currently selected provider.
   const defaultModel = settings?.default_models?.[selectedProvider] ?? '';
   const hasKeySet = isKeySetForProvider(settings, selectedProvider);
-  // Local runtimes (Ollama / vLLM) authenticate by server URL, not an API key.
-  // The backend AISettingsUpdate schema has no ``<provider>_api_key`` field for
-  // them, so sending one is silently dropped and looks like the key vanished
-  // (issue #244). Hide the key input for these and use the Server URL instead.
-  const isKeyless = ['ollama', 'vllm'].includes(selectedProvider);
+  const isSelfHosted = SELF_HOSTED_PROVIDERS.includes(selectedProvider);
+  // Ollama authenticates by server URL alone, so its key input is hidden and
+  // no key is ever sent for it (issue #244: a key the schema does not know is
+  // dropped and looks like it vanished). The OpenAI-compatible endpoint takes
+  // an optional key (issue #499).
+  const isKeyless = selectedProvider === 'ollama';
+  const keyIsOptional = selectedProvider === 'vllm';
   // A usable base URL exists when the user typed one or one is already stored.
   const hasBaseUrl = Boolean(baseUrlInput.trim()) || baseUrlTouched;
+  // A blank timeout means the default; anything else must be whole seconds in range.
+  const timeoutSeconds = timeoutInput.trim() === '' ? null : Number(timeoutInput.trim());
+  const timeoutInvalid =
+    timeoutSeconds !== null &&
+    (!Number.isInteger(timeoutSeconds) || timeoutSeconds < AI_TIMEOUT_MIN_S || timeoutSeconds > AI_TIMEOUT_MAX_S);
+  const hasUnsavedOptions = toolModeTouched || timeoutTouched;
+  const toolModeLabel = (mode: ToolCallingMode): string =>
+    mode === 'auto'
+      ? t('settings.ai_tool_calling_auto', { defaultValue: 'Auto: try, fall back if refused' })
+      : mode === 'on'
+        ? t('settings.ai_tool_calling_on', { defaultValue: 'On' })
+        : t('settings.ai_tool_calling_off', { defaultValue: 'Off' });
+
+  // What Save (and Test, which saves first) sends for the selected provider,
+  // or null when nothing on the card was edited.
+  const buildPendingUpdate = (): Record<string, unknown> | null => {
+    const update: Record<string, unknown> = { preferred_model: selectedProvider };
+    let changed = false;
+    // An emptied optional key is sent as '' so the stored one is cleared.
+    if (!isKeyless && hasUnsavedKey && (apiKeyInput.trim() || keyIsOptional)) {
+      update[`${selectedProvider}_api_key`] = apiKeyInput.trim();
+      changed = true;
+    }
+    if (modelTouched) {
+      // Blank string clears the override (server falls back to default).
+      update.model_overrides = { [selectedProvider]: modelInput.trim() };
+      changed = true;
+    }
+    if (baseUrlTouched) {
+      update[`${selectedProvider}_base_url`] = baseUrlInput.trim() || null;
+      changed = true;
+    }
+    if (toolModeTouched) {
+      update.tool_calling = { [selectedProvider]: toolModeInput };
+      changed = true;
+    }
+    if (timeoutTouched) {
+      update.timeouts = { [selectedProvider]: timeoutSeconds };
+      changed = true;
+    }
+    return changed ? update : null;
+  };
 
   // Test connection mutation — auto-saves unsaved key / model before testing
   // so the test exercises the exact provider + model id the real estimate
   // calls will use (this is what surfaces stale-model failures early).
   const testMutation = useMutation({
     mutationFn: async () => {
-      const hasNewKey = !isKeyless && hasUnsavedKey && Boolean(apiKeyInput.trim());
-      const needsSave = modelTouched || baseUrlTouched || hasNewKey;
-      if (needsSave) {
-        const update: Record<string, unknown> = { preferred_model: selectedProvider };
-        // Never attach <provider>_api_key for keyless local runtimes - the
-        // backend schema has no such field and would silently drop it.
-        if (!isKeyless && hasUnsavedKey && apiKeyInput.trim()) {
-          update[`${selectedProvider}_api_key`] = apiKeyInput.trim();
-        }
-        if (modelTouched) {
-          // Blank string clears the override (server falls back to default).
-          update.model_overrides = { [selectedProvider]: modelInput.trim() };
-        }
-        if (baseUrlTouched) update[`${selectedProvider}_base_url`] = baseUrlInput.trim() || null;
+      const update = buildPendingUpdate();
+      if (update) {
         await aiApi.updateSettings(update as Parameters<typeof aiApi.updateSettings>[0]);
       }
       return aiApi.testConnection(selectedProvider);
@@ -448,6 +523,7 @@ function AIConfigurationCard() {
         setShowKey(false);
       }
       setModelTouched(false); setBaseUrlTouched(false);
+      setToolModeTouched(false); setTimeoutTouched(false);
       // Same broadcast as the Save handler - the test path can also save.
       try {
         window.dispatchEvent(new CustomEvent('oe:ai-settings-updated'));
@@ -499,20 +575,7 @@ function AIConfigurationCard() {
   // Save settings mutation
   const saveMutation = useMutation({
     mutationFn: () => {
-      const update: Record<string, unknown> = {
-        preferred_model: selectedProvider,
-      };
-      // Never attach <provider>_api_key for keyless local runtimes - the
-      // backend schema has no such field and would silently drop it.
-      if (!isKeyless && hasUnsavedKey && apiKeyInput.trim()) {
-        const keyField = `${selectedProvider}_api_key`;
-        update[keyField] = apiKeyInput.trim();
-      }
-      if (modelTouched) {
-        // Blank string clears the override (server uses the default).
-        update.model_overrides = { [selectedProvider]: modelInput.trim() };
-      }
-      if (baseUrlTouched) update[`${selectedProvider}_base_url`] = baseUrlInput.trim() || null;
+      const update = buildPendingUpdate() ?? { preferred_model: selectedProvider };
       return aiApi.updateSettings(update as Parameters<typeof aiApi.updateSettings>[0]);
     },
     onSuccess: () => {
@@ -521,6 +584,7 @@ function AIConfigurationCard() {
       setHasUnsavedKey(false);
       setShowKey(false);
       setModelTouched(false); setBaseUrlTouched(false);
+      setToolModeTouched(false); setTimeoutTouched(false);
       addToast({
         type: 'success',
         title: t('settings.ai_saved', { defaultValue: 'AI settings saved' }),
@@ -588,7 +652,7 @@ function AIConfigurationCard() {
           defaultValue: 'Choose your AI provider for estimation and analysis',
         })}
         action={
-          hasUnsavedKey || modelTouched || baseUrlTouched ? (
+          hasUnsavedKey || modelTouched || baseUrlTouched || hasUnsavedOptions ? (
             <Badge variant="warning" size="sm" dot>
               {t('settings.ai_unsaved_changes', { defaultValue: 'Unsaved changes' })}
             </Badge>
@@ -609,6 +673,9 @@ function AIConfigurationCard() {
               {AI_PROVIDERS.map((provider) => {
                 const isSelected = selectedProvider === provider.id;
                 const hasKey = isKeySetForProvider(settings, provider.id);
+                const providerName = provider.nameKey
+                  ? t(provider.nameKey, { defaultValue: provider.name })
+                  : provider.name;
 
                 return (
                   <button
@@ -616,7 +683,7 @@ function AIConfigurationCard() {
                     type="button"
                     onClick={() => handleProviderChange(provider.id)}
                     aria-pressed={isSelected}
-                    aria-label={`${provider.name}${isSelected ? ` (${t('settings.ai_selected', { defaultValue: 'selected' })})` : ''}`}
+                    aria-label={`${providerName}${isSelected ? ` (${t('settings.ai_selected', { defaultValue: 'selected' })})` : ''}`}
                     className={`relative flex flex-col items-start gap-1 rounded-xl px-4 py-3 text-left transition-all duration-normal ease-oe ${
                       isSelected
                         ? 'bg-oe-blue-subtle border-2 border-oe-blue ring-2 ring-oe-blue/10'
@@ -645,7 +712,7 @@ function AIConfigurationCard() {
                           isSelected ? 'text-oe-blue' : 'text-content-primary'
                         }`}
                       >
-                        {provider.name}
+                        {providerName}
                       </span>
                     </div>
                     <p className="text-xs text-content-secondary pl-5.5 leading-relaxed">
@@ -662,14 +729,18 @@ function AIConfigurationCard() {
             </div>
           </div>
 
-          {/* API Key input - hidden for keyless local runtimes (Ollama / vLLM),
-              which authenticate via the Server URL field below instead. */}
+          {/* API Key input - hidden for Ollama, which authenticates via the
+              Server URL field below instead; optional for the
+              OpenAI-compatible endpoint. */}
           {!isKeyless && (
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label htmlFor="ai-api-key" className="text-sm font-medium text-content-primary">
-                {t('settings.ai_api_key', { defaultValue: 'API Key' })}
+                {keyIsOptional
+                  ? t('settings.ai_key_optional_label', { defaultValue: 'API key (optional)' })
+                  : t('settings.ai_api_key', { defaultValue: 'API Key' })}
               </label>
+              {!keyIsOptional && (
               <a
                 href={AI_PROVIDERS.find((p) => p.id === selectedProvider)?.docsUrl}
                 target="_blank"
@@ -679,6 +750,7 @@ function AIConfigurationCard() {
                 {t('settings.ai_get_key', { defaultValue: 'Get an API key' })}
                 <ExternalLink size={11} />
               </a>
+              )}
             </div>
             <div className="relative group">
               <input
@@ -709,37 +781,124 @@ function AIConfigurationCard() {
               </button>
             </div>
             <p className="mt-1.5 text-xs text-content-tertiary">
-              {t('settings.ai_key_hint', {
-                defaultValue: 'Your API key is encrypted and stored securely. It is never shared.',
-              })}
+              {keyIsOptional
+                ? t('settings.ai_key_optional_hint', {
+                    defaultValue:
+                      'Only needed when your endpoint asks for a bearer token. It is encrypted and stored securely. Clear the field and save to remove it.',
+                  })
+                : t('settings.ai_key_hint', {
+                    defaultValue: 'Your API key is encrypted and stored securely. It is never shared.',
+                  })}
             </p>
           </div>
           )}
 
           {/* The endpoint input only appears for self-hosted runtimes. */}
-          {isKeyless ? (
+          {isSelfHosted ? (
             <div><label htmlFor="ai-base-url" className={baseUrlLabelClass}>{
                 t('settings.ai_base_url', { defaultValue: 'Server URL' })
               }</label>
+              {isKeyless ? (
               <p className="mb-1.5 text-xs text-content-tertiary">{
                 t('settings.ai_keyless_hint', {
                   defaultValue: 'No API key needed - this provider runs locally. Just enter the server address below.',
                 })
               }</p>
+              ) : null}
               <input id="ai-base-url" type="text" autoComplete="off" spellCheck={false}
                 value={baseUrlInput} className={baseUrlInputClass}
-                placeholder={selectedProvider === 'vllm' ? 'http://localhost:8000' : 'http://localhost:11434'}
+                placeholder={selectedProvider === 'vllm' ? 'http://localhost:8001' : 'http://localhost:11434'}
                 onChange={(event) => {
                   setBaseUrlInput(event.currentTarget.value);
                   setBaseUrlTouched(true); // mark the field as user-edited
                 }} />
               <p className={baseUrlHintClass}>{
                 t('settings.ai_base_url_hint', {
-                  defaultValue: 'Enter the server address including port. ' +
-                    'The /v1/chat/completions path is appended automatically.',
+                  defaultValue: 'Enter the server address including port, or the API root of a gateway ' +
+                    '(for example https://gateway.example/v1). The /chat/completions path is completed automatically.',
                 })
               }</p></div>
           ) : null}
+
+          {/* Tool calling, self-hosted endpoints only: whether the assistant
+              offers this server its tools for reading project data. */}
+          {isSelfHosted ? (
+            <div>
+              <label htmlFor="ai-tool-calling" className={baseUrlLabelClass}>
+                {t('settings.ai_tool_calling', { defaultValue: 'Tool calling' })}
+              </label>
+              <select
+                id="ai-tool-calling"
+                value={toolModeInput}
+                onChange={(event) => {
+                  setToolModeInput(event.currentTarget.value as ToolCallingMode | '');
+                  setToolModeTouched(true);
+                }}
+                className={baseUrlInputClass}
+              >
+                <option value="">
+                  {t('settings.ai_tool_calling_default', {
+                    defaultValue: 'Server default ({{mode}})',
+                    mode: toolModeLabel(settings?.tool_calling_defaults?.[selectedProvider] ?? 'off'),
+                  })}
+                </option>
+                <option value="auto">{toolModeLabel('auto')}</option>
+                <option value="on">{toolModeLabel('on')}</option>
+                <option value="off">{toolModeLabel('off')}</option>
+              </select>
+              <p className={baseUrlHintClass}>
+                {t('settings.ai_tool_calling_hint', {
+                  defaultValue:
+                    'With tool calling the assistant can read your projects through this server. Auto tries it and falls back to plain answers if the server refuses; turn it on only if the server and model support OpenAI tool calls.',
+                })}
+              </p>
+            </div>
+          ) : null}
+
+          {/* Per-provider timeout. */}
+          <div>
+            <label htmlFor="ai-timeout" className={baseUrlLabelClass}>
+              {t('settings.ai_timeout_label', { defaultValue: 'Timeout (seconds)' })}
+            </label>
+            <input
+              id="ai-timeout"
+              type="number"
+              inputMode="numeric"
+              min={AI_TIMEOUT_MIN_S}
+              max={AI_TIMEOUT_MAX_S}
+              step={1}
+              value={timeoutInput}
+              aria-invalid={timeoutInvalid || undefined}
+              placeholder={t('settings.ai_timeout_placeholder', {
+                defaultValue: 'Default: {{seconds}}',
+                seconds: settings?.default_timeout_seconds ?? 240,
+              })}
+              onChange={(event) => {
+                setTimeoutInput(event.currentTarget.value);
+                setTimeoutTouched(true);
+              }}
+              className={baseUrlInputClass}
+            />
+            {timeoutInvalid ? (
+              <p className="mt-1.5 text-xs text-semantic-error" role="alert">
+                {t('settings.ai_timeout_range_error', {
+                  defaultValue: 'Enter whole seconds between {{min}} and {{max}}, or leave it blank for the default.',
+                  min: AI_TIMEOUT_MIN_S,
+                  max: AI_TIMEOUT_MAX_S,
+                })}
+              </p>
+            ) : null}
+            <p className={baseUrlHintClass}>
+              {t('settings.ai_timeout_hint', {
+                defaultValue:
+                  'How long to wait for this provider to answer, {{min}} to {{max}} seconds. The assistant chat waits this long. ' +
+                  'Requests outside the chat are still cut at 5 minutes by the app, and at 2 minutes by the default nginx config ' +
+                  'of the deployment with a separate web server.',
+                min: AI_TIMEOUT_MIN_S,
+                max: AI_TIMEOUT_MAX_S,
+              })}
+            </p>
+          </div>
           {/* Model name override — lets users track provider model
               renames/retirements without waiting for an app update. */}
           <div>
@@ -795,12 +954,13 @@ function AIConfigurationCard() {
           onClick={() => testMutation.mutate()}
           disabled={
             testMutation.isPending ||
-            // Keyless local runtimes test against a server URL (typed or stored);
+            timeoutInvalid ||
+            // Self-hosted endpoints test against a server URL (typed or stored);
             // keyed providers need a stored or freshly entered API key.
-            (isKeyless ? !hasBaseUrl : !hasKeySet && !hasUnsavedKey)
+            (isSelfHosted ? !hasBaseUrl : !hasKeySet && !hasUnsavedKey)
           }
           title={
-            baseUrlTouched || modelTouched || hasUnsavedKey
+            baseUrlTouched || modelTouched || hasUnsavedKey || hasUnsavedOptions
               ? t('settings.ai_test_save_hint', {
                   defaultValue: 'Save changes and test connection',
                 })
@@ -821,12 +981,13 @@ function AIConfigurationCard() {
           onClick={() => saveMutation.mutate()}
           disabled={
             saveMutation.isPending ||
-            // Keyless local runtimes can save once a server URL is present
-            // (typed or stored) so users are not blocked by the hidden key
-            // field. Keyed providers keep the prior unsaved-changes gate.
-            (isKeyless
-              ? !hasBaseUrl && selectedProvider === settings?.provider
-              : !(hasUnsavedKey || modelTouched || baseUrlTouched) &&
+            timeoutInvalid ||
+            // Self-hosted endpoints can save once a server URL is present
+            // (typed or stored) so users are not blocked by a key field they
+            // do not need. Keyed providers keep the prior unsaved-changes gate.
+            (isSelfHosted
+              ? !hasBaseUrl && !hasUnsavedOptions && selectedProvider === settings?.provider
+              : !(hasUnsavedKey || modelTouched || baseUrlTouched || hasUnsavedOptions) &&
                 selectedProvider === settings?.provider)
           }
           loading={saveMutation.isPending}
@@ -966,6 +1127,7 @@ function AppearanceCard() {
             );
           })}
         </div>
+        <TextSizeSetting />
       </CardContent>
     </Card>
   );
@@ -1245,7 +1407,7 @@ function DemoLoginAdminRow() {
 
 // ── Tab definitions ──────────────────────────────────────────────────────────
 
-type SettingsTab = 'general' | 'dashboard' | 'team' | 'account' | 'regional' | 'einvoice' | 'converters' | 'ai' | 'security' | 'integrations' | 'modules' | 'governance' | 'audit' | 'advanced';
+type SettingsTab = 'general' | 'dashboard' | 'team' | 'company' | 'account' | 'regional' | 'einvoice' | 'converters' | 'ai' | 'security' | 'integrations' | 'modules' | 'governance' | 'audit' | 'advanced';
 
 interface TabDef {
   id: SettingsTab;
@@ -1270,6 +1432,9 @@ const TABS: readonly TabDef[] = [
   { id: 'dashboard',    labelKey: 'settings.tab_dashboard',    defaultLabel: 'Dashboard',    icon: LayoutGrid, descKey: 'settings.tab_dashboard_desc',  descDefault: 'Reorder, show or hide dashboard sections' },
   { id: 'account',      labelKey: 'settings.tab_account',      defaultLabel: 'Account',      icon: User,     descKey: 'settings.tab_account_desc',      descDefault: 'Password and sign out' },
   { id: 'team',         labelKey: 'settings.tab_team',         defaultLabel: 'Team & Plan',  icon: Users,    descKey: 'settings.tab_team_desc',         descDefault: 'Members, roles, and license' },
+  // Company & documents - logos and the letterhead printed on exported
+  // documents. Visible to everyone; the panel is read-only below admin.
+  { id: 'company',      labelKey: 'settings.tab_company',      defaultLabel: 'Company & documents', icon: Building2, descKey: 'settings.tab_company_desc', descDefault: 'Logos, letterhead, and how printed documents look' },
   { id: 'regional',     labelKey: 'settings.tab_regional',     defaultLabel: 'Regional',     icon: Globe,    descKey: 'settings.tab_regional_desc',     descDefault: 'Language, timezone, and formats' },
   { id: 'einvoice',     labelKey: 'settings.tab_einvoice',     defaultLabel: 'E-invoice',    icon: ReceiptText, descKey: 'settings.tab_einvoice_desc',  descDefault: 'Seller identity and bank account for electronic invoices' },
   { id: 'converters',   labelKey: 'settings.tab_converters',   defaultLabel: 'Converters',  icon: Layers,   descKey: 'settings.tab_converters_desc',   descDefault: 'DDC converters - installed versions and GitHub sources' },
@@ -1328,7 +1493,7 @@ export function SettingsPage() {
     mutationFn: () => apiPost<{ deleted: number }>('/v1/projects/demo-data/purge/', {}),
     onSuccess: (data) => {
       setShowPurgeDemo(false);
-      queryClient.invalidateQueries({ queryKey: ['projects'] });
+      invalidateProjectLists(queryClient);
       queryClient.invalidateQueries({ queryKey: ['project'] });
       addToast({
         type: 'success',
@@ -1360,6 +1525,9 @@ export function SettingsPage() {
       apiPatch<UserProfile>('/v1/users/me/', data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['me'] });
+      // The dashboard greeting and other shell surfaces read the name from the
+      // auth store, not from ['me']; refresh it so a rename shows at once.
+      void useAuthStore.getState().syncRoleFromServer();
       setEditingProfile(false);
       addToast({ type: 'success', title: t('toasts.profile_updated', { defaultValue: 'Profile updated' }) });
     },
@@ -1429,6 +1597,17 @@ export function SettingsPage() {
     validTabIds.includes(initialTab) ? initialTab : 'general',
   );
 
+  // A link that only changes the query string (the branding editor's "logo and
+  // company details for documents") leaves this page mounted, so the tab has to
+  // follow the URL rather than read it once on mount. The functional update
+  // keeps the active tab out of the dependencies, so a click, which sets both
+  // at once, cannot bounce between the old and the new value.
+  useEffect(() => {
+    if (validTabIds.includes(initialTab)) {
+      setActiveTab((current) => (current === initialTab ? current : initialTab));
+    }
+  }, [initialTab, validTabIds]);
+
   const handleTabChange = useCallback((id: SettingsTab) => {
     setActiveTab(id);
     const params = new URLSearchParams(searchParams);
@@ -1456,14 +1635,9 @@ export function SettingsPage() {
 
   return (
     <div className="space-y-5 animate-fade-in">
-      {/* Update notification — surfaced in Settings so users see new
-          versions even if they dismissed the sidebar widget for the session.
-          Rendered FIRST so that when UpdateNotification returns null (the
-          common no-update case) it is the leading space-y child and reserves
-          no phantom margin (audit: settings-top). Full-bleed when shown. */}
-      <div className="-mx-4 sm:-mx-7 empty:hidden">
-        <UpdateNotification forceShow hideDismiss />
-      </div>
+      {/* Update notification, one line. The sidebar carries the full card;
+          both follow the same per-version dismissal. */}
+      <UpdateInlineNotice className="mb-4" />
 
       <Breadcrumb items={[{ label: t('nav.settings', 'Settings') }]} />
 
@@ -1795,6 +1969,8 @@ export function SettingsPage() {
                     </div>
                   )}
 
+                  {profile?.role === 'admin' && <DemoLeftoversPanel />}
+
                   {profile?.role === 'admin' && <DemoLoginAdminRow />}
 
                   <div className="mt-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-lg border border-semantic-error/20 bg-surface-elevated px-4 py-3">
@@ -1842,6 +2018,9 @@ export function SettingsPage() {
 
           {/* ── TEAM & PLAN ──────────────────────────────────────── */}
           {activeTab === 'team' && <SettingsTeamPanel />}
+
+          {/* ── COMPANY & DOCUMENTS ──────────────────────────────── */}
+          {activeTab === 'company' && <CompanyDocumentsSettings />}
 
           {/* ── REGIONAL ─────────────────────────────────────────── */}
           {activeTab === 'regional' && (
@@ -1893,6 +2072,9 @@ export function SettingsPage() {
 
               {/* Regional Settings (timezone, units, formats, currency) */}
               <RegionalSettings />
+
+              {/* Shipped countries, work calendars and tax rates (admin only) */}
+              {profile?.role === 'admin' && <ReferenceDataPanel />}
 
               {/* Translation Manager */}
               <div>

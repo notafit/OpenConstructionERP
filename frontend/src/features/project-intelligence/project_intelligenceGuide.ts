@@ -6,9 +6,10 @@
 // <ModuleGuideButton content={project_intelligenceGuide} /> on
 // ProjectIntelligencePage.
 //
-// i18n: every key carries its inline English defaultValue. These keys are
-// NOT added to en.ts or any locale file - the ModuleGuide reads them via
-// t(key, { defaultValue }). Key prefix: guide.project_intelligence.*
+// i18n: every key carries its inline English defaultValue. The keys are not
+// in en.ts, the inline defaults are the English source; their translations
+// live in the other locale files, so a changed default needs its translations
+// redone too. Key prefix: guide.project_intelligence.*
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

@@ -5,8 +5,9 @@
 // Consumed by <ModuleGuideButton content={rfiGuide} /> on RFIPage.
 //
 // i18n: every key carries its inline English default and is read via
-// t(key, { defaultValue }). These keys are NOT added to en.ts or any
-// locale file; the inline defaults are the single source of truth.
+// t(key, { defaultValue }). The inline defaults are the English source and
+// the keys are not in en.ts; the translations live in the other locale
+// files, so a changed default here needs its translations redone too.
 
 import type { ModuleGuideContent } from '@/shared/ui';
 
@@ -57,16 +58,16 @@ export const rfiGuide: ModuleGuideContent = {
       titleDefault: 'Find what is on your plate',
       bodyKey: 'guide.rfi.filter.body',
       bodyDefault:
-        'The stat cards summarise total, open, overdue and average days open. Use the quick views for Awaiting me, Raised by me and Overdue, and narrow further by status, priority or discipline, or search across every RFI.',
+        'The stat cards summarise total, open, overdue and average response days. Use the quick views for Awaiting me, Raised by me and Overdue, and narrow further by status, priority or discipline, or search across every RFI.',
       spotlightSelector: '[data-guide="rfi-quickviews"]',
     },
     {
       icon: 'Rocket',
       titleKey: 'guide.rfi.impact.title',
-      titleDefault: 'Carry impact into Variations',
+      titleDefault: 'Carry impact into change orders',
       bodyKey: 'guide.rfi.impact.body',
       bodyDefault:
-        'Flag cost or schedule impact on the RFI so it is never lost. When an answer carries cost, Create Variation spins it straight into a change order, and Export RFI Log produces the full register for records and reporting.',
+        'Flag cost or schedule impact on the RFI so it is never lost. When an answer carries cost, Create Change Order turns it straight into a change order, and Export RFI Log produces the full register for records and reporting.',
       spotlightSelector: '[data-guide="rfi-export"]',
     },
   ],

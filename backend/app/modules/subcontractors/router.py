@@ -42,6 +42,7 @@ from app.dependencies import (
     verify_project_access,
 )
 from app.modules.subcontractors.models import LienWaiver
+from app.modules.subcontractors.repository import PrimeContractReader
 from app.modules.subcontractors.schemas import (
     AgreementCreate,
     AgreementResponse,
@@ -51,12 +52,19 @@ from app.modules.subcontractors.schemas import (
     CertificateCreate,
     CertificateResponse,
     CertificateUpdate,
+    ClaimSubRollupResponse,
+    DismissTwinRequest,
     ExpiryAlert,
+    IncludePaymentApplicationsRequest,
     InsuranceExpiryEntry,
     LienWaiverFormFields,
     LienWaiverResponse,
     MonthlyRatingComputeRequest,
     PaymentApplicationCreate,
+    PaymentApplicationFinanceApproval,
+    PaymentApplicationLineListResponse,
+    PaymentApplicationLineResponse,
+    PaymentApplicationLineUpdate,
     PaymentApplicationResponse,
     PaymentApplicationUpdate,
     PaymentReleaseCheck,
@@ -78,8 +86,11 @@ from app.modules.subcontractors.schemas import (
     SubcontractorListResponse,
     SubcontractorResponse,
     SubcontractorUpdate,
+    SuggestedClaimLinesResponse,
     TaxIdValidationRequest,
     TaxIdValidationResponse,
+    UnlinkedTwinListResponse,
+    UnlinkedTwinResponse,
     VendorEligibility,
     WorkPackageCreate,
     WorkPackageResponse,
@@ -143,6 +154,26 @@ async def _verify_payment_application_project(
     if pa is None:
         return
     await _verify_agreement_project(pa.agreement_id, user_id, session, svc)
+
+
+async def _verify_claim_project(
+    claim_id: uuid.UUID,
+    user_id: str,
+    session: SessionDep,
+) -> None:
+    """Gate a GC-claim rollup route by the project of the claim's contract.
+
+    404 when the claim or its contract is missing: unlike the subcontractor
+    lookups above, there is nothing for the route to do without them.
+    """
+    reader = PrimeContractReader(session)
+    claim = await reader.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Progress claim not found")
+    contract = await reader.get_contract(claim.contract_id)
+    if contract is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contract not found")
+    await verify_project_access(contract.project_id, user_id, session)
 
 
 # ── Subcontractors ──────────────────────────────────────────────────────
@@ -632,6 +663,39 @@ async def update_agreement(
     return AgreementResponse.model_validate(entity)
 
 
+@router.get("/unlinked-twins/", response_model=UnlinkedTwinListResponse)
+async def list_unlinked_twins(
+    session: SessionDep,
+    user_id: CurrentUserId,
+    project_id: uuid.UUID = Query(...),
+    _perm: None = Depends(RequirePermission("subcontractors.read")),
+) -> UnlinkedTwinListResponse:
+    """Agreements and contracts on the project that look like the same subcontract.
+
+    Unlinked, finance counts such a pair twice. Nothing here merges them: link
+    one through ``PATCH /agreements/{id}`` with ``contract_id``, or dismiss it.
+    """
+    await verify_project_access(project_id, user_id, session)
+    pairs = await SubcontractorService(session).find_unlinked_twins(project_id)
+    items = [UnlinkedTwinResponse.model_validate(pair) for pair in pairs]
+    return UnlinkedTwinListResponse(items=items, total=len(items))
+
+
+@router.post("/agreements/{agreement_id}/dismiss-twin/", response_model=AgreementResponse)
+async def dismiss_unlinked_twin(
+    agreement_id: uuid.UUID,
+    data: DismissTwinRequest,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.update")),
+) -> AgreementResponse:
+    """Record that this agreement and the contract are different subcontracts."""
+    svc = SubcontractorService(session)
+    await _verify_agreement_project(agreement_id, user_id, session, svc)
+    entity = await svc.dismiss_unlinked_twin(agreement_id, data.contract_id)
+    return AgreementResponse.model_validate(entity)
+
+
 @router.get("/agreements/{agreement_id}/validate/")
 async def validate_agreement(
     agreement_id: uuid.UUID,
@@ -801,12 +865,23 @@ async def approve_payment_finance(
     payment_id: uuid.UUID,
     user_id: CurrentUserId,
     session: SessionDep,
+    data: PaymentApplicationFinanceApproval | None = Body(default=None),
     _perm: None = Depends(RequirePermission("subcontractors.approve_payment_finance")),
 ) -> PaymentApplicationResponse:
-    """Finance-level approval of a payment application."""
+    """Finance-level approval of a payment application, with the amount approved per line.
+
+    No body, ``{}`` and ``{"lines": []}`` all mean the same: every line still
+    at zero is approved at its claimed amount. 422 when a named line is not on
+    this pay application or its amount is above what was claimed; nothing is
+    written then.
+    """
     svc = SubcontractorService(session)
     await _verify_payment_application_project(payment_id, user_id, session, svc)
-    entity = await svc.approve_payment_application_finance(payment_id, user_id=user_id)
+    entity = await svc.approve_payment_application_finance(
+        payment_id,
+        user_id=user_id,
+        lines=data.lines if data is not None else None,
+    )
     return PaymentApplicationResponse.model_validate(entity)
 
 
@@ -823,7 +898,7 @@ async def mark_payment_paid(
     """Mark a finance-approved payment application as paid."""
     svc = SubcontractorService(session)
     await _verify_payment_application_project(payment_id, user_id, session, svc)
-    entity = await svc.mark_paid(payment_id)
+    entity = await svc.mark_paid(payment_id, user_id=str(user_id) if user_id else None)
     return PaymentApplicationResponse.model_validate(entity)
 
 
@@ -871,6 +946,147 @@ async def reject_payment_application(
     return PaymentApplicationResponse.model_validate(entity)
 
 
+@router.get(
+    "/payment-applications/{payment_id}/lines",
+    response_model=PaymentApplicationLineListResponse,
+)
+async def list_payment_application_lines(
+    payment_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
+    _perm: None = Depends(RequirePermission("subcontractors.read")),
+) -> PaymentApplicationLineListResponse:
+    """One page of a pay application's lines, each with its GC line override.
+
+    The default page holds more than the register's other lists because the
+    caller approving a payment confirms an amount on every line, and a page
+    that stops short of the pay application would have them approve part of
+    it without saying so. ``total`` says how many there are either way.
+    """
+    svc = SubcontractorService(session)
+    if await svc.payments.get_by_id(payment_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment application not found")
+    await _verify_payment_application_project(payment_id, user_id, session, svc)
+    rows, total = await svc.payment_lines.page_for_application(payment_id, offset=offset, limit=limit)
+    return PaymentApplicationLineListResponse(
+        items=[PaymentApplicationLineResponse.model_validate(r) for r in rows],
+        total=total,
+        offset=offset,
+        limit=limit,
+    )
+
+
+@router.patch(
+    "/payment-application-lines/{line_id}",
+    response_model=PaymentApplicationLineResponse,
+)
+async def update_payment_application_line(
+    line_id: uuid.UUID,
+    data: PaymentApplicationLineUpdate,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.update")),
+) -> PaymentApplicationLineResponse:
+    """Map one pay-application line onto a GC schedule-of-values line (or clear it)."""
+    svc = SubcontractorService(session)
+    line = await svc.payment_lines.get_by_id(line_id)
+    if line is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment application line not found")
+    await _verify_payment_application_project(line.payment_application_id, user_id, session, svc)
+    entity = await svc.update_payment_application_line(line_id, data)
+    return PaymentApplicationLineResponse.model_validate(entity)
+
+
+# ── GC claim rollup ────────────────────────────────────────────────────
+#
+# Rolls subcontractor pay applications up into the GC's progress claim. Every
+# route is gated by the project of the claim's contract. The rollup and the
+# suggested lines are read-only; the two write routes only record which pay
+# applications a claim includes. Claim lines themselves are written by the
+# contracts module's commit route after a person reviewed the suggestion.
+
+
+@router.get(
+    "/progress-claims/{claim_id}/rollup",
+    response_model=ClaimSubRollupResponse,
+)
+async def get_claim_rollup(
+    claim_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.read")),
+) -> ClaimSubRollupResponse:
+    """What the subcontractors billed under one GC claim, per GC line."""
+    await _verify_claim_project(claim_id, user_id, session)
+    svc = SubcontractorService(session)
+    return ClaimSubRollupResponse.model_validate(await svc.claim_rollup(claim_id))
+
+
+@router.post(
+    "/progress-claims/{claim_id}/rollup/include",
+    response_model=list[PaymentApplicationResponse],
+)
+async def include_payment_applications_in_claim(
+    claim_id: uuid.UUID,
+    payload: IncludePaymentApplicationsRequest,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.update")),
+) -> list[PaymentApplicationResponse]:
+    """Roll pay applications into a GC claim (all or nothing).
+
+    409 when the claim is past editing or a pay application is rejected or
+    already in another claim; 422 on another project, another prime contract
+    or another currency.
+    """
+    await _verify_claim_project(claim_id, user_id, session)
+    svc = SubcontractorService(session)
+    rows = await svc.include_payment_applications(claim_id, payload.payment_application_ids, user_id=user_id)
+    return [PaymentApplicationResponse.model_validate(r) for r in rows]
+
+
+@router.post(
+    "/payment-applications/{payment_id}/exclude-from-claim",
+    response_model=PaymentApplicationResponse,
+)
+async def exclude_payment_application_from_claim(
+    payment_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.update")),
+) -> PaymentApplicationResponse:
+    """Take a pay application back out of its GC claim (409 once the claim is approved)."""
+    svc = SubcontractorService(session)
+    pay_app = await svc.payments.get_by_id(payment_id)
+    if pay_app is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment application not found")
+    await _verify_payment_application_project(payment_id, user_id, session, svc)
+    entity = await svc.exclude_payment_application(payment_id, user_id=user_id)
+    return PaymentApplicationResponse.model_validate(entity)
+
+
+@router.get(
+    "/progress-claims/{claim_id}/rollup/suggested-lines",
+    response_model=SuggestedClaimLinesResponse,
+)
+async def get_suggested_claim_lines(
+    claim_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    _perm: None = Depends(RequirePermission("subcontractors.read")),
+) -> SuggestedClaimLinesResponse:
+    """Claim lines derived from the subs' approved amounts (preview only).
+
+    Same shape as the contracts populate-from-progress preview; commit it
+    through ``PUT /api/v1/contracts/progress-claims/{claim_id}/commit-populated-lines``.
+    """
+    await _verify_claim_project(claim_id, user_id, session)
+    svc = SubcontractorService(session)
+    return SuggestedClaimLinesResponse.model_validate(await svc.suggested_claim_lines(claim_id))
+
+
 # ── Retention ──────────────────────────────────────────────────────────
 
 
@@ -907,7 +1123,8 @@ async def release_retention(
         amount=payload.amount,
         reason=payload.reason,
     )
-    return RetentionLedgerEntryResponse.model_validate(entry)
+    warnings = await svc.retention_release_warnings(payload.agreement_id)
+    return RetentionLedgerEntryResponse.model_validate(entry).model_copy(update={"warnings": warnings})
 
 
 # ── Ratings ────────────────────────────────────────────────────────────
@@ -1175,6 +1392,7 @@ async def upload_lien_waiver(
     file: UploadFile = File(...),
     payment_application_id: uuid.UUID | None = Form(default=None),
     signed_date: str | None = Form(default=None),
+    through_date: str | None = Form(default=None),
     amount: str | None = Form(default=None),
     currency: str | None = Form(default=None),
     notes: str | None = Form(default=None),
@@ -1205,7 +1423,7 @@ async def upload_lien_waiver(
         )
     if not raw:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="file body is empty",
         )
 
@@ -1233,7 +1451,7 @@ async def upload_lien_waiver(
         parsed_amount = Decimal(amount) if amount not in (None, "") else Decimal("0")
     except (InvalidOperation, ValueError):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"amount is not a valid decimal: {amount!r}",
         )
     try:
@@ -1242,21 +1460,29 @@ async def upload_lien_waiver(
         parsed_signed = _date.fromisoformat(signed_date) if signed_date else None
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"signed_date is not a valid ISO date: {signed_date!r}",
+        )
+    try:
+        parsed_through = _date.fromisoformat(through_date) if through_date else None
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"through_date is not a valid ISO date: {through_date!r}",
         )
     try:
         form_payload = LienWaiverFormFields(
             waiver_type=waiver_type,
             payment_application_id=payment_application_id,
             signed_date=parsed_signed,
+            through_date=parsed_through,
             amount=parsed_amount,
             currency=currency or "",
             notes=notes,
         )
     except Exception as exc:  # pydantic.ValidationError
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         )
 
@@ -1278,6 +1504,31 @@ async def upload_lien_waiver(
             session,
             svc,
         )
+        # A waiver filed against a pay application is what releases that
+        # payment, so it must be this subcontractor's own pay application, in
+        # its currency. Otherwise one sub's paper, or an amount in another
+        # currency, would clear a payment it was never signed for: the release
+        # gate compares amounts, not who signed or in what money.
+        pay_app = await svc.payments.get_by_id(form_payload.payment_application_id)
+        agreement = await svc.agreements.get_by_id(pay_app.agreement_id) if pay_app is not None else None
+        if pay_app is None or agreement is None or agreement.subcontractor_id != sub_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "code": "payment_application_other_subcontractor",
+                    "message": "The payment application does not belong to this subcontractor.",
+                },
+            )
+        if not form_payload.currency:
+            form_payload = form_payload.model_copy(update={"currency": pay_app.currency})
+        elif pay_app.currency and form_payload.currency != pay_app.currency:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "code": "currency_mismatch",
+                    "message": "The waiver's currency differs from the payment application's.",
+                },
+            )
 
     # Disk write - per-subcontractor folder so listings stay cheap.
     target_dir = LIEN_WAIVERS_DIR / str(sub_id)
@@ -1308,6 +1559,7 @@ async def upload_lien_waiver(
         mime_type=safe_mime,
         file_size=len(raw),
         signed_date=form_payload.signed_date,
+        through_date=form_payload.through_date,
         amount=form_payload.amount,
         currency=form_payload.currency,
         notes=form_payload.notes,

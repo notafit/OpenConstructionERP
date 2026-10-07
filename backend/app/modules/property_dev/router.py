@@ -2717,7 +2717,7 @@ async def expire_reservation(
     session: SessionDep,
     payload: CurrentUserPayload,
     service: PropertyDevService = Depends(_svc),
-    _perm: None = Depends(RequirePermission("property_dev.reservation.expire")),
+    _perm: None = Depends(RequirePermission("property_dev.owner_scoped_reservation_expire")),
 ) -> ReservationResponse:
     await _verify_owner_via_reservation(session, r_id, payload)
     return ReservationResponse.model_validate(await service.expire_reservation(r_id))
@@ -3282,7 +3282,7 @@ async def waive_instalment(
     session: SessionDep,
     payload: CurrentUserPayload,
     service: PropertyDevService = Depends(_svc),
-    _perm: None = Depends(RequirePermission("property_dev.instalment.waive")),
+    _perm: None = Depends(RequirePermission("property_dev.owner_scoped_instalment_waive")),
 ) -> InstalmentResponse:
     await _verify_owner_via_instalment(session, ins_id, payload)
     return InstalmentResponse.model_validate(await service.waive_instalment(ins_id, data))
@@ -3900,8 +3900,7 @@ async def delete_escrow_account(
     _perm: None = Depends(RequirePermission("property_dev.owner_scoped_delete")),
 ) -> None:
     await _verify_owner_via_escrow_account(session, account_id, user_payload)
-    await service.get_escrow_account(account_id)
-    await service.escrow_accounts.delete(account_id)
+    await service.delete_escrow_account(account_id)
 
 
 @router.get(
@@ -4041,10 +4040,7 @@ async def delete_escrow_transaction(
     _perm: None = Depends(RequirePermission("property_dev.owner_scoped_delete")),
 ) -> None:
     await _verify_owner_via_escrow_transaction(session, tx_id, user_payload)
-    obj = await service.escrow_transactions.get_by_id(tx_id)
-    if obj is None:
-        raise HTTPException(status_code=404, detail=translate("errors.escrow_not_found", locale=get_locale()))
-    await service.escrow_transactions.delete(tx_id)
+    await service.delete_escrow_transaction(tx_id)
 
 
 @router.post(
@@ -4445,7 +4441,7 @@ async def preview_propdev_document(
             return uuid.UUID(str(raw))
         except (ValueError, TypeError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Invalid UUID for {name}",
             ) from exc
 
@@ -4544,7 +4540,7 @@ async def email_propdev_document(
     # super-linear, and RFC 5321 caps an address at 254 chars anyway.
     if not recipient or len(recipient) > 254 or not _EMAIL_RE.match(recipient):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="A valid recipient_email is required",
         )
     recipient_name = str(body.get("recipient_name", "")).strip() or None
@@ -4558,7 +4554,7 @@ async def email_propdev_document(
             return uuid.UUID(str(raw))
         except (ValueError, TypeError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Invalid UUID for {name}",
             ) from exc
 
@@ -5118,7 +5114,7 @@ def _validate_template_slug(value: str, *, field: str) -> str:
     value = (value or "custom").strip().lower()
     if not _TEMPLATE_SLUG_RE.match(value):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Invalid {field} '{value}'. Use 1-{_TEMPLATE_SLUG_MAX_LEN} "
                 "lowercase letters, digits, dots, dashes or underscores; "
@@ -5145,12 +5141,12 @@ def _validate_custom_template_metadata(
     name = (name or "").strip()
     if not name:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Template name is required",
         )
     if len(name) > 200:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Template name must be 200 characters or fewer",
         )
     doc_type = _validate_template_slug(doc_type, field="doc_type")
@@ -5291,7 +5287,7 @@ async def upload_custom_document_template(
 
     if not content:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Uploaded file is empty",
         )
     if len(content) > _CUSTOM_TEMPLATE_MAX_BYTES:
@@ -5331,7 +5327,7 @@ async def upload_custom_document_template(
         # is the same for every role, admin included.
         if first_proj is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=("No project found for current user. Create a project before uploading templates."),
             )
         resolved_project_id = first_proj
@@ -5563,19 +5559,19 @@ async def save_text_custom_document_template(
 
     if content_type not in _ALLOWED_TEXT_CONTENT_TYPES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"content_type '{content_type}' is not allowed. Use {', '.join(sorted(_ALLOWED_TEXT_CONTENT_TYPES))}."
             ),
         )
     if not isinstance(content_text, str):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="content_text must be a string",
         )
     if not content_text.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="content_text is empty",
         )
     if len(content_text) > _CUSTOM_TEMPLATE_TEXT_MAX_CHARS:
@@ -5612,7 +5608,7 @@ async def save_text_custom_document_template(
             template_id = uuid.UUID(str(template_id_raw))
         except (TypeError, ValueError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Invalid template_id",
             ) from exc
         existing_row = await session.get(PropertyDevCustomTemplate, template_id)
@@ -5643,7 +5639,7 @@ async def save_text_custom_document_template(
             project_id = uuid.UUID(str(project_id_raw))
         except (TypeError, ValueError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Invalid project_id",
             ) from exc
         proj = await session.get(Project, project_id)
@@ -5668,7 +5664,7 @@ async def save_text_custom_document_template(
         # because the ownership gates wave those through for every caller.
         if first_proj is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=("No project found for current user. Create a project before saving templates."),
             )
         resolved_project_id = first_proj
@@ -5679,7 +5675,7 @@ async def save_text_custom_document_template(
             development_id = uuid.UUID(str(development_id_raw))
         except (TypeError, ValueError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Invalid development_id",
             ) from exc
 
@@ -6626,7 +6622,7 @@ def _validate_iso_date(value: str | None, field: str) -> None:
         _date.fromisoformat(value)
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Invalid date for {field}: {exc}",
         )
 
@@ -6685,7 +6681,8 @@ async def _list_accessible_dev_ids(
     Used by the cross-development analytics endpoints (cohort-retention,
     time-to-close, lead-source-attribution, broker-performance) to scope
     rollups to the caller's tenant without forcing them to pass a
-    dev_id. Admins see ALL developments.
+    dev_id. Admins see ALL developments of live projects; a development of
+    a deleted (archived) project is not part of any rollup.
     """
     from sqlalchemy import select as _select
 
@@ -6696,14 +6693,14 @@ async def _list_accessible_dev_ids(
     user_id = user_payload.get("sub") or user_payload.get("user_id")
 
     if is_admin:
-        stmt = _select(_Dev.id)
+        stmt = _select(_Dev.id).join(Project, Project.id == _Dev.project_id).where(Project.status != "archived")
     else:
         if not user_id:
             return []
         stmt = (
             _select(_Dev.id)
             .join(Project, Project.id == _Dev.project_id)
-            .where(Project.owner_id == uuid.UUID(str(user_id)))
+            .where(Project.owner_id == uuid.UUID(str(user_id)), Project.status != "archived")
         )
     return [row for (row,) in (await session.execute(stmt)).all()]
 

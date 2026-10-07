@@ -266,7 +266,9 @@ def _one_declaration(call: ast.Call) -> tuple[str | None, set[str], str | None]:
     return role, filled, condition
 
 
-def declared_roles(manifest: pathlib.Path) -> list[tuple[str | None, set[str], str | None]]:
+def declared_roles(
+    manifest: pathlib.Path,
+) -> list[tuple[str | None, set[str], str | None]]:
     """Every declaration a manifest carries, as a role, the fields it filled, and its `when`.
 
     Read with ast rather than by importing, so the gate needs no dependency and
@@ -299,7 +301,11 @@ def declared_roles(manifest: pathlib.Path) -> list[tuple[str | None, set[str], s
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app_dir", nargs="?", help="app directory to scan (default: backend/app)")
-    parser.add_argument("--strict", action="store_true", help="exit non-zero on findings, not only on a broken scan")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit non-zero on findings, not only on a broken scan",
+    )
     args = parser.parse_args(argv)
 
     app = pathlib.Path(args.app_dir).resolve() if args.app_dir else APP
@@ -310,7 +316,10 @@ def main(argv: list[str] | None = None) -> int:
 
     graph, failures = build_graph(app)
     if failures:
-        print(f"{len(failures)} file(s) could not be parsed, so the import graph is partial:", file=sys.stderr)
+        print(
+            f"{len(failures)} file(s) could not be parsed, so the import graph is partial:",
+            file=sys.stderr,
+        )
         for failure in failures[:10]:
             print(f"  {failure}", file=sys.stderr)
         print(
@@ -326,7 +335,10 @@ def main(argv: list[str] | None = None) -> int:
     # finds nothing and the gate goes green on a tree it can no longer see.
     missing_roots = [p for p in PRIMITIVES if p not in graph["__known__"]]
     if missing_roots:
-        print(f"{len(missing_roots)} inference primitive(s) named here are not in {app}:", file=sys.stderr)
+        print(
+            f"{len(missing_roots)} inference primitive(s) named here are not in {app}:",
+            file=sys.stderr,
+        )
         for root in missing_roots:
             print(f"  {root}", file=sys.stderr)
         print(

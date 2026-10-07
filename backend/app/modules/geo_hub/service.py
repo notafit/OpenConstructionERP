@@ -68,6 +68,10 @@ from app.modules.geo_hub.tile_pipeline import (
 
 logger = logging.getLogger(__name__)
 
+#: Most projects one bulk auto-anchor sweep geocodes, so a large tenant cannot
+#: pin Nominatim for hours in a single request.
+BULK_ANCHOR_CAP = 200
+
 
 # ── FSMs ────────────────────────────────────────────────────────────────
 
@@ -297,7 +301,7 @@ class GeoHubService:
         if result is None:
             if address is None:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail={
                         "code": "address_missing",
                         "message": (
@@ -398,7 +402,7 @@ class GeoHubService:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required",
             )
-        from sqlalchemy import select
+        from sqlalchemy import and_, or_, select
 
         from app.modules.projects.models import Project
 
@@ -412,12 +416,32 @@ class GeoHubService:
                 "results": [],
             }
 
-        stmt = select(Project).where(Project.status != "archived").where(Project.address.is_not(None))
+        # Only projects this sweep can still do something for: no anchor, or
+        # the (0, 0) placeholder. Projects that already carry a real anchor
+        # used to be fetched too and spent the cap below on a guaranteed
+        # skip, and with no ORDER BY the database handed back the same
+        # arbitrary 200 on every run. Past 200 anchored projects the sweep
+        # therefore never reached a new one, however often it was re-run.
+        stmt = (
+            select(Project)
+            .outerjoin(GeoAnchor, GeoAnchor.project_id == Project.id)
+            .where(Project.status != "archived")
+            .where(Project.address.is_not(None))
+            .where(
+                or_(
+                    GeoAnchor.id.is_(None),
+                    and_(GeoAnchor.lat == Decimal("0"), GeoAnchor.lon == Decimal("0")),
+                )
+            )
+        )
         if not is_admin:
             stmt = stmt.where(Project.owner_id == user_id)
-        # Hard cap so a runaway admin doesn't pin Nominatim for hours;
-        # callers can re-run if they need more.
-        stmt = stmt.limit(200)
+        # Hard cap so a runaway admin doesn't pin Nominatim for hours. Newest
+        # first so the slice is deterministic and a just-created project is
+        # always in it; each anchored project leaves the set, so a re-run
+        # reaches further. One anchor per project (uq_oe_geo_hub_anchor_project),
+        # so the outer join cannot repeat a project.
+        stmt = stmt.order_by(Project.created_at.desc(), Project.id).limit(BULK_ANCHOR_CAP)
         rows = (await self.session.execute(stmt)).scalars().all()
 
         # Prefetch every existing anchor for the fetched projects in ONE
@@ -1513,7 +1537,7 @@ class GeoHubService:
             png_bytes, w, h, page_count = pdf_to_png(content, page=page)
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"PDF rasterisation failed: {exc}",
             ) from exc
 
@@ -1587,7 +1611,7 @@ class GeoHubService:
             ) from exc
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Image not parseable: {exc}",
             ) from exc
 
@@ -1662,7 +1686,7 @@ class GeoHubService:
             png_bytes, w, h = dwg_top_view_to_png(canonical)
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"DWG rasterisation failed: {exc}",
             ) from exc
 
@@ -1928,7 +1952,7 @@ class GeoHubService:
         anchor = await self.anchors.get_by_project(resolved_project_id)
         if anchor is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="no_anchor_for_project",
             )
 
@@ -1938,7 +1962,7 @@ class GeoHubService:
         )
         if not elements:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="canonical_elements_empty",
             )
 
@@ -1983,7 +2007,7 @@ class GeoHubService:
         # the upstream import.
         if build.feature_count == 0:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="canonical_elements_have_no_geometry",
             )
         tileset_id = uuid.uuid4()
@@ -2114,7 +2138,7 @@ class GeoHubService:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Authentication required",
             )
-        from sqlalchemy import or_, select
+        from sqlalchemy import and_, or_, select
 
         from app.modules.projects.models import Project
         from app.modules.teams.access import member_project_ids_subquery
@@ -2143,7 +2167,26 @@ class GeoHubService:
                     Project.id.in_(member_project_ids_subquery(user_id)),
                 )
             )
-        stmt = stmt.order_by(Project.created_at.desc()).limit(limit)
+        # Only projects that can carry a pin count against ``limit``. Without
+        # this the limit was spent on the newest projects first and the ones
+        # with no location were dropped afterwards, so a caller whose newest
+        # projects had none got an empty map although older located projects
+        # existed. ``->>`` is SQL NULL for a missing key and for JSON null.
+        # The range and number checks stay in ``_address_coords`` below, so a
+        # row this lets through can still be dropped, but only for bad data.
+        address = Project.address
+        stmt = stmt.where(
+            or_(
+                GeoAnchor.id.isnot(None),
+                and_(
+                    address["lat"].as_string().isnot(None),
+                    or_(address["lng"].as_string().isnot(None), address["lon"].as_string().isnot(None)),
+                ),
+            )
+        )
+        # ``id`` breaks ties on ``created_at``, so which projects fall under
+        # ``limit`` does not change from one request to the next.
+        stmt = stmt.order_by(Project.created_at.desc(), Project.id.desc()).limit(limit)
 
         result = await self.session.execute(stmt)
         rows = result.all()

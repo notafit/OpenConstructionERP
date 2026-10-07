@@ -10,8 +10,9 @@ import {
 } from 'lucide-react';
 import { Button, Input, LogoWithText, CountryFlag } from '@/shared/ui';
 import { SUPPORTED_LANGUAGES, getLanguageByCode } from '@/app/i18n';
-import { useAuthStore } from '@/stores/useAuthStore';
+import { readRememberChoice, useAuthStore } from '@/stores/useAuthStore';
 import { AuthBackground } from './AuthBackground';
+import { meetsPasswordPolicy } from './passwordPolicy';
 
 export function RegisterPage() {
   const { t, i18n } = useTranslation();
@@ -41,12 +42,9 @@ export function RegisterPage() {
   }, []);
 
   const passwordsMatch = password === confirmPassword;
-  // A usable password needs a minimum length and at least one letter (Latin or
-  // Cyrillic) plus one numeric character.
-  const meetsMinLength = password.length >= 8;
-  const containsLetter = /[a-zA-Zа-яА-Я]/.test(password);
-  const containsDigit = /\d/.test(password);
-  const passwordStrong = meetsMinLength && containsLetter && containsDigit;
+  // The server's rules (length, a letter in any script, a digit), shared with
+  // the reset page so the two forms cannot drift from each other.
+  const passwordStrong = meetsPasswordPolicy(password);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -122,7 +120,7 @@ export function RegisterPage() {
 
       if (loginRes.ok) {
         const data = await loginRes.json();
-        setTokens(data.access_token, data.refresh_token);
+        setTokens(data.access_token, data.refresh_token, readRememberChoice(), email);
         navigate('/');
       } else {
         navigate('/login');

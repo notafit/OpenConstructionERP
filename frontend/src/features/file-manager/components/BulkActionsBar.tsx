@@ -2,11 +2,17 @@
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 /** Bulk-actions bar — visible when one or more files are selected.
  *
- * Bulk delete dispatches per-kind:
- *   - documents → POST /v1/documents/batch/delete/ (server-side batch)
- *   - everything else (photos, sheets, BIM models, DWG drawings, takeoff
- *     uploads, reports, markups) → DELETE one-id-at-a-time on the module's
- *     own per-id endpoint, in parallel.
+ * Bulk delete (`dispatchBulkDelete`) moves every selected row, whatever its
+ * kind, to the recycle bin one row at a time, in parallel. The row leaves its
+ * own table at once and Restore puts it back under the same id. While the
+ * confirm is open, `BulkDeleteReferencesWarning` shows what the selected
+ * documents are still linked to. It is advisory, like the single-file panel,
+ * and nothing on this path asks the server to enforce it.
+ *
+ * The server-side guard, the 409 on POST /v1/documents/batch/delete/ until
+ * `acknowledge_references` is sent, protects only the legacy hard-delete
+ * path (`dispatchHardBulkDelete`), which no screen calls today. The bin's
+ * purge, manual or on expiry, does not check references either.
  *
  * The toast surface reports a per-kind tally: how many files of each kind
  * were deleted, and — on partial failure — which kinds had errors so the
@@ -42,6 +48,7 @@ import { showUndoDeleteToast } from '@/features/file-trash/UndoDeleteToast';
 import type { TrashKind } from '@/features/file-trash/types';
 import { BulkTagDrawer } from '@/features/file-tags/BulkTagDrawer';
 import { NewTransmittalWizard } from '@/features/file-transmittals/NewTransmittalWizard';
+import { BulkDeleteReferencesWarning } from '@/features/documents/DocumentDeleteWarning';
 
 interface BulkActionsBarProps {
   selectedRows: FileRow[];
@@ -100,9 +107,10 @@ export async function dispatchBulkDelete(
     const ids = items.map((r) => r.id);
 
     // W2 — soft-delete: every row passes through the recycle bin so an
-    // accidental purge is recoverable for 30 days. The trash service
-    // snapshots the row and flags the original as is_trashed in one
-    // call.
+    // accidental delete is recoverable for 30 days. The trash service
+    // snapshots the row and removes the original in one call; there is no
+    // is_trashed flag, the row really does leave its own table, and Restore
+    // re-inserts it with the original id so cross-module links re-attach.
     const settled = await Promise.allSettled(
       items.map((row) =>
         softDelete({
@@ -143,9 +151,25 @@ export async function dispatchBulkDelete(
 }
 
 /** Legacy hard-delete path — kept around so tests + admin tools that
- *  bypass the recycle bin can still wipe rows. Not used in the normal
- *  UI flow. */
-export async function dispatchHardBulkDelete(rows: FileRow[]): Promise<DispatchSummary> {
+ *  bypass the recycle bin can still wipe rows. No screen calls it today:
+ *  the bar's Delete goes through `dispatchBulkDelete` and the recycle bin.
+ *
+ *  The documents batch endpoint refuses (409, nothing deleted) while any
+ *  selected document is still pointed at by a row the delete would strand or
+ *  unlink. That refusal lands here as a per-kind failure carrying the server's
+ *  message. Set `acknowledgeReferences` only once the person has seen what the
+ *  delete severs.
+ *
+ *  Whoever wires this into a screen owns that acknowledge step. Show
+ *  `BulkDeleteReferencesWarning` for the selection and pass
+ *  `acknowledgeReferences: true` from the person's own confirmation of it.
+ *  Without the step every selection that anything links to fails with 409
+ *  and can never complete; passing `true` unconditionally instead makes the
+ *  server's guard meaningless. */
+export async function dispatchHardBulkDelete(
+  rows: FileRow[],
+  { acknowledgeReferences = false }: { acknowledgeReferences?: boolean } = {},
+): Promise<DispatchSummary> {
   const groups = groupByKind(rows);
   const perKind: PerKindResult[] = [];
 
@@ -154,7 +178,7 @@ export async function dispatchHardBulkDelete(rows: FileRow[]): Promise<DispatchS
 
     if (kind === 'document') {
       try {
-        const resp = await bulkDeleteDocuments(ids);
+        const resp = await bulkDeleteDocuments(ids, acknowledgeReferences);
         perKind.push({
           kind,
           requested: ids.length,
@@ -317,7 +341,8 @@ export function BulkActionsBar({ selectedRows, projectId, onClear }: BulkActions
 
   // How many of the selected rows are documents (the only kind with a CDE
   // state) — gates the "Set status" control.
-  const documentCount = selectedRows.filter((r) => r.kind === 'document').length;
+  const documentRows = selectedRows.filter((r) => r.kind === 'document');
+  const documentCount = documentRows.length;
 
   // Bulk CDE transition. Rejections (forward-only lifecycle, role gate) are
   // common on a mixed selection, so we suppress the global error toast and
@@ -684,6 +709,20 @@ export function BulkActionsBar({ selectedRows, projectId, onClear }: BulkActions
           </button>
         )}
       </div>
+
+      {/* What the delete severs, read while the confirm is open so it is seen
+          before Delete is pressed: the bulk form of the panel the single
+          file's menu shows. Documents only, since the references check
+          answers for that kind. Advisory like the single panel, so the
+          buttons above keep working while it loads. */}
+      {confirming && documentCount > 0 && (
+        <div className="basis-full -mx-4 -mb-2">
+          <BulkDeleteReferencesWarning
+            documentIds={documentRows.map((r) => r.id)}
+            namesById={Object.fromEntries(documentRows.map((r) => [r.id, r.name]))}
+          />
+        </div>
+      )}
 
       {/* W4 — bulk tag operations drawer. */}
       <BulkTagDrawer

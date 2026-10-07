@@ -8,8 +8,9 @@
 // real priced bill of quantities.
 //
 // i18n: every string carries its inline English default and is consumed
-// via t(key, { defaultValue }). These keys live ONLY here as inline
-// defaults and are intentionally NOT added to en.ts or any locale file.
+// via t(key, { defaultValue }). The keys are not in en.ts, the inline
+// defaults are the English source; their translations live in the other
+// locale files, so a changed default needs its translations redone too.
 
 import type { ModuleGuideContent } from '@/shared/ui';
 

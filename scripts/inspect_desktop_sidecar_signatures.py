@@ -308,7 +308,12 @@ def code_directories(data: bytes) -> list[dict[str, object]]:
         try:
             signature = _code_signature_blob(sl)
         except Exception as exc:  # noqa: BLE001
-            out.append({"state": "unreadable", "why": f"the load commands did not parse: {exc}"})
+            out.append(
+                {
+                    "state": "unreadable",
+                    "why": f"the load commands did not parse: {exc}",
+                }
+            )
             continue
         if signature is None:
             out.append({"state": "unsigned"})

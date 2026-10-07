@@ -9,6 +9,7 @@ Event publishing (slice E):
     reporting.report.generated     - new report rendered
 """
 
+import asyncio
 import html
 import logging
 import uuid
@@ -456,6 +457,29 @@ class ReportingService:
         await self.session.delete(report)
         await self.session.flush()
 
+    async def set_published(
+        self,
+        report_id: uuid.UUID,
+        *,
+        published: bool,
+        user_id: uuid.UUID | None,
+    ) -> GeneratedReport:
+        """Release a report to the client portal, or take it back.
+
+        Caller enforces project access, as for ``delete_report``. Publishing
+        an already published report keeps its first release time.
+        """
+        report = await self.get_report(report_id)
+        if published:
+            if report.published_at is None:
+                report.published_at = datetime.now(UTC)
+                report.published_by = user_id
+        else:
+            report.published_at = None
+            report.published_by = None
+        await self.session.flush()
+        return report
+
     async def generate_report(
         self,
         data: GenerateReportRequest,
@@ -779,7 +803,10 @@ class ReportingService:
                 html_body = None
 
         try:
-            return export_report(
+            # The arguments are plain values read above. Rendering the file walks the
+            # whole snapshot and is pure CPU, so it runs in a worker thread.
+            return await asyncio.to_thread(
+                export_report,
                 fmt=fmt,
                 report_type=report.report_type,
                 title=report.title,
@@ -842,7 +869,12 @@ class ReportingService:
             id=project_id,
             project_id=project_id,
         )
-        return build_cobie_export(facility, all_elements)
+        # The workbook covers every element of every model on the project, and
+        # the builder saves it, reopens it to add the profile's extra sheets and
+        # saves it again. That is seconds of CPU on a multi-discipline project,
+        # so it runs in a worker thread. The elements are loaded above and the
+        # builder only reads their column values; no session crosses the thread.
+        return await asyncio.to_thread(build_cobie_export, facility, all_elements)
 
     async def dispatch_report_email(
         self,

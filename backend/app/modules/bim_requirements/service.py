@@ -6,6 +6,7 @@ Handles file import orchestration, parser selection, DB persistence,
 and export generation.
 """
 
+import asyncio
 import logging
 import tempfile
 import uuid
@@ -118,7 +119,7 @@ class BIMRequirementService:
                 format_name = _classifier.classify(tmp_path)
             except ValueError as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=str(exc),
                 ) from exc
 
@@ -127,7 +128,7 @@ class BIMRequirementService:
                 parser = _get_parser(format_name)
             except ValueError as exc:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=str(exc),
                 ) from exc
 
@@ -152,7 +153,7 @@ class BIMRequirementService:
                     detail=security_errors[0].get("msg", "XML rejected for security reasons."),
                 )
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(
                     f"No requirements could be parsed from '{filename}' "
                     f"(format: {format_name}). "
@@ -266,7 +267,9 @@ class BIMRequirementService:
 
         req_set = await self.get_set(set_id)
         reqs = await self._load_requirements_as_universal(set_id)
-        return export_excel(reqs, title=req_set.name, language=language)
+        # The requirements are plain DTOs. Writing the workbook walks every row and is
+        # pure CPU, so it runs in a worker thread and the event loop keeps serving requests.
+        return await asyncio.to_thread(export_excel, reqs, title=req_set.name, language=language)
 
     async def export_ids(
         self,
@@ -277,7 +280,9 @@ class BIMRequirementService:
 
         req_set = await self.get_set(set_id)
         reqs = await self._load_requirements_as_universal(set_id)
-        return export_ids_xml(reqs, title=req_set.name)
+        # Serialising the IDS XML walks every requirement and is pure CPU, so it runs
+        # in a worker thread and the event loop keeps serving requests.
+        return await asyncio.to_thread(export_ids_xml, reqs, title=req_set.name)
 
     async def _load_requirements_as_universal(self, set_id: uuid.UUID) -> list[UniversalRequirement]:
         """Load DB requirements and convert to UniversalRequirement objects."""
@@ -636,7 +641,7 @@ class BIMRequirementService:
             pack = load_rule_pack(f"<inline:{project_id}>", text=yaml_text)
         except RulePackParseError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             ) from exc
 

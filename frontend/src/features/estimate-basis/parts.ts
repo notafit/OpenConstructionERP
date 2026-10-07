@@ -97,7 +97,7 @@ function headlineBlock(doc: EstimateBasisDocument, labels: MarkdownLabels): stri
   if (financials.direct_cost) out.push(`- ${labels.directCost}: ${financials.direct_cost}${suffix}`);
   if (financials.markups_total) out.push(`- ${labels.markups}: ${financials.markups_total}${suffix}`);
 
-  if (doc.estimate_class !== null && doc.estimate_class > 0) {
+  if (doc.estimate_class !== null && doc.estimate_class !== 0 && doc.estimate_class !== '') {
     const band = `${doc.accuracy_low_pct}% / ${doc.accuracy_high_pct}%`;
     out.push(`- ${labels.estimateClass}: ${doc.estimate_class} (${band})`);
     if (doc.accuracy_low_amount && doc.accuracy_high_amount) {

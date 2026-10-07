@@ -88,7 +88,13 @@ ATTR_LITERAL = re.compile(r"\b(" + "|".join(re.escape(a) for a in TEXT_ATTRS) + 
 
 SEEDED_HOOK = re.compile(r"\buse(State|Ref)\s*(?:<[^>()]*>)?\s*\(")
 
-SKIP_DIR_PARTS = ("__tests__", "node_modules", "dist", os.path.join("src", "test"), os.path.join("src", "tests"))
+SKIP_DIR_PARTS = (
+    "__tests__",
+    "node_modules",
+    "dist",
+    os.path.join("src", "test"),
+    os.path.join("src", "tests"),
+)
 
 
 def is_product_file(path: str) -> bool:
@@ -460,8 +466,16 @@ SELFTEST = [
 ]
 
 MUST_NOT_FIRE = [
-    ("untranslated_attributes", '<Input placeholder="Search projects" />', "a component prop is not an HTML attribute"),
-    ("untranslated_attributes", '<input placeholder="BP-001" />', "a specimen value is not prose"),
+    (
+        "untranslated_attributes",
+        '<Input placeholder="Search projects" />',
+        "a component prop is not an HTML attribute",
+    ),
+    (
+        "untranslated_attributes",
+        '<input placeholder="BP-001" />',
+        "a specimen value is not prose",
+    ),
     (
         "untranslated_attributes",
         '<input placeholder="name@company.com" />',
@@ -472,7 +486,11 @@ MUST_NOT_FIRE = [
         "<button onClick={go}><X size={16} /><span>{label}</span></button>",
         "an expression child may render the name",
     ),
-    ("unnamed_icon_controls", "<button onClick={go}><X size={16} /> Close</button>", "a literal text child names it"),
+    (
+        "unnamed_icon_controls",
+        "<button onClick={go}><X size={16} /> Close</button>",
+        "a literal text child names it",
+    ),
 ]
 
 FNS = dict(CHECKS)

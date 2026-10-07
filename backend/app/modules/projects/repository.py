@@ -51,13 +51,14 @@ class ProjectRepository:
 
         base = select(Project)
 
-        # Partner-pack scoping. When a pack is active the workspace presents a
-        # clean single-client view: only projects tagged with that pack's slug
-        # (metadata_->>'partner_pack') are listed. This deliberately overrides
-        # the admin-sees-all rule so an activated pack hides every unrelated
-        # project. Deactivating the pack untags its projects, so the normal
-        # un-scoped listing returns. Fail-soft: any partner-pack error leaves the
-        # standard ownership filter untouched.
+        # Partner-pack scoping. When a pack is active the workspace shows
+        # projects tagged with that pack PLUS untagged projects (created before
+        # any pack was activated). Only projects tagged with a *different* pack
+        # are hidden. This prevents pre-existing projects from silently
+        # disappearing when a pack is first activated. Deactivating the pack
+        # untags its projects, so the normal un-scoped listing returns.
+        # Fail-soft: any partner-pack error leaves the standard ownership
+        # filter untouched.
         base = scope_project_query(base, Project)
 
         # Non-admins still only ever see projects they own or are a member of,
@@ -73,14 +74,18 @@ class ProjectRepository:
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self.session.execute(count_stmt)).scalar_one()
 
-        # Fetch - skip eager loading of relationships for list queries
+        # Fetch - skip eager loading of relationships for list queries.
+        # ``id`` breaks ties on ``created_at``: projects created in one
+        # transaction (a seed, a pack install, a bulk import) share a
+        # timestamp, and without a total order the database may hand the
+        # same row to two pages and none to another.
         stmt = (
             base.options(
                 noload(Project.wbs_nodes),
                 noload(Project.milestones),
                 noload(Project.children),
             )
-            .order_by(Project.created_at.desc())
+            .order_by(Project.created_at.desc(), Project.id.desc())
             .offset(offset)
             .limit(limit)
         )

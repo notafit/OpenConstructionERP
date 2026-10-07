@@ -48,6 +48,14 @@ Three things worth knowing about how it counts.
     half. A blind spot that splits a pair is worse than one that drops both,
     because the half it does report reads as the whole population.
 
+    Neither was the reverse, which showed up later and the other way round.
+    The call site scan read the source as plain text, so a key named in a
+    comment counted as named literally and its form was excluded from every
+    locale at once. The test that forbids choosing a plural in JavaScript
+    writes the anti-pattern out in prose, and those two names cost this gate
+    37 rows about a key that is complete everywhere. Comments are blanked
+    before either scan now, and `_blank_comments` says which way it errs.
+
   * A group is only judged where the language already answers it. A key
     absent from a locale entirely is the orphan guard's business, not this
     one, and reporting it here would fail two gates for one cause and make
@@ -157,6 +165,84 @@ def _options_body(text: str, brace_index: int) -> str | None:
     return None
 
 
+def _blank_comments(text: str) -> str:
+    """``text`` with comment bodies replaced by spaces, everything else intact.
+
+    A comment is not a call site, and reading one as a call site is not a
+    hypothetical. ``pluralFormsAreChosenByI18nextNotByJavaScript.test.ts``
+    spells out the anti-pattern it forbids, naming ``..._one`` and ``..._many``
+    in prose, and those two names went into `literal` and excluded both forms
+    of a real counted key from every locale at once. The guard then reported
+    the whole product as missing them, on 37 rows, over a key that is in fact
+    complete everywhere.
+
+    Both scans are fed from here, not just the one that misfired. A comment
+    showing ``t('x.y', {count: n})`` would put a base into `counted` that
+    nothing calls, and the guard would then demand forms for a family that
+    does not exist.
+
+    The direction of failure is the whole design. Blanking too little leaves
+    the behaviour this replaces, which is noisy and visible. Blanking too much
+    would drop a real call site, the family would leave `counted`, and the
+    guard would go quiet on a key that genuinely lacks a form, which is
+    indistinguishable from health. So every ambiguity here resolves towards
+    leaving the text alone: only comment spans are ever overwritten, string
+    contents never are, and a quote the scanner misreads can at worst let a
+    comment survive. A naive line-comment strip has the opposite bias, because
+    ``'https://x'`` on the same line as a call would take the call with it.
+
+    Lengths and newlines are preserved, so offsets into the result still point
+    at the same characters as offsets into the source, which is what lets
+    ``_options_body`` keep indexing it.
+    """
+    out = list(text)
+    i = 0
+    end = len(text)
+    while i < end:
+        char = text[i]
+        if char in "'\"":
+            # Neither quote may span a line in JavaScript, so an unterminated
+            # one is not a string at all and the scanner steps over it rather
+            # than swallowing the rest of the file.
+            closing = i + 1
+            while closing < end and text[closing] != "\n":
+                if text[closing] == "\\":
+                    closing += 2
+                    continue
+                if text[closing] == char:
+                    break
+                closing += 1
+            i = closing + 1 if closing < end and text[closing] == char else i + 1
+            continue
+        if char == "`":
+            closing = i + 1
+            while closing < end:
+                if text[closing] == "\\":
+                    closing += 2
+                    continue
+                if text[closing] == "`":
+                    break
+                closing += 1
+            i = closing + 1 if closing < end else i + 1
+            continue
+        if char == "/" and text[i + 1 : i + 2] == "/":
+            stop = text.find("\n", i)
+            stop = end if stop == -1 else stop
+            out[i:stop] = " " * (stop - i)
+            i = stop
+            continue
+        if char == "/" and text[i + 1 : i + 2] == "*":
+            closing = text.find("*/", i + 2)
+            stop = end if closing == -1 else closing + 2
+            for position in range(i, stop):
+                if out[position] != "\n":
+                    out[position] = " "
+            i = stop
+            continue
+        i += 1
+    return "".join(out)
+
+
 def _read_locales() -> dict[str, set[str]]:
     by_locale: dict[str, set[str]] = {}
     for path in sorted(glob.glob(LOCALE_GLOB)):
@@ -174,6 +260,10 @@ def _call_sites() -> tuple[set[str], set[str]]:
     The second set is the one that matters: it is exactly the population
     where i18next consults CLDR, so it is exactly the population where a
     missing form prints English.
+
+    Both are read from source with its comments blanked out, because a key
+    named in prose is not called and a key shown in an example is not called
+    either. See ``_blank_comments`` for which way that scan errs and why.
     """
     literal: set[str] = set()
     counted: set[str] = set()
@@ -182,9 +272,12 @@ def _call_sites() -> tuple[set[str], set[str]]:
         if "/app/locales/" in posix:
             continue
         with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-        if "t(" not in text:
+            raw = fh.read()
+        # Cheap reject before the character scan, and safe: blanking comments
+        # can only remove call shapes, never introduce one.
+        if "t(" not in raw:
             continue
+        text = _blank_comments(raw)
         for match in _ANY_T_KEY.finditer(text):
             literal.add(match.group(2))
         if "count" not in text:

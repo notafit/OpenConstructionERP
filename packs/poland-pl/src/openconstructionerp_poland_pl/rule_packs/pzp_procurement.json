@@ -1,0 +1,25 @@
+{
+  "rule_pack_id": "pzp_procurement",
+  "name": "PZP — Public Procurement Law",
+  "standard": "Prawo zamowien publicznych (Ustawa z dnia 11 wrzesnia 2019 r., Dz.U. 2019 poz. 2019)",
+  "jurisdiction": "PL",
+  "description": "Validates public tender documents against the Polish Public Procurement Law (Prawo zamowien publicznych, PZP). Checks procedure type classification, threshold compliance (EU and national), SWZ (Specyfikacja Warunkow Zamowienia) completeness, kosztorys inwestorski (investor estimate) as the basis for szacunkowa wartosc zamowienia (estimated contract value), wadium (bid bond) requirements, and criteria for contract award.",
+  "applies_to": ["tender", "estimate", "validation"],
+  "enables_rule_ids": [
+    "pzp.procedure_type_defined",
+    "pzp.threshold_eu_check",
+    "pzp.threshold_national_check",
+    "pzp.swz_complete",
+    "pzp.szacunkowa_wartosc_documented",
+    "pzp.kosztorys_inwestorski_referenced",
+    "pzp.wadium_if_above_threshold",
+    "pzp.kryteria_oceny_ofert_documented",
+    "pzp.cena_criterion_max_60_pct",
+    "pzp.termin_wykonania_set",
+    "pzp.kary_umowne_documented",
+    "pzp.zabezpieczenie_nalezytego_wykonania_set",
+    "pzp.podwykonawstwo_clause_present"
+  ],
+  "regulator": "UZP (Urzad Zamowien Publicznych)",
+  "publication_year": 2021
+}

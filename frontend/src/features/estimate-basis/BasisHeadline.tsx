@@ -15,7 +15,7 @@
 
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, CalendarClock, Check, Gauge, Info } from 'lucide-react';
+import { AlertTriangle, CalendarClock, Check, Gauge, Info, Target } from 'lucide-react';
 import { Badge, Button, Card, CardContent, CardHeader } from '@/shared/ui';
 import { formatCurrency } from '@/shared/lib/money';
 import { fmtPercent } from '@/shared/lib/formatters';
@@ -23,14 +23,14 @@ import type { ClassReason, EstimateBasisDocument, EstimateClassOption } from './
 
 export interface BasisHeadlineProps {
   doc: EstimateBasisDocument;
-  /** The AACE class table as the platform publishes it (may still be loading). */
+  /** The estimate class table as the platform publishes it (may still be loading). */
   classes: EstimateClassOption[];
   /** Called when the estimator states, changes or clears the class (0 clears). */
-  onClassChange: (estimateClass: number) => void;
+  onClassChange: (estimateClass: number | string) => void;
   /** Called when the estimator edits one of the two accuracy bounds. */
   onBandChange: (bound: 'low' | 'high', value: string) => void;
   /** The class the draft currently states, which may be ahead of `doc`. */
-  estimateClass: number | null;
+  estimateClass: number | string | null;
   accuracyLowPct: string;
   accuracyHighPct: string;
 }
@@ -55,17 +55,17 @@ export function BasisHeadline({
   const suggestion = doc.provenance?.suggestion;
 
   const byClass = useMemo(() => {
-    const map = new Map<number, EstimateClassOption>();
+    const map = new Map<number | string, EstimateClassOption>();
     for (const option of classes) map.set(option.estimate_class, option);
     return map;
   }, [classes]);
 
   // The served English label is the fallback, so a locale that has not
   // translated a class still reads the standard's own wording rather than a key.
-  const classLabel = (n: number) =>
+  const classLabel = (n: number | string) =>
     t(`estimateBasis.class.label.${n}`, { defaultValue: byClass.get(n)?.label || String(n) });
 
-  const stated = estimateClass !== null && estimateClass > 0;
+  const stated = estimateClass !== null && estimateClass !== 0 && estimateClass !== '';
   // The band on the draft is authoritative while editing; the amounts are
   // recomputed by the server on save, so an unsaved band shows its percentages
   // without pretending to know the money yet.
@@ -91,20 +91,26 @@ export function BasisHeadline({
               {t('estimateBasis.headline.total', { defaultValue: 'Estimate total' })}
             </div>
             <div className="text-2xl font-semibold tabular-nums text-content-primary">
-              {formatCurrency(financials?.grand_total ?? '0', currency)}
+              {!financials || financials.boq_count === 0
+                ? <span className="text-content-tertiary italic">{t('estimateBasis.headline.notEstimated', { defaultValue: 'Not yet estimated' })}</span>
+                : formatCurrency(financials.grand_total ?? '0', currency)}
             </div>
           </div>
           <div className="text-xs text-content-tertiary">
             <div>
               {t('estimateBasis.headline.directCost', { defaultValue: 'Direct cost' })}{' '}
               <span className="tabular-nums text-content-secondary">
-                {formatCurrency(financials?.direct_cost ?? '0', currency)}
+                {!financials || financials.boq_count === 0
+                  ? '—'
+                  : formatCurrency(financials.direct_cost ?? '0', currency)}
               </span>
             </div>
             <div>
               {t('estimateBasis.headline.markups', { defaultValue: 'Markups' })}{' '}
               <span className="tabular-nums text-content-secondary">
-                {formatCurrency(financials?.markups_total ?? '0', currency)}
+                {!financials || financials.boq_count === 0
+                  ? '—'
+                  : formatCurrency(financials.markups_total ?? '0', currency)}
               </span>
               {financials?.markup_count ? (
                 <span className="text-content-quaternary">
@@ -129,6 +135,30 @@ export function BasisHeadline({
           )}
         </div>
 
+        {/* ── OC-03: Budget target ──────────────────────────────────────── */}
+        {doc.budget_target && doc.budget_target.amount && (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border-light bg-surface-secondary/30 px-3 py-2">
+            <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-content-tertiary">
+              <Target className="h-3.5 w-3.5" aria-hidden />
+              {t('estimateBasis.headline.budgetTarget', { defaultValue: 'Client budget target' })}
+            </div>
+            <span className="text-lg font-semibold tabular-nums text-content-primary">
+              {formatCurrency(doc.budget_target.amount, doc.budget_target.currency || currency)}
+            </span>
+            <span className="text-xs text-content-tertiary">
+              {doc.budget_target.gross_net === 'net'
+                ? t('estimateBasis.headline.netOfTax', { defaultValue: 'net of tax' })
+                : t('estimateBasis.headline.grossIncTax', { defaultValue: 'gross incl. tax' })}
+              {doc.budget_target.contingency_mode === 'included' && (
+                <> · {t('estimateBasis.headline.contingencyIncluded', { defaultValue: 'contingency included' })}</>
+              )}
+            </span>
+            {doc.budget_target.source && (
+              <span className="text-xs text-content-quaternary">{doc.budget_target.source}</span>
+            )}
+          </div>
+        )}
+
         {/* ── How firm it is ─────────────────────────────────────────────── */}
         <div className="rounded-lg border border-border-light bg-surface-secondary/40 p-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -141,7 +171,10 @@ export function BasisHeadline({
             <select
               id="estimate-basis-class"
               value={estimateClass ?? 0}
-              onChange={(e) => onClassChange(Number(e.target.value))}
+              onChange={(e) => {
+                const raw = e.target.value;
+                onClassChange(/^\d+$/.test(raw) ? Number(raw) : raw);
+              }}
               className="rounded-lg border border-border-light bg-surface-primary px-2.5 py-1.5 text-sm text-content-primary"
             >
               <option value={0}>

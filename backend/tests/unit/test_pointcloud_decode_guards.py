@@ -1,7 +1,7 @@
 # DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 """OOM guards for the point-cloud inline decode path.
 
-Two front-door guards keep ``get_points`` from OOMing the 2 GB core:
+Two front-door guards keep ``get_points`` from OOMing the 3 GB core:
 
 * a byte cap on the object pull (``_spill_stream_to_temp``) - the object is
   streamed to a temp file and refused with HTTP 413 the moment it exceeds the

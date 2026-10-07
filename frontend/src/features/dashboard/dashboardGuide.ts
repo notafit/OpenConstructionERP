@@ -7,7 +7,9 @@ import type { ModuleGuideContent } from '@/shared/ui';
  *
  * Co-located with the feature. Consumed by <ModuleGuideButton content={dashboardGuide} />
  * rendered next to the Dashboard tour button in DashboardPage.tsx. Every key carries an
- * inline English defaultValue; none of these keys live in en.ts or any locale file.
+ * inline English defaultValue; the keys are not in en.ts, the inline defaults
+ * are the English source; their translations live in the other locale files,
+ * so a changed default needs its translations redone too.
  *
  * Key prefix: guide.dashboard.*
  * Spotlight selectors reuse the same data-testid hooks the Dashboard ProductTour uses.

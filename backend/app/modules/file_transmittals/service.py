@@ -17,10 +17,12 @@ falls back to the project's country.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, status
@@ -98,8 +100,35 @@ def _build_cover_text(transmittal: FileTransmittal) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _cover_snapshot(transmittal: FileTransmittal) -> SimpleNamespace:
+    """Copy the fields the cover sheet reads into plain values.
+
+    The PDF is laid out in a worker thread, and no ORM row may cross into it,
+    so the send and read paths hand :func:`_build_cover_pdf` this snapshot.
+    """
+    return SimpleNamespace(
+        number=transmittal.number,
+        subject=transmittal.subject,
+        reason_code=transmittal.reason_code,
+        sent_at=transmittal.sent_at,
+        status=transmittal.status,
+        notes=transmittal.notes,
+        items=[
+            SimpleNamespace(
+                file_kind=it.file_kind,
+                canonical_name_snapshot=it.canonical_name_snapshot,
+                file_version_snapshot=it.file_version_snapshot,
+            )
+            for it in transmittal.items
+        ],
+        recipients=[
+            SimpleNamespace(email=r.email, display_name=r.display_name, role=r.role) for r in transmittal.recipients
+        ],
+    )
+
+
 def _build_cover_pdf(
-    transmittal: FileTransmittal,
+    transmittal: FileTransmittal | SimpleNamespace,
     pagesize: tuple[float, float],
 ) -> bytes | None:
     """Render a PDF cover sheet via ``reportlab``, or ``None`` if unavailable.
@@ -128,6 +157,7 @@ def _build_cover_pdf(
             TableStyle,
         )
 
+        from app.core.pdf_branding import branded_doc_metadata, branded_header_logo, branded_letterhead
         from app.core.pdf_fonts import BODY_FONT, BOLD_FONT, register_pdf_fonts
     except Exception:  # noqa: BLE001 - optional dep
         logger.debug(
@@ -147,7 +177,7 @@ def _build_cover_pdf(
             topMargin=0.75 * inch,
             bottomMargin=0.75 * inch,
             title=f"Transmittal {transmittal.number}",
-            author="OpenConstructionERP",
+            **branded_doc_metadata(),
         )
         # The three tables below were drawn in inches against the 7.0in content
         # box US Letter leaves at 0.75in margins, and the widest of them is
@@ -271,7 +301,18 @@ def _build_cover_pdf(
                 )
             )
             story.append(r_tbl)
-        doc.build(story)
+
+        # The frame pads 6pt on each side, so this is the width a flowable can use.
+        letterhead = branded_letterhead(doc.width - 12, doc_type="transmittal")
+        if letterhead is not None:
+            story.insert(0, letterhead)
+
+        def _first_page(canvas, page_doc) -> None:
+            # A letterhead already carries the logo; the header copy would print it twice.
+            if letterhead is None:
+                branded_header_logo(canvas, page_doc)
+
+        doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
         return buf.getvalue()
     except Exception:  # noqa: BLE001 - never let cover-render crash the send
         logger.exception("Cover-sheet PDF generation failed; falling back to TXT")
@@ -399,7 +440,7 @@ class TransmittalService:
         """
         if data.reason_code not in TRANSMITTAL_REASONS:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown reason_code '{data.reason_code}'",
             )
         number = await self._next_number(data.project_id)
@@ -556,7 +597,11 @@ class TransmittalService:
         transmittal = await self.get(transmittal.id)
 
         # Generate cover sheet (PDF preferred, TXT fallback).
-        pdf_bytes = _build_cover_pdf(transmittal, await self.cover_page_size(transmittal))
+        # Laying out the PDF is pure CPU, so it runs in a worker thread on a plain
+        # snapshot of the transmittal and the event loop keeps serving requests.
+        pdf_bytes = await asyncio.to_thread(
+            _build_cover_pdf, _cover_snapshot(transmittal), await self.cover_page_size(transmittal)
+        )
         if pdf_bytes is not None:
             cover_bytes = pdf_bytes
             ext = "pdf"
@@ -629,7 +674,11 @@ class TransmittalService:
                     transmittal_id,
                 )
         # Fall back to live regeneration.
-        pdf = _build_cover_pdf(transmittal, await self.cover_page_size(transmittal))
+        # Laying out the PDF is pure CPU, so it runs in a worker thread on a plain
+        # snapshot of the transmittal and the event loop keeps serving requests.
+        pdf = await asyncio.to_thread(
+            _build_cover_pdf, _cover_snapshot(transmittal), await self.cover_page_size(transmittal)
+        )
         if pdf is not None:
             return pdf, "application/pdf"
         return _build_cover_text(transmittal), "text/plain; charset=utf-8"

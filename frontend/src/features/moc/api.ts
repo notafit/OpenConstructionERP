@@ -108,6 +108,9 @@ export interface UpdateMoCPayload {
   currency?: string;
   review_notes?: string;
   decision_notes?: string;
+  variation_request_id?: string | null;
+  variation_order_id?: string | null;
+  change_order_id?: string | null;
 }
 
 export interface CreateImpactPayload {

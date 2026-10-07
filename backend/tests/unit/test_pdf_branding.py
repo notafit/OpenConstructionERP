@@ -30,6 +30,16 @@ from app.core.pdf_branding import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_company_profile(monkeypatch):
+    """Keep a company profile on the machine running the tests out of them.
+
+    The header prefers the profile's document logo, and the profile is read
+    from the real data dir; a test here that sets one patches this again.
+    """
+    monkeypatch.setattr("app.core.company_profile.read_company_profile", lambda: {})
+
+
 def _set_branding(monkeypatch, branding: dict) -> None:
     """Patch the lazily-imported ``read_branding`` to return *branding*."""
     monkeypatch.setattr("app.core.app_branding.read_branding", lambda: branding)
@@ -275,6 +285,38 @@ def test_branded_header_logo_draws_right_aligned_when_set(monkeypatch):
     img = canvas.images[0]
     # Right-aligned: the logo's right edge sits at page_w - rightMargin = 539.
     assert img["x"] + img["width"] == pytest.approx(539.0, abs=0.5)
+
+
+def test_branded_header_logo_draws_a_document_logo_without_an_app_logo(monkeypatch):
+    """A firm that uploaded only its formal logo still gets it in the header.
+
+    The helper used to return early on "no app logo" before looking anywhere
+    else, so a document logo alone drew nothing.
+    """
+    _set_branding(monkeypatch, {"mode": "text", "logo_data_url": None, "company_name": "Acme"})
+    monkeypatch.setattr(
+        "app.core.company_profile.read_company_profile",
+        lambda: {"document_logo_data_url": f"data:image/png;base64,{_PNG_1PX}"},
+    )
+    canvas = _RecordingCanvas()
+    assert branded_header_logo(canvas, _FakeDoc()) is True
+    assert len(canvas.images) == 1
+
+
+def test_branded_header_logo_never_raises_when_profile_read_fails(monkeypatch):
+    """A broken profile read costs the document logo, never the app logo."""
+    _set_branding(
+        monkeypatch,
+        {"mode": "logo", "logo_data_url": f"data:image/png;base64,{_PNG_1PX}", "company_name": ""},
+    )
+
+    def _boom():
+        raise RuntimeError("profile unavailable")
+
+    monkeypatch.setattr("app.core.company_profile.read_company_profile", _boom)
+    canvas = _RecordingCanvas()
+    assert branded_header_logo(canvas, _FakeDoc()) is True
+    assert len(canvas.images) == 1
 
 
 def test_branded_header_logo_never_raises_when_branding_read_fails(monkeypatch):

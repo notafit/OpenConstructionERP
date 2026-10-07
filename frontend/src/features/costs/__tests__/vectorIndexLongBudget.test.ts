@@ -219,7 +219,7 @@ describe('the flag is not a token - longRunning really buys the long budget', ()
     await expect(settled).resolves.toBe('rejected');
   });
 
-  it('still aborts the same request at 45 s without the flag', async () => {
+  it('still aborts the same request at 90 s without the flag', async () => {
     // The control: without `longRunning` the budget really is the short one, so
     // the test above is measuring the flag and not some ambient default.
     vi.useFakeTimers();
@@ -229,7 +229,7 @@ describe('the flag is not a token - longRunning really buys the long budget', ()
       () => 'rejected',
     );
 
-    await vi.advanceTimersByTimeAsync(44_000);
+    await vi.advanceTimersByTimeAsync(89_000);
     expect(only(signals).aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(only(signals).aborted).toBe(true);
@@ -246,7 +246,7 @@ describe('the flag is not a token - longRunning really buys the long budget', ()
 // reporting to the caller - and only that call's.
 describe('the global timeout toast defers to a caller that reports the timeout itself', () => {
   /** Mirrors TIMEOUT_TOAST_THROTTLE_MS in api.ts, which does not export it. */
-  const THROTTLE_WINDOW_MS = 12_000;
+  const THROTTLE_WINDOW_MS = 30_000;
 
   // api.ts coalesces timeout toasts behind a module-global timestamp that
   // outlives a single test, so a case inherits whatever the previous one

@@ -1,0 +1,22 @@
+{
+  "rule_pack_id": "nbc_2020",
+  "name": "National Building Code of Canada 2020",
+  "name_fr-CA": "Code national du bâtiment du Canada 2020",
+  "standard": "NBC 2020",
+  "jurisdiction": "CA",
+  "regulator": "National Research Council Canada (Canadian Commission on Building and Fire Codes)",
+  "publication_year": 2020,
+  "applies_to": [
+    "projects",
+    "boq",
+    "validation"
+  ],
+  "description": "Reference document for the National Building Code of Canada 2020, organised by its 10 numbered Parts. What each major Part governs: general requirements (Part 1-2), fire protection / occupant safety / accessibility (Part 3), structural design (Part 4), environmental separation (Part 5), HVAC (Part 6), plumbing (Part 7), safety at construction sites (Part 8), housing & small buildings (Part 9) and energy efficiency (Part 10 / NECB reference). This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur le Code national du bâtiment du Canada 2020, organisé selon ses 10 Parties numérotées. Ce que régit chaque Partie majeure : exigences générales (Parties 1-2), protection incendie / sécurité / accessibilité (Partie 3), calcul des structures (Partie 4), séparation environnementale (Partie 5), CVCA (Partie 6), plomberie (Partie 7), sécurité aux chantiers (Partie 8), maisons et petits bâtiments (Partie 9) et efficacité énergétique (Partie 10 / référence CNÉB). Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {
+    "boq_quality.position_has_unit_rate": "ERROR",
+    "boq_quality.position_has_quantity": "ERROR"
+  },
+  "why_no_rules": "This document ships as reference and enables no engine rules. A building code is satisfied through design review and authority approval, and the platform holds neither the drawings nor the approvals. A rule id here would be a compliance claim about a process that happens entirely outside this system.",
+  "enables_rule_ids": []
+}

@@ -86,6 +86,6 @@ async def _on_task_deleted(event: Event) -> None:
     await _delete_task_vector(event)
 
 
-event_bus.subscribe("tasks.task.created", _on_task_created)
-event_bus.subscribe("tasks.task.updated", _on_task_updated)
-event_bus.subscribe("tasks.task.deleted", _on_task_deleted)
+event_bus.subscribe_once("tasks.task.created", _on_task_created)
+event_bus.subscribe_once("tasks.task.updated", _on_task_updated)
+event_bus.subscribe_once("tasks.task.deleted", _on_task_deleted)

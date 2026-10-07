@@ -99,8 +99,8 @@ class BaseVariant:
         market_catalog: The ``markets/`` catalog file token this card reprices
             into (e.g. ``"GB_LONDON_en"``); empty for global and home variants.
         active: Whether this market is the one the base is currently repriced
-            into. Registry default is ``False``; the live value is tracked client
-            side (localStorage) in this MVP.
+            into. Registry default is ``False``; :func:`public_catalog` fills the
+            live value from the stored base state (``oe_costs_base_state``).
     """
 
     region: str
@@ -145,6 +145,11 @@ class BaseFamily:
         variants: Loadable market bases in this family.
         repriceable_markets: Count of additional markets the base can be
             repriced into via resource price sheets (0 when not applicable).
+        attribution: Who published the source data, shown wherever the base is
+            offered or used, when the source licence asks for attribution.
+        licence: The licence the source data is published under, as the
+            publisher states it ("" when the base carries no third-party data
+            under its own licence).
     """
 
     key: str
@@ -155,6 +160,8 @@ class BaseFamily:
     description: str
     variants: list[BaseVariant] = field(default_factory=list)
     repriceable_markets: int = 0
+    attribution: str = ""
+    licence: str = ""
 
 
 @dataclass(frozen=True)
@@ -372,6 +379,8 @@ def _national(
     coefficient: bool = False,
     repriceable_markets: int = 0,
     has_market_reprice: bool = True,
+    attribution: str = "",
+    licence: str = "",
 ) -> BaseFamily:
     """Build a national family: one bundled, offline-ready home market plus, when
     ``has_market_reprice`` is set, one repriced card per market/language.
@@ -411,6 +420,8 @@ def _national(
         description=description,
         variants=variants,
         repriceable_markets=repriceable_markets,
+        attribution=attribution,
+        licence=licence,
     )
 
 
@@ -512,6 +523,11 @@ _NATIONAL_FAMILIES: tuple[BaseFamily, ...] = (
         file_token="IT_TOSCANA",
         catalog_token="IT_TOSCANA",
         repriceable_markets=49,
+        # The 2026 edition, as bundled (TOS26_ codes). Regione Toscana
+        # publishes it as open data; the dati.gov.it catalogue record of the
+        # 2026 list states CC BY 4.0, which asks for this attribution.
+        attribution="Regione Toscana, Prezzario dei Lavori Pubblici della Toscana, edizione 2026",
+        licence="CC BY 4.0",
     ),
     _national(
         "greece",
@@ -628,6 +644,11 @@ def is_national_region(region: str) -> bool:
 def variant_by_region(region: str) -> BaseVariant | None:
     """Return the canonical (home) variant for a platform region id, or ``None``."""
     return _BY_REGION.get(region)
+
+
+def family_by_region(region: str) -> BaseFamily | None:
+    """Return the family whose home base is ``region``, or ``None``."""
+    return next((fam for fam in BASE_FAMILIES if fam.variants and fam.variants[0].region == region), None)
 
 
 def is_known_market(market_token: str) -> bool:
@@ -795,6 +816,52 @@ def home_language_code(base_region: str) -> str | None:
     return home.lang_code
 
 
+#: Language of the work-item text in each national base's HOME parquet, the one
+#: ``load-cwicr`` imports. Read off the published files rather than assumed:
+#: every home parquet is English except Turkiye's, which is Turkish. A base not
+#: listed here is English.
+_HOME_PARQUET_TEXT_LANG: dict[str, str] = {"TR_NATIONAL": "tr"}
+
+
+def home_parquet_text_lang(base_region: str) -> str | None:
+    """Language of a national base's home parquet text, or ``None`` if not national."""
+    if base_region not in _NATIONAL_REGIONS:
+        return None
+    return _HOME_PARQUET_TEXT_LANG.get(base_region, "en")
+
+
+def text_source_region(base_region: str, lang_code: str) -> str | None:
+    """Loader ``db_id`` whose parquet carries ``base_region``'s text in ``lang_code``.
+
+    The translated parquet (``ZH_CHINA_fr``) when one is published, the base's
+    own home parquet when that is already in the language (English for every
+    base but Turkiye), else ``None``: no file holds the base in that language,
+    so a caller must not claim to show it. English is the one language that
+    needs the second branch, because no ``EN___DDC_CWICR`` folder exists.
+    """
+    lang_code = normalize_lang_code(lang_code)
+    region = national_language_region(base_region, lang_code)
+    if region is not None:
+        return region
+    if home_parquet_text_lang(base_region) == lang_code:
+        return base_region
+    return None
+
+
+def variant_text_lang(v: BaseVariant) -> str:
+    """The language a card's work-item text is actually shown in once loaded.
+
+    A market card whose language no file holds falls back to the base's own
+    language (see ``load_base_market``), so the card must say that language,
+    not the market's. Global cards and non-national bases read as their own.
+    """
+    if v.base_region not in _NATIONAL_REGIONS:
+        return v.lang_code
+    if text_source_region(v.base_region, v.lang_code) is not None:
+        return normalize_lang_code(v.lang_code)
+    return home_language_code(v.base_region) or home_parquet_text_lang(v.base_region) or v.lang_code
+
+
 def national_language_workitems_files() -> dict[str, str]:
     """Map every ``<region>_<lang>`` pseudo-region to its language parquet path."""
     out: dict[str, str] = {}
@@ -818,11 +885,25 @@ def catalog_token(region: str) -> str | None:
     return v.catalog_token if v else None
 
 
-def _variant_public(v: BaseVariant, loaded_counts: dict[str, int]) -> dict:
+def _variant_public(
+    v: BaseVariant,
+    loaded_counts: dict[str, int],
+    base_states: dict[str, dict] | None = None,
+) -> dict:
     # A base's load lands under its base_region, and every card of that base
-    # shares it, so all cards of a loaded base read as loaded (the active card
-    # is tracked client-side in this MVP; the registry reports active=False).
+    # shares it, so all cards of a loaded base read as loaded. A market card is
+    # active when the stored state of its base says the rows are in that market
+    # and no switch is under way. A home card's ``active`` stays False: on the
+    # client "active" on a home card means the user's active database.
     loaded = loaded_counts.get(v.base_region, 0)
+    state = (base_states or {}).get(v.base_region)
+    active = bool(
+        v.market_catalog
+        and loaded > 10
+        and state is not None
+        and state.get("market_state") == "market"
+        and state.get("active_market") == v.market_catalog
+    )
     return {
         "region": v.region,
         "variant_id": v.variant_id,
@@ -832,18 +913,35 @@ def _variant_public(v: BaseVariant, loaded_counts: dict[str, int]) -> dict:
         "city": v.city,
         "language": v.language,
         "lang_code": v.lang_code,
+        # The language the loaded text is really in. Differs from ``lang_code``
+        # only where no file holds the base in the card's language.
+        "text_lang_code": variant_text_lang(v),
         "currency": v.currency,
         "flag": v.flag,
         "positions": v.positions,
         "bundled": v.bundled,
         "coefficient": v.coefficient,
-        "active": v.active,
+        "active": active or v.active,
         "loaded": loaded > 10,
         "loaded_positions": loaded,
     }
 
 
-def public_catalog(loaded_counts: dict[str, int] | None = None) -> dict:
+#: ``market_state`` of a loaded national base nothing is stored for: loaded
+#: before the state was kept, so its rows may be in any market.
+UNKNOWN_BASE_STATE: dict = {
+    "market_state": "unknown",
+    "active_market": None,
+    "switching_to": None,
+    "text_language": None,
+    "updated_at": None,
+}
+
+
+def public_catalog(
+    loaded_counts: dict[str, int] | None = None,
+    base_states: dict[str, dict] | None = None,
+) -> dict:
     """Serialize the catalog for the API, merging live loaded counts.
 
     Args:
@@ -851,14 +949,19 @@ def public_catalog(loaded_counts: dict[str, int] | None = None) -> dict:
             items, from ``oe_costs_item``. A region with more than 10 loaded
             items is marked ``loaded`` and carries its real count so the browser
             shows the true figure after import rather than only the estimate.
+        base_states: Region id to the stored market and language of that base
+            (``BaseState.public()``), from ``oe_costs_base_state``.
 
     Returns:
-        A JSON-ready dict with a ``families`` list and roll-up totals.
+        A JSON-ready dict with a ``families`` list and roll-up totals, plus
+        ``base_states``: for every loaded national base, which market it is in
+        (``home``, ``market``, ``switching`` or ``unknown``) and its language.
     """
     counts = loaded_counts or {}
+    states = base_states or {}
     families = []
     for fam in BASE_FAMILIES:
-        variants = [_variant_public(v, counts) for v in fam.variants]
+        variants = [_variant_public(v, counts, states) for v in fam.variants]
         families.append(
             {
                 "key": fam.key,
@@ -869,6 +972,8 @@ def public_catalog(loaded_counts: dict[str, int] | None = None) -> dict:
                 "description": fam.description,
                 "market_count": len(fam.variants),
                 "repriceable_markets": fam.repriceable_markets,
+                "attribution": fam.attribution or None,
+                "licence": fam.licence or None,
                 # Representative catalogue size: markets in a family share the
                 # same work-item count, so the first variant is representative.
                 "positions": fam.variants[0].positions if fam.variants else 0,
@@ -883,4 +988,9 @@ def public_catalog(loaded_counts: dict[str, int] | None = None) -> dict:
         "total_bases": len(all_variants),
         "total_families": len(BASE_FAMILIES),
         "loaded_regions": sorted(r for r, c in counts.items() if c > 10),
+        "base_states": {
+            region: dict(states.get(region) or UNKNOWN_BASE_STATE)
+            for region in sorted(_NATIONAL_REGIONS)
+            if counts.get(region, 0) > 10
+        },
     }

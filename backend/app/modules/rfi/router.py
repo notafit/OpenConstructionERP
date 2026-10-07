@@ -7,6 +7,7 @@ Endpoints:
     POST   /                              - Create RFI
     GET    /export                        - Export RFI log as Excel
     GET    /{rfi_id}                      - Get single RFI
+    GET    /{rfi_id}/export/pdf           - Printable PDF of one RFI
     PATCH  /{rfi_id}                      - Update RFI
     DELETE /{rfi_id}                      - Delete RFI
     POST   /{rfi_id}/respond              - Record official response
@@ -16,17 +17,20 @@ Endpoints:
     GET    /{rfi_id}/attachments/{index}  - Download a stored reply attachment
 """
 
+import asyncio
 import io
 import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.audit_log import count_activity_for_entity, get_activity_for_entity
 from app.core.bulk_ops import BulkDeleteRequest, BulkStatusRequest
+from app.core.content_disposition import attachment_disposition
 from app.core.file_signature import (
     SIGNATURE_BYTES_REQUIRED,
     FileSignatureMismatch,
@@ -47,6 +51,7 @@ from app.modules.approval_routes.schemas import (
     StepStateResponse,
 )
 from app.modules.approval_routes.service import ApprovalRouteService
+from app.modules.rfi.pdf_translations import resolve_pdf_locale, rfi_pdf_filename
 from app.modules.rfi.schemas import (
     RFIActivityEntry,
     RFIActivityListResponse,
@@ -266,14 +271,17 @@ async def export_rfi_log(
     session: SessionDep,
     project_id: uuid.UUID = Query(...),
 ) -> StreamingResponse:
-    """Export RFI log for a project as Excel."""
+    """Export RFI log for a project as Excel, set up to print.
+
+    People are written by name and statuses as words. The sheet prints
+    landscape, one page wide, with the header row repeated on every page.
+    """
     await verify_project_access(project_id, _user, session)
-    from openpyxl import Workbook
-    from openpyxl.styles import Font
     from sqlalchemy import select
 
     from app.core.csv_safety import neutralise_formula
     from app.modules.projects.models import Project
+    from app.modules.rfi.intl import localize_status
     from app.modules.rfi.models import RFI
 
     result = await session.execute(
@@ -281,12 +289,90 @@ async def export_rfi_log(
     )
     items = result.scalars().all()
 
+    # The row holds people as ids, and the log used to print them that way: a
+    # printed register with a 36-character UUID in three columns tells the
+    # reader nothing. An id that matches no user is kept as it is, so the
+    # export never loses a value.
+    people = await RFIService(session).user_display_names(
+        [value for item in items for value in (item.raised_by, item.assigned_to, item.ball_in_court)]
+    )
+
+    def _who(value: object) -> str:
+        if not value:
+            return ""
+        return people.get(str(value)) or str(value)
+
     # Resolve the project's currency so the cost-impact cell carries its ISO
     # code - the value lives in the project's currency (EUR/BRL/GBP/…), never
     # a bare number that downstream readers might assume is USD.
     project_currency = (
         (await session.scalar(select(Project.currency).where(Project.id == project_id)) or "").strip().upper()
     )
+
+    # BUG-RFI-CSV-INJECTION: ``subject`` / ``official_response`` /
+    # ``cost_impact_value`` are user-controlled free text. The schema's
+    # HTML sanitiser leaves a spreadsheet-formula payload such as
+    # ``=cmd|'/c calc'!A0`` intact (it has no HTML), so without
+    # output-side neutralisation Excel would execute it when a colleague
+    # opens the downloaded log. Route every user-controlled string cell
+    # through ``neutralise_formula`` (OWASP CSV-injection defence),
+    # mirroring the BOQ exporter. Numbers / server-derived enums pass
+    # through unchanged.
+    # A user's display name is user-controlled free text too.
+    rows: list[list[object]] = []
+    for item in items:
+        # Days open: reuse the canonical helper so the export agrees with the
+        # list/detail figure. The previous inline version subtracted a naive
+        # ``datetime.fromisoformat(responded_at)`` from a tz-aware
+        # ``created_at``, which raised TypeError (swallowed) and emitted 0 for
+        # every answered/closed RFI. ``_compute_rfi_fields`` normalizes both
+        # sides to UTC before subtracting.
+        _, days_open = _compute_rfi_fields(item)
+        cost_cell = "No"
+        if item.cost_impact:
+            amount = item.cost_impact_value
+            if amount is not None and str(amount).strip():
+                suffix = f" {project_currency}" if project_currency else ""
+                cost_cell = f"Yes ({amount}{suffix})"
+            else:
+                cost_cell = "Yes"
+        rows.append(
+            [
+                neutralise_formula(item.rfi_number),
+                neutralise_formula(item.subject),
+                localize_status(item.status, "en"),
+                neutralise_formula(_who(item.raised_by)),
+                neutralise_formula(_who(item.assigned_to)),
+                neutralise_formula(_who(item.ball_in_court)),
+                item.date_required or "",
+                item.response_due_date or "",
+                days_open,
+                neutralise_formula(cost_cell),
+                f"Yes ({item.schedule_impact_days}d)" if item.schedule_impact else "No",
+                neutralise_formula(item.official_response or ""),
+            ]
+        )
+
+    # Writing the workbook walks every RFI and is pure CPU, so it runs in a
+    # worker thread instead of holding up every other request on the event loop.
+    buf = await asyncio.to_thread(_render_rfi_log_xlsx, rows)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="rfi_log.xlsx"'},
+    )
+
+
+def _render_rfi_log_xlsx(rows: list[list[object]]) -> io.BytesIO:
+    """Build the print-ready RFI log workbook from plain cell values (pure CPU, no DB)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
 
     wb = Workbook()
     ws = wb.active
@@ -310,57 +396,34 @@ async def export_rfi_log(
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = Font(bold=True)
 
-    # BUG-RFI-CSV-INJECTION: ``subject`` / ``official_response`` /
-    # ``cost_impact_value`` are user-controlled free text. The schema's
-    # HTML sanitiser leaves a spreadsheet-formula payload such as
-    # ``=cmd|'/c calc'!A0`` intact (it has no HTML), so without
-    # output-side neutralisation Excel would execute it when a colleague
-    # opens the downloaded log. Route every user-controlled string cell
-    # through ``neutralise_formula`` (OWASP CSV-injection defence),
-    # mirroring the BOQ exporter. Numbers / server-derived enums pass
-    # through unchanged.
-    for row_idx, item in enumerate(items, 2):
-        ws.cell(row=row_idx, column=1, value=neutralise_formula(item.rfi_number))
-        ws.cell(row=row_idx, column=2, value=neutralise_formula(item.subject))
-        ws.cell(row=row_idx, column=3, value=item.status)
-        ws.cell(row=row_idx, column=4, value=str(item.raised_by) if item.raised_by else "")
-        ws.cell(row=row_idx, column=5, value=str(item.assigned_to) if item.assigned_to else "")
-        ws.cell(row=row_idx, column=6, value=str(item.ball_in_court) if item.ball_in_court else "")
-        ws.cell(row=row_idx, column=7, value=item.date_required or "")
-        ws.cell(row=row_idx, column=8, value=item.response_due_date or "")
-        # Days open: reuse the canonical helper so the export agrees with the
-        # list/detail figure. The previous inline version subtracted a naive
-        # ``datetime.fromisoformat(responded_at)`` from a tz-aware
-        # ``created_at``, which raised TypeError (swallowed) and emitted 0 for
-        # every answered/closed RFI. ``_compute_rfi_fields`` normalizes both
-        # sides to UTC before subtracting.
-        _, days_open = _compute_rfi_fields(item)
-        ws.cell(row=row_idx, column=9, value=days_open)
-        cost_cell = "No"
-        if item.cost_impact:
-            amount = item.cost_impact_value
-            if amount is not None and str(amount).strip():
-                suffix = f" {project_currency}" if project_currency else ""
-                cost_cell = f"Yes ({amount}{suffix})"
-            else:
-                cost_cell = "Yes"
-        ws.cell(row=row_idx, column=10, value=neutralise_formula(cost_cell))
-        ws.cell(
-            row=row_idx,
-            column=11,
-            value=f"Yes ({item.schedule_impact_days}d)" if item.schedule_impact else "No",
-        )
-        ws.cell(row=row_idx, column=12, value=neutralise_formula(item.official_response or ""))
+    for row_idx, values in enumerate(rows, 2):
+        for col, value in enumerate(values, 1):
+            ws.cell(row=row_idx, column=col, value=value)
+
+    # Print setup. Twelve columns at the default width ran across several
+    # portrait sheets, with the subject and the response cut at the cell edge.
+    for col, width in enumerate((10, 45, 12, 22, 22, 22, 14, 14, 10, 20, 16, 60), 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    wrap_top = Alignment(wrap_text=True, vertical="top")
+    top = Alignment(vertical="top")
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.alignment = wrap_top if cell.column in (2, 12) else top
+    ws.freeze_panes = "A2"
+    ws.print_title_rows = "1:1"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    # The letterhead goes above the table and moves the pane and the print
+    # titles with it; without a company profile the sheet is left as it is.
+    store_strings_as_text(ws)
+    apply_company_header(ws, title=ws.title)
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="rfi_log.xlsx"'},
-    )
+    return buf
 
 
 # ── Bulk operations (must be BEFORE parametric /{rfi_id}) ──────────────
@@ -490,6 +553,48 @@ async def get_rfi(
     return _to_response(rfi)
 
 
+@router.get(
+    "/{rfi_id}/export/pdf/",
+    dependencies=[Depends(RequirePermission("rfi.read"))],
+)
+async def export_rfi_pdf(
+    rfi_id: uuid.UUID,
+    session: SessionDep,
+    user_id: CurrentUserId,
+    locale: Annotated[
+        str | None,
+        Query(max_length=10, description="Force the PDF language (e.g. 'de'). Overrides Accept-Language."),
+    ] = None,
+    accept_language: Annotated[str | None, Header(alias="accept-language")] = None,
+    service: RFIService = Depends(_get_service),
+) -> StreamingResponse:
+    """Download one RFI as a printable PDF.
+
+    The document carries the project, the question, the linked documents,
+    the cost and schedule impact, the official response (or an empty box to
+    answer on paper) and signature lines. It is written in English, German
+    or Russian: ``?locale=`` wins, then the first ``Accept-Language`` tag the
+    catalogue has, then English, and ``Content-Language`` names the language
+    the body is actually in.
+    """
+    rfi = await service.get_rfi(rfi_id)
+    await verify_project_access(rfi.project_id, str(user_id), session)
+    pdf_locale = resolve_pdf_locale(locale, accept_language)
+    pdf_bytes, rfi_number = await service.generate_rfi_pdf(rfi_id, locale=pdf_locale)
+    return StreamingResponse(
+        iter([pdf_bytes]),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": attachment_disposition(rfi_pdf_filename(rfi_number)),
+            # The catalogue is narrower than the interface's locale list, so
+            # this can differ from what the reader asked for. Declaring it
+            # overrides the request-derived header the Accept-Language
+            # middleware would otherwise set.
+            "Content-Language": pdf_locale,
+        },
+    )
+
+
 @router.patch("/{rfi_id}", response_model=RFIResponse)
 async def update_rfi(
     rfi_id: uuid.UUID,
@@ -585,6 +690,11 @@ async def create_variation_from_rfi(
     """
     rfi = await service.get_rfi(rfi_id)
     await verify_project_access(rfi.project_id, str(user_id), session)
+    # Row lock shared with app.modules.changeorders.events, which drafts the
+    # same change order when the RFI is answered. Both sides take it before
+    # reading change_order_id, so whichever runs second sees the first one's
+    # link instead of minting a second order.
+    await session.refresh(rfi, with_for_update=True)
 
     if not rfi.cost_impact:
         raise HTTPException(

@@ -1616,7 +1616,7 @@ function FinanceDashboardView({
 
   // Per-card drill helpers: payable/receivable/overdue/cash-flow open the
   // Finance Invoices tab; budget/committed/actual/consumed open the Budgets
-  // tab. The ?tab= deep link is consumed by FinancePage on mount (CONN-74).
+  // tab. FinancePage reads ?tab= as its active tab and keeps it in the URL (CONN-74).
   const openFinance = (financeTab?: 'invoices' | 'budgets') =>
     navigate(`/projects/${project.id}/finance${financeTab ? `?tab=${financeTab}` : ''}`);
 
@@ -2318,10 +2318,11 @@ function ReportViewerModal({
                 // Open the same URL in a fresh tab so users can use the
                 // browser's native Print / Save-As-PDF flow.
                 const token = getAuthToken();
-                // We can't easily send Authorization on a window.open(),
-                // but the auth cookie (when present) covers the case.
-                // For Bearer-only auth we copy the URL to clipboard as
-                // a graceful fallback.
+                // A window.open() cannot carry the Authorization header and
+                // auth is bearer-only (no cookie, no token in the URL), so a
+                // bare open of the content URL answers 401. With a token we
+                // fetch it with the header and open the blob instead; the
+                // bare URL is only the last resort when that fetch fails.
                 //
                 // The language rides in the query string rather than in a
                 // header because one of the two paths below is a bare

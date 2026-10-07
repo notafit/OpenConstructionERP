@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Arbejdet på projektet begyndte den {start}, før ansøgningen blev indsendt den {filed} - de fleste programmer yder slet ingen støtte, når projektet først er gået i gang",
+      "unevidenced": "Arbejdet begyndte før tid, den {start}, og sagen angiver, at myndigheden har tilladt det, men henviser ikke til nogen skriftlig tilladelse",
+      "evidence": "Registrér referencen på den skriftlige tilladelse til tidlig start, så sagen selv kan dokumentere den",
+      "suggestion": "Tjek programmets vilkår, før der bruges flere penge. Blev den tidlige start tilladt skriftligt, så registrér tilladelsen; blev den ikke, så spørg myndigheden, før ansøgningen går videre"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Udbetalingsanmodning {draw} omfatter udgifter fra før {period_start}, den dag tilsagnsperioden begynder",
+      "after": "Udbetalingsanmodning {draw} omfatter udgifter fra efter {period_end}, den dag tilsagnsperioden slutter",
+      "spans": "Udbetalingsanmodning {draw} rækker ud over tilsagnsperioden i begge ender, {period_start} til {period_end}",
+      "suggestion": "Flyt udgifterne uden for perioden over i en særskilt udbetalingsanmodning, og afklar dem med myndigheden, i stedet for at lade én anmodning dække begge dele"
+    },
+    "own_share_is_covered": {
+      "fail": "Programmet kræver en egenandel på {rate} procent, svarende til {required}, men ansøgningen angiver {recorded}",
+      "suggestion": "Angiv, hvor den resterende egenandel kommer fra, før ansøgningen indsendes, for programmet beregner den af det tilskudsberettigede grundlag og ikke af projektets samlede omkostninger"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "De {count} ansøgninger på dette projekt udgør tilsammen {intensity} procent af de tilskudsberettigede omkostninger og overstiger dermed loftet for støtteintensitet på {cap} procent, som det strengeste af deres programmer angiver",
+      "suggestion": "Offentlig støtte kumuleres på tværs af programmer og forvaltningsniveauer. Nedsæt det ansøgte beløb i én af ansøgningerne, eller undersøg, om projekterne kan adskilles, så hvert af dem bærer sine egne omkostninger"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Tilsagnsperioden sluttede den {period_end}, og den endelige dokumentation for anvendelse er endnu ikke påbegyndt",
+      "late": "Den endelige dokumentation for anvendelse skulle være indsendt senest den {due} og blev først indsendt den {submitted}",
+      "overdue": "Den endelige dokumentation for anvendelse skulle være indsendt senest den {due} og er endnu ikke indsendt",
+      "suggestion": "Indsend det, der foreligger, i stedet for at vente på, at det er komplet. De fleste myndigheder forlænger en frist efter anmodning, men ingen forlænger en frist, der allerede er overskredet"
+    },
+    "errors": {
+      "application_not_found": "Ansøgningen blev ikke fundet",
+      "programme_code_taken": "Der findes allerede et program med denne kode i dette land",
+      "programme_not_found": "Programmet blev ikke fundet",
+      "programme_has_applications": "Dette program har ansøgninger og kan ikke slettes. Luk det i stedet.",
+      "application_code_taken": "Der findes allerede en ansøgning med denne kode i dette projekt",
+      "approved_application_not_deletable": "En bevilget ansøgning kan ikke slettes. Sæt i stedet dens status til trukket tilbage eller afsluttet.",
+      "approval_needs_period_end": "Et tilsagn kræver en slutdato for tilsagnsperioden, fordi alle senere frister regnes fra den",
+      "draw_needs_approval": "Der kan kun anmodes om udbetaling på en bevilget ansøgning",
+      "draw_not_found": "Udbetalingsanmodningen blev ikke fundet",
+      "paid_draw_not_deletable": "En udbetalingsanmodning, der allerede er udbetalt, kan ikke slettes",
+      "proof_not_found": "Dokumentationen for anvendelse blev ikke fundet",
+      "obligation_not_found": "Forpligtelsen blev ikke fundet",
+      "eligible_exceeds_amount": "Det tilskudsberettigede beløb kan ikke være større end det samlede beløb",
+      "allocation_not_found": "Omkostningsfordelingen blev ikke fundet"
+    }
+  }
+}

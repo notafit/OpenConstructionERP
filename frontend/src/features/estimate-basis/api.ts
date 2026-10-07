@@ -21,6 +21,8 @@ export interface QualificationItem {
   basis: string;
   source: 'auto' | 'manual';
   enabled: boolean;
+  /** OC-14: linked review task id. */
+  linked_task_id?: string | null;
 }
 
 export interface TradePresence {
@@ -120,9 +122,10 @@ export interface ProvenanceSummary {
   suggestion: ClassSuggestion;
 }
 
-/** One AACE 18R-97 class as the platform publishes it. */
+/** One estimate class as the platform publishes it (AACE, Canadian CCA, etc.). */
 export interface EstimateClassOption {
-  estimate_class: number;
+  estimate_class: number | string;
+  classification_system: string;
   label: string;
   accuracy_low: string;
   accuracy_high: string;
@@ -151,7 +154,7 @@ export interface EstimateBasisDocument {
   currency: string;
   pricing_date: string | null;
   /** The class an estimator stated. `null` means nobody has stated one. */
-  estimate_class: number | null;
+  estimate_class: number | string | null;
   accuracy_low_pct: string;
   accuracy_high_pct: string;
   /** The band applied to the grand total. Blank while no class is stated. */
@@ -159,9 +162,24 @@ export interface EstimateBasisDocument {
   accuracy_high_amount: string;
   market_conditions: string;
   contingency_rationale: string;
+  /** OC-03: client budget target, separate from the calculated estimate. */
+  budget_target?: BudgetTarget | null;
   generated_at: string | null;
   created_at: string | null;
   updated_at: string | null;
+}
+
+/** OC-03: client's stated budget target alongside the calculated estimate. */
+export interface BudgetTarget {
+  type: 'client_target' | 'budget' | 'tender' | 'contract' | string;
+  amount: string;
+  currency: string;
+  gross_net: 'gross' | 'net';
+  contingency_mode: 'included' | 'additional';
+  contingency_amount?: string | null;
+  source?: string | null;
+  date?: string | null;
+  notes?: string | null;
 }
 
 export interface EstimateBasisSummary {
@@ -173,7 +191,7 @@ export interface EstimateBasisSummary {
   inclusion_count: number;
   exclusion_count: number;
   assumption_count: number;
-  estimate_class: number | null;
+  estimate_class: number | string | null;
   grand_total: string;
   currency: string;
   generated_at: string | null;
@@ -201,12 +219,14 @@ export interface UpdateBasisRequest {
   inclusions?: QualificationItem[] | null;
   exclusions?: QualificationItem[] | null;
   assumptions?: QualificationItem[] | null;
-  /** AACE class 1-5. Send 0 to unstate it; omit to leave it alone. */
-  estimate_class?: number | null;
+  /** Estimate class (AACE 1-5 or string like 'D'). Send 0 to unstate it; omit to leave it alone. */
+  estimate_class?: number | string | null;
   accuracy_low_pct?: string | null;
   accuracy_high_pct?: string | null;
   market_conditions?: string | null;
   contingency_rationale?: string | null;
+  /** OC-03: client budget target. */
+  budget_target?: BudgetTarget | null;
 }
 
 const BASE = '/v1/estimate-basis';

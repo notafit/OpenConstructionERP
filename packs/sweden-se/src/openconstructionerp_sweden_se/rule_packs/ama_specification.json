@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "ama_specification",
+  "name": "AMA — Allman Material- och Arbetsbeskrivning",
+  "standard": "AMA Hus 21",
+  "jurisdiction": "SE",
+  "regulator": "Svensk Byggtjanst",
+  "publication_year": 2021,
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for AMA, the Swedish general material and workmanship descriptions, in the edition named above. The structure asks that a specification item carries an AMA code in the form the edition defines, that the material and workmanship codes are present, that quantities are measured by the rule the item states and that the item is assigned to a discipline. None of that is implemented as a rule. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swedish quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared six ids under the ama prefix (specification_code_required, valid_ama_code_format, material_specification_present, workmanship_code_present, measurement_rule_applied, discipline_assignment_valid), and the engine defines none of them and registers no rule set by that name. A generic description-present or unit-present check is not a AMA check, and naming one here would claim the standard was satisfied by arithmetic. The universal BOQ hygiene checks run on every project regardless of this document and are not claimed here.",
+  "enables_rule_ids": []
+}

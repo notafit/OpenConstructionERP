@@ -122,6 +122,7 @@ import { getNumberLocale } from '@/stores/usePreferencesStore';
 import { ClashCostImpactColumn } from './ClashCostImpactColumn';
 import { clashGuide } from './clashGuide';
 import { fmtFixed, getIntlLocale } from '@/shared/lib/formatters';
+import { IssueHubLink } from '@/features/issues/IssueHubLink';
 
 const EMPTY_SET: ClashSelectionSet = {
   disciplines: [],
@@ -1993,6 +1994,7 @@ export function ClashDetectionPage() {
         actions={
           <>
             <ModuleGuideButton content={clashGuide} />
+            <IssueHubLink />
             <Button
               variant="secondary"
               size="sm"

@@ -104,7 +104,7 @@ def register_subscribers() -> None:
     """Idempotently subscribe daily-diary cross-module handlers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe("daily_diary.closed", _on_diary_closed)
-    event_bus.subscribe("daily_diary.signed", _on_diary_signed)
+    event_bus.subscribe_once("daily_diary.closed", _on_diary_closed)
+    event_bus.subscribe_once("daily_diary.signed", _on_diary_signed)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     logger.info("Daily Diary: 2 cross-module subscriber(s) registered")

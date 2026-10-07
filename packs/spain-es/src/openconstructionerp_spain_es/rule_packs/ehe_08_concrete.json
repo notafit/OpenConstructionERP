@@ -1,0 +1,23 @@
+{
+  "rule_pack_id": "ehe_08_concrete",
+  "name": "EHE-08 — Structural Concrete Code",
+  "standard": "EHE-08 (R.D. 1247/2008)",
+  "jurisdiction": "ES",
+  "description": "Validates structural concrete specifications against the Instruccion de Hormigon Estructural (EHE-08). Checks exposure class (I, IIa/b, IIIa/b/c, IV, Qa/b/c), minimum concrete strength for durability, cover requirements, reinforcement steel type (B 400 S / B 500 S / B 500 SD), execution control level (normal / intenso / estadistico), and that the plan de control de calidad (quality control plan) is referenced.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "ehe.clase_exposicion_set",
+    "ehe.resistencia_caracteristica_specified",
+    "ehe.resistencia_minima_for_durability",
+    "ehe.recubrimiento_minimo_set",
+    "ehe.tipo_acero_specified",
+    "ehe.nivel_control_ejecucion_set",
+    "ehe.plan_control_calidad_referenced",
+    "ehe.ensayos_hormigon_requirements_noted",
+    "ehe.curado_provisions_documented",
+    "ehe.hormigon_autocompactante_if_applicable",
+    "ehe.prefabricados_marcado_ce_if_applicable"
+  ],
+  "regulator": "Ministerio de Transportes y Movilidad Sostenible",
+  "publication_year": 2008
+}

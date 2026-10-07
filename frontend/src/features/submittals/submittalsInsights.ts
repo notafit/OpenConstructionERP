@@ -16,6 +16,7 @@
  */
 import { useTranslation } from 'react-i18next';
 import type { InsightDataset, InsightDef } from '@/features/insights';
+import { parseDateUTC } from '@/shared/lib/dates';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -116,7 +117,7 @@ function toRow(r: SubmittalLite, t: Translate): Row {
   const done = DONE_STATUSES.includes(r.status);
   const approved = APPROVED_STATUSES.includes(r.status);
   const open = done ? 0 : 1;
-  const dueRaw = r.date_required ? new Date(r.date_required).getTime() : NaN;
+  const dueRaw = r.date_required ? parseDateUTC(r.date_required).getTime() : NaN;
   const overdue = open === 1 && !Number.isNaN(dueRaw) && dueRaw < Date.now() ? 1 : 0;
   const turnaround = daysOpen(r);
   return {

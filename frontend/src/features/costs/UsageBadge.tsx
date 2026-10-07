@@ -97,9 +97,9 @@ export function UsageBadge({ count, band, className }: UsageBadgeProps) {
     defaultValue: 'Used in {{count}} estimate position',
     defaultValue_other: 'Used in {{count}} estimate positions',
   });
-  // Combine usage with the freshness phrase when we have band data, so the
-  // single control still surfaces "how recently" on hover.
-  const label = band
+  // Usage and freshness are one translated sentence, so each language can
+  // order them its own way; the band meaning and the source follow it.
+  const usageLine = band
     ? t('costs.usage.used_count_with_age', {
         count,
         age: formatAge(band.age_days, t),
@@ -107,6 +107,16 @@ export function UsageBadge({ count, band, className }: UsageBadgeProps) {
         defaultValue_other: 'Used in {{count}} estimate positions, last {{age}}',
       })
     : usageLabel;
+  const bandMeaning = band?.confidence_badge === 'green'
+    ? t('costs.certainty.band_green', { defaultValue: 'well proven' })
+    : band?.confidence_badge === 'yellow'
+      ? t('costs.certainty.band_yellow', { defaultValue: 'in use, not yet proven' })
+      : band?.confidence_badge === 'red'
+        ? t('costs.certainty.band_red', { defaultValue: 'stale or unverified' })
+        : '';
+  const bandLine = bandMeaning ? ` (${bandMeaning})` : '';
+  const sourceLine = band?.source ? ` · ${band.source}` : '';
+  const label = `${usageLine}${bandLine}${sourceLine}`;
 
   return (
     <span

@@ -253,7 +253,7 @@ class SavedViewService:
     ) -> AsyncIterator[bytes]:
         """Stream a capped export (CSV) in chunks; never one unbounded fetch.
 
-        Each page re-applies the row cap, honouring the 2GB-core rule. ``parquet``
+        Each page re-applies the row cap, honouring the 3GB-core rule. ``parquet``
         falls back to CSV bytes when pandas is unavailable; the CSV path is pure
         stdlib so it always works.
         """

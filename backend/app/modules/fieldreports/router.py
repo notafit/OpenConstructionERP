@@ -18,6 +18,7 @@ Endpoints:
     GET    /reports/export?project_id=X    - Export all as Excel
 """
 
+import asyncio
 import csv
 import io
 import logging
@@ -201,7 +202,7 @@ async def get_current_weather(
     # is not enough. Reject explicitly to keep upstream params safe.
     if not (math.isfinite(lat) and math.isfinite(lon)):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Coordinates must be finite numbers.",
         )
 
@@ -443,8 +444,12 @@ def _match_report_column(header: str) -> str | None:
     return None
 
 
-def _parse_report_rows_from_csv(content_bytes: bytes) -> list[dict[str, Any]]:
-    """Parse rows from a CSV file for field report import."""
+def _parse_report_rows_from_csv(content_bytes: bytes) -> list[tuple[int, dict[str, Any]]]:
+    """Parse a CSV file for field report import into ``(row number, row)`` pairs.
+
+    The number is the row a spreadsheet shows for the record, blank rows
+    counted, so an import error points at the right line.
+    """
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             text = content_bytes.decode(encoding)
@@ -471,30 +476,38 @@ def _parse_report_rows_from_csv(content_bytes: bytes) -> list[dict[str, Any]]:
         if canonical:
             column_map[idx] = canonical
 
-    rows: list[dict[str, Any]] = []
-    for raw_row in reader:
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, raw_row in enumerate(reader, start=2):
         row: dict[str, Any] = {}
         for idx, val in enumerate(raw_row):
             canonical = column_map.get(idx)
             if canonical:
                 row[canonical] = val.strip() if isinstance(val, str) else val
         if row:
-            rows.append(row)
+            rows.append((row_number, row))
 
     return rows
 
 
-def _parse_report_rows_from_excel(content_bytes: bytes) -> list[dict[str, Any]]:
-    """Parse rows from an Excel (.xlsx) file for field report import."""
+def _parse_report_rows_from_excel(content_bytes: bytes) -> list[tuple[int, dict[str, Any]]]:
+    """Parse an Excel (.xlsx) file for field report import into ``(row number, row)`` pairs.
+
+    The header is row 1, or the table's header under a company letterhead
+    when the file is one of our own exports (see ``app.core.sheet_header``).
+    The number is the sheet's own row number, so an import error points at
+    the right row either way.
+    """
     from openpyxl import load_workbook
+
+    from app.core.sheet_header import find_header_row
 
     wb = load_workbook(io.BytesIO(content_bytes), read_only=True, data_only=True)
     ws = wb.active
     if ws is None:
         raise ValueError("Excel file has no worksheets")
 
-    rows_iter = ws.iter_rows(values_only=True)
-    raw_headers = next(rows_iter, None)
+    header = find_header_row(ws.iter_rows(values_only=True), _match_report_column)
+    raw_headers = header.values
     if not raw_headers:
         raise ValueError("Excel file is empty or has no header row")
 
@@ -505,15 +518,15 @@ def _parse_report_rows_from_excel(content_bytes: bytes) -> list[dict[str, Any]]:
             if canonical:
                 column_map[idx] = canonical
 
-    rows: list[dict[str, Any]] = []
-    for raw_row in rows_iter:
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, raw_row in enumerate(header.rows, start=header.number + 1):
         row: dict[str, Any] = {}
         for idx, val in enumerate(raw_row):
             canonical = column_map.get(idx)
             if canonical and val is not None:
                 row[canonical] = val
         if row:
-            rows.append(row)
+            rows.append((row_number, row))
 
     wb.close()
     return rows
@@ -600,14 +613,14 @@ async def import_field_reports_file(
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No data rows found in file. Check that the first row contains column headers.",
+            detail="No data rows found in file. Check that the header row names the columns.",
         )
 
     imported_count = 0
     skipped = 0
     errors: list[dict[str, Any]] = []
 
-    for row_idx, row in enumerate(rows, start=2):
+    for row_idx, row in rows:
         try:
             report_date_raw = str(row.get("report_date", "")).strip()
             if not report_date_raw:
@@ -696,25 +709,10 @@ async def import_field_reports_file(
 # ── Export all reports as Excel ────────────────────────────────────────────
 
 
-@router.get("/reports/export/")
-async def export_field_reports(
-    session: SessionDep,
-    project_id: uuid.UUID = Query(...),
-    _user_id: CurrentUserId = None,  # type: ignore[assignment]
-    _perm: None = Depends(RequirePermission("fieldreports.read")),
-    service: FieldReportService = Depends(_get_service),
-) -> StreamingResponse:
-    """Export all field reports for a project as an Excel file."""
-    await verify_project_access(project_id, _user_id, session)
+def _render_field_reports_xlsx(rows: list[list[object]]) -> io.BytesIO:
+    """Build the field reports workbook from plain cell values (pure CPU, no DB)."""
     from openpyxl import Workbook
     from openpyxl.styles import Font
-
-    # Export every report for the project. The previous ``limit=2000`` cap
-    # silently truncated the file for large projects, contradicting the
-    # "Export all field reports" contract. ``all_for_project`` fetches the
-    # full set; sort newest-first to match the list view's ordering.
-    reports = await service.repo.all_for_project(project_id)
-    reports.sort(key=lambda r: r.report_date, reverse=True)
 
     wb = Workbook()
     ws = wb.active
@@ -734,42 +732,63 @@ async def export_field_reports(
         cell = ws.cell(row=1, column=i, value=h)
         cell.font = Font(bold=True)
 
-    for row_idx, report in enumerate(reports, 2):
-        workforce = report.workforce or []  # type: ignore[attr-defined]
-        equipment = report.equipment_on_site or []  # type: ignore[attr-defined]
-        workforce_count = sum((e.get("count", 0) if isinstance(e, dict) else 0) for e in workforce)
-        ws.cell(
-            row=row_idx,
-            column=1,
-            value=str(report.report_date),  # type: ignore[attr-defined]
-        )
-        ws.cell(
-            row=row_idx,
-            column=2,
-            value=report.weather_condition,  # type: ignore[attr-defined]
-        )
-        ws.cell(
-            row=row_idx,
-            column=3,
-            value=report.temperature_c,  # type: ignore[attr-defined]
-        )
-        ws.cell(
-            row=row_idx,
-            column=4,
-            value=report.wind_speed,  # type: ignore[attr-defined]
-        )
-        ws.cell(
-            row=row_idx,
-            column=5,
-            value=report.work_performed,  # type: ignore[attr-defined]
-        )
-        ws.cell(row=row_idx, column=6, value=workforce_count)
-        ws.cell(row=row_idx, column=7, value=len(equipment))
-        ws.cell(row=row_idx, column=8, value=report.notes)  # type: ignore[attr-defined]
+    for row_idx, values in enumerate(rows, 2):
+        for col, value in enumerate(values, 1):
+            ws.cell(row=row_idx, column=col, value=value)
+
+    # Company letterhead above the table; a no-op without a company profile.
+    # The importer finds the header under it, so the file re-imports as is.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(ws, title=ws.title)
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
+    return output
+
+
+@router.get("/reports/export/")
+async def export_field_reports(
+    session: SessionDep,
+    project_id: uuid.UUID = Query(...),
+    _user_id: CurrentUserId = None,  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("fieldreports.read")),
+    service: FieldReportService = Depends(_get_service),
+) -> StreamingResponse:
+    """Export all field reports for a project as an Excel file."""
+    await verify_project_access(project_id, _user_id, session)
+
+    # Export every report for the project. The previous ``limit=2000`` cap
+    # silently truncated the file for large projects, contradicting the
+    # "Export all field reports" contract. ``all_for_project`` fetches the
+    # full set; sort newest-first to match the list view's ordering.
+    reports = await service.repo.all_for_project(project_id)
+    reports.sort(key=lambda r: r.report_date, reverse=True)
+
+    rows: list[list[object]] = []
+    for report in reports:
+        workforce = report.workforce or []  # type: ignore[attr-defined]
+        equipment = report.equipment_on_site or []  # type: ignore[attr-defined]
+        workforce_count = sum((e.get("count", 0) if isinstance(e, dict) else 0) for e in workforce)
+        rows.append(
+            [
+                str(report.report_date),  # type: ignore[attr-defined]
+                report.weather_condition,  # type: ignore[attr-defined]
+                report.temperature_c,  # type: ignore[attr-defined]
+                report.wind_speed,  # type: ignore[attr-defined]
+                report.work_performed,  # type: ignore[attr-defined]
+                workforce_count,
+                len(equipment),
+                report.notes,  # type: ignore[attr-defined]
+            ]
+        )
+
+    # Writing the workbook walks every report and is pure CPU, so it runs in a
+    # worker thread instead of holding up every other request on the event loop.
+    output = await asyncio.to_thread(_render_field_reports_xlsx, rows)
 
     return StreamingResponse(
         output,

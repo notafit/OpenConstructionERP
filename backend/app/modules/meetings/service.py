@@ -150,7 +150,7 @@ class MeetingService:
                 bad.append(str(raw))
         if bad:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(f"document_ids reference documents that do not belong to project {project_id}: {bad}"),
             )
 
@@ -334,7 +334,28 @@ class MeetingService:
         auto-created via ``complete_meeting`` - preventing dangling FK
         pointers without destroying the user's task history.
         """
-        await self.get_meeting(meeting_id)  # Raises 404 if not found
+        meeting = await self.get_meeting(meeting_id)  # Raises 404 if not found
+
+        # A completed meeting and one whose minutes were issued are the record
+        # of what was decided; the minutes row cascades with the meeting, so a
+        # delete would take the issued document with it. A meeting that will
+        # not take place is cancelled instead.
+        if meeting.status == "completed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot delete a completed meeting: it is the record of what was decided and is kept.",
+            )
+        minutes = await self.get_minutes_row(meeting_id)
+        if minutes is not None and minutes.status == "issued":
+            remedy = (
+                " Cancel the meeting instead."
+                if "cancelled" in _MEETING_STATUS_TRANSITIONS.get(meeting.status, set())
+                else ""
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot delete a meeting whose minutes were issued: they are kept as the record.{remedy}",
+            )
 
         # Clear the meeting_id FK on tasks that reference this meeting
         try:
@@ -937,7 +958,7 @@ class MeetingService:
         problems = logic.validate_action_fields(data.owner_id, data.owner_name, data.due_date, data.status)
         if problems:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=" ".join(problems),
             )
         row = MeetingActionItem(
@@ -984,7 +1005,7 @@ class MeetingService:
             problems = logic.validate_action_fields(new_owner_id, new_owner_name, new_due, new_status)
             if problems:
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail=" ".join(problems),
                 )
 
@@ -1237,12 +1258,18 @@ class MeetingService:
 
         Blocks while a required agenda item is unaddressed or no attendee is
         marked present. Issuing is the human-confirmed step; nothing is auto-issued.
+        Issuing again is refused, so the issue stamp keeps who issued them and when.
         """
+        if row.status == "issued":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Minutes have already been issued for this meeting",
+            )
         content = row.content if isinstance(row.content, dict) else {}
         problems = logic.minutes_issue_problems(content)
         if problems:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=" ".join(problems),
             )
         row.status = "issued"

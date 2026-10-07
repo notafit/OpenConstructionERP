@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "abudhabi_building_code",
+  "name": "Abu Dhabi International Building Code",
+  "standard": "Abu Dhabi International Building Code (IBC-based, ADM)",
+  "jurisdiction": "AE",
+  "description": "Validates project documentation against the Abu Dhabi International Building Code as adopted by Abu Dhabi Municipality (ADM). Based on the International Building Code (IBC) with local amendments, it covers structural requirements, fire protection, means of egress, accessibility, building envelope, and MEP provisions. Checks that the correct building occupancy classification, construction type, and applicable ADM circulars are referenced.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "adibc.occupancy_classification_set",
+    "adibc.construction_type_classified",
+    "adibc.fire_resistance_rating_set",
+    "adibc.means_of_egress_documented",
+    "adibc.accessibility_provisions_documented",
+    "adibc.structural_design_criteria_set",
+    "adibc.seismic_design_category_if_applicable",
+    "adibc.wind_load_criteria_set",
+    "adibc.building_envelope_performance_set",
+    "adibc.mep_provisions_documented",
+    "adibc.adm_circular_compliance_noted",
+    "adibc.noc_requirements_referenced"
+  ],
+  "regulator": "Abu Dhabi Municipality (ADM)",
+  "publication_year": 2023
+}

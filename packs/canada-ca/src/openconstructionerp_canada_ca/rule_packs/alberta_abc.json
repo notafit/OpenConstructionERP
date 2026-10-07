@@ -1,0 +1,18 @@
+{
+  "rule_pack_id": "alberta_abc",
+  "name": "Alberta Building Code",
+  "name_fr-CA": "Code du bâtiment de l'Alberta",
+  "standard": "Alberta Building Code (ABC)",
+  "jurisdiction": "CA-AB",
+  "regulator": "Province of Alberta under the Safety Codes Act, administered with the Safety Codes Council",
+  "applies_to": [
+    "projects",
+    "validation"
+  ],
+  "description": "Reference document for Alberta compliance on top of the national code. Alberta adopts the national model code with provincial amendments and administers it under the Safety Codes Act, so what matters is naming the instruments the project is actually built to: the building permit is referenced, the edition of the Alberta Building Code in force for the project is recorded, the accredited municipality or agency acting as authority having jurisdiction is identified, WCB-Alberta account details are on file for every contractor, and construction lien holdback and the prompt-payment schedule are configured. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la conformité particulière à l'Alberta en complément du code national. L'Alberta adopte le code modèle national avec des modifications provinciales et l'administre en vertu de la Safety Codes Act ; il s'agit donc d'identifier les instruments réellement applicables au projet : le permis de construire est référencé, l'édition du code du bâtiment de l'Alberta applicable est consignée, la municipalité ou l'organisme accrédité agissant comme autorité compétente est identifié, les renseignements du compte WCB-Alberta sont au dossier pour chaque entrepreneur, et la retenue pour privilège de construction ainsi que l'échéancier de paiement rapide sont configurés. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "review_status": "Alberta reissues its building code on its own cycle and the edition of the national model code it is based on changes with it, so no edition year is pinned here. Alberta's construction lien and prompt-payment legislation has also been amended; the statute name, the holdback percentage and the payment periods in force must be confirmed against current provincial legislation and the Safety Codes Council before this is relied on for a submission.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. The provincial code is applied by the authority having jurisdiction against a submitted design, which this platform does not hold. A rule id here would report on a question the engine is not in a position to ask.",
+  "enables_rule_ids": []
+}

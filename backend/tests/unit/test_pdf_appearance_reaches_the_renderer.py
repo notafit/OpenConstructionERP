@@ -35,10 +35,15 @@ _MEDIABOX = re.compile(rb"/MediaBox\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d
 
 @pytest.fixture
 def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point every no-argument appearance read at a throwaway directory."""
-    from app.core import pdf_appearance
+    """Point every no-argument appearance read at a throwaway directory.
+
+    The company profile too: the header draws its document logo in place of
+    the text brand these tests look for.
+    """
+    from app.core import company_profile, pdf_appearance
 
     monkeypatch.setattr(pdf_appearance, "resolve_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(company_profile, "resolve_data_dir", lambda: tmp_path)
     return tmp_path
 
 

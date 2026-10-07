@@ -6,6 +6,7 @@ Renders one diary into a clean, single-document PDF using reportlab
 (already a platform dependency - see ``boq/pdf_export.py`` for the same
 conventions). The layout is:
 
+- The firm's letterhead on page one, when the company profile has one.
 - Header band: project name + diary date + status badge.
 - Overview: site supervisor, labour / equipment counts, completeness.
 - Weather: the day's weather readings (temperature, wind, precipitation,
@@ -57,11 +58,19 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from app.core.pdf_branding import branded_cover_brand, branded_doc_metadata, branded_header_logo
+from app.core.pdf_branding import (
+    branded_appearance,
+    branded_cover_brand,
+    branded_doc_metadata,
+    branded_header_logo,
+    branded_letterhead,
+)
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
-    pdf_font_for_text,
+    pdf_fit_line,
+    pdf_fitted_style,
+    pdf_room_beside,
     pdf_style_for_text,
     register_pdf_fonts,
 )
@@ -216,43 +225,96 @@ def _build_styles() -> dict[str, ParagraphStyle]:
     }
 
 
-def _make_footer(author_line: str, generated_date: str, locale: str) -> Any:
+def _make_footer(
+    author_line: str,
+    generated_date: str,
+    locale: str,
+    *,
+    letterhead_on_first_page: bool = False,
+    appearance: dict[str, Any] | None = None,
+) -> Any:
     """Return an ``onPage`` callback drawing the footer on every page.
+
+    The footer follows the document appearance for the daily report, as the
+    RFI's does: a saved footer line replaces the brand and timestamp line, the
+    footer colour colours the footer, and page numbers can be switched off.
 
     Args:
         author_line: Pre-escaped, plain-text author / supervisor line.
         generated_date: The generated-at timestamp string.
         locale: PDF locale for the fixed footer strings.
+        letterhead_on_first_page: Whether page one opens with the letterhead,
+            decided once by the caller. The letterhead already carries the
+            logo, so the small header logo is left off that page.
+        appearance: The document appearance, read once for the whole document.
 
     Returns:
         A ``func(canvas, doc)`` callable for a reportlab PageTemplate.
     """
+    look = appearance or {}
+    footer_colour = look.get("footer_color") or "#999999"
+    custom_footer = str(look.get("footer_text") or "").strip()
+    show_page_numbers = look.get("show_page_numbers", True) is not False
 
     def _footer(canvas: Any, doc: Any) -> None:
         canvas.saveState()
         canvas.setStrokeColor(colors.HexColor("#cccccc"))
         canvas.setLineWidth(0.5)
         canvas.line(MARGIN_LEFT, 13 * mm, PAGE_WIDTH - MARGIN_RIGHT, 13 * mm)
-        canvas.setFillColor(colors.HexColor("#999999"))
         # Footer carries the workspace brand (issue #284) plus the supervisor
         # line; the brand falls back to the default name when none is set.
+        # All three footer strings come from tr(locale, ...) and may be in any
+        # script (Thai, Devanagari, CJK). Paragraph is the only route through
+        # which reportlab's shaper acts on complex scripts.
         brand = branded_cover_brand()
-        left_text = (author_line or brand)[:120]
-        # The supervisor's name and a white-labelled brand are both user data.
-        canvas.setFont(pdf_font_for_text(left_text), 7)
-        canvas.drawString(MARGIN_LEFT, 9 * mm, left_text)
+        footer_style = ParagraphStyle(
+            "_diaryFooter",
+            fontName=BODY_FONT,
+            fontSize=7,
+            leading=7,
+            textColor=colors.HexColor(footer_colour),
+        )
+        # Both footer lines are anchored by the top of their box, so a wrapped
+        # one grows downward: the author line would come down over the brand
+        # line and the brand line off the bottom edge. Each is fitted onto a
+        # single line instead, the author line into the room beside the page
+        # number it shares a baseline with.
+        page_line = tr(locale, "footer_page", page=doc.page) if show_page_numbers else ""
+        full_width = PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT
+        # Supervisor / author line (user data, could be non-Latin).
+        left_text, _left_face, left_size = pdf_fit_line(
+            (author_line or brand)[:120], pdf_room_beside(full_width, page_line), base=BODY_FONT
+        )
+        p1 = Paragraph(html.escape(left_text, quote=True), pdf_fitted_style(footer_style, left_text, left_size))
+        pw1, ph1 = p1.wrapOn(canvas, full_width, 20)
+        p1.drawOn(canvas, MARGIN_LEFT, 9 * mm - ph1 + 7 * 0.22)
+        # Brand + generated timestamp line, or the workspace's own footer line,
+        # printed as saved and untranslated.
         generated_line = tr(locale, "footer_generated", timestamp=generated_date)
-        brand_line = f"{brand}  |  {generated_line}"
-        canvas.setFont(pdf_font_for_text(brand_line), 7)
-        canvas.drawString(MARGIN_LEFT, 6 * mm, brand_line)
-        page_line = tr(locale, "footer_page", page=doc.page)
-        canvas.setFont(pdf_font_for_text(page_line), 7)
-        canvas.drawRightString(PAGE_WIDTH - MARGIN_RIGHT, 9 * mm, page_line)
+        brand_line, _brand_face, brand_size = pdf_fit_line(
+            custom_footer or brand,
+            full_width,
+            suffix="" if custom_footer else f"  |  {generated_line}",
+            base=BODY_FONT,
+        )
+        p2 = Paragraph(html.escape(brand_line, quote=True), pdf_fitted_style(footer_style, brand_line, brand_size))
+        pw2, ph2 = p2.wrapOn(canvas, full_width, 20)
+        p2.drawOn(canvas, MARGIN_LEFT, 6 * mm - ph2 + 7 * 0.22)
+        # Page number (locale-translated, could be Thai/Devanagari). Right
+        # aligned inside the full width: a Paragraph wraps to the width it is
+        # offered, not to its text, so offsetting by that width put the page
+        # number at the left margin on top of the supervisor line.
+        if page_line:
+            page_style = ParagraphStyle("_diaryFooterPage", parent=footer_style, alignment=TA_RIGHT)
+            p3 = Paragraph(html.escape(page_line, quote=True), pdf_style_for_text(page_style, page_line))
+            pw3, ph3 = p3.wrapOn(canvas, PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, 20)
+            p3.drawOn(canvas, MARGIN_LEFT, 9 * mm - ph3 + 7 * 0.22)
         canvas.restoreState()
         # The uploaded white-label logo (if any) appears top-right in the header
         # margin on every page; the dark title band stays inside the content
         # frame, so they do not overlap. Issue #284 follow-up.
-        branded_header_logo(canvas, doc)
+        if not (letterhead_on_first_page and doc.page == 1):
+            branded_header_logo(canvas, doc)
 
     return _footer
 
@@ -553,6 +615,11 @@ def generate_diary_pdf(
         else tr(locale, "footer_supervisor_missing")
     )
 
+    # The firm's letterhead, when the company profile has one. Decided once, so
+    # the page callback can never put the logo on page one twice or not at all.
+    # The frame pads 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(USABLE_WIDTH - 12, doc_type="daily_report")
+
     buffer = io.BytesIO()
     frame = Frame(
         MARGIN_LEFT,
@@ -564,7 +631,13 @@ def generate_diary_pdf(
     template = PageTemplate(
         id="body",
         frames=[frame],
-        onPage=_make_footer(author_line, generated_date, locale),
+        onPage=_make_footer(
+            author_line,
+            generated_date,
+            locale,
+            letterhead_on_first_page=letterhead is not None,
+            appearance=branded_appearance(doc_type="daily_report"),
+        ),
     )
     doc = BaseDocTemplate(
         buffer,
@@ -583,6 +656,8 @@ def generate_diary_pdf(
     doc.addPageTemplates([template])
 
     flowables: list[Any] = []
+    if letterhead is not None:
+        flowables.append(letterhead)
     flowables.extend(_build_header(project_name, diary_date, status_text, styles, locale))
     flowables.extend(_build_overview(diary, supervisor_name, completeness, styles, locale))
     flowables.extend(_build_weather(diary, weather_records, styles, locale))

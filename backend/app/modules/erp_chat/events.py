@@ -76,5 +76,5 @@ async def _on_message_deleted(event: Event) -> None:
     await _delete_message_vector(event)
 
 
-event_bus.subscribe("erp_chat.message.created", _on_message_created)
-event_bus.subscribe("erp_chat.message.deleted", _on_message_deleted)
+event_bus.subscribe_once("erp_chat.message.created", _on_message_created)
+event_bus.subscribe_once("erp_chat.message.deleted", _on_message_deleted)

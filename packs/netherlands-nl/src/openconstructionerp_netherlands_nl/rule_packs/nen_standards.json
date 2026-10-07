@@ -1,0 +1,23 @@
+{
+  "rule_pack_id": "nen_standards",
+  "name": "NEN — Dutch Normalisation Institute Construction Standards",
+  "standard": "NEN construction standards series",
+  "jurisdiction": "NL",
+  "description": "Validates specifications and BOQ items against key NEN (Nederlands Normalisatie-instituut) construction standards. Covers NEN 6700-series (structural safety, now superseded by Eurocode national annexes), NEN 2580 (floor area measurement, GBO/BVO), NEN 2767 (condition assessment), NEN-EN 1990-1999 (Eurocodes with Dutch National Annexes), and NEN 7120 / NTA 8800 (energy performance). Checks that specification clauses reference applicable NEN standards.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "nen.standard_reference_present",
+    "nen.standard_version_current",
+    "nen.nen2580_floor_area_method_applied",
+    "nen.nen2767_condition_assessment_if_renovation",
+    "nen.eurocode_national_annex_referenced",
+    "nen.en_1992_concrete_nl_annex_if_applicable",
+    "nen.en_1993_steel_nl_annex_if_applicable",
+    "nen.en_1998_seismic_nl_annex_if_applicable",
+    "nen.nta8800_energy_performance_referenced",
+    "nen.nen3650_pipeline_if_applicable",
+    "nen.material_test_standard_cited"
+  ],
+  "regulator": "NEN (Nederlands Normalisatie-instituut)",
+  "publication_year": 2024
+}

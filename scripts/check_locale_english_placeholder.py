@@ -47,7 +47,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from i18n_new_locale import KEY_VAL_MULTILINE, LOCALES, english_sources, locale_paths, read, unescape  # noqa: E402
+from i18n_new_locale import (
+    KEY_VAL_MULTILINE,
+    LOCALES,
+    english_sources,
+    locale_paths,
+    read,
+    unescape,
+)  # noqa: E402
 
 # The share of a locale's values that may be byte-identical to their English
 # source before the locale reads as unfinished rather than as translated.
@@ -224,27 +231,44 @@ def selftest() -> int:
     cases: list[tuple[str, dict[str, str], bool]] = [
         (
             "a finished locale, 3 of 100 values left in English",
-            {**{f"k{i}": f"Forditas {i}" for i in range(100)}, "k0": "English 0", "k1": "English 1", "k2": "English 2"},
+            {
+                **{f"k{i}": f"Forditas {i}" for i in range(100)},
+                "k0": "English 0",
+                "k1": "English 1",
+                "k2": "English 2",
+            },
             True,
         ),
         (
             "a locale assembled from untouched batches, 74 of 100 still English",
-            {**{f"k{i}": f"Forditas {i}" for i in range(100)}, **{f"k{i}": f"English {i}" for i in range(74)}},
+            {
+                **{f"k{i}": f"Forditas {i}" for i in range(100)},
+                **{f"k{i}": f"English {i}" for i in range(74)},
+            },
             False,
         ),
         (
             "exactly on the threshold, 10 of 100, passes",
-            {**{f"k{i}": f"Forditas {i}" for i in range(100)}, **{f"k{i}": f"English {i}" for i in range(10)}},
+            {
+                **{f"k{i}": f"Forditas {i}" for i in range(100)},
+                **{f"k{i}": f"English {i}" for i in range(10)},
+            },
             True,
         ),
         (
             "one over the threshold, 11 of 100, fails",
-            {**{f"k{i}": f"Forditas {i}" for i in range(100)}, **{f"k{i}": f"English {i}" for i in range(11)}},
+            {
+                **{f"k{i}": f"Forditas {i}" for i in range(100)},
+                **{f"k{i}": f"English {i}" for i in range(11)},
+            },
             False,
         ),
         (
             "a narrow population: 90 of 100 keys have no English, so the verdict is refused",
-            {**{f"k{i}": f"Forditas {i}" for i in range(10)}, **{f"absent{i}": "whatever" for i in range(90)}},
+            {
+                **{f"k{i}": f"Forditas {i}" for i in range(10)},
+                **{f"absent{i}": "whatever" for i in range(90)},
+            },
             False,
         ),
         (
@@ -268,7 +292,14 @@ def selftest() -> int:
     # The exemption, pinned rather than assumed. An English bundle that is 100%
     # identical to English is right, and any other bundle at 100% is the defect
     # this guard exists for, so both directions are asserted.
-    exempt = [("en", True), ("en-US", True), ("en-GB", True), ("hu", False), ("eng", False), ("enum", False)]
+    exempt = [
+        ("en", True),
+        ("en-US", True),
+        ("en-GB", True),
+        ("hu", False),
+        ("eng", False),
+        ("enum", False),
+    ]
     for code, expected in exempt:
         if is_english_variant(code) != expected:
             verb = "should be skipped" if expected else "must be judged"

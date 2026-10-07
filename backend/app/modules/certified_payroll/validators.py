@@ -58,6 +58,14 @@ from app.core.validation.engine import (
     ValidationRule,
     rule_registry,
 )
+
+# The amount format the built-in rules already use: the decimals the currency
+# genuinely has, thousands separators, and the code. Taken from the core rules
+# rather than rewritten here, because a second spelling of the same idea is how
+# two findings on one screen end up disagreeing about what an amount looks
+# like. Importing it registers nothing; the built-in rules go into the registry
+# through an explicit call, not on import.
+from app.core.validation.rules import _fmt_money
 from app.modules.certified_payroll.certpay_math import total_package, underpaid_by, week_days
 
 logger = logging.getLogger(__name__)
@@ -254,8 +262,10 @@ class RateBelowDeterminationRule(ValidationRule):
             if min(required_basic, required_fringe, paid_basic, paid_fringe) < 0:
                 continue
             shortfall = underpaid_by(paid_basic, paid_fringe, required_basic, required_fringe)
+            # The currency this line states, never a default. A blank one stays
+            # blank: the renderer then groups the digits and writes no code,
+            # which is honest, where a guessed code would read as authoritative.
             currency = str(line.get("currency") or "").strip()
-            unit = f" {currency}" if currency else ""
             if shortfall > _RATE_TOLERANCE:
                 paid = total_package(paid_basic, paid_fringe)
                 required = total_package(required_basic, required_fringe)
@@ -263,10 +273,11 @@ class RateBelowDeterminationRule(ValidationRule):
                 results.append(
                     _fail(
                         self,
-                        f"{_worker_of(line)} was paid a total package of {paid}{unit} an hour "
-                        f"({paid_basic} basic plus {paid_fringe} fringe) against the {required}{unit} required "
-                        f"by determination {identifier}, a shortfall of {shortfall}{unit} for every one of "
-                        f"{_hours_worked(line)} hours.",
+                        f"{_worker_of(line)} was paid a total package of {_fmt_money(paid, currency)} an hour "
+                        f"({_fmt_money(paid_basic, currency)} basic plus {_fmt_money(paid_fringe, currency)} "
+                        f"fringe) against the {_fmt_money(required, currency)} required "
+                        f"by determination {identifier}, a shortfall of {_fmt_money(shortfall, currency)} "
+                        f"for every one of {_hours_worked(line)} hours.",
                         str(line.get("resource_id") or line.get("worker_name") or ""),
                         "Pay the difference and restate the payroll, or correct the rates recorded here if "
                         "they do not match what was actually paid.",
@@ -287,9 +298,10 @@ class RateBelowDeterminationRule(ValidationRule):
                     _fail(
                         self,
                         f"{_worker_of(line)} met the total package but was paid a basic wage of "
-                        f"{paid_basic}{unit} against the {required_basic}{unit} the determination sets. "
-                        f"The overtime premium is computed on the basic wage, so {overtime} overtime hours "
-                        f"are underpaid by {basic_short}{unit} of base each.",
+                        f"{_fmt_money(paid_basic, currency)} against the {_fmt_money(required_basic, currency)} "
+                        f"the determination sets. The overtime premium is computed on the basic wage, "
+                        f"so {overtime} overtime hours are underpaid by {_fmt_money(basic_short, currency)} "
+                        f"of base each.",
                         str(line.get("resource_id") or line.get("worker_name") or ""),
                         "Raise the basic wage to the determination's basic rate, or move the excess out of "
                         "the fringe amount, then recompute the overtime.",
@@ -329,15 +341,17 @@ class OvertimeBaseIncludesFringeRule(ValidationRule):
             if excess <= _RATE_TOLERANCE:
                 continue
             currency = str(line.get("currency") or "").strip()
-            unit = f" {currency}" if currency else ""
-            fringe_text = f" and the fringe rate is {paid_fringe}{unit}" if paid_fringe is not None else ""
+            fringe_text = (
+                f" and the fringe rate is {_fmt_money(paid_fringe, currency)}" if paid_fringe is not None else ""
+            )
             results.append(
                 _fail(
                     self,
-                    f"{_worker_of(line)} has {overtime} overtime hours computed on a base of {base}{unit} "
-                    f"while the basic wage is {paid_basic}{unit}{fringe_text}. The overtime multiplier has "
-                    f"been applied to {excess}{unit} an hour of fringe benefit money, which is not part of "
-                    "the overtime base.",
+                    f"{_worker_of(line)} has {overtime} overtime hours computed on a base of "
+                    f"{_fmt_money(base, currency)} while the basic wage is "
+                    f"{_fmt_money(paid_basic, currency)}{fringe_text}. The overtime multiplier has "
+                    f"been applied to {_fmt_money(excess, currency)} an hour of fringe benefit money, "
+                    "which is not part of the overtime base.",
                     str(line.get("resource_id") or line.get("worker_name") or ""),
                     "Set the overtime base to the basic hourly wage. The fringe amount is paid at face value "
                     "on overtime hours, never multiplied.",
@@ -415,11 +429,16 @@ class FringeElectionUnstatedRule(ValidationRule):
             election = str(line.get("fringe_election") or "").strip().lower()
             if election in {"plan", "cash", "mixed"}:
                 continue
+            # Read off the same field the two rate rules read it off. This rule
+            # used to write the amount with no currency at all while its
+            # siblings wrote one from the very same line.
+            currency = str(line.get("currency") or "").strip()
             results.append(
                 _fail(
                     self,
-                    f"{_worker_of(line)} is shown with {fringe} an hour of fringe benefit money and the "
-                    "payroll does not say whether it went into a benefit plan or was paid in cash.",
+                    f"{_worker_of(line)} is shown with {_fmt_money(fringe, currency)} an hour of fringe "
+                    "benefit money and the payroll does not say whether it went into a benefit plan or "
+                    "was paid in cash.",
                     str(line.get("resource_id") or line.get("worker_name") or ""),
                     "State the election for this worker: paid into a plan, paid in cash, or part to a plan "
                     "with the remainder in cash.",

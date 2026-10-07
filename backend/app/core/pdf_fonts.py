@@ -783,6 +783,91 @@ def pdf_shaping_for_text(text: str | None, *, bold: bool = False, base: str | No
     return font_needs_shaping(pdf_font_for_text(text, bold=bold, base=base))
 
 
+#: The smallest size a line of page furniture is set in before it is cut short.
+#: Below six points a footer stops being readable on an office printer, so a
+#: name longer than that allows loses its tail rather than its legibility.
+MIN_FURNITURE_SIZE = 6.0
+
+
+def pdf_fit_line(
+    text: str,
+    width: float,
+    *,
+    suffix: str = "",
+    size: float = 7.0,
+    bold: bool = False,
+    base: str | None = None,
+) -> tuple[str, str, float]:
+    """Fit one line of page furniture into ``width`` points.
+
+    A header band or a footer draws a single line of text beside something else
+    on the same baseline, usually the page number, so it cannot wrap and cannot
+    grow. The company name in it is the firm's own, up to
+    :data:`app.core.company_profile.MAX_LEGAL_NAME` characters, which is twice
+    the workspace name these lines were written for, and a Chinese name is
+    about twice as wide per character as a Latin one.
+
+    Three steps, in order: the line is set at ``size`` if it fits; else it is
+    set smaller, down to :data:`MIN_FURNITURE_SIZE`; else ``text`` is cut and
+    closed with an ellipsis at that size, keeping ``suffix`` whole, because the
+    suffix is usually the generated date and a half-written date is worse than
+    a shortened name.
+
+    Every width is measured in the face the line will actually be drawn in, so
+    CJK counts at its own width rather than at a Latin approximation.
+
+    Args:
+        text: The part that may be cut.
+        width: The room available, in points.
+        suffix: Text kept whole at the end of the line, cut only if nothing
+            else is left.
+        size: The size the line is drawn at when it fits.
+        bold: Whether the escalation rungs use the bold weight.
+        base: The face the caller draws in today, as
+            :func:`pdf_font_for_text` means it. Pass it to keep an unchanged
+            line byte for byte.
+
+    Returns:
+        ``(line, face, size)``: the whole line to draw, the face to draw it in
+        and the size to draw it at.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    line = f"{text}{suffix}"
+    face = pdf_font_for_text(line, bold=bold, base=base)
+    natural = stringWidth(line, face, size)
+    if natural <= width or natural <= 0:
+        return line, face, size
+    smallest = min(size, MIN_FURNITURE_SIZE)
+    if natural * smallest / size <= width:
+        return line, face, size * width / natural
+    # Still too wide at the smallest size, so the name is what has to give.
+    ellipsis = "…" if font_can_draw(face, "…") else "..."
+    cut = text
+    while cut and stringWidth(f"{cut.rstrip()}{ellipsis}{suffix}", face, smallest) > width:
+        cut = cut[:-1]
+    return f"{cut.rstrip()}{ellipsis}{suffix}", face, smallest
+
+
+#: The clear space kept between the two ends of a header or footer band.
+FURNITURE_GAP = 8.0
+
+
+def pdf_room_beside(width: float, reserved: str | None, *, size: float = 7.0, gap: float = FURNITURE_GAP) -> float:
+    """The width left for a line of furniture beside ``reserved`` on one baseline.
+
+    ``reserved`` is what the renderer draws at the other end of the band, in
+    practice the page number, measured in the body face because that is what
+    every page number in the app is drawn in. Returns the whole ``width`` when
+    nothing shares the baseline.
+    """
+    if not reserved:
+        return width
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    return max(0.0, width - stringWidth(reserved, BODY_FONT, size) - gap)
+
+
 def pdf_style_for_text(style: Any, text: str | None, *, base: str | None = None) -> Any:
     """Return ``style``, or a clone of it faced for a script its own face cannot draw.
 
@@ -822,6 +907,28 @@ def pdf_style_for_text(style: Any, text: str | None, *, base: str | None = None)
     if shaping:
         return style.clone(name, fontName=face, shaping=1)
     return style.clone(name, fontName=face)
+
+
+def pdf_fitted_style(style: Any, text: str | None, size: float, *, base: str | None = None) -> Any:
+    """A style for one line of furniture already measured by :func:`pdf_fit_line`.
+
+    A footer line that has to shrink is still drawn as a paragraph, because a
+    paragraph is the only route through which reportlab's shaper acts, so the
+    size the fit arrived at has to reach the style. A line that did not shrink
+    gets :func:`pdf_style_for_text` unchanged, which returns the caller's own
+    style object for Latin text and so leaves an existing document alone.
+    """
+    styled = pdf_style_for_text(style, text, base=base)
+    if size >= float(getattr(style, "fontSize", size) or size):
+        return styled
+    # Only the size changes. The leading is left where the caller set it because
+    # it cancels out: these footers place the paragraph by ``y = c - height``,
+    # which pins the top of its box, and reportlab sets the first baseline a
+    # font size below that top whatever the leading is. A fitted line never
+    # wraps, so no second line is affected either. What the smaller size does
+    # move is that baseline, by the difference between the two sizes - at most a
+    # point, upward, away from the edge of the sheet.
+    return styled.clone(f"{getattr(styled, 'name', 'Style')}-{size:g}", fontSize=size)
 
 
 def pdf_table_font_commands(

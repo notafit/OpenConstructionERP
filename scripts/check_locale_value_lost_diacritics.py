@@ -209,7 +209,12 @@ def selftest() -> int:
         ("Řízení změn", "Rizeni zmen", True, "two words, damaged in one edit"),
         ("Schůzky", "Schůzky", False, "unchanged"),
         ("Schuzky", "Schůzky", False, "a repair, not a loss"),
-        ("Řízení změn", "Sprava zmen", False, "a different word, not this rule's business"),
+        (
+            "Řízení změn",
+            "Sprava zmen",
+            False,
+            "a different word, not this rule's business",
+        ),
         ("Infrastruktura", "Infrastruktura", False, "correct with no accent to lose"),
         ("naïve", "naive", True, "a mark inside a word"),
         ("Байланыш", "Байланыш", False, "Cyrillic left alone"),
@@ -251,7 +256,11 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base", default=None, help="revision to start from (default: the most recent tag)")
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="revision to start from (default: the most recent tag)",
+    )
     parser.add_argument("--head", default="HEAD", help="revision to check (default: HEAD)")
     parser.add_argument("--selftest", action="store_true", help="check the rule and exit")
     args = parser.parse_args()

@@ -165,7 +165,17 @@ async def test_profiles_seeded_and_readable(http_client, two_tenants):
     profiles = r.json()
     keys = {p["format_key"] for p in profiles}
     assert {"generic_xml", "gaeb_x83", "cobie"} <= keys
-    assert all(p["jurisdiction"] is None for p in profiles if p["is_builtin"])
+    # Built-ins were jurisdiction-neutral to a one when this was written, and
+    # are not any more: a German Bauantrag profile now ships as a built-in and
+    # names its jurisdiction so the frontend can filter by country. So the
+    # invariant is per profile rather than blanket - the formats that are
+    # neutral by definition stay neutral, and a built-in that does name a
+    # jurisdiction names a country code rather than free text.
+    builtins = {p["format_key"]: p for p in profiles if p["is_builtin"]}
+    for neutral in ("generic_xml", "gaeb_x83", "cobie", "doc_package_xml"):
+        assert builtins[neutral]["jurisdiction"] is None, f"{neutral} is a jurisdiction-neutral format"
+    tagged = {k: p["jurisdiction"] for k, p in builtins.items() if p["jurisdiction"] is not None}
+    assert all(len(v) == 2 and v.isupper() for v in tagged.values()), tagged
 
     one = await http_client.get(f"{_BASE}/profiles/{profiles[0]['id']}/", headers=a["headers"])
     assert one.status_code == 200, one.text

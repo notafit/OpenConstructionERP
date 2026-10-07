@@ -86,7 +86,7 @@ _COBIE = _slot(
 )
 _PUNCH = _slot(
     "punch_closure",
-    "Punch / snag closure evidence",
+    "Punch list closure evidence",
     CATEGORY_PUNCH,
     source_kind="generated",
     generated_artifact="punch_closure_report",
@@ -194,7 +194,7 @@ CATEGORY_LABELS: dict[str, str] = {
     CATEGORY_ASSET_REGISTER: "Asset register / COBie",
     CATEGORY_PUNCH: "Punch closure",
     CATEGORY_INSPECTION: "Inspection certificates",
-    CATEGORY_HS: "H&S file",
+    CATEGORY_HS: "Health & safety file",
     CATEGORY_COMMISSIONING: "Commissioning",
     CATEGORY_OTHER: "Other",
 }

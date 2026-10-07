@@ -230,12 +230,19 @@ def boot(data_dir: Path | str) -> bool:
         # never carried the package, which is the opposite of what is wrong.
         from app.core.self_upgrade import repair_hint  # noqa: PLC0415
 
+        hint = repair_hint(
+            "reinstall the package: pip install --upgrade --force-reinstall "
+            "openconstructionerp, or install pixeltable-pgserver directly"
+        )
+        emit_stage(
+            "pg",
+            "fail",
+            f"The database engine is missing from this installation ({type(exc).__name__}). "
+            f"Reinstalling the application should fix this.",
+        )
         logger.error(
             "embedded PostgreSQL requested but pixeltable-pgserver is not importable (%s): %r",
-            repair_hint(
-                "reinstall the package: pip install --upgrade --force-reinstall "
-                "openconstructionerp, or install pixeltable-pgserver directly"
-            ),
+            hint,
             exc,
         )
         return False
@@ -338,6 +345,11 @@ def boot(data_dir: Path | str) -> bool:
     try:
         pgdata.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
+        emit_stage(
+            "pg",
+            "fail",
+            f"Cannot create the data directory at {pgdata.parent}: {exc}",
+        )
         logger.error("embedded PostgreSQL data dir unavailable at %s: %r", pgdata, exc)
         return False
 
@@ -416,6 +428,12 @@ def boot(data_dir: Path | str) -> bool:
     # no-ops once the cluster exists and is configured.
     _apply_ascii_locale_env()
     _pre_initialize_cluster(resolved_pgdata)
+    # _pre_initialize_cluster sets _fatal_detail when it finds a condition that
+    # no retry can fix (disk full, binary quarantined). Continuing into the
+    # retry loop would waste time on doomed attempts and overwrite the specific
+    # STAGE:pg:fail with a generic one.
+    if _fatal_detail is not None:
+        return False
     _apply_server_settings(resolved_pgdata)
 
     # Note how far the cluster's log had already grown, after the last step that
@@ -522,6 +540,11 @@ def boot(data_dir: Path | str) -> bool:
         os.environ["DATABASE_URL"] = async_url.render_as_string(hide_password=False)
         os.environ["DATABASE_SYNC_URL"] = sync_url.render_as_string(hide_password=False)
     except Exception as exc:  # noqa: BLE001
+        emit_stage(
+            "pg",
+            "fail",
+            f"The database started but could not be connected to: {type(exc).__name__}: {exc}",
+        )
         logger.error("embedded PostgreSQL booted but URL wiring failed: %r", exc)
         try:
             srv.cleanup()
@@ -1719,7 +1742,7 @@ _SETTINGS_END = "# END OpenConstructionERP settings"
 #: takes a lock on each one, so several connections doing that at once exhaust
 #: the default pool of 64 and PostgreSQL fails the statement with "out of shared
 #: memory". The extra slots cost a few megabytes, which is worth paying to keep
-#: the cluster usable on a 2 GB box.
+#: the cluster usable on a 3 GB box.
 _SERVER_SETTINGS = (("max_locks_per_transaction", "512"),)
 
 
@@ -1792,11 +1815,69 @@ def _pre_initialize_cluster(pgdata: Path) -> bool:
     # directory, so clear that first. This is what unblocks a user upgrading from
     # a build that was stuck "Recovering the local database" forever.
     _clear_incomplete_cluster(pgdata)
+
+    # Disk-space guard: initdb needs room to create the cluster (WAL, clog,
+    # timezone data). A drive with less than 500 MB free will either fail partway
+    # (leaving an incomplete cluster for the next boot to clean up) or succeed
+    # and leave no room for the first migration. Say so now rather than letting
+    # the user watch three opaque retries of a doomed initdb.
+    import shutil
+
+    global _fatal_detail
+    try:
+        free = shutil.disk_usage(pgdata.parent).free
+        if free < 500_000_000:
+            free_mb = free // 1_000_000
+            _fatal_detail = (
+                f"Not enough disk space to create the local database: {free_mb} MB free, "
+                f"at least 500 MB is needed. Free up space on the drive that holds {pgdata.parent}."
+            )
+            emit_stage("pg", "fail", _fatal_detail)
+            logger.error(
+                "disk space too low to create embedded PostgreSQL cluster: %d MB free at %s",
+                free_mb,
+                pgdata.parent,
+            )
+            return False
+    except OSError:
+        pass  # Cannot measure — proceed and let initdb fail if the disk is full.
+
     try:
         from pixeltable_pgserver.pgexec import pgexec
     except Exception as exc:  # noqa: BLE001
         logger.warning("could not import pixeltable pgexec for pre-init: %r", exc)
         return False
+
+    # Pre-flight probe: run ``initdb --version`` before the real initdb. This
+    # catches the case where the binary is quarantined by antivirus, deleted, or
+    # its permissions are wrong. The real initdb call below would also fail, but
+    # it fails with an opaque message; this probe lets us name the cause.
+    try:
+        pgexec("initdb", ("--version",))
+    except PermissionError:
+        _fatal_detail = (
+            "The database initialiser (initdb.exe) was blocked, most likely by antivirus software. "
+            "Add the application's installation folder to the antivirus exclusion list and try again."
+        )
+        emit_stage("pg", "fail", _fatal_detail)
+        logger.error(
+            "initdb --version failed with PermissionError: the binary is likely quarantined by "
+            "antivirus. The user needs to exclude the installation directory."
+        )
+        return False
+    except FileNotFoundError:
+        _fatal_detail = (
+            "The database initialiser (initdb) is missing from the installation. "
+            "Reinstalling the application should fix this."
+        )
+        emit_stage("pg", "fail", _fatal_detail)
+        logger.error("initdb --version failed with FileNotFoundError: binary not found in bundle")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        # Any other error from --version (e.g. a missing DLL) is logged but does
+        # not block: the real initdb call below will surface the full error.
+        logger.warning("initdb --version probe failed (%r); proceeding with real initdb", exc)
+
     try:
         pgexec("initdb", _initdb_args(pgdata))
     except Exception as exc:  # noqa: BLE001

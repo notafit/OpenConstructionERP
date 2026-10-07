@@ -81,7 +81,7 @@ jobs:
         # This step used to export NODE_OPTIONS with an 8192 ceiling and explain
         # at length why that number mattered. It did not matter. The build script
         # in frontend/package.json runs both tsc and vite through
-        # node --max-old-space-size=9216 on the command line, and an explicit
+        # node --max-old-space-size=12288 on the command line, and an explicit
         # flag beats NODE_OPTIONS in both directions. Measured: an environment
         # asking for 9999 alongside a flag of 1024 produces a 1216 MB heap, so
         # the flag wins even when it is the smaller of the two. Nothing written

@@ -40,7 +40,7 @@ EMBEDDED_TEXT_FALLBACK_THRESHOLD: int = 32
 # OCR rasterisation caps. ``page.get_pixmap`` has no size ceiling of its own,
 # so a large-format sheet (an A0 drawing at 150 DPI is ~35 MP) or a
 # maliciously oversized page can make a single render allocate hundreds of MB
-# and OOM a 2 GB worker. We clamp every page render so its pixmap never exceeds
+# and OOM a 3 GB worker. We clamp every page render so its pixmap never exceeds
 # ``MAX_OCR_PIXELS`` (mirroring geo_hub.raster_pipeline.MAX_RASTER_PIXELS) and
 # cap how many pages one document is OCR'd through so a 1000-page scan cannot
 # pin an OCR worker. Text OCR does not need a huge raster, so the pixel cap is

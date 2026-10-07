@@ -21,7 +21,7 @@ Coverage:
 9.  ``replay_with_new_prompt`` writes a NEW row.
 10. Subject-type polymorphism — default ``clash`` + ``clash_issue``
     promotion when the table is reachable.
-11. Concurrent triage on the same clash deduplicates (one LLM call).
+11. Concurrent triage on the same clash is serialised by the subject lock.
 12. Prior-triage context is interpolated into the user prompt on re-run.
 """
 
@@ -546,32 +546,55 @@ async def test_subject_type_promotes_to_clash_issue(session: AsyncSession) -> No
     assert row.clash_id == clash_id
 
 
-# ── 11. Concurrent triage on same clash deduplicates ───────────────────────
+# ── 11. Concurrent triage on one clash is serialised ───────────────────────
 
 
 @pytest.mark.asyncio
-async def test_concurrent_calls_deduplicate(session: AsyncSession) -> None:
-    """Two coroutines hit the same clash simultaneously → one LLM call."""
-    svc = ClashTriageService(session)
+async def test_concurrent_calls_serialise_on_the_subject_lock(session: AsyncSession) -> None:
+    """Two simultaneous requests on one clash never run the LLM side by side.
+
+    Each request gets its OWN session, which is what the dependency hands an
+    endpoint and the only shape that is legal here: driving one AsyncSession
+    from two coroutines is forbidden outright by SQLAlchemy's asyncio
+    extension ("this session is provisioning a new connection; concurrent
+    operations are not permitted"), so the single-session version of this test
+    could not pass whatever the product did - it failed in the harness before
+    reaching the lock it meant to exercise.
+
+    What ``_subject_lock`` guarantees is serialisation, and that is what is
+    asserted. It does not guarantee ONE LLM call across two requests: the lock
+    is released when ``triage_clash`` returns, which is before the caller
+    commits, so the second caller can find no committed row to reuse and pays
+    for its own call. Cache reuse is covered sequentially in section 2 above,
+    where the first row is visible by the time the second call looks.
+    """
     user_id = session.info["owner_id"]
     clash_id = session.info["clash_id"]
-    counter: dict[str, int] = {"count": 0}
+    in_flight = 0
+    peak = 0
 
     async def _slow_mock(*args, **kwargs):
-        counter["count"] += 1
-        # Hold the call open so the second coroutine is forced to wait
-        # on the per-subject lock and find the persisted row instead.
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        # Hold the call open long enough that a second caller which was NOT
+        # serialised would overlap it.
         await asyncio.sleep(0.05)
+        in_flight -= 1
         return _VALID_VERDICT_JSON, 150
 
-    with patch("app.modules.clash_ai_triage.service.call_ai", new=_slow_mock):
-        results = await asyncio.gather(
-            svc.triage_clash(clash_id, user_id=user_id),
-            svc.triage_clash(clash_id, user_id=user_id),
-        )
+    async def _request() -> tuple[uuid.UUID, uuid.UUID]:
+        async with async_session_factory() as s:
+            row = await ClashTriageService(s).triage_clash(clash_id, user_id=user_id)
+            ids = (row.id, row.subject_id)
+            await s.commit()
+            return ids
 
-    assert results[0].id == results[1].id
-    assert counter["count"] == 1  # second call hit the lock + cache
+    with patch("app.modules.clash_ai_triage.service.call_ai", new=_slow_mock):
+        first, second = await asyncio.gather(_request(), _request())
+
+    assert peak == 1, f"the per-subject lock let {peak} LLM calls run at once"
+    assert first[1] == second[1], "both requests triaged the same subject"
 
 
 # ── 12. Prior triage interpolated on re-run ────────────────────────────────

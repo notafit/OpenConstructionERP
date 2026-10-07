@@ -9,7 +9,9 @@ from typing import Any
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.events import event_bus, publish_after_commit
+# event_bus stays importable here: tests/unit/test_ncr.py patches
+# app.modules.ncr.service.event_bus.publish.
+from app.core.events import event_bus, publish_after_commit  # noqa: F401
 from app.core.json_merge import merge_metadata
 from app.modules.ncr.models import NCR
 from app.modules.ncr.repository import NCRRepository
@@ -37,12 +39,63 @@ class NCRService:
         self.session = session
         self.repo = NCRRepository(session)
 
+    async def _check_change_order(self, project_id: uuid.UUID, change_order_id: str) -> str:
+        """Return *change_order_id* normalised, or 400 unless it is a change order of the project.
+
+        ``change_order_id`` is a plain ``VARCHAR(36)`` with no foreign key. A
+        database foreign key is deliberately not added: running installs
+        already hold free strings in the column, the boot heal would add the
+        key ``NOT VALID`` over them (such a row can never be repointed), and
+        the change orders table belongs to another module. So the link is
+        checked here, on every write that names one.
+        """
+        try:
+            order_uuid = uuid.UUID(str(change_order_id).strip())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="change_order_id is not a change order id",
+            ) from exc
+        # Lazy import: ncr stays loadable without the changeorders module. With
+        # that module disabled or not installed there is nothing to link to, and
+        # the write is refused as a 400 that says so rather than failing as a 500
+        # on the import or on a table that was never created.
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.core.module_loader import module_loader  # noqa: PLC0415
+
+        unavailable = HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Change orders are not enabled, so this NCR cannot be linked to one",
+        )
+        # A process that loaded no modules (a script, a unit test) has nothing
+        # to filter by; the running app has loaded every enabled one.
+        if module_loader.loaded_modules and not module_loader.is_enabled("oe_changeorders"):
+            raise unavailable
+        try:
+            from app.modules.changeorders.models import ChangeOrder  # noqa: PLC0415
+        except ImportError as exc:
+            raise unavailable from exc
+
+        found = await self.session.scalar(
+            select(ChangeOrder.id).where(ChangeOrder.id == order_uuid, ChangeOrder.project_id == project_id)
+        )
+        if found is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Change order not found in this project",
+            )
+        return str(order_uuid)
+
     async def create_ncr(
         self,
         data: NCRCreate,
         user_id: str | None = None,
     ) -> NCR:
         """Create a new NCR with auto-generated number."""
+        change_order_id = data.change_order_id or None
+        if change_order_id:
+            change_order_id = await self._check_change_order(data.project_id, change_order_id)
         ncr = NCR(
             project_id=data.project_id,
             title=data.title,
@@ -61,7 +114,7 @@ class NCRService:
             location_lon=data.location_lon,
             location_accuracy_m=data.location_accuracy_m,
             linked_inspection_id=data.linked_inspection_id,
-            change_order_id=data.change_order_id,
+            change_order_id=change_order_id,
             created_by=user_id,
             metadata_=data.metadata,
         )
@@ -199,6 +252,10 @@ class NCRService:
             )
 
         fields: dict[str, Any] = data.model_dump(exclude_unset=True)
+        # Checked only when it changes: a row written before the check may hold
+        # a free string, and echoing it back on an unrelated edit must not fail.
+        if fields.get("change_order_id") and fields["change_order_id"] != ncr.change_order_id:
+            fields["change_order_id"] = await self._check_change_order(ncr.project_id, fields["change_order_id"])
         # Merge a partial metadata patch into the existing column instead of
         # replacing it wholesale - a PATCH touching one key must not wipe the
         # rest. NCRs are auto-created with source/report tracking keys in
@@ -266,7 +323,16 @@ class NCRService:
         return ncr
 
     async def delete_ncr(self, ncr_id: uuid.UUID) -> None:
-        await self.get_ncr(ncr_id)
+        ncr = await self.get_ncr(ncr_id)
+        # A closed NCR is the verified record update_ncr freezes, and a void
+        # one is how an NCR raised in error leaves the register. Change orders
+        # and MoC entries reference both by id, so they are kept.
+        if ncr.status in ("closed", "void"):
+            remedy = "" if ncr.status == "closed" else " Voiding already takes it out of the open register."
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot delete a {ncr.status} NCR: it is kept as the quality record.{remedy}",
+            )
         await self.repo.delete(ncr_id)
         logger.info("NCR deleted: %s", ncr_id)
 
@@ -328,9 +394,12 @@ class NCRService:
 
         logger.info("NCR closed: %s", ncr_id)
 
-        # Emit event for variation creation when cost impact exists
+        # Emit event for variation creation when cost impact exists. Deferred
+        # to the commit: the change orders subscriber reads this NCR from its
+        # own session and must see it closed.
         if ncr.cost_impact:
-            event_bus.publish_detached(
+            publish_after_commit(
+                self.session,
                 "ncr.closed_with_cost_impact",
                 {
                     "ncr_id": str(ncr.id),

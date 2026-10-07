@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
@@ -62,6 +62,7 @@ class PortalUserInvite(BaseModel):
     language: str = Field(default="en", min_length=2, max_length=10)
     timezone: str = Field(default="UTC", max_length=64)
     redirect_path: str | None = Field(default=None, max_length=512)
+    send_email: bool = Field(default=True, description="Email the invitation link when mail is configured.")
 
 
 class PortalUserResponse(BaseModel):
@@ -129,9 +130,16 @@ class PortalUserInviteResponse(BaseModel):
 
     user: PortalUserResponse
     magic_link_token: str = Field(
-        description="Plaintext one-time token - caller must email this to the user",
+        description=(
+            "Plaintext one-time token. The server emails it when mail is configured; "
+            "the staff screen still offers it as a copy-link either way."
+        ),
     )
     magic_link_expires_at: datetime
+    email_status: Literal["sent", "failed", "not_configured", "not_requested"] = Field(
+        default="not_requested",
+        description="What happened to the invitation email, so the screen can say whether to copy the link.",
+    )
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -360,6 +368,8 @@ class PortalInvoiceEntry(BaseModel):
     currency_code: str = ""
     amount_total: Decimal | None = None
     status: str = ""
+    is_overdue: bool = False
+    days_overdue: int | None = Field(default=None, description="Whole days past the due date, when overdue.")
 
 
 class PortalInvoiceList(BaseModel):
@@ -423,6 +433,75 @@ class PortalProgressReportList(BaseModel):
 
     items: list[PortalProgressReportEntry] = Field(default_factory=list)
     total: int = 0
+
+
+class PortalMilestoneEntry(BaseModel):
+    """A schedule milestone a person marked for the client.
+
+    Only what the client needs: the name, the date it was planned for, the
+    date the schedule now expects, and whether it is done or running late.
+    Dependencies, float, resources and costs stay internal.
+    """
+
+    id: UUID
+    name: str
+    planned_date: str
+    expected_date: str
+    status: str
+    is_done: bool = False
+    is_late: bool = Field(default=False, description="Not done and its expected date has passed.")
+    days_until: int = Field(description="Days from today to the expected date; negative when late.")
+
+
+class PortalMilestoneList(BaseModel):
+    """Late milestones and the ones expected within the window, soonest first."""
+
+    items: list[PortalMilestoneEntry] = Field(default_factory=list)
+    window_days: int
+
+
+class PortalPaymentPlanLine(BaseModel):
+    """One instalment a person marked for the client.
+
+    The client sees what is owed, when, and how far the date moved. Claims,
+    notes, metadata, validation findings and the schedule links stay internal.
+    ``status`` is ``upcoming``, ``due``, ``invoiced``, ``paid`` or ``overdue``.
+    """
+
+    id: UUID
+    sequence: int
+    label: str
+    amount: Decimal
+    percent_of_contract: Decimal | None = None
+    status: str
+    milestone_name: str
+    forecast_due_date: str | None = None
+    original_due_date: str | None = None
+    days_moved: int | None = Field(default=None, description="Days the due date moved from the contract's date.")
+    days_until: int | None = Field(default=None, description="Days to the due date, while it is still ahead.")
+    days_overdue: int | None = Field(default=None, description="Days past the due date, while it is unpaid.")
+
+
+class PortalPaymentPlanContract(BaseModel):
+    """A client contract's visible instalments and what they add up to.
+
+    ``paid_total`` and ``outstanding_total`` add up the visible lines only, so
+    the figures always match the rows the client is shown.
+    """
+
+    contract_id: UUID
+    contract_title: str
+    currency: str
+    contract_total: Decimal
+    paid_total: Decimal
+    outstanding_total: Decimal
+    lines: list[PortalPaymentPlanLine] = Field(default_factory=list)
+
+
+class PortalPaymentPlanResponse(BaseModel):
+    """The payment plans of a project's client contracts the caller may see."""
+
+    items: list[PortalPaymentPlanContract] = Field(default_factory=list)
 
 
 class PortalProjectSummary(BaseModel):

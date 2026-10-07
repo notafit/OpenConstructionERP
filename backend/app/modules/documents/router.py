@@ -29,7 +29,6 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import FileResponse
 
-from app.core.bulk_ops import BulkDeleteRequest
 from app.core.demo_placeholders import materialize_placeholder
 from app.core.i18n import get_locale
 from app.core.rate_limiter import upload_limiter
@@ -45,10 +44,14 @@ from app.dependencies import (
 from app.modules.documents.schemas import (
     DocumentActivityListResponse,
     DocumentActivityResponse,
+    DocumentBatchDeleteRequest,
+    DocumentBatchReferencesRequest,
+    DocumentBatchReferencesResponse,
     DocumentBIMLinkCreate,
     DocumentBIMLinkListResponse,
     DocumentBIMLinkResponse,
     DocumentListResponse,
+    DocumentReferencesResponse,
     DocumentResponse,
     DocumentSummary,
     DocumentUpdate,
@@ -65,6 +68,7 @@ from app.modules.documents.schemas import (
     SheetCompletenessRequest,
     SheetCompletenessResponse,
     SheetListResponse,
+    SheetRereadSummary,
     SheetResponse,
     SheetUpdate,
     SheetVersionHistory,
@@ -201,6 +205,8 @@ async def upload_document(
     session: SessionDep,
     project_id: uuid.UUID = Query(...),
     category: str = Query(default="other"),
+    revision_code: str | None = Query(default=None, max_length=20),
+    drawing_number: str | None = Query(default=None, max_length=100),
     file: UploadFile = File(...),
     content_length: int | None = Header(default=None),
     user_id: CurrentUserId = "",  # type: ignore[assignment]
@@ -245,6 +251,13 @@ async def upload_document(
     # No upload size cap - per product policy.
     try:
         doc = await service.upload_document(project_id, file, category, user_id)
+        if revision_code is not None:
+            doc.revision_code = revision_code
+        if drawing_number is not None:
+            doc.drawing_number = drawing_number
+        if revision_code is not None or drawing_number is not None:
+            session.add(doc)
+            await session.flush()
         return _doc_to_response(doc)
     except HTTPException:
         raise
@@ -1042,6 +1055,24 @@ async def split_pdf(
         )
 
 
+@router.post("/sheets/reread-title-blocks/", response_model=SheetRereadSummary)
+async def reread_title_blocks(
+    session: SessionDep,
+    project_id: uuid.UUID = Query(...),
+    user_id: CurrentUserId = "",  # type: ignore[assignment]
+    _perm: None = Depends(RequirePermission("documents.update")),
+    service: SheetService = Depends(_get_sheet_service),
+) -> SheetRereadSummary:
+    """Read every sheet's title block again from the PDF already stored.
+
+    For a register imported before the title block reader was fixed: the
+    fields it got wrong are read again and the revision stacks rebuilt, with
+    no re-upload. A field somebody corrected by hand is left alone.
+    """
+    await verify_project_access(project_id, user_id, session)
+    return SheetRereadSummary.model_validate(await service.reread_title_blocks(project_id))
+
+
 # ── Sheet completeness (drawing index reconciliation) ──────────────────
 
 
@@ -1077,7 +1108,7 @@ async def check_sheet_completeness(
         msg = str(exc)
         # "not found" is an IDOR-safe 404 (missing or foreign index document);
         # every other ValueError is bad/unreadable input -> 422.
-        code = status.HTTP_404_NOT_FOUND if "not found" in msg.lower() else status.HTTP_422_UNPROCESSABLE_ENTITY
+        code = status.HTTP_404_NOT_FOUND if "not found" in msg.lower() else status.HTTP_422_UNPROCESSABLE_CONTENT
         raise HTTPException(status_code=code, detail=msg) from exc
     return SheetCompletenessResponse.model_validate(result)
 
@@ -1210,7 +1241,7 @@ async def list_bim_links(
     """
     if (element_id is None) == (document_id is None):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Exactly one of 'element_id' or 'document_id' must be provided",
         )
 
@@ -1344,20 +1375,114 @@ async def delete_bim_link(
 # ══════════════════════════════════════════════════════════════════════════
 
 
+async def _readable_document_ids(
+    session,  # type: ignore[no-untyped-def]
+    user_id: str,
+    ids: list[uuid.UUID],
+) -> list[uuid.UUID]:
+    """The subset of ``ids`` the caller could open one by one.
+
+    Applies the guard ``GET /{document_id}/references`` applies to a single
+    document - project membership, then folder read - so asking about a batch
+    never reveals more than asking about each document would. Ids the caller
+    cannot see are dropped silently, the batch analogue of that endpoint's
+    404. Membership and folder access are resolved once per project and
+    folder, not once per document.
+    """
+    from sqlalchemy import select as _select
+
+    from app.modules.documents.folder_permissions_service import (
+        folder_access_for,
+        kind_and_path_for_document,
+    )
+    from app.modules.documents.models import Document
+
+    rows = (
+        await session.execute(_select(Document.id, Document.project_id, Document.category).where(Document.id.in_(ids)))
+    ).all()
+
+    project_ok: dict[uuid.UUID, bool] = {}
+    folder_ok: dict[tuple[uuid.UUID, str, str | None], bool] = {}
+    caller = uuid.UUID(str(user_id))
+    readable: list[uuid.UUID] = []
+    for doc_id, project_id, category in rows:
+        if project_id not in project_ok:
+            try:
+                await _verify_project_membership_or_404(project_id, user_id, session)
+                project_ok[project_id] = True
+            except HTTPException:
+                project_ok[project_id] = False
+        if not project_ok[project_id]:
+            continue
+        kind, path = kind_and_path_for_document(category)
+        folder_key = (project_id, kind, path)
+        if folder_key not in folder_ok:
+            role = await folder_access_for(
+                session,
+                project_id=project_id,
+                user_id=caller,
+                scope_kind=kind,
+                scope_path=path,
+            )
+            folder_ok[folder_key] = role is not None
+        if folder_ok[folder_key]:
+            readable.append(doc_id)
+    # Keep the caller's order, which is the order the selection was made in.
+    order = {doc_id: index for index, doc_id in enumerate(ids)}
+    readable.sort(key=lambda doc_id: order.get(doc_id, len(order)))
+    return readable
+
+
+@router.post(
+    "/batch/references/",
+    response_model=DocumentBatchReferencesResponse,
+)
+async def batch_document_references(
+    body: DocumentBatchReferencesRequest,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    service: DocumentService = Depends(_get_service),
+) -> DocumentBatchReferencesResponse:
+    """Report what still points at any document of a bulk delete.
+
+    The bulk counterpart of ``GET /{document_id}/references``, read before a
+    multi-file delete so its prompt can say what the whole delete severs.
+    Read-only, and guarded per document exactly like the single endpoint:
+    documents the caller cannot open are left out rather than refused, and
+    ``checked`` says how many were looked at.
+    """
+    readable = await _readable_document_ids(session, str(user_id), list(body.ids))
+    return await service.get_references_batch(readable)
+
+
 @router.post(
     "/batch/delete/",
     status_code=200,
     dependencies=[Depends(RequirePermission("documents.delete"))],
 )
 async def batch_delete_documents(
-    body: BulkDeleteRequest,
+    body: DocumentBatchDeleteRequest,
     user_id: CurrentUserId,
     session: SessionDep,
+    service: DocumentService = Depends(_get_service),
 ) -> dict:
-    """Delete multiple documents in one request."""
+    """Delete multiple documents in one request.
+
+    Before anything is removed the batch is checked for rows elsewhere in the
+    platform that still point at its documents, the same report
+    ``POST /batch/references/`` gives. If any of them would be stranded or
+    unlinked and the request did not set ``acknowledge_references``, nothing
+    is deleted and the answer is 409 with that report under
+    ``detail.references``. Rows that only retain the id (append-only audit,
+    takeoff's own copy of the file) are reported but do not need the
+    acknowledgement, because they lose nothing. A batch nothing points at is
+    deleted as before, so existing callers see no change there.
+
+    The report of what was severed is returned with the deletion count either
+    way, so the caller can say afterwards what the delete cost.
+    """
     from sqlalchemy import select as _select
 
-    from app.core.bulk_ops import bulk_delete
     from app.modules.documents.models import Document
     from app.modules.projects.repository import ProjectRepository
 
@@ -1365,35 +1490,42 @@ async def batch_delete_documents(
     owned_projects, _ = await proj_repo.list_for_user(owner_id=user_id, offset=0, limit=10000, exclude_archived=False)
     owned_project_ids = {str(p.id) for p in owned_projects}
 
-    rows = (
-        await session.execute(_select(Document.id, Document.project_id, Document.name).where(Document.id.in_(body.ids)))
-    ).all()
-    allowed = [r[0] for r in rows if str(r[1]) in owned_project_ids]
-    name_by_id = {r[0]: r[2] for r in rows if str(r[1]) in owned_project_ids}
+    rows = (await session.execute(_select(Document.id, Document.project_id).where(Document.id.in_(body.ids)))).all()
+    allowed = list(dict.fromkeys(r[0] for r in rows if str(r[1]) in owned_project_ids))
 
-    # Audit log BEFORE the bulk delete so the rows still reference a
-    # live document_id. The FK cascade wipes them along with the parent,
-    # so retention is best-effort; the event-bus publish carries the
-    # same payload for external audit collectors.
-    from app.modules.documents.activity_service import record_activity
-
-    for doc_id in allowed:
-        await record_activity(
-            session,
-            doc_id,
-            str(user_id) if user_id else None,
-            "deleted",
-            {"name": name_by_id.get(doc_id, ""), "batch": True},
+    references = await service.get_references_batch(allowed)
+    if references.severs and not body.acknowledge_references:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "document_references",
+                "message": translate("errors.documents_batch_delete_referenced", locale=get_locale()),
+                "references": references.model_dump(mode="json"),
+            },
         )
 
-    deleted = await bulk_delete(session, Document, allowed)
+    # Each document goes through the same delete the single endpoint uses.
+    # A bare bulk DELETE of the rows skipped everything around it: no
+    # ``documents.document.deleted`` (so the file-reference purge and the
+    # search index never heard of it), no takeoff copy of a blob it still
+    # reads, and the file left on disk for good. ``batch=True`` holds the
+    # deleted event and every file removal until this request commits, so a
+    # failure on a later document rolls back to a state with nothing missing.
+    actor = str(user_id) if user_id else None
+    for doc_id in allowed:
+        await service.delete_document(doc_id, user_id=actor, batch=True)
+    deleted = len(allowed)
     logger.info(
         "Bulk delete documents: requested=%d deleted=%d user=%s",
         len(body.ids),
         deleted,
         user_id,
     )
-    return {"requested": len(body.ids), "deleted": deleted}
+    return {
+        "requested": len(body.ids),
+        "deleted": deleted,
+        "references": references.model_dump(mode="json"),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1793,6 +1925,7 @@ async def upload_document_revision(
     session: SessionDep,
     file: UploadFile = File(...),
     notes: str | None = Form(default=None),
+    revision_code: str | None = Form(default=None),
     user_id: CurrentUserId = "",  # type: ignore[assignment]
     _perm: None = Depends(RequirePermission("documents.update")),
     service: DocumentService = Depends(_get_service),
@@ -1855,6 +1988,10 @@ async def upload_document_revision(
 
     try:
         doc = await service.upload_document_revision(document_id, file, str(user_id) if user_id else "", notes=notes)
+        if revision_code is not None:
+            doc.revision_code = revision_code
+            session.add(doc)
+            await session.flush()
         return _doc_to_response(doc)
     except HTTPException:
         raise
@@ -1867,6 +2004,46 @@ async def upload_document_revision(
 
 
 # ── Delete ───────────────────────────────────────────────────────────────────
+
+
+@router.get("/{document_id}/references", response_model=DocumentReferencesResponse)
+async def get_document_references(
+    document_id: uuid.UUID,
+    user_id: CurrentUserId,
+    session: SessionDep,
+    service: DocumentService = Depends(_get_service),
+) -> DocumentReferencesResponse:
+    """Report what still points at a document, so a delete can be informed.
+
+    Read-only and advisory. ``DELETE /{document_id}`` does not consult it and
+    is not blocked by it: the links counted here are severable on purpose
+    (``CloseoutBinding`` says so in as many words), so the call belongs to
+    the person confirming rather than to the server.
+
+    Guarded exactly like ``GET /{document_id}`` - project membership plus
+    folder read - because it says no more about the document than reading it
+    already does.
+    """
+    doc = await service.get_document(document_id)
+    await _verify_project_membership_or_404(doc.project_id, user_id, session)
+
+    from app.modules.documents.folder_permissions_service import (
+        folder_access_for,
+        kind_and_path_for_document,
+        require_read,
+    )
+
+    kind, path = kind_and_path_for_document(doc.category)
+    role = await folder_access_for(
+        session,
+        project_id=doc.project_id,
+        user_id=uuid.UUID(str(user_id)),
+        scope_kind=kind,
+        scope_path=path,
+    )
+    require_read(role)
+
+    return await service.get_references(document_id)
 
 
 @router.delete("/{document_id}", status_code=204)

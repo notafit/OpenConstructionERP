@@ -135,7 +135,7 @@ def register_file_approvals_notification_subscribers() -> None:
     Idempotent - the event bus deduplicates handlers by identity.
     """
     for event_name, handler in _FILE_APPROVAL_SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications/FileApprovals: subscribed to %d document-approval event(s)",
         len(_FILE_APPROVAL_SUBSCRIPTIONS),

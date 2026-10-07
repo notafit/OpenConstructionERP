@@ -91,6 +91,36 @@ repos:
         pass_filenames: false
         files: ^(backend/pyproject\.toml|frontend/package\.json|CHANGELOG\.md|frontend/src/features/about/Changelog\.tsx)$
 
+      # The two changelogs against each other, which is a different question
+      # from the one above and is silent in exactly the case that matters.
+      # version-sync-check reads the top of each file, but only to compare it
+      # with the version literal in pyproject. When a release is written into
+      # one changelog and forgotten in the other, the forgotten file simply
+      # does not mention it, and a comparison against a version literal has no
+      # drift to see. Twelve commits landed after 17.7.1 with no [Unreleased]
+      # section in either file and every gate in the tree stayed green.
+      #
+      # It runs on a commit rather than only in the lane because it costs about
+      # a second and is scoped to the two files it reads, so a commit touching
+      # neither never pays for it. A changelog is also the one thing easiest to
+      # fix while the change is still in front of you and hardest to
+      # reconstruct a week later from a lane that went red after the push.
+      - id: changelog-mirror-check
+        name: Check the two changelogs tell the same story
+        entry: python scripts/check_changelog_mirror.py
+        language: system
+        pass_filenames: false
+        files: ^(CHANGELOG\.md|frontend/src/features/about/Changelog\.tsx)$
+
+      # Parse both the page on disk and the exact staged version. A release
+      # note with an unescaped apostrophe must fail before the full build.
+      - id: changelog-syntax-check
+        name: Check the release page parses as TSX
+        entry: node frontend/scripts/check-changelog-syntax.mjs --index
+        language: system
+        pass_filenames: false
+        files: ^frontend/(src/features/about/Changelog\.tsx|scripts/check-changelog-syntax\.mjs)$
+
       # backend/NOTICE is a byte copy of the root NOTICE, carried because PEP 639
       # cannot reach outside the project root. Nothing local stopped an edit
       # landing on one side alone: the enforcement was a pytest in the backend

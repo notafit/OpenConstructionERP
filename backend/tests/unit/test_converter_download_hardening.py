@@ -28,6 +28,7 @@ import pytest
 from app.modules.takeoff.router import (
     _ALLOWED_DOWNLOAD_HOSTS,
     _MAX_DOWNLOAD_BYTES,
+    _MAX_INSTALL_BYTES,
     _check_download_url_allowed,
     _download_one_file,
     _verify_pe_executable,
@@ -129,11 +130,29 @@ class _FakeResponse:
 def test_size_cap_constant_is_reasonable() -> None:
     """If someone bumps the cap to a stupid value, fail loudly.
 
-    256 MB <= cap <= 2 GB is the sane band — the largest single
-    legitimate file today is the ~140 MB IfcExporter.exe and 2 GB is
-    the SQLite blob ceiling.
+    The floor is the largest file the installer legitimately pulls. The
+    declaration site puts that at the ~140 MB IfcExporter.exe and sets the
+    cap at roughly three times it, so a cap under 256 MB would have stopped
+    leaving room for a converter that grew rather than for an attack.
+
+    The ceiling is ``_MAX_INSTALL_BYTES``, the cumulative cap on one
+    install. It is enforced on the same bytes this cap is, per chunk in the
+    .deb path and per completed file in the repo path, so a per-file cap
+    above it can never fire: the running total trips first and the per-file
+    check becomes decoration. Deriving the bound from that constant rather
+    than repeating a number also means the two cannot drift apart.
+
+    This band used to be justified by the SQLite blob ceiling, which is
+    worth recording rather than quietly deleting, because it was not merely
+    out of date. These bytes never reach a database at all.
+    ``_download_one_file`` opens a path under ``~/.openestimator/converters/``
+    and writes chunks to a file descriptor, so no storage engine's blob
+    limit was ever the constraint on it. SQLite going away in 6.6.0 is why
+    the sentence reads as dead today; it was describing the wrong thing
+    before that, and the number it named survived only because nothing
+    depended on the reason being true.
     """
-    assert 256 * 1024 * 1024 <= _MAX_DOWNLOAD_BYTES <= 2 * 1024 * 1024 * 1024
+    assert 256 * 1024 * 1024 <= _MAX_DOWNLOAD_BYTES <= _MAX_INSTALL_BYTES
 
 
 def test_streaming_cap_rejects_oversized_content_length(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -5,6 +5,7 @@
 Endpoints:
     POST  /validation/run                    - Run validation on a BOQ
     POST  /validation/import-ids             - Import IDS rules (multipart upload)
+    GET   /validation/portfolio-status/      - Latest status of every estimate, all projects
     GET   /validation/reports?project_id=X   - List validation reports
     GET   /validation/reports/{report_id}    - Get single report
     GET   /validation/reports/{id}/sarif     - Export report as SARIF v2.1.0 JSON
@@ -14,8 +15,10 @@ Endpoints:
     GET   /validation/rule-sets              - List available rule sets
 """
 
+import asyncio
 import logging
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -34,6 +37,7 @@ from app.modules.validation.schemas import (
     CheckBIMModelRequest,
     RunValidationRequest,
     RunValidationResponse,
+    ValidationPortfolioResponse,
     ValidationReportResponse,
     ValidationResultItem,
 )
@@ -350,6 +354,33 @@ async def get_bim_scorecard_trend(
         ) from exc
 
 
+# ── GET /portfolio-status - Latest status of every estimate, all projects ─
+
+
+@router.get(
+    "/portfolio-status/",
+    response_model=ValidationPortfolioResponse,
+    summary="Validation status across projects",
+    description=(
+        "For every live project the caller can open, the validation verdict of each estimate in its "
+        "bill register, with the project's worst state on top. An estimate's verdict rests on every "
+        "report that is still the newest for one of the rule sets it ran, so a narrower later run does "
+        "not clear an older broader run's findings. Reads stored reports only and never runs "
+        "validation. An estimate without a report, or whose reports checked nothing, is "
+        "'not_validated', never 'passed'."
+    ),
+    dependencies=[Depends(RequirePermission("validation.read"))],
+)
+async def portfolio_status(
+    user_id: CurrentUserId,
+    session: SessionDep,
+) -> ValidationPortfolioResponse:
+    """Cross-project validation status, sorted worst first."""
+    from app.modules.validation.portfolio import build_portfolio_status
+
+    return await build_portfolio_status(session, user_id)
+
+
 # ── GET /reports - List validation reports ───────────────────────────────
 
 
@@ -465,7 +496,7 @@ async def import_ids(
         rules = parse_ids(payload)
     except IDSImportError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
 
@@ -541,6 +572,22 @@ def _export_filename(report: ValidationReport, ext: str) -> str:
     return f"validation_{base or 'report'}.{ext}"
 
 
+def _report_snapshot(report: ValidationReport) -> SimpleNamespace:
+    """Detached copy of the report fields the CSV / XLSX exporters read.
+
+    The exporters run in a worker thread and duck-type the report, so they get
+    this plain copy instead of the live ORM row.
+    """
+    return SimpleNamespace(
+        id=getattr(report, "id", ""),
+        target_type=getattr(report, "target_type", ""),
+        target_id=getattr(report, "target_id", ""),
+        rule_set=getattr(report, "rule_set", ""),
+        created_at=getattr(report, "created_at", None),
+        results=list(getattr(report, "results", []) or []),
+    )
+
+
 @router.get(
     "/reports/{report_id}/export.csv",
     dependencies=[Depends(RequirePermission("validation.read"))],
@@ -558,7 +605,9 @@ async def export_report_csv(
     by the exporter.
     """
     report = await _require_report_access(session, report_id, user_id)
-    blob = report_to_csv(report)
+    # Writing the file walks every finding and is pure CPU, so it runs in a
+    # worker thread instead of holding up every other request on the event loop.
+    blob = await asyncio.to_thread(report_to_csv, _report_snapshot(report))
     filename = _export_filename(report, "csv")
     return Response(
         content=blob,
@@ -585,7 +634,9 @@ async def export_report_xlsx(
     only the serialisation differs.
     """
     report = await _require_report_access(session, report_id, user_id)
-    blob = report_to_xlsx(report)
+    # Writing the workbook walks every finding and is pure CPU, so it runs in a
+    # worker thread instead of holding up every other request on the event loop.
+    blob = await asyncio.to_thread(report_to_xlsx, _report_snapshot(report))
     filename = _export_filename(report, "xlsx")
     return Response(
         content=blob,

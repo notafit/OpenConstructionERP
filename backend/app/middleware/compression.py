@@ -13,7 +13,7 @@ under a tenth of a second.
 Starlette ships ``GZipMiddleware`` and it would do most of this, but it
 compresses by content length alone. That means it also spends CPU on PDF
 exports, GAEB archives and photo bytes, which are already compressed and come
-out slightly larger, and it buffers streaming responses to do it. On a 2 GB VPS
+out slightly larger, and it buffers streaming responses to do it. On a 3 GB server
 that is the wrong trade, so this one asks what the body is before it spends
 anything: text compresses, everything else is passed through untouched.
 

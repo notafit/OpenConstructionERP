@@ -1,0 +1,26 @@
+{
+  "rule_pack_id": "cte",
+  "name": "CTE — Codigo Tecnico de la Edificacion",
+  "standard": "CTE (R.D. 314/2006, updated 2019)",
+  "jurisdiction": "ES",
+  "description": "Validates project documentation against the Codigo Tecnico de la Edificacion (CTE). Checks compliance documentation for DB-SE (structural safety), DB-SI (fire safety), DB-SUA (safety of use and accessibility), DB-HS (health / hygiene), DB-HR (noise protection), and DB-HE (energy saving). Verifies that the declared climate zone and building use are consistent with the applicable CTE requirements.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "cte.building_use_classified",
+    "cte.climate_zone_declared",
+    "cte.db_se_structural_safety_documented",
+    "cte.db_se_ae_seismic_actions_if_applicable",
+    "cte.db_si_fire_safety_documented",
+    "cte.db_si_sector_incendio_size_check",
+    "cte.db_si_evacuacion_documented",
+    "cte.db_sua_accessibility_documented",
+    "cte.db_hs_salubridad_documented",
+    "cte.db_hr_noise_protection_documented",
+    "cte.db_he_energy_saving_documented",
+    "cte.db_he0_consumo_energetico_limit",
+    "cte.db_he1_demanda_energetica_limit",
+    "cte.certificado_energetico_referenced"
+  ],
+  "regulator": "Ministerio de Transportes y Movilidad Sostenible",
+  "publication_year": 2019
+}

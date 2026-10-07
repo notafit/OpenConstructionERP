@@ -122,6 +122,50 @@ function naturalFractionDigits(code: string): number {
 }
 
 /**
+ * Formatter instances, reused across calls.
+ *
+ * Building an `Intl.NumberFormat` costs tens of microseconds, formatting with
+ * one costs well under one. The BOQ grid formats money in every visible cell,
+ * in the rate and total tooltips and in the footer on every refresh, and a
+ * refresh follows every save, so a fresh instance per call was a measurable
+ * part of the pause after entering a price. An instance is immutable and its
+ * output depends only on the locale and the options, so one per distinct set
+ * is exact.
+ *
+ * Bounded so a caller that varies its options freely cannot grow it without
+ * limit; clearing it only costs rebuilding the few instances actually in use.
+ */
+const numberFormatCache = new Map<string, Intl.NumberFormat>();
+const NUMBER_FORMAT_CACHE_LIMIT = 256;
+
+/**
+ * The formatter `build` makes, built once per `key` and reused after that.
+ *
+ * `key` must name the call site and every input the formatter is built from:
+ * the locale and each value that ends up in the options. Two calls that share
+ * a key get the same instance, so a key that leaves an input out would serve
+ * one caller's format to another. Starting it with the call site's own name
+ * keeps two sites with different options apart.
+ *
+ * The constructor stays at the call site, inside `build`, on purpose. The
+ * source gates in `shared/lib/__tests__` read every `new Intl.NumberFormat(`
+ * where it is written - which locale it is built on, which currency, which
+ * digit bounds - and a helper that took the options and built the formatter
+ * itself would hide every one of those sites from them.
+ *
+ * If `build` throws (a malformed locale tag), nothing is cached and the error
+ * reaches the caller, whose own fallback keeps working.
+ */
+export function reuseNumberFormat(key: string, build: () => Intl.NumberFormat): Intl.NumberFormat {
+  const cached = numberFormatCache.get(key);
+  if (cached) return cached;
+  const created = build();
+  if (numberFormatCache.size >= NUMBER_FORMAT_CACHE_LIMIT) numberFormatCache.clear();
+  numberFormatCache.set(key, created);
+  return created;
+}
+
+/**
  * Minor units of `code`, for callers that render money themselves.
  *
  * `formatCurrency` is the right answer whenever the caller can hand over the
@@ -217,13 +261,15 @@ export function formatCompactCurrency(
   const whole = { minimumFractionDigits: 0, maximumFractionDigits: 0 };
   if (Math.abs(amount) < 1000) return formatCurrency(amount, code, loc, whole);
   try {
-    return new Intl.NumberFormat(loc, {
+    // The key names every input of the options below; see reuseNumberFormat.
+    const key = `formatCompactCurrency|${loc}|${isValid ? code : ''}`;
+    return reuseNumberFormat(key, () => new Intl.NumberFormat(loc, {
       notation: 'compact',
       compactDisplay: 'short',
       minimumFractionDigits: 0,
       maximumFractionDigits: 1,
       ...(isValid ? { style: 'currency' as const, currency: code } : {}),
-    }).format(amount);
+    })).format(amount);
   } catch {
     // A malformed locale tag, the same case formatCurrency guards against.
     return formatCurrency(amount, code, loc, whole);
@@ -250,11 +296,15 @@ export function formatCurrency(
   const digits = resolveFractionDigits(options, { minimum: natural, maximum: natural });
 
   try {
-    return new Intl.NumberFormat(loc, {
+    // The key names every input of the options below; see reuseNumberFormat.
+    const key =
+      `formatCurrency|${loc}|${isValid ? code : ''}|${options?.signDisplay ?? ''}` +
+      `|${digits.minimumFractionDigits}|${digits.maximumFractionDigits}`;
+    return reuseNumberFormat(key, () => new Intl.NumberFormat(loc, {
       ...(isValid ? { style: 'currency' as const, currency: code } : {}),
       ...(options?.signDisplay ? { signDisplay: options.signDisplay } : {}),
       ...digits,
-    }).format(amount);
+    })).format(amount);
   } catch {
     // Defence in depth. The digit pair is now valid by construction, which
     // leaves a malformed `locale` tag as the only RangeError Intl can still

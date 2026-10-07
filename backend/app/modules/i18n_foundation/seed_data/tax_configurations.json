@@ -72,6 +72,23 @@
       "fr": "TVA taux normal"
     },
     "tax_code": "VAT",
+    "rate_pct": "7.7",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2018-01-01",
+    "effective_to": "2023-12-31",
+    "is_default": true
+  },
+  {
+    "country_code": "CH",
+    "tax_name": "VAT Standard",
+    "tax_name_translations": {
+      "en": "VAT Standard",
+      "de": "MWST Normalsatz",
+      "fr": "TVA taux normal"
+    },
+    "tax_code": "VAT",
     "rate_pct": "8.1",
     "tax_type": "vat",
     "combination": "national",
@@ -89,12 +106,45 @@
       "fr": "TVA taux réduit"
     },
     "tax_code": "VAT_REDUCED",
+    "rate_pct": "2.5",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2018-01-01",
+    "effective_to": "2023-12-31",
+    "is_default": false
+  },
+  {
+    "country_code": "CH",
+    "tax_name": "VAT Reduced",
+    "tax_name_translations": {
+      "en": "VAT Reduced",
+      "de": "MWST reduzierter Satz",
+      "fr": "TVA taux réduit"
+    },
+    "tax_code": "VAT_REDUCED",
     "rate_pct": "2.6",
     "tax_type": "vat",
     "combination": "national",
     "subdivision_code": null,
     "effective_from": "2024-01-01",
     "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "CH",
+    "tax_name": "VAT Special Rate (Accommodation)",
+    "tax_name_translations": {
+      "en": "VAT Special Rate",
+      "de": "MWST Sondersatz"
+    },
+    "tax_code": "VAT_SPECIAL",
+    "rate_pct": "3.7",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2018-01-01",
+    "effective_to": "2023-12-31",
     "is_default": false
   },
   {
@@ -946,6 +996,54 @@
     "is_default": false
   },
   {
+    "country_code": "GR",
+    "tax_name": "VAT Standard (FPA)",
+    "tax_name_translations": {
+      "en": "VAT Standard",
+      "el": "ΦΠΑ κανονικός συντελεστής"
+    },
+    "tax_code": "FPA",
+    "rate_pct": "24.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2016-06-01",
+    "effective_to": null,
+    "is_default": true
+  },
+  {
+    "country_code": "GR",
+    "tax_name": "VAT Reduced (FPA)",
+    "tax_name_translations": {
+      "en": "VAT Reduced",
+      "el": "ΦΠΑ μειωμένος συντελεστής"
+    },
+    "tax_code": "FPA_RED",
+    "rate_pct": "13.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2011-01-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "GR",
+    "tax_name": "VAT Super-reduced (FPA)",
+    "tax_name_translations": {
+      "en": "VAT Super-reduced",
+      "el": "ΦΠΑ υπερμειωμένος συντελεστής"
+    },
+    "tax_code": "FPA_SRED",
+    "rate_pct": "6.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2015-07-20",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
     "country_code": "BR",
     "tax_name": "ICMS (São Paulo)",
     "tax_name_translations": {
@@ -1165,6 +1263,36 @@
     "combination": "national",
     "subdivision_code": null,
     "effective_from": "2012-01-01",
+    "effective_to": "2020-08-31",
+    "is_default": true
+  },
+  {
+    "country_code": "IE",
+    "tax_name": "VAT Standard",
+    "tax_name_translations": {
+      "en": "VAT Standard"
+    },
+    "tax_code": "VAT",
+    "rate_pct": "21.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2020-09-01",
+    "effective_to": "2021-02-28",
+    "is_default": true
+  },
+  {
+    "country_code": "IE",
+    "tax_name": "VAT Standard",
+    "tax_name_translations": {
+      "en": "VAT Standard"
+    },
+    "tax_code": "VAT",
+    "rate_pct": "23.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2021-03-01",
     "effective_to": null,
     "is_default": true
   },
@@ -1184,6 +1312,36 @@
     "is_default": false
   },
   {
+    "country_code": "IE",
+    "tax_name": "VAT Second Reduced",
+    "tax_name_translations": {
+      "en": "VAT Second Reduced Rate"
+    },
+    "tax_code": "VAT_RED_9",
+    "rate_pct": "9.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2011-07-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "IE",
+    "tax_name": "VAT Zero-Rated",
+    "tax_name_translations": {
+      "en": "VAT Zero-Rated"
+    },
+    "tax_code": "VAT_ZERO",
+    "rate_pct": "0.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "1972-11-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
     "country_code": "HU",
     "tax_name": "VAT Standard (ÁFA)",
     "tax_name_translations": {
@@ -1198,6 +1356,38 @@
     "effective_from": "2012-01-01",
     "effective_to": null,
     "is_default": true
+  },
+  {
+    "country_code": "HU",
+    "tax_name": "VAT Reduced 18% (ÁFA)",
+    "tax_name_translations": {
+      "en": "VAT Reduced 18%",
+      "hu": "ÁFA kedvezményes kulcs 18%"
+    },
+    "tax_code": "AFA_18",
+    "rate_pct": "18.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2009-07-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "HU",
+    "tax_name": "VAT Reduced 5% (ÁFA)",
+    "tax_name_translations": {
+      "en": "VAT Reduced 5%",
+      "hu": "ÁFA kedvezményes kulcs 5%"
+    },
+    "tax_code": "AFA_5",
+    "rate_pct": "5.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2004-01-01",
+    "effective_to": null,
+    "is_default": false
   },
   {
     "country_code": "RO",
@@ -1275,9 +1465,57 @@
     "tax_type": "vat",
     "combination": "national",
     "subdivision_code": null,
-    "effective_from": "2013-03-01",
+    "effective_from": "2012-03-01",
     "effective_to": null,
     "is_default": true
+  },
+  {
+    "country_code": "HR",
+    "tax_name": "VAT Reduced 13% (PDV)",
+    "tax_name_translations": {
+      "en": "VAT Reduced 13%",
+      "hr": "PDV snižena stopa 13%"
+    },
+    "tax_code": "PDV_13",
+    "rate_pct": "13.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2014-01-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "HR",
+    "tax_name": "VAT Reduced 5% (PDV)",
+    "tax_name_translations": {
+      "en": "VAT Reduced 5%",
+      "hr": "PDV snižena stopa 5%"
+    },
+    "tax_code": "PDV_5",
+    "rate_pct": "5.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2013-01-01",
+    "effective_to": null,
+    "is_default": false
+  },
+  {
+    "country_code": "HR",
+    "tax_name": "VAT Zero Rate (PDV)",
+    "tax_name_translations": {
+      "en": "VAT Zero Rate",
+      "hr": "PDV nulta stopa"
+    },
+    "tax_code": "PDV_0",
+    "rate_pct": "0.0",
+    "tax_type": "vat",
+    "combination": "national",
+    "subdivision_code": null,
+    "effective_from": "2022-10-01",
+    "effective_to": null,
+    "is_default": false
   },
   {
     "country_code": "IL",

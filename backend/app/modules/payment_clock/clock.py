@@ -42,6 +42,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from app.core.currency_registry import sentence_amount
 from app.core.day_basis import add_days, is_business_day
 
 
@@ -135,11 +136,23 @@ def parse_money(value: Any) -> Decimal | None:
 
 
 def format_money(amount: Decimal | None, currency: str = "") -> str:
-    """An amount and its currency as one string, for a message a person reads."""
+    """An amount and its currency as one string, for a message a person reads.
+
+    The spelling is the platform's, :func:`app.core.currency_registry.sentence_amount`,
+    rather than one of this module's own. It used to be one of this module's own:
+    it named the currency but never grouped the digits and never asked the
+    currency how many decimals it keeps, so a sum this module wrote as
+    ``1234.50 GBP`` appeared two panels away, from the same underlying figure, as
+    ``1,234.50 GBP``.
+
+    The absent case stays a sentence rather than a number. ``None`` here means
+    the record states no amount, which is a different fact from zero, and this
+    module reaches that case often enough that printing ``None`` into a statutory
+    notice would be a visible defect.
+    """
     if amount is None:
         return "an unstated amount"
-    text = format(amount, "f")
-    return f"{text} {currency}".strip() if currency else text
+    return sentence_amount(amount, currency)
 
 
 # ── The schedule ─────────────────────────────────────────────────────────────

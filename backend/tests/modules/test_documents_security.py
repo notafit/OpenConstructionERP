@@ -210,11 +210,19 @@ def test_sanitize_filename_strips_path_components() -> None:
     """
     assert _sanitize_filename("/etc/passwd") == "passwd"
     assert _sanitize_filename("../../boot.ini") == "boot.ini"
-    # Windows-style backslashes — assert the dangerous prefix is gone,
-    # not the exact string (it differs per platform).
+    # Windows-style backslashes — assert the safety properties, and only those.
+    # On POSIX the whole payload is ONE filename: basename leaves it alone, the
+    # character filter turns each backslash into an underscore, and the leading
+    # dots then send it to "untitled". On Windows basename cuts it down to
+    # "cmd.exe". Both are safe and they are different strings, so asserting the
+    # surviving tail (as this once did with ``endswith("cmd.exe")``) is exactly
+    # the platform-specific assertion the docstring above rules out - and it is
+    # why this test was red on every Linux job of the nightly and green here.
     out = _sanitize_filename("..\\..\\windows\\system32\\cmd.exe")
     assert ".." not in out
-    assert out.endswith("cmd.exe")
+    assert "/" not in out
+    assert "\\" not in out
+    assert out, "a sanitised name is never empty"
 
 
 def test_sanitize_filename_replaces_special_chars() -> None:

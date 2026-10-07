@@ -33,6 +33,7 @@ import {
 import { Button, Badge, DismissibleInfo, IntroRichText } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { apiGet } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { parseExcelFile } from '../_shared/excelImport';
@@ -42,6 +43,7 @@ import { SampleTemplateButton } from '../_shared/SampleTemplateButton';
 import type { ExchangePosition, ImportParseResult } from '../_shared/templateTypes';
 import type { RegionalTemplate } from './regionalRegistry';
 import { importDispatcher } from './regionalRegistry';
+import { importFailureFromBody } from '@/features/boq/importFailureText';
 import { fmtList, fmtFixed } from '@/shared/lib/formatters';
 
 /* ── Types from the BOQ module ──────────────────────────────────────── */
@@ -150,8 +152,11 @@ function ImportPreview({
     <div className="border border-border-light rounded-lg overflow-hidden">
       <div className="px-3 py-2 bg-surface-tertiary/50 flex items-center justify-between">
         <span className="text-xs font-medium text-content-secondary">
-          {t('regional.preview', { defaultValue: 'Preview' })}: {positions.length}{' '}
-          {t('regional.positions', { defaultValue: 'positions' })}
+          {t('regional.preview', { defaultValue: 'Preview' })}: {t('regional.positions_count', {
+            count: positions.length,
+            defaultValue_one: '{{count}} position',
+            defaultValue: '{{count}} positions',
+          })}
         </span>
         {positions.length > 20 && (
           <button
@@ -279,7 +284,7 @@ export default function RegionalExchangePage({ template }: RegionalExchangePageP
   /* Project + BOQ queries */
   const { data: projects = [] } = useQuery<Project[]>({
     queryKey: ['projects-list'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
   });
 
   const [importProjectId, setImportProjectId] = useState('');
@@ -408,10 +413,9 @@ export default function RegionalExchangePage({ template }: RegionalExchangePageP
 
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { detail?: unknown };
+        const failed = t('regional.import_failed', { defaultValue: 'Import failed' });
         throw new Error(
-          typeof body.detail === 'string'
-            ? body.detail
-            : t('regional.import_failed', { defaultValue: 'Import failed' }),
+          importFailureFromBody(body, t, failed) ?? (typeof body.detail === 'string' ? body.detail : failed),
         );
       }
 
@@ -677,8 +681,11 @@ export default function RegionalExchangePage({ template }: RegionalExchangePageP
                 {parsedPositions && (
                   <div className="flex items-center justify-center gap-1.5 text-xs text-emerald-600">
                     <CheckCircle2 size={14} />
-                    {parsedPositions.length}{' '}
-                    {t('regional.positions_found', { defaultValue: 'positions found' })}
+                    {t('regional.positions_found_count', {
+                      count: parsedPositions.length,
+                      defaultValue_one: '{{count}} position found',
+                      defaultValue: '{{count}} positions found',
+                    })}
                     <Badge variant="blue" className="ml-2">
                       {template.excelTemplate.classification}
                     </Badge>

@@ -95,6 +95,26 @@ class POCreate(BaseModel):
         return _validate_non_negative_decimal(v)
 
 
+class InvoiceCheckLine(BaseModel):
+    """One line of an invoice being checked against its order."""
+
+    description: str = Field(default="", max_length=500)
+    quantity: str = Field(default="0", max_length=50)
+
+
+class InvoiceCheckRequest(BaseModel):
+    """A supplier invoice, saved or not yet, to check against the order it bills.
+
+    ``invoice_id`` names the saved invoice being edited, so its own earlier
+    figures are not counted as "invoiced before".
+    """
+
+    amount_subtotal: str = Field(default="0", max_length=50)
+    line_items: list[InvoiceCheckLine] = Field(default_factory=list)
+    invoice_id: UUID | None = None
+    invoice_number: str | None = Field(default=None, max_length=50)
+
+
 class POUpdate(BaseModel):
     """Partial update for a purchase order."""
 
@@ -232,6 +252,12 @@ class POResponse(BaseModel):
     # ad-hoc vendors. Stamped by the router from the service gate; not a
     # persisted column.
     vendor_warnings: list[str] = Field(default_factory=list)
+    # ── Invoiced against this order ──────────────────────────────────────
+    # Supplier invoices linked to this order (``pending`` onwards, not
+    # cancelled or credited), net of VAT, in the order's currency, so it reads
+    # against ``amount_subtotal``. Computed on read, not a column.
+    invoiced_net: str = "0"
+    invoice_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -623,3 +649,45 @@ class ProjectDeliveryPerformanceResponse(BaseModel):
     project_id: UUID
     overall: SupplierDeliveryPerformance
     suppliers: list[SupplierDeliveryPerformance] = Field(default_factory=list)
+
+
+# -- Committed vs remaining by BOQ position ---------------------------------
+
+
+class CommittedByPositionRow(BaseModel):
+    """What one BOQ position has been ordered against, across every PO.
+
+    ``boq_position_id`` is the position the money rolls up to. It falls back
+    to the cost line's own id for a line whose cost line names no position,
+    which is the ordinary state of a project whose spine was generated before
+    the bill was finished; the field is therefore an id of one kind or the
+    other and is carried as text rather than as a ``UUID``.
+
+    Both amounts are Decimal-as-string, like every other money field on this
+    API. ``committed_qty`` is a quantity rather than money but travels the
+    same way, because it is summed from the same Decimal columns and a float
+    would round it.
+    """
+
+    boq_position_id: str
+    committed_qty: str
+    committed_value: str
+
+
+class CommittedByPositionListResponse(BaseModel):
+    """A page of the committed-by-position rollup, and its full size.
+
+    ``total`` is the number of positions the project has commitments against,
+    not the number on the page. A buyer comparing committed quantities with
+    the bill is deciding what still has to be bought, and a page that could
+    not say it was a page would have them order against scope that is already
+    on order.
+
+    ``offset`` / ``limit`` default to the window the route applies, matching
+    :class:`PORetainageReleaseListResponse`.
+    """
+
+    items: list[CommittedByPositionRow]
+    total: int
+    offset: int = 0
+    limit: int = 100

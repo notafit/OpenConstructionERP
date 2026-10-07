@@ -308,10 +308,10 @@ def _register_handlers() -> None:
     identity - re-registering the same function twice would create two
     invocations per event, so we keep registration in one place.
     """
-    event_bus.subscribe("costs.item.created", _on_cost_item_created)
-    event_bus.subscribe("costs.item.updated", _on_cost_item_updated)
-    event_bus.subscribe("costs.item.deleted", _on_cost_item_deleted)
-    event_bus.subscribe("costs.items.bulk_imported", _on_bulk_import)
+    event_bus.subscribe_once("costs.item.created", _on_cost_item_created)
+    event_bus.subscribe_once("costs.item.updated", _on_cost_item_updated)
+    event_bus.subscribe_once("costs.item.deleted", _on_cost_item_deleted)
+    event_bus.subscribe_once("costs.items.bulk_imported", _on_bulk_import)
 
 
 _register_handlers()

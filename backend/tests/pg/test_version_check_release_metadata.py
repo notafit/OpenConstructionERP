@@ -30,6 +30,8 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from app.core import update_check_policy
+from app.dependencies import get_current_user_id
 from app.main import create_app
 
 PYPI = "pypi.org"
@@ -97,12 +99,21 @@ async def ask():
     empty, and the lifespan is deliberately not run: this route reads no
     database, and starting one would tie a metadata test to a cluster.
 
+    The route answers signed-in callers only, and who is asking is not what
+    this file tests, so the caller is stood in for rather than signed in.
+
     The client is constructed before ``httpx.AsyncClient`` is replaced, so the
     transport this test speaks over stays real while the route gets the fake.
     """
 
-    async def _ask(monkeypatch: pytest.MonkeyPatch, routes: dict[str, _Response]) -> dict[str, Any]:
+    async def _ask(
+        monkeypatch: pytest.MonkeyPatch, routes: dict[str, _Response], *, disabled: bool = False
+    ) -> dict[str, Any]:
+        # The machine running the suite may carry its own opt-out file or
+        # OE_DISABLE_UPDATE_CHECK, and neither may decide these tests.
+        monkeypatch.setattr(update_check_policy, "update_check_disabled", lambda home=None: disabled)
         app = create_app()
+        app.dependency_overrides[get_current_user_id] = lambda: "version-check-reader"
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             _FakeClient.routes = routes
@@ -177,3 +188,83 @@ async def test_pypi_alone_names_a_version_and_promises_nothing_else(ask, monkeyp
     assert data["latest_version"] == "15.1.0"
     assert data["release_notes"] == ""
     assert data["release_url"].endswith("/releases")
+
+
+async def test_a_disabled_check_asks_nobody(ask, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launcher's "Turn off update checks" has to reach this route too.
+
+    Both upstreams would announce a far newer release, and the route swallows
+    upstream errors, so only an answer naming the running version proves the
+    route stayed off the network rather than asking and then saying nothing.
+    """
+    data = await ask(
+        monkeypatch,
+        {PYPI: _pypi_version("99.0.0"), GITHUB: _github_release("v99.0.0")},
+        disabled=True,
+    )
+
+    assert data["check_disabled"] is True
+    assert data["update_available"] is False
+    assert data["latest_version"] == data["current_version"]
+    assert data["assets"] == []
+
+
+async def test_a_pressed_button_skips_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """About's "Check for updates" must not be answered from this morning's cache."""
+    monkeypatch.setattr(update_check_policy, "update_check_disabled", lambda home=None: False)
+    app = create_app()
+    app.dependency_overrides[get_current_user_id] = lambda: "version-check-reader"
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        _FakeClient.routes = {PYPI: _pypi_version("15.1.0"), GITHUB: _github_release("v15.1.0")}
+        first = (await client.get("/api/system/version-check")).json()
+        _FakeClient.routes = {PYPI: _pypi_version("15.2.0"), GITHUB: _github_release("v15.2.0")}
+        cached = (await client.get("/api/system/version-check")).json()
+        fresh = (await client.get("/api/system/version-check", params={"force": "true"})).json()
+
+    assert first["latest_version"] == "15.1.0"
+    assert cached["latest_version"] == "15.1.0"
+    assert fresh["latest_version"] == "15.2.0"
+
+
+async def test_the_desktop_hears_about_a_release_without_a_button(ask, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sidebar's notice is how a desktop user learns of a new version.
+
+    The launcher no longer asks GitHub on a healthy start, so this unforced
+    call, the one the sidebar makes after sign-in, is the only thing left that
+    tells the desktop about a release. It has to go out and say so.
+    """
+    monkeypatch.setenv("OE_DESKTOP", "1")
+    data = await ask(
+        monkeypatch,
+        {PYPI: _pypi_version("99.0.0"), GITHUB: _github_release("v99.0.0")},
+    )
+
+    assert data["update_available"] is True
+    assert data["latest_version"] == "99.0.0"
+    assert data.get("check_disabled", False) is False
+
+
+async def test_the_automatic_answer_is_held_for_a_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asked again only once a day has passed, not after the old four hours."""
+    monkeypatch.setattr(update_check_policy, "update_check_disabled", lambda home=None: False)
+    app = create_app()
+    app.dependency_overrides[get_current_user_id] = lambda: "version-check-reader"
+    transport = ASGITransport(app=app)
+
+    def age_cache(seconds: float) -> None:
+        app.state._version_check_cache["checked_at"] -= seconds
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        _FakeClient.routes = {PYPI: _pypi_version("15.1.0"), GITHUB: _github_release("v15.1.0")}
+        await client.get("/api/system/version-check")
+        _FakeClient.routes = {PYPI: _pypi_version("15.2.0"), GITHUB: _github_release("v15.2.0")}
+        age_cache(23 * 60 * 60)
+        within_the_day = (await client.get("/api/system/version-check")).json()
+        age_cache(60 * 60 + 1)
+        next_day = (await client.get("/api/system/version-check")).json()
+
+    assert within_the_day["latest_version"] == "15.1.0"
+    assert next_day["latest_version"] == "15.2.0"

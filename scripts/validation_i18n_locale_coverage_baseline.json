@@ -4,6 +4,7 @@
       "de",
       "en",
       "es",
+      "it",
       "ru"
     ],
     "backend/app/modules/bcf/messages": [
@@ -21,6 +22,11 @@
       "en",
       "ru"
     ],
+    "backend/app/modules/contracts/messages": [
+      "de",
+      "en",
+      "ru"
+    ],
     "backend/app/modules/cost_match/messages": [
       "de",
       "en",
@@ -31,10 +37,55 @@
       "en",
       "ru"
     ],
+    "backend/app/modules/funding/messages": [
+      "ar",
+      "bg",
+      "bn",
+      "cs",
+      "da",
+      "de",
+      "el",
+      "en",
+      "es",
+      "et",
+      "fa",
+      "fi",
+      "fil",
+      "fr",
+      "he",
+      "hi",
+      "hr",
+      "hu",
+      "id",
+      "it",
+      "ja",
+      "kk",
+      "ko",
+      "ky",
+      "nl",
+      "no",
+      "pl",
+      "pt",
+      "ro",
+      "ru",
+      "sv",
+      "th",
+      "tr",
+      "uk",
+      "ur",
+      "uz",
+      "vi",
+      "zh"
+    ],
     "backend/app/modules/rebar_schedule/messages": [
       "de",
       "en",
       "es",
+      "ru"
+    ],
+    "backend/app/modules/subcontractors/messages": [
+      "de",
+      "en",
       "ru"
     ]
   }

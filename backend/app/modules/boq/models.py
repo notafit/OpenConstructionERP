@@ -46,6 +46,12 @@ class BOQ(Base):
     approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     approved_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     base_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    #: The day the bill's VAT is resolved on, when it is not the price base.
+    #: NULL means "same as ``base_date``", which is every bill that predates
+    #: the column, so none of them is taxed differently for its arrival. The
+    #: rule for which of the two decides lives in
+    #: :func:`app.modules.boq.base_date.tax_point`.
+    tax_date: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     # ── Issue #435: the variation request this bill was raised for ───────
     # NULL is the whole existing world: a bill of the project at large, the
@@ -141,6 +147,10 @@ class Position(Base):
     quantity: Mapped[str] = mapped_column(String(50), nullable=False, default="0")
     unit_rate: Mapped[str] = mapped_column(String(50), nullable=False, default="0")
     total: Mapped[str] = mapped_column(String(50), nullable=False, default="0")
+    # Three-tier pricing for contractor workflow: cost -> target -> sale
+    net_cost_rate: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    target_rate: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    sale_rate: Mapped[str | None] = mapped_column(String(50), nullable=True)
     classification: Mapped[dict] = mapped_column(  # type: ignore[assignment]
         JSON,
         nullable=False,
@@ -446,8 +456,8 @@ class BOQActivityLog(Base):
         nullable=True,
         index=True,
     )
-    # Nullable: system-generated activity (e.g. event-driven ``cost_breakdown.
-    # computed``) has no acting user. Previously a nil-UUID sentinel was written,
+    # Nullable: system-generated activity (an event published without an
+    # acting user) has no user. Previously a nil-UUID sentinel was written,
     # which SQLite accepted (FK enforcement off by default) but PostgreSQL
     # rejected with a ForeignKeyViolationError. NULL = "System" in the feed.
     user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -643,5 +653,7 @@ class QuantityLink(Base):
 # conftest) imports ``app.modules.boq.models``; importing the copilot model from
 # this already-discovered module guarantees ``oe_boq_position_copilot_message``
 # is created on a fresh database and seen by Alembic autogenerate, without
-# adding a hand-maintained import elsewhere.
+# adding a hand-maintained import elsewhere. The change-flag model
+# (``oe_boq_change_flag``) is registered the same way.
+from app.modules.boq.change_review_models import BOQChangeFlag  # noqa: E402,F401
 from app.modules.boq.copilot_models import PositionCopilotMessage  # noqa: E402,F401

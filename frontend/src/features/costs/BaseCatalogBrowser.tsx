@@ -14,10 +14,10 @@
 
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, ChevronDown, Download, Loader2, Search } from 'lucide-react';
+import { Check, ChevronDown, Download, Loader2, RotateCcw, Search } from 'lucide-react';
 import { CountryFlag, CountryFlagBackdrop } from '@/shared/ui';
 import type { BaseCatalog, BaseFamily, BaseVariant } from './baseCatalog';
-import { variantMatches } from './baseCatalog';
+import { canReturnHome, effectiveActiveMarkets, languageName, variantMatches } from './baseCatalog';
 import { DEPTH_BANDS, baseDepthLevel } from './baseDepth';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 
@@ -84,13 +84,18 @@ interface BaseCatalogBrowserProps {
   /** Make a loaded base the active one (global family's set-active-database). */
   onSetActive?: (region: string) => void;
   /** National market card selected: load the base + reprice into that market,
-   *  or switch the active market when already loaded. Wire this on the import
-   *  page to enable the market cards; without it, market variants behave like a
-   *  plain "load this base" card. */
+   *  or switch the active market when already loaded. Without it, 'load' mode
+   *  hides the market cards: loading one as a plain base would install the
+   *  home language instead of the card's. */
   onReprice?: (variant: BaseVariant) => void;
-  /** Active market token per base_region (e.g. { ZH_CHINA: 'GB_LONDON_en' }),
-   *  used to show the "Active market" badge vs a "Switch to" action. */
+  /** This browser's cached market token per base_region (e.g.
+   *  { ZH_CHINA: 'GB_LONDON_en' }). The server's stored state in
+   *  `catalog.base_states` wins wherever it knows one; this fills in only for a
+   *  base the server knows nothing about. */
   activeMarkets?: Record<string, string>;
+  /** Bring a national base back from a market to its own prices, currency and
+   *  language. Without it the home card offers no way back. */
+  onRestoreHome?: (variant: BaseVariant) => void;
   /** Seconds elapsed on the in-flight import, for the spinner label. */
   elapsedSeconds?: number;
   className?: string;
@@ -159,6 +164,10 @@ interface CardProps {
    *  when already loaded, switch the active market). Distinct from onSetActive,
    *  which stays for the global family's set-active-database. */
   onReprice?: (variant: BaseVariant) => void;
+  /** Home card of a base priced into a market: offer the way back. */
+  onRestoreHome?: (variant: BaseVariant) => void;
+  /** Home card of a base whose last market switch has not finished. */
+  unfinishedSwitch?: boolean;
   elapsedSeconds?: number;
 }
 
@@ -176,9 +185,11 @@ function BaseVariantCard({
   onSelect,
   onSetActive,
   onReprice,
+  onRestoreHome,
+  unfinishedSwitch = false,
   elapsedSeconds,
 }: CardProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const shownPositions = loaded && variant.loaded_positions > 0 ? variant.loaded_positions : variant.positions;
   // A national market card (reprice target). Only treat it as one when a
   // reprice handler is wired (the import page); on surfaces without it, market
@@ -203,6 +214,7 @@ function BaseVariantCard({
         disabled && !loading ? 'pointer-events-none opacity-40' : ''
       } ${clickable ? 'cursor-pointer' : ''}`}
       onClick={clickable ? () => onSelect?.(variant) : undefined}
+      data-testid="base-variant-card"
     >
       {/* Header: flag + title + top-right status badge */}
       <div className="flex items-start gap-2.5">
@@ -233,6 +245,26 @@ function BaseVariantCard({
           </span>
         )}
       </div>
+
+      {/* The card's language is a promise about the text. Where no published
+          file holds the base in it (Turkiye has no English text), say which
+          language the work items will really be in. */}
+      {variant.text_lang_code && variant.text_lang_code !== variant.lang_code && (
+        <div className="mt-1.5 text-[11px] font-medium text-semantic-warning" data-testid="base-text-lang-note">
+          {t('costs.base_text_only_in', {
+            defaultValue: 'Work items in {{language}} only',
+            language: languageName(variant.text_lang_code, i18n.language),
+          })}
+        </div>
+      )}
+
+      {unfinishedSwitch && (
+        <div className="mt-1.5 text-[11px] font-medium text-semantic-warning" data-testid="base-switch-unfinished">
+          {t('costs.base_market_unfinished', {
+            defaultValue: 'A market switch of this base has not finished',
+          })}
+        </div>
+      )}
 
       {/* Count + currency + coefficient marker */}
       <div className="mt-2.5 flex items-end justify-between gap-2">
@@ -323,6 +355,23 @@ function BaseVariantCard({
                 : t('costs.base_download', { defaultValue: 'Download' })}
             </button>
           )}
+          {/* The way back from a market. Only on the home card of a base the
+              server (or, where it knows nothing, this browser) has in a market. */}
+          {!isMarket && loaded && onRestoreHome && (
+            <button
+              type="button"
+              disabled={disabled || loading}
+              onClick={() => onRestoreHome(variant)}
+              title={t('costs.base_restore_home_hint', {
+                defaultValue: 'Put this base back on its own prices, currency and language',
+              })}
+              className={`mt-1.5 flex items-center justify-center gap-1.5 ${ACTION_SECONDARY_CLASS} disabled:opacity-50`}
+              data-testid="base-restore-home"
+            >
+              {loading ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+              {t('costs.base_restore_home', { defaultValue: 'Return to home market' })}
+            </button>
+          )}
         </div>
       )}
 
@@ -348,11 +397,19 @@ export function BaseCatalogBrowser({
   onSetActive,
   onReprice,
   activeMarkets,
+  onRestoreHome,
   elapsedSeconds,
   className = '',
 }: BaseCatalogBrowserProps) {
   const { t } = useTranslation();
   const [query, setQuery] = useState('');
+
+  // A national market card promises a market AND a language, and only a
+  // surface that runs the market load can keep that promise. In 'load' mode
+  // without onReprice the card used to fall back to a plain Load button that
+  // installed the home base in the home language, so it is not offered there.
+  // In 'select' mode the parent owns what the pick loads.
+  const offersMarkets = mode === 'select' || !!onReprice;
 
   // Loaded is a property of the BASE, not the card: every card of a base shares
   // its base_region, so once the base is loaded all its market cards read as
@@ -360,13 +417,34 @@ export function BaseCatalogBrowser({
   const isLoaded = (v: BaseVariant) => (loadedRegions ? loadedRegions.has(v.base_region) : v.loaded);
   const anyLoading = loadingRegion !== null;
 
+  // Which market each base is in: the server's stored state where it has one,
+  // this browser's cache only where it does not. Every surface that renders the
+  // browser gets the same answer, whatever it passes in.
+  const markets = useMemo(() => effectiveActiveMarkets(catalog, activeMarkets), [catalog, activeMarkets]);
+
+  // Bases that have market cards at all, so only their home card can offer a
+  // way back from a market.
+  const marketBases = useMemo(
+    () =>
+      new Set(
+        catalog.families.flatMap((f) => f.variants.filter((v) => v.market_catalog !== '').map((v) => v.base_region)),
+      ),
+    [catalog.families],
+  );
+
   // Whether a card is the active choice. A national market card is active when
   // its base is loaded and its market_catalog is the active market for that
   // base; a home/global card is active via the set-active-database mechanism.
   const isActive = (v: BaseVariant) =>
     v.market_catalog !== ''
-      ? isLoaded(v) && (activeMarkets?.[v.base_region] ?? '') === v.market_catalog
+      ? isLoaded(v) && (markets[v.base_region] ?? '') === v.market_catalog
       : activeRegion === v.variant_id;
+
+  const offersReturnHome = (v: BaseVariant) =>
+    v.market_catalog === '' &&
+    marketBases.has(v.base_region) &&
+    isLoaded(v) &&
+    canReturnHome(v.base_region, catalog, activeMarkets);
 
   // China first, the Global CWICR (GESN / FER / TER) base second, then the rest.
   const orderedFamilies = useMemo(() => orderFamilies(catalog.families), [catalog.families]);
@@ -393,10 +471,12 @@ export function BaseCatalogBrowser({
       orderedFamilies
         .map((family) => ({
           family,
-          variants: family.variants.filter((v) => variantMatches(v, family, query)),
+          variants: family.variants.filter(
+            (v) => variantMatches(v, family, query) && (offersMarkets || v.market_catalog === ''),
+          ),
         }))
         .filter((row) => row.variants.length > 0),
-    [orderedFamilies, query],
+    [orderedFamilies, query, offersMarkets],
   );
 
   // Count DISTINCT loaded bases: every card of a base shares its base_region, so
@@ -426,6 +506,10 @@ export function BaseCatalogBrowser({
       onSelect={onSelect}
       onSetActive={onSetActive}
       onReprice={onReprice}
+      onRestoreHome={onRestoreHome && offersReturnHome(variant) ? onRestoreHome : undefined}
+      unfinishedSwitch={
+        variant.market_catalog === '' && catalog.base_states?.[variant.base_region]?.market_state === 'switching'
+      }
       elapsedSeconds={elapsedSeconds}
     />
   );
@@ -565,6 +649,15 @@ export function BaseCatalogBrowser({
                     )}
                   </div>
                   <div className="truncate text-xs text-content-tertiary">{family.description}</div>
+                  {family.attribution && (
+                    <div className="truncate text-[11px] text-content-tertiary" data-testid="base-family-attribution">
+                      {t('costs.base_source_attribution', {
+                        defaultValue: 'Source: {{attribution}}, {{licence}}',
+                        attribution: family.attribution,
+                        licence: family.licence ?? '',
+                      })}
+                    </div>
+                  )}
                 </div>
                 <div className="hidden shrink-0 text-right sm:block">
                   <div className="text-sm font-bold tabular-nums text-content-primary">

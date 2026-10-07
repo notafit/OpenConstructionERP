@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "csa_a23_3",
+  "name": "CSA A23.3 — Design of Concrete Structures",
+  "name_fr-CA": "CSA A23.3 — Calcul des ouvrages en béton",
+  "standard": "CSA A23.3:19",
+  "jurisdiction": "CA",
+  "regulator": "CSA Group",
+  "publication_year": 2019,
+  "applies_to": [
+    "projects",
+    "boq",
+    "validation"
+  ],
+  "description": "Reference document for CSA A23.3 limit-states design of structural concrete. What the standard requires the design package to document: load combinations consistent with NBC 2020 Part 4, importance factor I assigned, material resistance factors applied, minimum concrete cover per exposure class, seismic detailing category, two-way slab punching shear and deflection serviceability checks are all documented. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur le calcul aux états limites CSA A23.3 du béton structural. Ce que la norme exige de documenter : combinaisons de charges cohérentes avec la Partie 4 du CNB 2020, coefficient d'importance I attribué, coefficients de tenue des matériaux appliqués, enrobage minimal du béton selon la classe d'exposition, catégorie de dimensionnement sismique, vérifications du poinçonnement et de la déflexion en service des dalles bidirectionnelles sont tous documentés. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. Design of concrete structures is a structural calculation carried out in design software, not something a bill of quantities reveals. No registered rule reads it, and naming one would claim the platform reviews a design it never sees.",
+  "enables_rule_ids": []
+}

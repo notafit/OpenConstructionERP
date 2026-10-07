@@ -48,7 +48,10 @@ from app.core.pdf_branding import branded_cover_brand, branded_doc_metadata, bra
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
+    pdf_fit_line,
+    pdf_fitted_style,
     pdf_font_for_text,
+    pdf_room_beside,
     pdf_style_for_text,
     register_pdf_fonts,
 )
@@ -312,11 +315,20 @@ def _make_header_footer(
         canvas.setFillColor(colors.HexColor("#666666"))
         # A plain hyphen separator (never an em dash) per the project text rule.
         text = f"{project_name}  -  {methodology_name}"
-        # Drawn straight onto the canvas rather than through a Paragraph, so the
-        # style facing never reaches it and both names here are party-supplied.
-        # The face is asked of the whole line because one setFont covers it all.
-        canvas.setFont(pdf_font_for_text(text, base=BODY_FONT), 8)
-        canvas.drawString(MARGIN_LEFT, PAGE_HEIGHT - 15 * mm, text)
+        # Both names are party-supplied and may contain non-Latin text that needs
+        # shaping (Thai tone marks, Devanagari reordering). Paragraph is the only
+        # route through which reportlab's shaper acts; canvas.drawString drops its
+        # shaping argument silently without rlbidi.
+        header_style = ParagraphStyle(
+            "_methHeader",
+            fontName=BODY_FONT,
+            fontSize=8,
+            leading=8,
+            textColor=colors.HexColor("#666666"),
+        )
+        p = Paragraph(html.escape(text, quote=True), pdf_style_for_text(header_style, text))
+        pw, ph = p.wrapOn(canvas, PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, 20)
+        p.drawOn(canvas, MARGIN_LEFT, PAGE_HEIGHT - 15 * mm - ph + 8 * 0.22)
         canvas.setStrokeColor(colors.HexColor("#cccccc"))
         canvas.setLineWidth(0.5)
         line_y = PAGE_HEIGHT - 17 * mm
@@ -328,19 +340,33 @@ def _make_header_footer(
     def _footer(canvas: Any, doc: Any) -> None:
         canvas.saveState()
         canvas.setFillColor(colors.HexColor("#999999"))
-        brand_line = f"{branded_cover_brand()}  |  Generated: {generated_date}"
         if getattr(doc, "page_count", 0) > 0:
             page_text = f"Page {doc.page} of {doc.page_count}"
         else:
             page_text = f"Page {doc.page}"
-        # One setFont covers both draws below, so the face has to be able to
-        # draw both strings. Asked of the pair rather than of either one: the
-        # brand is white-label configurable and can be in any script, while the
-        # page counter is always ASCII. A second setFont would read better and
-        # would also emit a second Tf operator, moving the bytes of every Latin
-        # document, which is the one thing this wiring must not do.
-        canvas.setFont(pdf_font_for_text(brand_line + page_text, base=BODY_FONT), 7)
-        canvas.drawString(MARGIN_LEFT, 10 * mm, brand_line)
+        # The brand is white-label configurable and can be in any script;
+        # Paragraph is needed so the shaper can act on it.
+        footer_style = ParagraphStyle(
+            "_methFooter",
+            fontName=BODY_FONT,
+            fontSize=7,
+            leading=7,
+            textColor=colors.HexColor("#999999"),
+        )
+        # Fitted onto one line in the room beside the page number: the brand is
+        # the firm's legal name and can reach the number, and this paragraph is
+        # anchored by its top, so a wrapped one would run off the bottom edge.
+        brand_line, _brand_face, brand_size = pdf_fit_line(
+            branded_cover_brand(),
+            pdf_room_beside(PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, page_text),
+            suffix=f"  |  Generated: {generated_date}",
+            base=BODY_FONT,
+        )
+        p = Paragraph(html.escape(brand_line, quote=True), pdf_fitted_style(footer_style, brand_line, brand_size))
+        pw, ph = p.wrapOn(canvas, PAGE_WIDTH - MARGIN_LEFT - MARGIN_RIGHT, 20)
+        p.drawOn(canvas, MARGIN_LEFT, 10 * mm - ph + 7 * 0.22)
+        # Page counter is always ASCII, safe as bare drawString.
+        canvas.setFont(pdf_font_for_text(page_text, base=BODY_FONT), 7)
         canvas.drawRightString(PAGE_WIDTH - MARGIN_RIGHT, 10 * mm, page_text)
         canvas.restoreState()
 

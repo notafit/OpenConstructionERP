@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "Tamam"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Bu tedbire ilişkin işler {start} tarihinde, yani başvurunun yapıldığı {filed} tarihinden önce başladı. Çoğu program, başvurudan önce başlamış bir tedbiri hiç desteklemez",
+      "unevidenced": "İşler erken, {start} tarihinde başladı. Dosyada kurumun buna izin verdiği belirtiliyor, ancak hiçbir yazılı izin gösterilmemiş",
+      "evidence": "Erken başlama için verilen yazılı iznin tarih ve sayısını kaydedin, böylece dosya bir denetimde kendi başına yeterli olur",
+      "suggestion": "Daha fazla harcama yapmadan önce program şartlarını kontrol edin. Erken başlamaya yazılı olarak izin verildiyse bunu kaydedin, verilmediyse başvuruyu ilerletmeden önce kuruma danışın"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "{draw} numaralı ödeme talebi, destek döneminin başladığı {period_start} tarihinden önceki maliyetleri içeriyor",
+      "after": "{draw} numaralı ödeme talebi, destek döneminin sona erdiği {period_end} tarihinden sonraki maliyetleri içeriyor",
+      "spans": "{draw} numaralı ödeme talebi, {period_start} ile {period_end} arasındaki destek döneminin iki ucunun da dışına taşıyor",
+      "suggestion": "Dönem dışındaki maliyetleri ayrı bir ödeme talebine taşıyın ve bunları kurumla görüşün, dönem içi ve dışı maliyetleri tek bir talepte birleştirmeyin"
+    },
+    "own_share_is_covered": {
+      "fail": "Program yüzde {rate} oranında, yani {required} tutarında öz kaynak katkısı istiyor, ancak başvuruda {recorded} kayıtlı",
+      "suggestion": "Göndermeden önce eksik öz kaynak katkısının nereden karşılanacağını belirtin, çünkü program bunu proje toplamı üzerinden değil uygun maliyet tabanı üzerinden hesaplar"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Bu projedeki {count} başvurunun toplam destek yoğunluğu uygun maliyetlerin yüzde {intensity} oranına ulaşıyor ve programlarından en katı olanının yüzde {cap} olarak belirlediği tavanı aşıyor",
+      "suggestion": "Kamu finansmanı programlar ve yönetim kademeleri arasında birikir. Başvurulardan birinde talep edilen tutarı azaltın ya da tedbirlerin, her biri kendi maliyetlerini taşıyacak şekilde ayrılıp ayrılamayacağını kuruma sorun"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Destek dönemi {period_end} tarihinde sona erdi ve nihai kullanım belgesine henüz başlanmadı",
+      "late": "Nihai kullanım belgesinin son teslim tarihi {due} idi, ancak belge {submitted} tarihinde sunuldu",
+      "overdue": "Nihai kullanım belgesinin son teslim tarihi {due} idi ve belge henüz sunulmadı",
+      "suggestion": "Tamamlanmasını beklemek yerine elinizdekini sunun. Çoğu kurum talep üzerine son tarihi uzatır, ancak geçmiş bir son tarihi hiçbiri uzatmaz"
+    },
+    "errors": {
+      "application_not_found": "Başvuru bulunamadı",
+      "programme_code_taken": "Bu ülkede bu referansa sahip bir program zaten var",
+      "programme_not_found": "Program bulunamadı",
+      "programme_has_applications": "Bu programın başvuruları olduğu için silinemez. Bunun yerine programı kapatın.",
+      "application_code_taken": "Bu projede bu referansa sahip bir başvuru zaten var",
+      "approved_application_not_deletable": "Onaylanmış bir başvuru silinemez. Bunun yerine durumunu “Geri Çekildi” veya “Kapalı” olarak değiştirin.",
+      "approval_needs_period_end": "Onay için destek döneminin bitiş tarihi gerekir, çünkü sonraki tüm son tarihler bu tarihten itibaren hesaplanır",
+      "draw_needs_approval": "Ödeme talebi yalnızca onaylanmış bir başvuru için yapılabilir",
+      "draw_not_found": "Ödeme talebi bulunamadı",
+      "paid_draw_not_deletable": "Ödenmiş bir ödeme talebi silinemez",
+      "proof_not_found": "Kullanım belgesi bulunamadı",
+      "obligation_not_found": "Yükümlülük bulunamadı",
+      "eligible_exceeds_amount": "Uygun tutar toplam tutarı aşamaz",
+      "allocation_not_found": "Maliyet kalemi bulunamadı"
+    }
+  }
+}

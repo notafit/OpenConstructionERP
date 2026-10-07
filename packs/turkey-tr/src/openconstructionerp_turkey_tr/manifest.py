@@ -33,10 +33,18 @@ MANIFEST = PartnerPackManifest(
     default_currency="TRY",
     default_tax_template="tr_kdv_20",
     default_methodology="turkey",
-    validation_rule_packs=[],
-    # No Turkish-specific engine rule set yet. When one is built it will
-    # carry rules for birim fiyat item references and pozlar numbering.
-    validation_rule_sets=[],
+    validation_rule_packs=[
+        "tbdy_2018",
+        "tse_standards",
+        "bayindirlik_unit_prices",
+        "kamu_ihale",
+    ],
+    # The engine rule set that reads the poz number every Turkish line is
+    # priced from. It shares its name with the classification key it reads,
+    # unlike Hungary, where the classification is tetelrend and the rule set
+    # is hungary, so the name is checked against the registry by test rather
+    # than assumed.
+    validation_rule_sets=["birimfiyat"],
     default_modules=[],  # empty = show all
     hidden_modules=[],
     demo_template_ids=["mixed-use-istanbul"],

@@ -1,0 +1,21 @@
+{
+  "rule_pack_id": "bkp_classification",
+  "name": "BKP Baukostenplan — Cost Classification",
+  "name_fr": "CFC Code des frais de construction — Classification des couts",
+  "standard": "BKP Baukostenplan (CRB)",
+  "jurisdiction": "CH",
+  "regulator": "CRB (Schweizerische Zentralstelle fuer Baurationalisierung)",
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for the BKP (Baukostenplan), the classification a Swiss estimate is structured against, published by the CRB and known in French as the CFC (Code des frais de construction). The BKP divides construction costs into main groups 0 through 9 with three-digit subgroups, and a Kostenvoranschlag or devis that does not follow it is not what a Swiss client, Bauherrenberater or public authority expects to receive. The standard requires that every position carries a code, that the code has the three-digit shape and sits under a main group that exists, that the project declares whether it uses the trade-based BKP or the element-based eBKP variant, and that the estimate rolls up cleanly to its main groups. None of that is implemented as a rule. What the pack checks is one step earlier: that the project declares a classification standard at all.",
+  "description_fr": "Document de reference sur le CFC (Code des frais de construction), la classification selon laquelle le devis suisse est structure, publiee par le CRB et appelee BKP en allemand. Le CFC repartit les couts de construction en groupes principaux 0 a 9 avec des sous-groupes a trois chiffres. La norme exige un code par poste, de forme a trois chiffres rattachee a un groupe principal existant, la declaration de la variante utilisee (CFC par corps de metier ou eCFC par elements) et la coherence des totaux par groupe principal. Rien de cela n'est implemente comme regle. Le pack verifie une etape en amont : que le projet declare une classification.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swiss Baukostenplaner or quantity surveyor before they are relied on for a public submission. The CRB code tables and the NPK Normpositionen-Katalog are published products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "severity_overrides": {},
+  "note": "The engine's country-to-classification map resolves CH to din276, and the 'classification_nudge.country_mismatch' rule only crosswalks din276, nrm and masterformat. Enabled on a Swiss project that rule would report BKP as the wrong standard and suggest DIN 276, which is the opposite of what this document is for, so it is deliberately not enabled here. Whether that map should return a Swiss standard for CH is a question for the platform rather than for this pack.",
+  "enables_rule_ids": [
+    "project_completeness.classification_standard_set"
+  ]
+}

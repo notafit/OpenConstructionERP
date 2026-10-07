@@ -1,0 +1,26 @@
+{
+  "rule_pack_id": "gaeb_x83_x86",
+  "name": "GAEB DA XML 3.3 — Data Exchange Phases",
+  "standard": "GAEB DA XML 3.3",
+  "jurisdiction": "DE",
+  "description": "Validates GAEB data exchange files across the four principal phases: X81 (cost estimate / Kostenberechnung), X83 (tender / Angebotsaufforderung), X84 (bid / Angebotsabgabe), and X86 (award / Auftragserteilung). Checks XML structure compliance, mandatory GAEB elements, LV numbering consistency, unit and quantity integrity, and price completeness per phase.",
+  "applies_to": ["boq", "tender", "estimate", "validation"],
+  "enables_rule_ids": [
+    "gaeb.xml_schema_valid",
+    "gaeb.phase_x81_structure_valid",
+    "gaeb.phase_x83_structure_valid",
+    "gaeb.phase_x84_structure_valid",
+    "gaeb.phase_x86_structure_valid",
+    "gaeb.lv_numbering_consistent",
+    "gaeb.oz_ordnungszahl_format_valid",
+    "gaeb.item_description_not_empty",
+    "gaeb.unit_specified_per_item",
+    "gaeb.quantity_present_x83",
+    "gaeb.unit_price_present_x84",
+    "gaeb.total_price_calculated_correctly",
+    "gaeb.currency_element_present",
+    "gaeb.bidder_info_present_x84"
+  ],
+  "regulator": "GAEB (Gemeinsamer Ausschuss Elektronik im Bauwesen)",
+  "publication_year": 2023
+}

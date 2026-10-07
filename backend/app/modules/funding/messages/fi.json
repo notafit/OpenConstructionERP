@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Toimenpiteen työt alkoivat {start}, ennen kuin hakemus jätettiin {filed} - useimmat ohjelmat eivät rahoita lainkaan jo aloitettua toimenpidettä",
+      "unevidenced": "Työt alkoivat etuajassa {start}. Asiakirjojen mukaan viranomainen salli aikaisen aloituksen, mutta kirjallisen luvan viitettä ei ole kirjattu",
+      "evidence": "Kirjaa viite kirjalliseen lupaan aloittaa etuajassa, jotta asiakirjat kestävät tarkastuksen",
+      "suggestion": "Tarkista ohjelman ehdot ennen kuin käytät lisää rahaa. Jos viranomainen salli aikaisen aloituksen kirjallisesti, kirjaa lupa; jos ei sallinut, kysy viranomaiselta ennen kuin hakemusta viedään eteenpäin"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Nosto {draw} sisältää kustannuksia ajalta ennen tukikauden alkua {period_start}",
+      "after": "Nosto {draw} sisältää kustannuksia ajalta tukikauden päättymisen {period_end} jälkeen",
+      "spans": "Nosto {draw} ulottuu tukikauden ulkopuolelle sen kummastakin päästä (tukikausi {period_start} - {period_end})",
+      "suggestion": "Siirrä tukikauden ulkopuoliset kustannukset omaan nostoonsa ja selvitä ne viranomaisen kanssa, sen sijaan että sama nosto sisältäisi molemmat"
+    },
+    "own_share_is_covered": {
+      "fail": "Ohjelma edellyttää {rate} prosentin omarahoitusosuutta eli {required}, mutta hakemukseen on kirjattu {recorded}",
+      "suggestion": "Kerro ennen hakemuksen lähettämistä, mistä loput omarahoitusosuudesta tulevat, koska ohjelma laskee sen tukikelpoisesta kustannuspohjasta eikä hankkeen kokonaiskustannuksista"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "Tämän hankkeen hakemukset ({count} kpl) kattavat yhteensä {intensity} prosenttia tukikelpoisista kustannuksista, mikä ylittää niiden ohjelmista tiukimman asettaman {cap} prosentin tuki-intensiteetin ylärajan",
+      "suggestion": "Julkinen rahoitus kasautuu ohjelmien ja hallinnon tasojen yli. Pienennä jonkin hakemuksen haettua summaa tai selvitä, voidaanko toimenpiteet erottaa niin, että kullakin on omat kustannuksensa"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "Tukikausi päättyi {period_end}, eikä lopullista käyttöselvitystä ole aloitettu",
+      "late": "Lopullinen käyttöselvitys erääntyi {due} ja lähetettiin {submitted}",
+      "overdue": "Lopullinen käyttöselvitys erääntyi {due}, eikä sitä ole lähetetty",
+      "suggestion": "Lähetä se, mitä on valmiina, äläkä odota selvityksen valmistumista. Useimmat viranomaiset myöntävät lisäaikaa pyynnöstä, mutta yksikään ei pidennä jo umpeutunutta määräaikaa"
+    },
+    "errors": {
+      "application_not_found": "Hakemusta ei löytynyt",
+      "programme_code_taken": "Tässä maassa on jo ohjelma, jolla on tämä koodi",
+      "programme_not_found": "Ohjelmaa ei löytynyt",
+      "programme_has_applications": "Tällä ohjelmalla on hakemuksia, joten sitä ei voi poistaa. Sulje se sen sijaan.",
+      "application_code_taken": "Tässä hankkeessa on jo hakemus, jolla on tämä koodi",
+      "approved_application_not_deletable": "Hyväksyttyä hakemusta ei voi poistaa. Muuta sen sijaan hakemuksen tilaksi peruttu tai suljettu.",
+      "approval_needs_period_end": "Hyväksyntä edellyttää tukikauden päättymispäivää, koska kaikki myöhemmät määräajat lasketaan siitä",
+      "draw_needs_approval": "Tukea voi nostaa vain hyväksytyn hakemuksen perusteella",
+      "draw_not_found": "Nostoa ei löytynyt",
+      "paid_draw_not_deletable": "Maksettua nostoa ei voi poistaa",
+      "proof_not_found": "Käyttöselvitystä ei löytynyt",
+      "obligation_not_found": "Velvoitetta ei löytynyt",
+      "eligible_exceeds_amount": "Tukikelpoinen summa ei voi olla suurempi kuin koko summa",
+      "allocation_not_found": "Kustannuserää ei löytynyt"
+    }
+  }
+}

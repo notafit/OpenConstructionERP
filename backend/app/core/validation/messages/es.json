@@ -145,6 +145,10 @@
     "base_date_readable": {
       "fail": "La fecha base '{base_date}' no es una fecha, por lo que la medición se grava al tipo de hoy y no al suyo propio",
       "suggestion": "Indique la base de precios como día, mes, trimestre o año ({shapes})"
+    },
+    "tax_date_readable": {
+      "fail": "La fecha fiscal '{tax_date}' no es una fecha, por lo que la medición se grava al tipo de hoy y no al suyo propio",
+      "suggestion": "Indique la fecha fiscal como día, mes, trimestre o año ({shapes}), o déjela vacía para gravar la medición según su fecha base"
     }
   },
   "din276": {
@@ -329,14 +333,67 @@
       "suggestion": "Asigne a cada posición su propio número de partida antes de enviar el presupuesto"
     }
   },
+  "prezzario": {
+    "voce_code_format_valid": {
+      "fail": "El código '{code}' de la posición {ordinal} no indica de qué lista de precios procede",
+      "suggestion": "Un código oficial empieza por la región y el año de edición de su lista de precios, por ejemplo TOS25_01.A03.001.001 (Toscana 2025). Copie el código tal como lo imprime la lista regional, importe la línea desde la lista o numere un precio nuevo como NP.01"
+    },
+    "voce_reference_present": {
+      "fail": "La posición {ordinal} no cita ninguna partida de la lista de precios",
+      "suggestion": "Tome la línea de una lista de precios regional importada o márquela como precio nuevo (NP) con su análisis de precio"
+    },
+    "costi_sicurezza_separated": {
+      "fail": "El presupuesto no tiene una línea propia para los costes de seguridad no sujetos a la baja de la oferta",
+      "suggestion": "Añada los oneri della sicurezza como capítulo o línea de recargo propia, valorada con el capítulo de seguridad de la lista o el plan de seguridad"
+    },
+    "incidenza_manodopera_documented": {
+      "fail": "La posición {ordinal} ({code}) no indica su incidencia de mano de obra",
+      "suggestion": "Tome la incidencia de mano de obra de la lista de precios o añada un recurso de mano de obra, para que el coste laboral figure por separado en la licitación"
+    },
+    "overheads_not_applied_twice": {
+      "fail": "Los precios de las listas regionales ya incluyen gastos generales (13-17 %) y beneficio (10 %). Aplicarlos de nuevo eleva el total en torno a un {percent} %.",
+      "suggestion": "Elimine los recargos de gastos generales y beneficio de este presupuesto, o manténgalos solo en las líneas con análisis de precio propio (NP)."
+    }
+  },
+  "romania": {
+    "deviz_chapter_required": {
+      "fail": "La posición {ordinal} no indica ningún capítulo del deviz general",
+      "suggestion": "Asigne la partida a su capítulo y subcapítulo según la HG 907/2016, por ejemplo 4.1 para obras de construcción e instalaciones o 5.1 para la organización de obra"
+    },
+    "deviz_chapter_recognised": {
+      "fail": "El código de deviz '{code}' de la posición {ordinal} no es un capítulo ni un subcapítulo del deviz general",
+      "suggestion": "Use un código de los capítulos 1 a 6 del deviz general de la HG 907/2016, como 1.2, 2, 3.5, 4.1, 5.1 o 6.2"
+    }
+  },
+  "greece": {
+    "net_article_required": {
+      "fail": "La posición {ordinal} no lleva ningún artículo de las listas de precios unificadas (ΝΕΤ)",
+      "suggestion": "Indique el artículo ΝΕΤ con el que se valora la partida, por ejemplo ΟΙΚ 32.01.06, o ΝΑΟΙΚ para un artículo nuevo"
+    },
+    "net_article_valid": {
+      "invalid": "El artículo '{code}' de la posición {ordinal} no tiene la forma de un artículo ΝΕΤ",
+      "chapter": "El artículo '{code}' de la posición {ordinal} abre el capítulo {chapter}, que la lista de precios de edificación no tiene",
+      "suggestion": "Escriba el prefijo de la lista y el número de artículo, por ejemplo ΟΙΚ 38.20.02, ΟΔΟ Α-2 o ΑΤΗΕ 8151.1"
+    }
+  },
+  "ukraine": {
+    "zkr_chapter_required": {
+      "fail": "La posición {ordinal} no indica ningún capítulo del presupuesto resumen",
+      "suggestion": "Asigne la partida a su capítulo del зведений кошторисний розрахунок, del 1 al 12; las obras del objeto principal van en el capítulo 2"
+    },
+    "zkr_chapter_recognised": {
+      "fail": "El capítulo {chapter} de la posición {ordinal} no es uno de los doce capítulos del presupuesto resumen",
+      "suggestion": "Use un número de capítulo del 1 al 12"
+    }
+  },
   "birimfiyat": {
     "code_required": {
       "fail": "A la posición {ordinal} le falta el número de poz de birim fiyat",
       "suggestion": "Asigne un número de poz de Bayındırlık (p. ej., 04.013/1)"
     },
     "valid_poz": {
-      "fail": "El poz '{code}' no coincide con el formato XX.XXX/X",
-      "suggestion": "Use el formato: NN.NNN o NN.NNN/N (p. ej., 04.013/1)"
+      "fail": "El poz '{code}' no es un número actual del libro de precios unitarios (XX.XXX.XXXX) ni uno antiguo (XX.XXX/X)",
+      "suggestion": "Use el número del libro, p. ej. 15.140.1002, o 04.013/1 en un contrato antiguo; numere sus partidas analizadas como ÖZEL-1"
     }
   },
   "sekisan": {
@@ -509,6 +566,18 @@
     "po_line_cost_coded": {
       "fail": "La línea {line} no tiene WBS, categoría de coste ni línea de coste, por lo que no aparecerá en el desglose",
       "suggestion": "Asigne un código de coste para que el compromiso impute a un presupuesto"
+    },
+    "invoice_within_order": {
+      "fail": "La factura de {invoice} supera en {excess} los {remaining} pendientes del pedido {po}",
+      "suggestion": "Compare la factura con el pedido; si el exceso se acordó, regístrelo como cambio del pedido antes de aprobar"
+    },
+    "invoice_quantity_received": {
+      "fail": "La línea {line} quedaría facturada por {invoiced} en total, pero solo se han recibido {received}",
+      "suggestion": "Espere el albarán o confirme la recepción de mercancía antes de aprobar esta cantidad"
+    },
+    "invoice_value_received": {
+      "fail": "En el pedido {po} las facturas sumarían {invoiced}, pero la mercancía recibida solo vale {received} a los precios del pedido",
+      "suggestion": "Espere el albarán o confirme la recepción de mercancía antes de aprobar este importe"
     }
   },
   "subcontract": {
@@ -543,6 +612,10 @@
     "insurance_valid_at_start": {
       "fail": "El seguro del subcontratista vencio el {expiry}, antes del inicio de los trabajos el {reference}",
       "suggestion": "Recabe un certificado vigente antes de dar acceso a obra al subcontratista"
+    },
+    "unlinked_contract_twin": {
+      "fail": "El subcontrato {agreement} y el contrato {contract} parecen ser el mismo subcontrato, por lo que las finanzas podrían contarlo dos veces",
+      "suggestion": "Vincúlelos si son el mismo subcontrato, o márquelos como distintos"
     }
   },
   "submittal": {
@@ -626,10 +699,13 @@
     "boq_not_found": "BOQ no encontrado",
     "session_not_found": "Sesión no encontrada",
     "document_not_found": "Documento no encontrado",
+    "documents_batch_delete_referenced": "Otros registros aún apuntan a documentos de este lote. Revise lo que la eliminación desvincula y confirme con acknowledge_references.",
     "invitation_not_found": "Invitación no encontrada",
     "agreement_not_found": "Contrato no encontrado",
     "rejection_not_found": "Rechazo no encontrado",
     "claim_not_found": "Certificación de avance no encontrada",
+    "gaeb_x89_final_account_unsupported": "Una liquidación final o liquidación final parcial todavía no se puede exportar como GAEB X89. Debe facturar la obra acumulada menos los pagos anteriores, y a partir de una certificación solo se genera una factura parcial de un período. Exporte la certificación como factura parcial.",
+    "xpwe_native_file_refused": "Este es el archivo de proyecto propio de un programa de presupuestos, que solo ese programa puede abrir. Exporte el presupuesto como XPWE desde su programa de presupuestos y suba el archivo .xpwe.",
     "plot_not_found": "Parcela no encontrada",
     "survey_not_found": "Levantamiento con dron no encontrado",
     "diary_video_not_found": "Vídeo del diario de obra no encontrado",
@@ -648,7 +724,10 @@
     "estimate_job_not_found": "Tarea de estimación no encontrada",
     "escrow_not_found": "Transacción de depósito en garantía no encontrada",
     "commission_accrual_not_found": "Devengo de comisión no encontrado",
-    "baseline_not_found": "Línea base no encontrada"
+    "baseline_not_found": "Línea base no encontrada",
+    "fx_rate_set_locked": "Los tipos del BCE del {date} están bloqueados, por lo que esta actualización no los ha sobrescrito. Desbloquee primero ese conjunto de tipos si debe recibir la nueva publicación.",
+    "boq_locked": "El BOQ está bloqueado y no se puede modificar. Cree una revisión para hacer cambios.",
+    "boq_link_owner_locked": "El código '{code}' está definido por una partida del BOQ bloqueado '{bill}', y vincularlo modificaría ese BOQ. Desbloquee primero ese BOQ o introduzca la partida con un código nuevo."
   },
   "variations": {
     "boq_lines_are_traced": {
@@ -774,6 +853,16 @@
       "norm_collapsed": "Posición {ordinal}: las filas de recursos perdieron su rendimiento de catálogo y llevan la cantidad de la posición en su lugar, por lo que el precio unitario no se volvió a derivar de ellas",
       "whole_position_quantities": "Posición {ordinal}: las filas de recursos llevan cantidades de toda la posición en vez de rendimientos por unidad, por lo que el precio unitario no se volvió a derivar de ellas",
       "suggestion": "Revise el descompuesto - vuelva a derivar la posición desde su elemento de catálogo mediante la revisión de rendimientos de recursos, o corrija las filas a mano"
+    }
+  },
+  "poland": {
+    "knr_reference_required": {
+      "fail": "La posición {ordinal} no cita ninguna tabla de catálogo KNR",
+      "suggestion": "Indique en la columna podstawa la tabla de catálogo de la que salen las normas, por ejemplo KNR 2-02 0201-01, o escriba kalkulacja indywidualna para una partida de cálculo propio"
+    },
+    "knr_reference_recognised": {
+      "fail": "La referencia '{code}' de la posición {ordinal} no nombra ninguna familia de catálogos KNR",
+      "suggestion": "Empiece la referencia por su familia de catálogo, como KNR, KNNR, KNR-W o KSNR, o marque la partida como kalkulacja indywidualna"
     }
   }
 }

@@ -46,9 +46,21 @@ import {
 } from '@/features/match-elements/catalogues-payload';
 import { fetchCostCatalogs, type CostCatalog } from './api';
 import { ResourcePriceSheetPanel } from './ResourcePriceSheetPanel';
+import { RegionalPriceListImport } from './RegionalPriceListImport';
 import { BaseCatalogBrowser } from './BaseCatalogBrowser';
 import { BaseCatalogError } from './BaseCatalogError';
-import { useBaseCatalog, flattenVariants, type BaseVariant } from './baseCatalog';
+import {
+  useBaseCatalog,
+  flattenVariants,
+  getActiveMarkets,
+  languageName,
+  loadBaseMarket,
+  restoreBaseHome,
+  textLanguageFallback,
+  canPriceMarkets as roleCanPriceMarkets,
+  type BaseMarketResult,
+  type BaseVariant,
+} from './baseCatalog';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -173,29 +185,8 @@ function setActiveDatabase(dbId: string): void {
   }
 }
 
-// Which market each national base is currently repriced into. Keyed by
-// base_region -> market_catalog token (e.g. { ZH_CHINA: 'GB_LONDON_en' }). MVP
-// client-side tracking; a server table is a later hardening.
-const ACTIVE_MARKETS_KEY = 'oe_active_markets';
-
-function getActiveMarkets(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(ACTIVE_MARKETS_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, string>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function setActiveMarketFor(baseRegion: string, token: string): void {
-  try {
-    const current = getActiveMarkets();
-    current[baseRegion] = token;
-    localStorage.setItem(ACTIVE_MARKETS_KEY, JSON.stringify(current));
-  } catch {
-    // Storage unavailable -- ignore.
-  }
-}
+// Which market each national base is repriced into lives in ./baseCatalog, next
+// to the one call that changes it (loadBaseMarket), so every surface records it.
 
 // ── API helper for file upload ───────────────────────────────────────────────
 
@@ -418,7 +409,9 @@ function MiniFlag({ code }: { code: string }) {
 }
 
 function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  // Pricing a base into a market rewrites the shared catalogue (costs.update).
+  const canPriceMarkets = roleCanPriceMarkets(useAuthStore((s) => s.userRole));
   const queryClient = useQueryClient();
   const [loading, setLoading] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<Set<string>>(() => new Set(getLoadedDatabases()));
@@ -435,6 +428,7 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
   // "Active market" badge vs a "Switch to" action.
   const [activeMarkets, setActiveMarkets] = useState<Record<string, string>>(() => getActiveMarkets());
   const addToast = useToastStore((s) => s.addToast);
+  const { confirm: confirmRestore, ...restoreConfirmProps } = useConfirm();
 
   // The whole loadable catalog (9 base families, 38 cost bases) with real
   // work-item counts, from the single-source backend registry. The browser
@@ -504,14 +498,9 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
         setResult(null);
         setLastLoadedDb(variant);
         try {
-          const data = await apiPost<Record<string, unknown>>(
-            `/v1/costs/base-market/${baseRegion}/${variant.market_catalog}`,
-            undefined,
-            { longRunning: true },
-          );
+          const data = await loadBaseMarket(variant);
           setLoaded((prev) => new Set(prev).add(baseRegion));
           addLoadedDatabase(baseRegion);
-          setActiveMarketFor(baseRegion, variant.market_catalog);
           setActiveMarkets((prev) => ({ ...prev, [baseRegion]: variant.market_catalog }));
           // Make this base the working database if none is set yet (mirrors the
           // home-load behaviour - never steal an already-chosen active db).
@@ -519,20 +508,36 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
             setActiveDatabase(baseRegion);
             setActiveDb(baseRegion);
           }
-          const repriced = (data.items_repriced as number) ?? (data.items_total as number) ?? 0;
+          const repriced = data.items_repriced ?? data.items_total ?? 0;
           setResult({ id: variant.variant_id, imported: repriced, skipped: 0, file: '' });
+          if (data.catalog?.error) {
+            addToast({
+              type: 'warning',
+              title: variant.market,
+              message: t('costs.market_catalog_not_updated', {
+                defaultValue: 'The prices are switched, but the Resource Catalog could not be updated to this market.',
+              }),
+            });
+          }
+          const fellBackTo = textLanguageFallback(data);
           addToast({
-            type: 'success',
+            type: fellBackTo ? 'warning' : 'success',
             title: t('costs.market_priced_title', {
               defaultValue: 'Priced into {{market}}',
               market: variant.market,
             }),
-            message: t('costs.market_priced_msg', {
-              defaultValue: '{{items}} items repriced into {{market}} ({{currency}})',
-              items: repriced.toLocaleString(getNumberLocale()),
-              market: variant.market,
-              currency: variant.currency,
-            }),
+            message: fellBackTo
+              ? t('costs.market_text_fallback', {
+                  defaultValue: 'The work items are in {{language}}: this base has no {{requested}} version.',
+                  language: languageName(fellBackTo, i18n.language),
+                  requested: languageName(data.text_language_requested ?? variant.lang_code, i18n.language),
+                })
+              : t('costs.market_priced_msg', {
+                  defaultValue: '{{items}} items repriced into {{market}} ({{currency}})',
+                  items: repriced.toLocaleString(getNumberLocale()),
+                  market: variant.market,
+                  currency: variant.currency,
+                }),
           });
           queryClient.invalidateQueries({ queryKey: ['costs'] });
         } catch (err: unknown) {
@@ -575,7 +580,7 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
         // default abort. Opt into the 5-min long-running budget (see api.ts) so
         // the request waits for the backend instead of aborting mid-import and
         // showing a false "Request timed out" (GitHub #171).
-        const data = await apiPost<Record<string, unknown>>(
+        const data = await apiPost<BaseMarketResult>(
           `/v1/costs/load-cwicr/${db.id}`,
           undefined,
           { longRunning: true },
@@ -613,6 +618,20 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
             type: 'success',
             title: t('costs.db_installed', { defaultValue: 'Database installed successfully' }),
             message: `${imported.toLocaleString(getNumberLocale())} cost items imported`,
+          });
+        }
+
+        // A national base opens in its own language only if that swap landed.
+        const homeFellBackTo = textLanguageFallback(data);
+        if (homeFellBackTo) {
+          addToast({
+            type: 'warning',
+            title: db.name,
+            message: t('costs.base_text_swap_failed', {
+              defaultValue: 'The work items stayed in {{language}}: the {{requested}} text could not be loaded.',
+              language: languageName(homeFellBackTo, i18n.language),
+              requested: languageName(String(data.text_language_requested), i18n.language),
+            }),
           });
         }
 
@@ -714,7 +733,117 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
         if (mountedRef.current) setLoading(null);
       }
     },
-    [addToast, t, queryClient],
+    [addToast, t, i18n, queryClient],
+  );
+
+  // The way back from a market: the base's own prices, currency and language,
+  // every item id kept. It rewrites the shared rows and replaces the price
+  // sheet, so it is confirmed first.
+  const handleRestoreHome = useCallback(
+    async (variant: BaseVariant) => {
+      const baseRegion = variant.base_region;
+      const ok = await confirmRestore({
+        title: t('costs.restore_home_confirm_title', {
+          defaultValue: 'Return {{base}} to its home market?',
+          base: variant.market,
+        }),
+        message: t('costs.restore_home_confirm_msg', {
+          defaultValue:
+            'Every work item of this base goes back to its own prices in {{currency}} and its own language, for everyone using it. Prices edited on its resource price sheet are replaced.',
+          currency: variant.currency,
+        }),
+        confirmLabel: t('costs.base_restore_home', { defaultValue: 'Return to home market' }),
+        variant: 'warning',
+      });
+      if (!ok) return;
+      setLoading(variant.variant_id);
+      setResult(null);
+      try {
+        const data = await restoreBaseHome(baseRegion);
+        if (!mountedRef.current) return;
+        setActiveMarkets((prev) =>
+          Object.fromEntries(Object.entries(prev).filter(([region]) => region !== baseRegion)),
+        );
+        const discarded = data.user_prices_discarded ?? 0;
+        addToast({
+          type: 'success',
+          title: t('costs.restore_home_done_title', {
+            defaultValue: '{{base}} is back on its home market',
+            base: variant.market,
+          }),
+          message:
+            t('costs.restore_home_done_msg', {
+              count: data.items_restored ?? 0,
+              defaultValue_one: '{{items}} item is back on its own price in {{currency}}.',
+              defaultValue: '{{items}} items are back on their own prices in {{currency}}.',
+              items: (data.items_restored ?? 0).toLocaleString(getNumberLocale()),
+              currency: data.currency ?? variant.currency,
+            }) +
+            (discarded > 0
+              ? ` ${t('costs.restore_home_discarded', {
+                  defaultValue: 'Edited resource prices replaced: {{n}}.',
+                  n: discarded,
+                })}`
+              : ''),
+        });
+        // Items whose recipe the home sheet cannot price keep the market's
+        // rates and currency. The server counts them so nobody takes them for
+        // home prices.
+        const leftInMarket = data.items_left_in_market ?? 0;
+        if (leftInMarket > 0) {
+          addToast({
+            type: 'warning',
+            title: variant.market,
+            message: t('costs.restore_home_left_in_market', {
+              count: leftInMarket,
+              defaultValue_one:
+                '{{items}} item still carries a market price: its recipe has no resource the home price sheet prices. Check it before using it in an estimate.',
+              defaultValue:
+                '{{items}} items still carry market prices: their recipes have no resource the home price sheet prices. Check them before using them in an estimate.',
+              items: leftInMarket.toLocaleString(getNumberLocale()),
+            }),
+          });
+        }
+        const fellBackTo = textLanguageFallback(data);
+        if (fellBackTo) {
+          addToast({
+            type: 'warning',
+            title: variant.market,
+            message: t('costs.base_text_swap_failed', {
+              defaultValue: 'The work items stayed in {{language}}: the {{requested}} text could not be loaded.',
+              language: languageName(fellBackTo, i18n.language),
+              requested: languageName(String(data.text_language_requested), i18n.language),
+            }),
+          });
+        }
+        if (data.catalog?.error) {
+          addToast({
+            type: 'warning',
+            title: variant.market,
+            message: t('costs.restore_home_catalog_not_updated', {
+              defaultValue:
+                'The prices are back, but the Resource Catalog could not be given its home resources. Import them again from the Resource Catalog page.',
+            }),
+          });
+        }
+        queryClient.invalidateQueries({ queryKey: ['costs'] });
+      } catch (err: unknown) {
+        if (!mountedRef.current) return;
+        addToast({
+          type: 'error',
+          title: t('costs.restore_home_failed_title', {
+            defaultValue: 'Could not return {{base}} to its home market',
+            base: variant.market,
+          }),
+          message: err instanceof Error ? err.message : '',
+        });
+        // A failure may leave the switch marked unfinished; show what the server says.
+        queryClient.invalidateQueries({ queryKey: ['costs', 'base-catalog'] });
+      } finally {
+        if (mountedRef.current) setLoading(null);
+      }
+    },
+    [addToast, confirmRestore, t, i18n, queryClient],
   );
 
   return (
@@ -729,7 +858,8 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
           activeRegion={activeDb}
           activeMarkets={activeMarkets}
           onLoad={handleLoad}
-          onReprice={handleLoad}
+          onReprice={canPriceMarkets ? handleLoad : undefined}
+          onRestoreHome={canPriceMarkets ? handleRestoreHome : undefined}
           onSetActive={handleSetActive}
           elapsedSeconds={elapsed}
         />
@@ -741,6 +871,8 @@ function CWICRDatabaseGrid(_props: { onLoadDatabase: (file: File) => void }) {
           {t('costs.base_loading_catalog', { defaultValue: 'Loading cost bases...' })}
         </div>
       )}
+
+      <ConfirmDialog {...restoreConfirmProps} />
 
       {/* ── Import Progress Panel ─────────────────────────────────────── */}
       {(loading || result) && (() => {
@@ -931,7 +1063,7 @@ async function downloadExcelExport(): Promise<void> {
 
 // ── Loaded Databases Section ────────────────────────────────────────────────
 
-function LoadedDatabasesSection() {
+export function LoadedDatabasesSection() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
@@ -1015,6 +1147,21 @@ function LoadedDatabasesSection() {
     },
   });
 
+  // A base whose licence asks to be credited (the Toscana prezzario, CC BY)
+  // keeps its credit on the row once loaded, not only on the card that loads
+  // it. Same query as the catalogue above, so it is read from the cache.
+  const { data: baseCatalog } = useBaseCatalog();
+  const creditByRegion = new Map<string, { attribution: string; licence: string }>();
+  for (const family of baseCatalog?.families ?? []) {
+    if (!family.attribution) continue;
+    for (const variant of family.variants) {
+      creditByRegion.set(variant.base_region || variant.region, {
+        attribution: family.attribution,
+        licence: family.licence ?? '',
+      });
+    }
+  }
+
   const activeDbId = getActiveDatabase();
   const regionCount = regionStats?.length ?? 0;
 
@@ -1031,7 +1178,7 @@ function LoadedDatabasesSection() {
               {isLoading
                 ? t('costs.loaded_loading', { defaultValue: 'Loading installed databases...' })
                 : hasData
-                  ? `${regionCount} ${regionCount === 1 ? t('costs.region_singular', { defaultValue: 'region' }) : t('costs.region_plural', { defaultValue: 'regions' })} · ${totalItems.toLocaleString(getNumberLocale())} ${t('costs.items_total', { defaultValue: 'items total' })}`
+                  ? `${t('costs.region_count', { count: regionCount, defaultValue_one: '{{count}} region', defaultValue_other: '{{count}} regions' })} · ${totalItems.toLocaleString(getNumberLocale())} ${t('costs.items_total', { defaultValue: 'items total' })}`
                   : t('costs.no_databases_installed', {
                       defaultValue: 'No databases installed yet. Pick a region above to install.',
                     })}
@@ -1151,6 +1298,15 @@ function LoadedDatabasesSection() {
                           {db && (
                             <span className="text-2xs text-content-tertiary ml-1.5">
                               {db.currency}
+                            </span>
+                          )}
+                          {creditByRegion.has(rs.region) && (
+                            <span className="block text-2xs text-content-tertiary" data-testid="loaded-base-attribution">
+                              {t('costs.base_source_attribution', {
+                                defaultValue: 'Source: {{attribution}}, {{licence}}',
+                                attribution: creditByRegion.get(rs.region)!.attribution,
+                                licence: creditByRegion.get(rs.region)!.licence,
+                              })}
                             </span>
                           )}
                         </div>
@@ -2854,6 +3010,9 @@ export function ImportDatabasePage() {
           Indonesia AHSP) so their zero-rate work items become estimable. */}
       <ResourcePriceSheetPanel />
 
+      {/* Regional price lists (prezzari regionali) from the file the region publishes. */}
+      <RegionalPriceListImport />
+
       {/* Divider */}
       <div className="flex items-center gap-3">
         <div className="h-px flex-1 bg-border-light" />
@@ -2886,8 +3045,11 @@ export function ImportDatabasePage() {
                   {t('costs.import_complete', { defaultValue: 'Import Complete' })}
                 </h3>
                 <p className="text-sm text-content-secondary">
-                  {result.total_rows}{' '}
-                  {t('costs.import_rows_processed', { defaultValue: 'rows processed' })}
+                  {t('costs.import_rows_processed_count', {
+                    count: result.total_rows,
+                    defaultValue_one: '{{count}} row processed',
+                    defaultValue: '{{count}} rows processed',
+                  })}
                 </p>
               </div>
             </div>

@@ -1,0 +1,27 @@
+{
+  "rule_pack_id": "nf_p_03_001",
+  "name": "NF P 03-001 — General Conditions for Private Construction Contracts",
+  "standard": "NF P 03-001:2017",
+  "jurisdiction": "FR",
+  "description": "Validates tender and contract documents against NF P 03-001 (Cahier des clauses administratives applicable aux travaux de batiment faisant l'objet de marches prives). Checks that the CCAP covers essential clauses: price structure, payment terms, acceptance, defects liability (garantie de parfait achevement), retention, insurance, and dispute resolution. Applicable to private-sector building contracts in France.",
+  "applies_to": ["tender", "contracts", "validation"],
+  "enables_rule_ids": [
+    "nfp03.contract_type_specified",
+    "nfp03.ccap_present",
+    "nfp03.price_structure_defined",
+    "nfp03.prix_forfaitaire_or_unitaire_stated",
+    "nfp03.delai_execution_set",
+    "nfp03.penalites_retard_rate_set",
+    "nfp03.reception_clause_present",
+    "nfp03.garantie_parfait_achevement_1_year",
+    "nfp03.garantie_biennale_set",
+    "nfp03.garantie_decennale_referenced",
+    "nfp03.retenue_garantie_max_5_pct",
+    "nfp03.assurance_dommage_ouvrage_referenced",
+    "nfp03.assurance_rc_professionnelle_referenced",
+    "nfp03.reglement_differends_clause_present",
+    "nfp03.sous_traitance_clause_present"
+  ],
+  "regulator": "AFNOR",
+  "publication_year": 2017
+}

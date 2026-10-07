@@ -123,7 +123,11 @@ def main() -> int:
     canonical_source = canonical_path.read_text(encoding="utf-8")
     # Guard against the source of truth being renamed or gutted while this
     # script keeps reporting a clean tree over the remaining copies.
-    for expected in ("_JWT_KNOWN_WEAK_SECRETS", "jwt_secret_is_known_weak", "jwt_secret_is_too_short"):
+    for expected in (
+        "_JWT_KNOWN_WEAK_SECRETS",
+        "jwt_secret_is_known_weak",
+        "jwt_secret_is_too_short",
+    ):
         if expected not in canonical_source:
             print(f"ERROR: {canonical_path} no longer defines {expected}.")
             print("The source of truth moved; update CANONICAL in this script.")

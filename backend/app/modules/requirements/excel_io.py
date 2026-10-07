@@ -154,9 +154,14 @@ def parse_xlsx(payload: bytes) -> tuple[list[dict[str, Any]], list[str]]:
 
     The parser is forgiving: header row may be in any column order,
     extra columns are ignored, and missing rows are skipped silently.
-    Empty rows (no entity AND no attribute) are dropped.
+    Empty rows (no entity AND no attribute) are dropped. The header is row 1,
+    or the table's header under a company letterhead when the file is one of
+    our own exports (see ``app.core.sheet_header``); warnings name the row
+    as the spreadsheet numbers it either way.
     """
     import openpyxl
+
+    from app.core.sheet_header import find_header_row
 
     warnings: list[str] = []
     rows: list[dict[str, Any]] = []
@@ -172,12 +177,11 @@ def parse_xlsx(payload: bytes) -> tuple[list[dict[str, Any]], list[str]]:
         warnings.append("Workbook has no active sheet")
         return rows, warnings
 
-    iterator = sheet.iter_rows(values_only=True)
-    try:
-        header_row = next(iterator)
-    except StopIteration:
+    found = find_header_row(sheet.iter_rows(values_only=True), lambda text: text.strip().lower() in COLUMNS)
+    if found.values is None:
         warnings.append("Workbook is empty")
         return rows, warnings
+    header_row, iterator = found.values, found.rows
 
     headers = [str(c).strip().lower() if c is not None else "" for c in header_row]
     col_index: dict[str, int] = {}
@@ -190,7 +194,7 @@ def parse_xlsx(payload: bytes) -> tuple[list[dict[str, Any]], list[str]]:
         warnings.append("Missing required columns: " + ", ".join(sorted(missing_required)))
         return rows, warnings
 
-    for line_no, raw_row in enumerate(iterator, start=2):
+    for line_no, raw_row in enumerate(iterator, start=found.number + 1):
         if raw_row is None:
             continue
         entity = (
@@ -289,6 +293,15 @@ def export_xlsx(rows: list[dict[str, Any]], title: str = "Requirements") -> byte
             ws.cell(row=r_idx, column=c_idx, value=row.get(col, "") or "")
 
     ws.freeze_panes = "A2"
+
+    # Company letterhead above the table; a no-op without a company profile.
+    # ``parse_xlsx`` finds the header under it, so the file re-imports as is.
+    from app.core.xlsx_branding import apply_company_header
+    from app.core.xlsx_text import store_strings_as_text
+
+    store_strings_as_text(ws)
+    apply_company_header(ws, title=ws.title)
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

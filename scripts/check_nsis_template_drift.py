@@ -2,15 +2,17 @@
 """Check that the vendored NSIS installer template is upstream plus our edits.
 
 ``desktop/src-tauri/windows/installer.nsi`` is a copy of the template that ships
-inside the Tauri bundler, carrying four deliberate changes, all of them on the
-reinstall page a user meets when a previous version is already installed. The
-second radio button, "Do not uninstall", starts selected on an upgrade. The WiX
+inside the Tauri bundler, carrying seven deliberate changes. Four are on the
+reinstall page a user meets when a previous version is already installed: the
+second radio button, "Do not uninstall", starts selected on an upgrade; the WiX
 migration branch obeys whichever button was selected rather than uninstalling
-regardless. The old uninstaller is run with a five-minute timeout via nsExec
+regardless; the old uninstaller is run with a five-minute timeout via nsExec
 instead of an unbounded ExecWait, so a hanging pre-v15.9.0 uninstaller cannot
-freeze the upgrade forever. And a file the old uninstaller left behind after
-reporting success no longer aborts the install. The reasons are written at length
-in that file.
+freeze the upgrade forever; and a file the old uninstaller left behind after
+reporting success no longer aborts the install. Two more are in the Uninstall
+section: the main executable and the uninstaller binary are deleted with
+/REBOOTOK so that a locked file is scheduled for removal on reboot rather than
+silently surviving. The reasons are written at length in that file.
 
 Vendoring it costs something, and this script is the payment. The template is a
 Handlebars template, not plain NSI: blocks like each-resources and each-binaries
@@ -322,20 +324,79 @@ LEFTOVER_FILE_AFTER = r"""    ; OpenConstructionERP fork, edit three of four (wa
         Abort
       ${EndIf}
 
+      ; OpenConstructionERP fork. When the old uninstaller fails for any reason
+      ; other than user cancellation (codes 1 / 1602 above), continue with the
+      ; install instead of aborting. The install writes over every file in
+      ; $INSTDIR, NSIS_HOOK_PREINSTALL stops running processes, and the new
+      ; uninstaller replaces the broken one. Aborting here leaves the user
+      ; stuck: the old uninstaller is broken, the new installer refuses to
+      ; proceed, and the only way forward is manual removal via Windows Settings.
+      ;
+      ; On an UPGRADE ($R0 = 1) this is completely silent. Code -1 in the field
+      ; has been traced to old hooks (pre-v15.9) whose PowerShell fails under
+      ; antivirus or group policy on specific machines, and showing a scary
+      ; "Unable to uninstall!" dialog on every upgrade when the fix is always
+      ; "click Yes and continue" is worse than the error it reports. The new
+      ; installer's NSIS_HOOK_PREINSTALL stops every process the old uninstaller
+      ; missed, and every file is overwritten. On same-version reinstalls or
+      ; downgrades the dialog is kept so the user can decide.
+      ${If} $R0 = 1
+        ; Upgrading: silently continue. Log it for diagnostics but do not
+        ; block the user with a dialog they can only answer one way.
+        DetailPrint "Note: the previous version's uninstaller exited with code $0. Continuing with the upgrade."
+        Goto reinst_done
+      ${EndIf}
+
       ${If} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
         StrCpy $R5 "$R5$\nIt left $INSTDIR\${MAINBINARYNAME}.exe behind."
       ${EndIf}
 
-      ; Other errors? say what happened and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)$\n$\n$R5$\n$\nOpen Windows Settings, go to Apps, remove ${PRODUCTNAME} there, then run this installer again."
+      MessageBox MB_YESNO|MB_ICONEXCLAMATION "$(unableToUninstall)$\n$\n$R5$\n$\nThe installer can continue and overwrite the existing files. Continue?" /SD IDYES IDYES reinst_done
+"""
+
+# ── Edit five: /REBOOTOK on main exe delete ──────────────────────────────────
+# If the executable is still locked (antivirus, indexer) after hooks have run,
+# NSIS schedules it for deletion on the next reboot instead of silently
+# leaving it on disk. Without it the directory cannot be removed.
+
+REBOOTOK_EXE_BEFORE = r"""  ; Delete the app directory and its content from disk
+  ; Copy main executable
+  Delete "$INSTDIR\${MAINBINARYNAME}.exe"
+"""
+
+REBOOTOK_EXE_AFTER = r"""  ; Delete the app directory and its content from disk.
+  ; /REBOOTOK: if the executable is still locked (antivirus, indexer), Windows
+  ; schedules it for deletion on the next reboot instead of silently failing.
+  ; Without it the file stays behind and the directory cannot be removed.
+  Delete /REBOOTOK "$INSTDIR\${MAINBINARYNAME}.exe"
+"""
+
+# ── Edit six: /REBOOTOK on uninstaller delete ────────────────────────────────
+
+REBOOTOK_UNINST_BEFORE = r"""  ; Delete uninstaller
+  Delete "$INSTDIR\uninstall.exe"
+"""
+
+REBOOTOK_UNINST_AFTER = r"""  ; Delete uninstaller
+  Delete /REBOOTOK "$INSTDIR\uninstall.exe"
 """
 
 # Applied in this order, which is the order they appear in the file.
 PATCHES: tuple[tuple[str, str, str], ...] = (
     ("the reinstall page default", REINSTALL_DEFAULT_BEFORE, REINSTALL_DEFAULT_AFTER),
-    ("the WiX branch honouring the selection", WIX_SELECTION_BEFORE, WIX_SELECTION_AFTER),
+    (
+        "the WiX branch honouring the selection",
+        WIX_SELECTION_BEFORE,
+        WIX_SELECTION_AFTER,
+    ),
     ("the old uninstaller timeout", UNINSTALL_TIMEOUT_BEFORE, UNINSTALL_TIMEOUT_AFTER),
     ("a leftover file not being fatal", LEFTOVER_FILE_BEFORE, LEFTOVER_FILE_AFTER),
+    ("/REBOOTOK on the main executable", REBOOTOK_EXE_BEFORE, REBOOTOK_EXE_AFTER),
+    (
+        "/REBOOTOK on the uninstaller binary",
+        REBOOTOK_UNINST_BEFORE,
+        REBOOTOK_UNINST_AFTER,
+    ),
 )
 
 HANDLEBARS = re.compile(r"\{\{.*?\}\}", re.DOTALL)
@@ -358,7 +419,13 @@ def pinned_cli_version(workflow: Path) -> str:
     """
     if not workflow.is_file():
         raise CheckError(f"release workflow not found: {workflow}")
-    found = set(re.findall(r"^\s*TAURI_CLI_VERSION:\s*\"([^\"]+)\"", workflow.read_text(encoding="utf-8"), re.M))
+    found = set(
+        re.findall(
+            r"^\s*TAURI_CLI_VERSION:\s*\"([^\"]+)\"",
+            workflow.read_text(encoding="utf-8"),
+            re.M,
+        )
+    )
     if not found:
         raise CheckError(f"no TAURI_CLI_VERSION in {workflow}")
     if len(found) > 1:
@@ -442,7 +509,10 @@ def reconstruct(upstream: str) -> str:
 
 def compare_handlebars(vendored: str, upstream: str) -> list[str]:
     """Every Handlebars expression upstream has, ours must have, as many times."""
-    ours, theirs = Counter(HANDLEBARS.findall(vendored)), Counter(HANDLEBARS.findall(upstream))
+    ours, theirs = (
+        Counter(HANDLEBARS.findall(vendored)),
+        Counter(HANDLEBARS.findall(upstream)),
+    )
     problems = []
     for token in sorted((theirs - ours).elements()):
         problems.append(f"missing from the vendored template: {token}")
@@ -453,10 +523,28 @@ def compare_handlebars(vendored: str, upstream: str) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--vendored", type=Path, default=VENDORED, help="the copy to check (default: the repo's)")
-    parser.add_argument("--workflow", type=Path, default=WORKFLOW, help="where to read TAURI_CLI_VERSION from")
-    parser.add_argument("--config", type=Path, default=TAURI_CONF, help="the tauri config that must name the fork")
-    parser.add_argument("--version", help="check against this Tauri CLI version instead of the pinned one")
+    parser.add_argument(
+        "--vendored",
+        type=Path,
+        default=VENDORED,
+        help="the copy to check (default: the repo's)",
+    )
+    parser.add_argument(
+        "--workflow",
+        type=Path,
+        default=WORKFLOW,
+        help="where to read TAURI_CLI_VERSION from",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=TAURI_CONF,
+        help="the tauri config that must name the fork",
+    )
+    parser.add_argument(
+        "--version",
+        help="check against this Tauri CLI version instead of the pinned one",
+    )
     args = parser.parse_args()
 
     try:
@@ -480,7 +568,10 @@ def main() -> int:
             tofile=str(args.vendored),
             lineterm="",
         )
-        print("FAIL: the vendored template is not upstream plus our own edits.", file=sys.stderr)
+        print(
+            "FAIL: the vendored template is not upstream plus our own edits.",
+            file=sys.stderr,
+        )
         for line in diff:
             print(line, file=sys.stderr)
         problems.append("content differs")

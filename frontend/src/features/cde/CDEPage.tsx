@@ -1,9 +1,9 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
-import React, { Fragment, useState, useMemo, useCallback, useEffect } from 'react';
+import React, { Fragment, useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Link, useParams, useNavigate } from 'react-router-dom';
+import { Link, useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import clsx from 'clsx';
 import {
   Database,
@@ -30,12 +30,14 @@ import { DismissibleInfo, IntroRichText } from '@/shared/ui/DismissibleInfo';
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { apiGet, type Page } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import {
   fetchCDEContainers,
+  fetchCDEContainer,
   createCDEContainer,
   transitionContainer,
   fetchContainerRevisions,
@@ -56,6 +58,7 @@ import { CDEHistoryDrawer } from './CDEHistoryDrawer';
 import { CDETransmittalsBadge } from './CDETransmittalsBadge';
 import { CDESetupWizard } from './CDESetupWizard';
 import { cdeGuide } from './cdeGuide';
+import { withFocusedContainer } from './focusedContainer';
 import { fmtFixed } from '@/shared/lib/formatters';
 import { normalizeRole } from '@/shared/lib/roles';
 
@@ -863,16 +866,28 @@ const ContainerRow = React.memo(function ContainerRow({
   onPromote,
   onLinkDocument,
   onShowHistory,
+  focused = false,
 }: {
   container: CDEContainer;
   userRole: string | null;
   onPromote: (c: CDEContainer) => void;
   onLinkDocument: (c: CDEContainer) => void;
   onShowHistory: (c: CDEContainer) => void;
+  /** Opened from a link that names this container (`?container=<id>`, e.g. the
+   *  "published" notification): start expanded and bring it into view. */
+  focused?: boolean;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(focused);
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!focused) return;
+    setExpanded(true);
+    // Optional call: jsdom (and some embedded webviews) lack scrollIntoView.
+    rowRef.current?.scrollIntoView?.({ block: 'center' });
+  }, [focused]);
   const containerState = getContainerState(container);
   const containerDiscipline = getContainerDiscipline(container);
   const stateCfg = STATE_CONFIG[containerState] ?? STATE_CONFIG.wip;
@@ -896,7 +911,13 @@ const ContainerRow = React.memo(function ContainerRow({
     | undefined;
 
   return (
-    <div className="border-b border-border-light last:border-b-0">
+    <div
+      ref={rowRef}
+      className={clsx(
+        'border-b border-border-light last:border-b-0',
+        focused && 'ring-1 ring-inset ring-oe-blue/40',
+      )}
+    >
       {/* Main row */}
       <div
         className={clsx(
@@ -1543,6 +1564,10 @@ export function CDEPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { projectId: routeProjectId } = useParams<{ projectId: string }>();
+  // `?container=<id>` deep-links one container (the notification sent when a
+  // container is published points here).
+  const [searchParams] = useSearchParams();
+  const focusContainerId = searchParams.get('container');
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
   const activeProjectId = useProjectContextStore((s) => s.activeProjectId);
@@ -1559,7 +1584,7 @@ export function CDEPage() {
   // Data
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1603,6 +1628,36 @@ export function CDEPage() {
     );
   }, [containers, searchQuery]);
 
+  // `?container=<id>` names one container, but the list above is one page
+  // (50 by default) and a register is usually longer. When the page does not
+  // hold the named container, read it on its own and pin it on top, so the
+  // link from the "published" notification works for every container rather
+  // than only the first fifty. A key of its own, not a branch of
+  // ['cde-containers']: that prefix holds arrays and the create path writes
+  // into it as one. invalidateAll refreshes this one after a promote.
+  const focusInList = !!focusContainerId && containers.some((c) => c.id === focusContainerId);
+  const { data: focusedContainer, isError: focusLookupFailed } = useQuery({
+    queryKey: ['cde-container', focusContainerId],
+    queryFn: () => fetchCDEContainer(focusContainerId ?? ''),
+    enabled: !!focusContainerId && !!projectId && !isLoading && !containersError && !focusInList,
+    retry: false,
+  });
+  const rows = useMemo(
+    () =>
+      withFocusedContainer(filtered, focusInList ? null : focusedContainer, {
+        projectId,
+        stateFilter,
+        searchQuery,
+      }),
+    [filtered, focusInList, focusedContainer, projectId, stateFilter, searchQuery],
+  );
+  // Gone, or not in this project: say so instead of leaving a link that
+  // looks broken.
+  const focusNotFound =
+    !!focusContainerId &&
+    !focusInList &&
+    (focusLookupFailed || (!!focusedContainer && focusedContainer.project_id !== projectId));
+
   // State counts for filter tabs
   const stateCounts = useMemo(() => {
     const counts: Record<string, number> = { all: containers.length };
@@ -1615,6 +1670,7 @@ export function CDEPage() {
   // Invalidation
   const invalidateAll = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['cde-containers'] });
+    qc.invalidateQueries({ queryKey: ['cde-container'] });
     qc.invalidateQueries({ queryKey: ['cde-revisions'] });
     qc.invalidateQueries({ queryKey: ['cde-stats'] });
   }, [qc]);
@@ -2021,6 +2077,14 @@ export function CDEPage() {
         />
       </div>
 
+      {focusNotFound && (
+        <p className="text-sm text-content-secondary" role="status">
+          {t('cde.focus_not_found', {
+            defaultValue: 'The container this link points to was not found in this project.',
+          })}
+        </p>
+      )}
+
       {/* Table */}
       <div>
         {!projectId ? (
@@ -2029,7 +2093,7 @@ export function CDEPage() {
           <SkeletonTable rows={5} columns={5} />
         ) : containersError ? (
           <RecoveryCard error={containersErrorValue} onRetry={() => refetchContainers()} />
-        ) : filtered.length === 0 ? (
+        ) : rows.length === 0 ? (
           <EmptyState
             icon={<Database size={28} strokeWidth={1.5} />}
             title={
@@ -2061,7 +2125,7 @@ export function CDEPage() {
             <p className="mb-3 text-sm text-content-tertiary">
               {t('cde.showing_count', {
                 defaultValue: '{{count}} containers',
-                count: filtered.length,
+                count: rows.length,
               })}
             </p>
             <Card padding="none" className="overflow-x-auto">
@@ -2092,7 +2156,7 @@ export function CDEPage() {
               </div>
 
               {/* Rows */}
-              {filtered.map((c) => (
+              {rows.map((c) => (
                 <ContainerRow
                   key={c.id}
                   container={c}
@@ -2100,6 +2164,7 @@ export function CDEPage() {
                   onPromote={handlePromote}
                   onLinkDocument={handleLinkDocument}
                   onShowHistory={handleShowHistory}
+                  focused={c.id === focusContainerId}
                 />
               ))}
             </Card>

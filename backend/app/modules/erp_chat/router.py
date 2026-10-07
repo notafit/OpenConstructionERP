@@ -8,6 +8,17 @@ Endpoints:
     POST   /erp_chat/sessions/                      - Create a new chat session
     GET    /erp_chat/sessions/{session_id}/messages/ - Get messages for a session
     DELETE /erp_chat/sessions/{session_id}/          - Delete a chat session
+
+Assistant proposals (``actions/router.py``, included at the end of this file).
+The model's ``propose_*`` tools store a proposal and nothing else; a person
+reviews it and applies it here, under the gates of the record's own REST route:
+    GET    /erp_chat/actions/                       - List proposals (filters, counts)
+    GET    /erp_chat/actions/{id}/                  - One proposal
+    PATCH  /erp_chat/actions/{id}/                  - Edit a proposal before applying it
+    POST   /erp_chat/actions/{id}/apply/            - Apply it as the caller
+    POST   /erp_chat/actions/{id}/reject/           - Reject it
+    POST   /erp_chat/actions/{id}/revert/           - Undo an applied proposal
+    POST   /erp_chat/actions/apply-batch/           - Apply several, each on its own
 """
 
 import logging
@@ -63,7 +74,14 @@ async def stream_chat(
     interacts badly with StreamingResponse and cancels the dependency session
     between chunks, killing every ``await session.flush()`` inside the agent
     loop with ``CancelledError``. Instead the generator opens its own session
-    whose lifetime matches the stream.
+    whose lifetime matches the stream. The service commits on it mid-stream
+    when the model proposes a change, so the card's Apply request (another
+    session) sees the proposal as soon as the card is on screen.
+
+    ``project_id`` and ``client_context.project_id`` are what the browser
+    claims. The service checks the project against the caller's access before
+    naming it to the model or storing it on a new chat session; a project the
+    caller cannot open is dropped, and the chat answers without it.
     """
     from app.database import async_session_factory
 
@@ -342,6 +360,7 @@ async def admin_stats(
 
 
 # ── Mount vector status + reindex via the shared factory ────────────────
+from sqlalchemy import Select as _Select  # noqa: E402
 from sqlalchemy import select as _select  # noqa: E402
 from sqlalchemy.orm import selectinload as _selectinload  # noqa: E402
 
@@ -352,21 +371,32 @@ from app.modules.erp_chat.vector_adapter import (  # noqa: E402
 )
 
 
-async def _chat_loader(session: Any, project_id: uuid.UUID | None) -> list[Any]:
+async def _chat_statement(_session: Any, project_id: uuid.UUID | None) -> _Select[Any]:
+    """Return the SELECT over chat messages, scoped through their session.
+
+    Hands back the statement, not its rows: the factory is what orders, pages
+    and releases it, and a scope that returned a list would have read every
+    message in the deployment into memory before the first one was embedded.
+    """
     stmt = _select(ChatMessage).options(_selectinload(ChatMessage.session))
     if project_id is not None:
         stmt = stmt.join(ChatSession, ChatMessage.session_id == ChatSession.id).where(
             ChatSession.project_id == project_id
         )
-    return list((await session.execute(stmt)).scalars().all())
+    return stmt
 
 
 router.include_router(
     create_vector_routes(
         collection=COLLECTION_CHAT,
         adapter=_chat_message_adapter,
-        loader=_chat_loader,
+        statement_factory=_chat_statement,
         read_permission=None,
         write_permission=None,
     )
 )
+
+# ── Assistant proposals: review, apply, reject, undo (/actions/) ─────────
+from app.modules.erp_chat.actions.router import router as _actions_router  # noqa: E402
+
+router.include_router(_actions_router)

@@ -110,7 +110,13 @@ LANG_PARAMS = {"lang", "locale", "language", "lang_code", "locale_code"}
 
 #: (base language, the same language with a region). The regional codes are
 #: real ones a client would send, not invented, so a reader can recognise them.
-PROBES = (("de", "de-AT"), ("ru", "ru-RU"), ("es", "es-MX"), ("pt", "pt-BR"), ("zh", "zh-CN"))
+PROBES = (
+    ("de", "de-AT"),
+    ("ru", "ru-RU"),
+    ("es", "es-MX"),
+    ("pt", "pt-BR"),
+    ("zh", "zh-CN"),
+)
 
 #: Used only to recognise a dict that is keyed BY language rather than by
 #: message key. Not a statement about what the platform supports.
@@ -261,7 +267,11 @@ def probe_module(dotted: str) -> dict[str, object]:
     try:
         module = importlib.import_module(dotted)
     except Exception as exc:  # noqa: BLE001 - any import failure is a reported skip
-        return {"module": dotted, "status": "import-failed", "detail": f"{type(exc).__name__}: {exc}"[:120]}
+        return {
+            "module": dotted,
+            "status": "import-failed",
+            "detail": f"{type(exc).__name__}: {exc}"[:120],
+        }
     return probe_loaded_module(dotted, module)
 
 
@@ -386,7 +396,13 @@ def probe_loaded_module(dotted: str, module: object) -> dict[str, object]:
 
     if not probes:
         return {"module": dotted, "status": "not-demonstrable"}
-    return {"module": dotted, "status": "probed", "probes": probes, "unstripped": unstripped, "evidence": evidence}
+    return {
+        "module": dotted,
+        "status": "probed",
+        "probes": probes,
+        "unstripped": unstripped,
+        "evidence": evidence,
+    }
 
 
 def measure(app_root: Path = APP_ROOT) -> list[dict[str, object]]:
@@ -499,7 +515,11 @@ def check(*, app_root: Path = APP_ROOT, baseline_path: Path = BASELINE_PATH) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Locale-resolution regression lock.")
-    parser.add_argument("--write-baseline", action="store_true", help="Record today's unstripped lookups and exit 0.")
+    parser.add_argument(
+        "--write-baseline",
+        action="store_true",
+        help="Record today's unstripped lookups and exit 0.",
+    )
     parser.add_argument(
         "--baseline",
         type=Path,

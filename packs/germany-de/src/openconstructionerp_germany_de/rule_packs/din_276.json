@@ -1,0 +1,30 @@
+{
+  "rule_pack_id": "din_276",
+  "name": "DIN 276 — Cost Groups in Building Construction",
+  "standard": "DIN 276:2018-12",
+  "jurisdiction": "DE",
+  "description": "Validates cost group hierarchy (KG 100-800) at levels 1, 2 and 3, checks mandatory fields per cost group, and ensures that estimation phases (Kostenrahmen through Kostenfeststellung) reach the required level of detail per DIN 276:2018-12.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "din276.cost_group_required",
+    "din276.valid_cost_group",
+    "din276.hierarchy",
+    "din276.completeness",
+    "din276.cost_group_hierarchy_valid",
+    "din276.kg_code_format",
+    "din276.kg100_grundstueck_completeness",
+    "din276.kg200_herrichten_completeness",
+    "din276.kg300_bauwerk_baukonstruktion_completeness",
+    "din276.kg400_bauwerk_technische_anlagen_completeness",
+    "din276.kg500_aussenanlagen_completeness",
+    "din276.kg600_ausstattung_completeness",
+    "din276.kg700_baunebenkosten_completeness",
+    "din276.kg800_finanzierungskosten_completeness",
+    "din276.level_2_required_for_kostenrahmen",
+    "din276.level_3_required_for_kostenberechnung",
+    "din276.no_orphan_positions",
+    "din276.parent_sum_matches_children"
+  ],
+  "regulator": "DIN (Deutsches Institut fuer Normung)",
+  "publication_year": 2018
+}

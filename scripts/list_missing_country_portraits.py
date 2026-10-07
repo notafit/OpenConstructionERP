@@ -221,7 +221,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--summary", action="store_true", help="counts only, no filenames")
     parser.add_argument("--country", help="restrict to one region code, for example ZA")
-    parser.add_argument("--briefs", action="store_true", help="one commission per missing file, ready to hand over")
+    parser.add_argument(
+        "--briefs",
+        action="store_true",
+        help="one commission per missing file, ready to hand over",
+    )
     args = parser.parse_args()
 
     if not PEOPLE_DIR.is_dir():

@@ -239,6 +239,37 @@ MIGRATED_ENDPOINTS: dict[str, str] = {
     # decorative entry the notes above ban three times. Add it the day a caller
     # appears. `/v1/variations/site-measurements/` sits in the same position
     # for the same reason.
+    #
+    # Wave 6. One reader, the procurement api wrapper, and it had to be made
+    # visible before this line was worth writing: it built the route with the
+    # query string interpolated as one suffix, so the literal collapsed to
+    # `.../committed-by-position/{}` and no entry could have matched it. The
+    # route now carries its own `?`, which is what `/v1/transmittals/` does and
+    # why that one is guarded. Worth knowing before enveloping anything else:
+    # an endpoint can be correct, enveloped, read, and still unguardable
+    # because of where a caller put a `?`.
+    "/v1/procurement/project/{}/committed-by-position/": "committed by BOQ position",
+    #
+    # Deliberately absent, same rule as fuel-logs above: the funding
+    # application's four child registers, `/disbursements/`, `/proofs/`,
+    # `/obligations/` and `/allocations/`. All four are enveloped, and the
+    # application detail response embeds the four lists whole, so the interface
+    # never reads the paged routes - it POSTs to them and reads the detail.
+    # Nothing to count, so nothing to list yet.
+    #
+    # The lines of one subcontractor pay application. This one is read by
+    # somebody approving an amount on every line and reading a payable total
+    # underneath, so a first page would have them confirm part of a payment
+    # on a screen that reads as the whole of it. Its api wrapper follows the
+    # pages to the end for that reason, which is a use of the envelope rather
+    # than a way round it: without a total there is nothing to say a page was
+    # short, and the wrapper would have no way to know it had everything.
+    "/v1/subcontractors/payment-applications/{}/lines": "pay application lines",
+    # Not paged: every pair on the project comes back and `total` says so. The
+    # CVR claim picker went to the same shape at the same time, but its caller
+    # builds the URL on a `${BASE}` prefix this scan cannot read, so it is not
+    # listed rather than listed at zero call sites.
+    "/v1/subcontractors/unlinked-twins/": "subcontract twin pairs",
 }
 
 # Left bare on purpose in wave 4: `/v1/documents/photos/recent/`. It is a
@@ -415,6 +446,7 @@ CALL_RE = re.compile("|".join(re.escape(n) for n in sorted((*READ_CALLS, *WRITE_
 # and `.items` belonging to some neighbouring line inside the window is enough
 # to acquit a caller that reads a bare array.
 ENVELOPE_HINT = re.compile(r"Page<|\.items\b|items:\s")
+MATCHER_BEFORE_URL = re.compile(r"(?:\.(?:startsWith|endsWith|includes)\(\s*|[!=]==?\s*)$")
 BARE_ARRAY_HINT = re.compile(r"(?:" + "|".join(re.escape(n) for n in READ_CALLS) + r")<[^>]*\[\]")
 
 
@@ -446,6 +478,13 @@ def scan(root: Path) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
             # consumer, and counting one produces a failure nobody can fix.
             line_start = text.rfind("\n", 0, m.start()) + 1
             if text[line_start : m.start()].lstrip().startswith(("*", "//", "/*")):
+                continue
+            # A route a test mock matches a request URL against is not a
+            # request. `url.startsWith('/v1/contracts/contracts/')` inside an
+            # `apiGetMock.mockImplementation` sits right after a name that
+            # begins with apiGet, so it was counted as a bare read and the
+            # envelope it returns two lines down was never in the window.
+            if MATCHER_BEFORE_URL.search(text[max(0, m.start() - 20) : m.start()]):
                 continue
             # Only a GET reads the collection. The same route is also a POST
             # target (create) and a DELETE target (clear); neither returns a
@@ -626,6 +665,24 @@ def self_test() -> int:
         if len(consumers["/v1/schedule/schedules/"]) != 1:
             print("SELF-TEST FAIL: a doc comment quoting the route was counted as a consumer.")
             return 1
+
+        # A test mock routing on the URL is not a read of it, and neither may
+        # the matcher hide a real read further down the same file.
+        (fake / "Mock.test.tsx").write_text(
+            "apiGetMock.mockImplementation((url) => {\n"
+            "  if (url.startsWith('/v1/schedule/schedules/')) return Promise.resolve(rows);\n"
+            "  if (url === `/v1/schedule/schedules/`) return Promise.resolve(rows);\n"
+            "});\n"
+            "const bare = await apiGet<ScheduleRow[]>(`/v1/schedule/schedules/?project_id=${id}`);\n",
+            encoding="utf-8",
+        )
+        consumers, unmigrated = scan(fake)
+        mock_bad = [p.name for p in unmigrated["/v1/schedule/schedules/"]]
+        if mock_bad != ["Mock.test.tsx"] or len(consumers["/v1/schedule/schedules/"]) != 2:
+            print("SELF-TEST FAIL: a mock's URL matcher was read as a request, or it hid the real")
+            print("                bare read below it.")
+            return 1
+        (fake / "Mock.test.tsx").unlink()
 
         # A migrated call standing next to a bare read of some OTHER route.
         # Link pickers are written this way everywhere, and the neighbour's

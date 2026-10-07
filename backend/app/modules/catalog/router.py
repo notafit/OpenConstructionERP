@@ -44,6 +44,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import String
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.i18n import get_locale
 from app.core.validation.messages import translate
@@ -508,25 +509,48 @@ async def import_catalog_from_github(
     codeless coefficient bases VN_NATIONAL and ID_NATIONAL are recognised keys
     but have no resource catalog to import.
     """
-    import csv
-    import io
-
-    folder = REGION_MAP.get(region)
-    if folder is None:
+    if region not in REGION_MAP:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown region '{region}'. Valid regions: {', '.join(sorted(REGION_MAP))}",
         )
-
-    # Offload blocking file/network I/O to a worker thread so the event loop
-    # stays responsive during the 60-second download window.
     try:
-        raw_bytes, csv_source = await asyncio.to_thread(_read_region_catalog_csv, region, folder)
+        return await import_region_catalog(session, region)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
         ) from exc
+
+
+async def import_region_catalog(session: AsyncSession, region: str) -> dict[str, Any]:
+    """Replace the resource catalogue of ``region`` with the published CSV.
+
+    The body of ``POST /catalog/import/{region}``, taken out so the one-click
+    pack install can load a country's catalogue through the same code the
+    Catalog page uses. The caller owns the transaction.
+
+    Args:
+        session: Session the rows are flushed into; not committed here.
+        region: A key of ``REGION_MAP``.
+
+    Returns:
+        ``{"imported", "skipped", "region", "source"}``.
+
+    Raises:
+        ValueError: ``region`` has no catalogue in ``REGION_MAP``.
+        RuntimeError: The CSV could be neither found locally nor downloaded.
+    """
+    import csv
+    import io
+
+    folder = REGION_MAP.get(region)
+    if folder is None:
+        raise ValueError(f"Unknown catalogue region '{region}'")
+
+    # Offload blocking file/network I/O to a worker thread so the event loop
+    # stays responsive during the 60-second download window.
+    raw_bytes, csv_source = await asyncio.to_thread(_read_region_catalog_csv, region, folder)
     logger.info("Catalog CSV for %s resolved from %s (%d bytes)", region, csv_source, len(raw_bytes))
 
     text = raw_bytes.decode("utf-8-sig")
@@ -540,10 +564,22 @@ async def import_catalog_from_github(
     await session.execute(sql_delete(CatalogResource).where(CatalogResource.region == region))
     await session.flush()
 
-    imported = 0
-    skipped = 0
+    imported, skipped = await _add_catalog_rows(session, region, reader, source="github_import")
 
-    _MAPPED_FIELDS = {
+    logger.info(
+        "Catalog import complete for %s: %d imported, %d skipped",
+        region,
+        imported,
+        skipped,
+    )
+
+    return {"imported": imported, "skipped": skipped, "region": region, "source": csv_source}
+
+
+# CSV columns that map onto a CatalogResource column; every other non-empty
+# column is kept in ``specifications``.
+_CATALOG_MAPPED_FIELDS = frozenset(
+    {
         "resource_code",
         "name",
         "type",
@@ -555,72 +591,214 @@ async def import_catalog_from_github(
         "currency",
         "usage_count",
     }
+)
 
-    batch: list[CatalogResource] = []
-    BATCH_SIZE = 500
+#: ``source`` values of catalogue rows a cost-base load wrote, as opposed to
+#: rows a person created. Only these are replaced when a base changes market.
+IMPORTED_CATALOG_SOURCES: tuple[str, ...] = ("github_import", "market_import")
 
-    for row in reader:
-        resource_code = (row.get("resource_code") or "").strip()
-        if not resource_code:
-            skipped += 1
-            continue
+#: What a market switch rewrites on a catalogue row it keeps: everything the
+#: CSV row carries. ``id``, ``region``, ``metadata_`` and ``is_active`` are left
+#: to :func:`replace_imported_catalog_rows`.
+_CATALOG_REPLACED_FIELDS: tuple[str, ...] = (
+    "name",
+    "resource_type",
+    "category",
+    "unit",
+    "base_price",
+    "min_price",
+    "max_price",
+    "currency",
+    "usage_count",
+    "source",
+    "specifications",
+)
 
-        # Build specifications from unmapped fields
-        specifications: dict[str, Any] = {}
-        for key, val in row.items():
-            if key and key not in _MAPPED_FIELDS and val:
-                specifications[key] = val
 
+def _catalog_resource_from_row(row: dict[str, Any], region: str, source: str) -> Any:
+    """Build one CatalogResource from a catalogue CSV row, or ``None`` to skip it.
+
+    Shared by the region import and the market import so both read the same
+    columns the same way. Raises ``ValueError``/``TypeError`` on a number that
+    does not parse, which the callers count as skipped.
+    """
+    from app.modules.catalog.models import CatalogResource
+
+    resource_code = (row.get("resource_code") or "").strip()
+    if not resource_code:
+        return None
+
+    # Build specifications from unmapped fields
+    specifications: dict[str, Any] = {}
+    for key, val in row.items():
+        if key and key not in _CATALOG_MAPPED_FIELDS and val:
+            specifications[key] = val
+
+    # CAT-001: normalise the price band on import - a CSV row may
+    # ship price_min > price_max (or an avg outside the band),
+    # and this write path bypasses the create-time validator.
+    _b, _lo, _hi = _normalise_band(
+        float(row.get("price_avg") or 0),
+        float(row.get("price_min") or 0),
+        float(row.get("price_max") or 0),
+    )
+    return CatalogResource(
+        resource_code=resource_code,
+        name=(row.get("name") or resource_code).strip()[:500],
+        resource_type=(row.get("type") or "material").strip().lower(),
+        category=(row.get("category") or "General").strip(),
+        unit=(row.get("unit") or "unit").strip()[:20],
+        # CAT-003: preserve source precision; do not truncate to
+        # 2dp on import (compounds with later adjust-prices passes).
+        base_price=_fmt_price(_b),
+        min_price=_fmt_price(_lo),
+        max_price=_fmt_price(_hi),
+        currency=(row.get("currency") or "").strip(),
+        usage_count=int(float(row.get("usage_count") or 0)),
+        source=source,
+        region=region,
+        specifications=specifications,
+        metadata_={},
+    )
+
+
+async def _add_catalog_rows(session: AsyncSession, region: str, rows: Any, *, source: str) -> tuple[int, int]:
+    """Add catalogue CSV rows under ``region`` in flushed batches; return (imported, skipped)."""
+    imported = 0
+    skipped = 0
+    batch: list[Any] = []
+    batch_size = 500
+    for row in rows:
         try:
-            # CAT-001: normalise the price band on import - a CSV row may
-            # ship price_min > price_max (or an avg outside the band),
-            # and this write path bypasses the create-time validator.
-            _b, _lo, _hi = _normalise_band(
-                float(row.get("price_avg") or 0),
-                float(row.get("price_min") or 0),
-                float(row.get("price_max") or 0),
-            )
-            resource = CatalogResource(
-                resource_code=resource_code,
-                name=(row.get("name") or resource_code).strip()[:500],
-                resource_type=(row.get("type") or "material").strip().lower(),
-                category=(row.get("category") or "General").strip(),
-                unit=(row.get("unit") or "unit").strip()[:20],
-                # CAT-003: preserve source precision; do not truncate to
-                # 2dp on import (compounds with later adjust-prices passes).
-                base_price=_fmt_price(_b),
-                min_price=_fmt_price(_lo),
-                max_price=_fmt_price(_hi),
-                currency=(row.get("currency") or "").strip(),
-                usage_count=int(float(row.get("usage_count") or 0)),
-                source="github_import",
-                region=region,
-                specifications=specifications,
-                metadata_={},
-            )
-            batch.append(resource)
-            imported += 1
+            resource = _catalog_resource_from_row(row, region, source)
         except (ValueError, TypeError):
             skipped += 1
             continue
-
-        if len(batch) >= BATCH_SIZE:
+        if resource is None:
+            skipped += 1
+            continue
+        batch.append(resource)
+        imported += 1
+        if len(batch) >= batch_size:
             session.add_all(batch)
             await session.flush()
             batch.clear()
-
     if batch:
         session.add_all(batch)
         await session.flush()
+    return imported, skipped
 
-    logger.info(
-        "Catalog import complete for %s: %d imported, %d skipped",
-        region,
-        imported,
-        skipped,
+
+async def replace_imported_catalog_rows(
+    session: AsyncSession,
+    region: str,
+    rows: list[dict[str, Any]],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    """Put a base's catalogue rows under ``region`` in place of the imported ones.
+
+    Used when a cost base changes market: the Resource Catalog then lists the
+    resources at the prices and in the currency the base's work items now use.
+    Only rows a load wrote (:data:`IMPORTED_CATALOG_SOURCES`) are touched, so a
+    resource a person added under the region stays.
+
+    The rows are updated in place, matched on ``resource_code``, and never
+    deleted: an assembly component links a catalogue resource by id with
+    ``ON DELETE SET NULL``, so a delete and re-insert on every market switch
+    silently cut every such link and the component stopped following the
+    resource's price. An imported row whose code the new set does not carry is
+    retired (``is_active = False``) instead, which hides it from the catalogue
+    and keeps the link; it comes back when a later set carries the code again.
+    An empty ``rows`` (the caller could not read a catalogue) therefore retires
+    every imported row and deletes none. There is no unique constraint on
+    (region, code), so duplicates on either side are paired off one by one and
+    an extra CSV row is added as a new resource.
+
+    Flushed, not committed: the caller owns the transaction.
+    """
+    from sqlalchemy import select
+
+    from app.modules.catalog.models import CatalogResource
+
+    existing_rows = (
+        (
+            await session.execute(
+                select(CatalogResource)
+                .where(
+                    CatalogResource.region == region,
+                    CatalogResource.source.in_(IMPORTED_CATALOG_SOURCES),
+                )
+                .order_by(CatalogResource.id)
+            )
+        )
+        .scalars()
+        .all()
     )
+    by_code: dict[str, list[Any]] = {}
+    for existing in existing_rows:
+        by_code.setdefault(existing.resource_code, []).append(existing)
 
-    return {"imported": imported, "skipped": skipped, "region": region, "source": csv_source}
+    updated = 0
+    added = 0
+    skipped = 0
+    fresh: list[Any] = []
+    for row in rows:
+        try:
+            resource = _catalog_resource_from_row(row, region, source)
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+        if resource is None:
+            skipped += 1
+            continue
+        matches = by_code.get(resource.resource_code)
+        if not matches:
+            fresh.append(resource)
+            added += 1
+            continue
+        target = matches.pop(0)
+        for field in _CATALOG_REPLACED_FIELDS:
+            setattr(target, field, getattr(resource, field))
+        target.is_active = True
+        updated += 1
+    if fresh:
+        session.add_all(fresh)
+
+    # Whatever no row of the new set claimed is retired, not deleted.
+    retired = 0
+    for leftovers in by_code.values():
+        for existing in leftovers:
+            if existing.is_active:
+                existing.is_active = False
+                retired += 1
+    await session.flush()
+    return {
+        "region": region,
+        "imported": updated + added,
+        "updated": updated,
+        "added": added,
+        "retired": retired,
+        "skipped": skipped,
+        "source": source,
+    }
+
+
+async def fetch_region_catalog_rows(region: str) -> list[dict[str, Any]]:
+    """Read and parse a region's own catalogue CSV without writing anything.
+
+    The same lookup ``POST /import/{region}`` uses (cache, local catalogue
+    directory, then the download). Raises ``ValueError`` for a region without a
+    catalogue and ``RuntimeError`` when the CSV cannot be found or downloaded.
+    """
+    import csv
+    import io
+
+    folder = REGION_MAP.get(region)
+    if folder is None:
+        raise ValueError(f"Unknown catalogue region '{region}'")
+    raw_bytes, _source = await asyncio.to_thread(_read_region_catalog_csv, region, folder)
+    return [dict(row) for row in csv.DictReader(io.StringIO(raw_bytes.decode("utf-8-sig")))]
 
 
 # ── List loaded regions ──────────────────────────────────────────────────
@@ -683,7 +861,7 @@ async def adjust_prices(
     # Explicit validation - Query(gt=, le=) may not be enforced in all FastAPI versions
     if factor <= 0 or factor > 10:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Factor must be between 0 (exclusive) and 10 (inclusive), got {factor}",
         )
 

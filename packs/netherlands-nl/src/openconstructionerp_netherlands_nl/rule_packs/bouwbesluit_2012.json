@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "bouwbesluit_2012",
+  "name": "Bouwbesluit 2012 — Building Decree",
+  "standard": "Bouwbesluit 2012 (Besluit bouwwerken leefomgeving under Omgevingswet)",
+  "jurisdiction": "NL",
+  "description": "Validates project documentation against the Bouwbesluit 2012 (Building Decree), transitioning to Besluit bouwwerken leefomgeving (Bbl) under the Omgevingswet. Checks structural safety requirements, fire safety provisions (brandveiligheid), energy performance (BENG, EPC), building physics (acoustics, daylight), health and usability requirements, and vergunning (permit) documentation.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "bouwbesluit.gebruiksfunctie_classified",
+    "bouwbesluit.constructieve_veiligheid_documented",
+    "bouwbesluit.brandveiligheid_class_set",
+    "bouwbesluit.brandcompartiment_size_within_limit",
+    "bouwbesluit.vluchtroute_documented",
+    "bouwbesluit.beng1_energy_demand_documented",
+    "bouwbesluit.beng2_primary_fossil_energy_documented",
+    "bouwbesluit.beng3_renewable_share_documented",
+    "bouwbesluit.geluidsisolatie_requirements_set",
+    "bouwbesluit.daglicht_requirements_set",
+    "bouwbesluit.omgevingsvergunning_referenced",
+    "bouwbesluit.toegankelijkheid_provisions_present"
+  ],
+  "regulator": "Ministerie van Binnenlandse Zaken en Koninkrijksrelaties (BZK)",
+  "publication_year": 2024
+}

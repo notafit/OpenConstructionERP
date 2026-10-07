@@ -28,7 +28,11 @@ COPY frontend/ .
 # 134 ("JavaScript heap out of memory"). This image had no ceiling at all, so
 # the two-container production layout in docker-compose.prod.yml could not
 # build its frontend. Scoped to this one command, not the stage.
-RUN NODE_OPTIONS=--max-old-space-size=8192 npm run build
+# The ceiling that applies is the explicit --max-old-space-size=12288 in the
+# frontend/package.json build script, which beats NODE_OPTIONS; the value
+# here only mirrors it. The type check alone peaks at about 9.2 GB, so the
+# Docker host needs about 14 GB of memory to build this stage.
+RUN NODE_OPTIONS=--max-old-space-size=12288 npm run build
 
 FROM nginx:alpine
 

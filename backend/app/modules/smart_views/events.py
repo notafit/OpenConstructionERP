@@ -114,4 +114,4 @@ async def _refresh_on_project_update(event: Event) -> None:
         )
 
 
-event_bus.subscribe("projects.project.updated", _refresh_on_project_update)
+event_bus.subscribe_once("projects.project.updated", _refresh_on_project_update)

@@ -10,7 +10,7 @@
  * .toFixed on it or use '+' to add two of them.
  */
 
-import { apiGet, apiPost, apiPatch, apiDelete } from '@/shared/lib/api';
+import { apiGet, apiPost, apiPatch, apiDelete, type Page } from '@/shared/lib/api';
 
 const BASE = '/v1/cvr';
 
@@ -123,6 +123,8 @@ export interface PaymentApplication {
   currency: string;
   status: PaymentApplicationStatus;
   notes: string | null;
+  /** The contract progress claim the application was raised from, if any. */
+  progress_claim_id: string | null;
   created_by: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
@@ -180,6 +182,8 @@ export interface UpdateCashflowPointPayload {
 export interface CreatePaymentApplicationPayload {
   project_id: string;
   period: string;
+  /** Raise the application from this progress claim (same project). */
+  progress_claim_id?: string;
   application_number?: string;
   gross_value?: string;
   retention?: string;
@@ -288,6 +292,29 @@ export async function updatePaymentApplication(
   data: Partial<CreatePaymentApplicationPayload>,
 ): Promise<PaymentApplication> {
   return apiPatch<PaymentApplication>(`${BASE}/payment-applications/${id}`, data);
+}
+
+/** A contract progress claim offered by the payment application picker. */
+export interface ProgressClaimOption {
+  id: string;
+  contract_id: string;
+  contract_code: string;
+  claim_number: string;
+  status: string;
+  /** YYYY-MM the claim bills, from its period end; null when unreadable. */
+  period: string | null;
+  gross_amount: string;
+  retention_amount: string;
+  net_due: string;
+  currency: string;
+}
+
+export async function fetchProgressClaimOptions(projectId: string): Promise<ProgressClaimOption[]> {
+  // The route is not paged, it answers with every claim of the project.
+  const page = await apiGet<Pick<Page<ProgressClaimOption>, 'items' | 'total'>>(
+    `${BASE}/progress-claims/?project_id=${encodeURIComponent(projectId)}`,
+  );
+  return page.items;
 }
 
 export async function deletePaymentApplication(id: string): Promise<void> {

@@ -110,7 +110,7 @@ import { dailyDiaryGuide } from './dailyDiaryGuide';
 import { VoiceEntry, getField } from '@/features/voice';
 import { Panorama360Viewer } from './Panorama360Viewer';
 import { is360Photo, panoramaImageUrl } from './panorama360';
-import { getNumberLocale } from '@/stores/usePreferencesStore';
+import { getNumberLocale, usePreferencesStore } from '@/stores/usePreferencesStore';
 // Real file upload + "choose from already-uploaded" picker reuse the
 // documents/photo APIs. A diary photo only stores a URL, so we upload the
 // binary through the photo endpoint first (which classifies it as a field
@@ -1752,6 +1752,7 @@ function WeatherCard({
   onAddManual: () => void;
 }) {
   const { t } = useTranslation();
+  const isImperial = usePreferencesStore((s) => s.measurementSystem) === 'imperial';
   return (
     <Card padding="md">
       <div className="flex items-center gap-2 mb-3">
@@ -1803,7 +1804,7 @@ function WeatherCard({
               {t('daily_diary.temp', { defaultValue: 'Temperature' })}
             </dt>
             <dd className="text-base font-semibold">
-              {weather.temperature_c != null ? `${weather.temperature_c}°C` : '—'}
+              {weather.temperature_c != null ? (isImperial ? `${Math.round(Number(weather.temperature_c) * 9 / 5 + 32)}°F` : `${weather.temperature_c}°C`) : '—'}
             </dd>
           </div>
           <div>
@@ -1819,7 +1820,7 @@ function WeatherCard({
               {t('daily_diary.wind', { defaultValue: 'Wind' })}
             </dt>
             <dd className="text-base font-semibold">
-              {weather.wind_speed_kmh != null ? `${weather.wind_speed_kmh} km/h` : '—'}
+              {weather.wind_speed_kmh != null ? (isImperial ? `${Math.round(Number(weather.wind_speed_kmh) * 0.621371)} mph` : `${weather.wind_speed_kmh} km/h`) : '—'}
             </dd>
           </div>
           <div>
@@ -2193,16 +2194,14 @@ function EntriesTimeline({
 }
 
 /**
- * Render a diary-photo thumbnail. Diary photos uploaded through the new file
- * input / file picker point at the platform's OWN bearer-protected endpoints
- * (``/api/v1/documents/...``); a bare <img> would 401 on those, so we route
- * same-origin API URLs through <AuthImage> (token fetch -> object URL).
- * Externally-hosted or public ``/files/...`` URLs keep the plain <img> path.
+ * Render a diary-photo thumbnail.
+ *
+ * ``AuthImage`` covers both shapes a diary photo URL takes: the platform's
+ * own bearer-protected routes (``/api/v1/documents/...``, which a bare <img>
+ * would 401 on) are fetched with the token, and anything else is loaded
+ * directly. Either way a URL that yields no picture shows the camera glyph
+ * instead of the browser's broken-image icon.
  */
-function isAuthAssetUrl(url: string | null | undefined): boolean {
-  return !!url && url.startsWith('/api/');
-}
-
 function DiaryPhotoThumb({
   url,
   alt,
@@ -2212,23 +2211,20 @@ function DiaryPhotoThumb({
   alt: string;
   className: string;
 }) {
-  if (isAuthAssetUrl(url)) {
-    return (
-      <AuthImage
-        src={url}
-        alt={alt}
-        className={className}
-        loading="lazy"
-        placeholder={<div className="h-full w-full animate-pulse bg-surface-secondary" />}
-        fallback={
-          <div className="flex h-full w-full items-center justify-center text-content-quaternary">
-            <Camera size={16} strokeWidth={1.5} />
-          </div>
-        }
-      />
-    );
-  }
-  return <img src={url} alt={alt} loading="lazy" className={className} />;
+  return (
+    <AuthImage
+      src={url}
+      alt={alt}
+      className={className}
+      loading="lazy"
+      placeholder={<div className="h-full w-full animate-pulse bg-surface-secondary" />}
+      fallback={
+        <div className="flex h-full w-full items-center justify-center text-content-quaternary">
+          <Camera size={16} strokeWidth={1.5} />
+        </div>
+      }
+    />
+  );
 }
 
 function PhotoGrid({
@@ -3308,6 +3304,7 @@ function ManualWeatherModal({
   const { t } = useTranslation();
   const qc = useQueryClient();
   const addToast = useToastStore((s) => s.addToast);
+  const isImperial = usePreferencesStore((s) => s.measurementSystem) === 'imperial';
   const [temperature, setTemperature] = useState('');
   const [humidity, setHumidity] = useState('');
   const [wind, setWind] = useState('');
@@ -3318,15 +3315,19 @@ function ManualWeatherModal({
   const submit = async () => {
     setBusy(true);
     try {
+      // Convert imperial input back to metric for storage
+      const tempVal = temperature.trim();
+      const windVal = wind.trim();
+      const precipVal = precip.trim();
       await createWeather({
         project_id: projectId,
         // Anchor the reading to the diary's local calendar day.
         captured_at: `${diaryDate}T${nowLocalISO().slice(11)}`,
         source: 'manual',
-        temperature_c: temperature.trim() || undefined,
+        temperature_c: tempVal ? (isImperial ? String(Math.round(((parseFloat(tempVal) - 32) * 5 / 9) * 10) / 10) : tempVal) : undefined,
         humidity_pct: humidity.trim() || undefined,
-        wind_speed_kmh: wind.trim() || undefined,
-        precipitation_mm: precip.trim() || undefined,
+        wind_speed_kmh: windVal ? (isImperial ? String(Math.round((parseFloat(windVal) / 0.621371) * 10) / 10) : windVal) : undefined,
+        precipitation_mm: precipVal ? (isImperial ? String(Math.round((parseFloat(precipVal) * 25.4) * 10) / 10) : precipVal) : undefined,
         conditions_text: conditions.trim() || undefined,
       });
       qc.invalidateQueries({ queryKey: ['daily-diary', 'weather'] });
@@ -3368,7 +3369,7 @@ function ManualWeatherModal({
             step="0.1"
             value={temperature}
             onChange={(e) => setTemperature(e.target.value)}
-            placeholder="°C"
+            placeholder={isImperial ? '°F' : '°C'}
             className={inputCls}
           />
         </WideModalField>
@@ -3390,7 +3391,7 @@ function ManualWeatherModal({
             step="0.1"
             value={wind}
             onChange={(e) => setWind(e.target.value)}
-            placeholder="km/h"
+            placeholder={isImperial ? 'mph' : 'km/h'}
             className={inputCls}
           />
         </WideModalField>
@@ -3401,7 +3402,7 @@ function ManualWeatherModal({
             step="0.1"
             value={precip}
             onChange={(e) => setPrecip(e.target.value)}
-            placeholder="mm"
+            placeholder={isImperial ? 'in' : 'mm'}
             className={inputCls}
           />
         </WideModalField>

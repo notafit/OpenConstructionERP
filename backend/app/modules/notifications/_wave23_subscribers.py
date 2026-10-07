@@ -448,7 +448,7 @@ _WAVE23_SUBSCRIPTIONS: list[tuple[str, Callable[[Event], object]]] = [
 def register_wave23_notification_subscribers() -> None:
     """Wire Wave 2 + Wave 3 high-value events onto the global event bus."""
     for event_name, handler in _WAVE23_SUBSCRIPTIONS:
-        event_bus.subscribe(event_name, handler)
+        event_bus.subscribe_once(event_name, handler)
     logger.info(
         "Notifications: subscribed to %d Wave 2/3 event(s)",
         len(_WAVE23_SUBSCRIPTIONS),

@@ -267,7 +267,12 @@ def test_a_payment_application_that_already_fitted_is_laid_out_where_it_was() ->
     """The control. Ordinary values were never the problem and must not move."""
     runs = {run.text: (round(run.x0, 1), round(run.x1, 1)) for run in drawn_runs(aia_pdf())}
     assert runs["Ortega Architects"] == (231.9, 302.3)
-    assert runs["Substructure"] == (53.3, 98.6)
+    # Moved on purpose. The continuation sheet was 278mm wide on a sheet with
+    # 247mm inside its margins, so it started 2pt from the paper edge and this
+    # run sat at 53.3pt. Its columns are now fitted to the frame, which starts
+    # the table at the margin and puts the description at 94pt. The run is as
+    # wide as it was, so it moved and was not restyled.
+    assert runs["Substructure"] == (94.0, 139.3)
     assert runs["Application No."] == (90.2, 159.2)
 
 

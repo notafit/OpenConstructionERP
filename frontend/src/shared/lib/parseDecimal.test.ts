@@ -6,7 +6,7 @@
  * `48,60` must parse to 48.6, never 4860.
  */
 import { describe, it, expect } from 'vitest';
-import { parseDecimalInput, normalizeDecimalSeparators } from './parseDecimal';
+import { parseDecimalInput, parseMoneyInput, normalizeDecimalSeparators } from './parseDecimal';
 
 describe('parseDecimalInput - plain dot decimals (canonical)', () => {
   it.each([
@@ -108,5 +108,23 @@ describe('normalizeDecimalSeparators', () => {
   });
   it('maps the unicode minus to ASCII', () => {
     expect(parseDecimalInput('−5')).toBe(-5);
+  });
+});
+
+describe('parseMoneyInput - a currency sign beside the amount', () => {
+  it('reads the amount whichever side the sign is on', () => {
+    expect(parseMoneyInput('12,50 €')).toBe(12.5);
+    expect(parseMoneyInput('€12,50')).toBe(12.5);
+    expect(parseMoneyInput('$ 1,234.56')).toBe(1234.56);
+    expect(parseMoneyInput('1 234,56 €')).toBe(1234.56);
+    expect(parseMoneyInput('-€5')).toBe(-5);
+  });
+  it('still refuses what is not a number', () => {
+    expect(parseMoneyInput('€')).toBeNull();
+    expect(parseMoneyInput('12 EUR')).toBeNull();
+    expect(parseMoneyInput('')).toBeNull();
+  });
+  it('leaves the plain parser strict, so a quantity never takes a sign', () => {
+    expect(parseDecimalInput('12,50 €')).toBeNull();
   });
 });

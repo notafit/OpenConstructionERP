@@ -6,16 +6,20 @@ All database queries for BOQs, positions, markups, and activity logs live here.
 No business logic - pure data access.
 """
 
+import json
 import uuid
+from collections.abc import Iterable
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import Row, RowMapping, Text, any_, cast, delete, func, select, update
+from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.orm.util import identity_key
-from sqlalchemy.sql.elements import ClauseElement
+from sqlalchemy.sql.elements import ClauseElement, ColumnElement
 
 from app.core.sql_numeric import numeric_value
+from app.modules.boq.activity_text import READ_ONLY_ACTIVITY_ACTIONS
 from app.modules.boq.models import (
     BOQ,
     BOQActivityLog,
@@ -37,6 +41,109 @@ from app.modules.boq.models import (
 # and cuts those reads to a single query.
 _POSITION_NOLOAD_TREE = (noload(Position.children), noload(Position.parent))
 
+# Code points outside ASCII whose Unicode case fold is nothing but ASCII
+# letters: the two sharp s, the long s, the Kelvin sign and the seven Latin
+# ligatures. A stored resource code spelled with one of them ("STRAẞE") equals
+# an ASCII code ("strasse") under the ``casefold()`` match the #133 propagation
+# applies, and no SQL lower-casing maps it there. Found by folding every code
+# point and keeping those whose fold is all ASCII.
+_NON_ASCII_FOLDING_TO_ASCII = "\u00df\u017f\u1e9e\u212a\ufb00\ufb01\ufb02\ufb03\ufb04\ufb05\ufb06"
+_ASCII_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_ASCII_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_FOLD_ASCII = str.maketrans(_ASCII_UPPER, _ASCII_LOWER)
+
+
+def resource_code_prefilter(codes: Iterable[str], dialect_name: str) -> ColumnElement[bool] | None:
+    """Build a SQL condition that keeps every position whose metadata may hold one of ``codes``.
+
+    Issue #133 matches a resource code as ``str(code).strip().casefold()`` in
+    Python, which no SQL expression reproduces, so this never decides a match.
+    It only has to keep every row the Python match would accept, and drop most
+    of the rest before their metadata crosses the wire and gets decoded.
+
+    It holds that promise under three conditions, and answers ``None`` (no
+    narrowing, scan everything) whenever one is missing:
+
+    * PostgreSQL. ``jsonb`` renders a string value verbatim apart from ``"``,
+      ``\\`` and control characters, and ``translate()`` lower-cases A-Z by a
+      fixed table. ``lower()`` and ``ILIKE`` would not do: they fold by the
+      database locale, and under a Turkish one ``I`` does not become ``i``.
+    * Every code is printable ASCII without ``"`` or ``\\``, so it appears
+      unescaped in the rendered JSON.
+    * A stored code the Python match accepts is then ASCII too, apart from the
+      handful of letters in ``_NON_ASCII_FOLDING_TO_ASCII``; a row carrying any
+      of those is always kept.
+
+    Every pattern is matched against the one folded text in a single
+    ``LIKE ANY (ARRAY[...])``, which PostgreSQL evaluates once per row. One
+    ``OR`` branch per pattern rendered and translated the whole metadata again
+    for each of them, 25 times a row for a three-code resource: 2.7 s for a
+    2160-position project on the E2E server, 7 s on a busy machine.
+
+    Args:
+        codes: Resource codes being looked for.
+        dialect_name: ``dialect.name`` of the connection the query runs on.
+
+    Returns:
+        The condition, or ``None`` when narrowing cannot be proven safe.
+    """
+    if dialect_name != "postgresql":
+        return None
+    fragments: list[str] = []
+    for raw in codes:
+        code = str(raw or "").strip()
+        if not code or any(not (" " <= ch <= "~") or ch in '"\\' for ch in code):
+            return None
+        fragments.append(code.translate(_FOLD_ASCII))
+    if not fragments:
+        return None
+    for ch in _NON_ASCII_FOLDING_TO_ASCII:
+        # Verbatim as ``jsonb`` renders it (``translate`` leaves it alone), and
+        # as the ``\\u00df`` escape a plain ``json`` column keeps from the
+        # writer (either hex case, since the text is lower-cased).
+        fragments.append(ch)
+        fragments.append(json.dumps(ch)[1:-1])
+    folded = func.translate(cast(Position.metadata_, Text), _ASCII_UPPER, _ASCII_LOWER)
+    return folded.like(any_(pg_array([_like_containing(f) for f in fragments])))
+
+
+def _like_containing(fragment: str) -> str:
+    """A ``LIKE`` pattern matching ``fragment`` anywhere, under the default backslash escape."""
+    escaped = fragment.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+#: The BOQ columns a full-BOQ response carries, keyed by attribute name.
+BOQ_HEADER_COLUMNS = (
+    BOQ.id,
+    BOQ.project_id,
+    BOQ.name,
+    BOQ.description,
+    BOQ.status,
+    BOQ.metadata_,
+    BOQ.created_at,
+    BOQ.updated_at,
+    BOQ.is_locked,
+    BOQ.approved_by,
+    BOQ.approved_at,
+    BOQ.base_date,
+    BOQ.tax_date,
+    BOQ.estimate_type,
+    BOQ.parent_estimate_id,
+    BOQ.variation_request_id,
+)
+
+#: Which bills make up a project's bill register. See ``list_for_project`` for
+#: why a variation request's own bill is not one of them. Shared by the one
+#: project and the many projects listing, so the two cannot disagree about it.
+_IN_BILL_REGISTER = BOQ.variation_request_id.is_(None)
+
+#: The order of a bill register, newest first. The id breaks a tie between two
+#: bills created in the same instant, which otherwise the database may order
+#: differently from one query to the next, so a page boundary could show one of
+#: them twice and the other never.
+_BILL_REGISTER_ORDER = (BOQ.created_at.desc(), BOQ.id.desc())
+
 
 class BOQRepository:
     """Data access for BOQ model."""
@@ -47,6 +154,19 @@ class BOQRepository:
     async def get_by_id(self, boq_id: uuid.UUID) -> BOQ | None:
         """Get BOQ by ID."""
         return await self.session.get(BOQ, boq_id)
+
+    async def get_header(self, boq_id: uuid.UUID) -> RowMapping | None:
+        """The BOQ's own columns, read without loading the BOQ entity.
+
+        ``session.get(BOQ)`` pulls every position and markup through the
+        ``selectin`` relationships. A caller that reads the positions itself
+        (the full-BOQ read does, in sort order) paid for them twice, and on a
+        2100-line bill each read decodes about 2 MB of jsonb on the event loop.
+        A plain column select leaves the identity map alone, so no caller that
+        later touches ``boq.positions`` sees a half-loaded entity.
+        """
+        stmt = select(*BOQ_HEADER_COLUMNS).where(BOQ.id == boq_id)
+        return (await self.session.execute(stmt)).mappings().first()
 
     async def list_for_project(
         self,
@@ -68,7 +188,7 @@ class BOQRepository:
         and by id like any other bill. Rows written before that column existed
         carry NULL, so nothing that is listed today stops being listed.
         """
-        base = select(BOQ).where(BOQ.project_id == project_id, BOQ.variation_request_id.is_(None))
+        base = select(BOQ).where(BOQ.project_id == project_id, _IN_BILL_REGISTER)
 
         # Count
         count_stmt = select(func.count()).select_from(base.subquery())
@@ -77,7 +197,7 @@ class BOQRepository:
         # Fetch - skip eager loading of positions/markups for list queries
         stmt = (
             base.options(noload(BOQ.positions), noload(BOQ.markups))
-            .order_by(BOQ.created_at.desc())
+            .order_by(*_BILL_REGISTER_ORDER)
             .offset(offset)
             .limit(limit)
         )
@@ -85,6 +205,51 @@ class BOQRepository:
         boqs = list(result.scalars().all())
 
         return boqs, total
+
+    async def list_for_projects(
+        self,
+        project_ids: list[uuid.UUID],
+        *,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[uuid.UUID, list[BOQ]]:
+        """The bill register of several projects, paginated per project, in one query.
+
+        Each project gets exactly the page :meth:`list_for_project` would give
+        it with the same ``offset`` and ``limit``: the same bills, in the same
+        order, with the same bills left out. The page is cut per project by
+        numbering each project's bills in register order and keeping the
+        numbers ``offset + 1`` to ``offset + limit``, so one busy project
+        cannot use up another project's page, which a single ``LIMIT`` over
+        the union would do.
+
+        Args:
+            project_ids: Projects to list. Access is the caller's business.
+            offset: Bills to skip at the head of each project's register.
+            limit: Most bills returned for each project.
+
+        Returns:
+            ``{project_id: [bill, ...]}`` in register order. A project with no
+            bill on the requested page is absent rather than present and empty.
+        """
+        if not project_ids:
+            return {}
+
+        place = func.row_number().over(partition_by=BOQ.project_id, order_by=_BILL_REGISTER_ORDER).label("place")
+        ranked = (
+            select(BOQ.id.label("boq_id"), place).where(BOQ.project_id.in_(project_ids), _IN_BILL_REGISTER).subquery()
+        )
+        stmt = (
+            select(BOQ)
+            .join(ranked, ranked.c.boq_id == BOQ.id)
+            .where(ranked.c.place > offset, ranked.c.place <= offset + limit)
+            .options(noload(BOQ.positions), noload(BOQ.markups))
+            .order_by(BOQ.project_id, ranked.c.place)
+        )
+        grouped: dict[uuid.UUID, list[BOQ]] = {}
+        for boq in (await self.session.execute(stmt)).scalars().all():
+            grouped.setdefault(boq.project_id, []).append(boq)
+        return grouped
 
     async def active_markups_for_boqs(
         self,
@@ -473,17 +638,22 @@ class PositionRepository:
         self,
         project_id: uuid.UUID,
         reference_code: str,
+        boq_id: uuid.UUID | None = None,
     ) -> Position | None:
-        """Return the definition-owner Position for ``reference_code`` in a project.
+        """Return the definition-owner Position for ``reference_code``.
 
-        Searches every BOQ of the project (Position → BOQ → project_id).
+        When *boq_id* is given the search is restricted to that single BOQ,
+        preventing accidental cross-BOQ inheritance when the caller did not
+        explicitly request it.  When *boq_id* is ``None`` the lookup spans
+        every BOQ in the project (used for intentional cross-BOQ reuse).
+
         Preference order:
 
         1. an explicit ``link_role='master'`` row, else
         2. the oldest standalone owner of that code (will be promoted to
            master by the service when a reuse instance is created).
 
-        Returns ``None`` when the code is unused anywhere in the project.
+        Returns ``None`` when the code is unused in the search scope.
         """
         rc = (reference_code or "").strip()
         if not rc:
@@ -494,6 +664,8 @@ class PositionRepository:
             .where(BOQ.project_id == project_id, Position.reference_code == rc)
             .options(*_POSITION_NOLOAD_TREE)
         )
+        if boq_id is not None:
+            base = base.where(Position.boq_id == boq_id)
         # 1. explicit master wins
         master_stmt = base.where(Position.link_role == "master").order_by(Position.created_at)
         master = (await self.session.execute(master_stmt)).scalars().first()
@@ -536,6 +708,110 @@ class PositionRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_resource_carrier_rows(
+        self,
+        project_id: uuid.UUID,
+        codes: Iterable[str],
+    ) -> list[Row]:
+        """Return the rows of a project that may carry one of ``codes``, oldest first.
+
+        Issue #133 propagation reads six columns of every position that holds a
+        resource code, and ``list_for_project`` built a full ORM object for every
+        position in the project and decoded all their metadata to find them. This
+        selects only ``id``, ``boq_id``, ``ordinal``, ``quantity``, ``version``
+        and ``metadata`` (as ``meta``), in the same ``created_at, sort_order``
+        order, so the first carrier is still the master.
+
+        The row set is narrowed in SQL by :func:`resource_code_prefilter`, which
+        only ever keeps too much: the caller must still match each resource's
+        code exactly, and does.
+
+        Args:
+            project_id: Project whose positions are scanned (all of its BOQs).
+            codes: Resource codes the caller is looking for.
+
+        Returns:
+            Plain rows, not ORM instances, so nothing lands in the identity map.
+        """
+        stmt = (
+            select(
+                Position.id,
+                Position.boq_id,
+                Position.ordinal,
+                Position.quantity,
+                Position.version,
+                Position.metadata_.label("meta"),
+            )
+            .join(BOQ, BOQ.id == Position.boq_id)
+            .where(BOQ.project_id == project_id)
+            .order_by(Position.created_at, Position.sort_order)
+        )
+        narrowing = resource_code_prefilter(codes, self.session.get_bind().dialect.name)
+        if narrowing is not None:
+            stmt = stmt.where(narrowing)
+        return list((await self.session.execute(stmt)).all())
+
+    async def update_many(self, rows: list[dict[str, object]]) -> None:
+        """Write a different field set to each of many positions, one UPDATE per row.
+
+        Sibling of :meth:`update_fields` for fan-out writes, with one flush for
+        the batch. Every dict carries the target ``id`` plus the mapped attribute
+        names to write. Instances already in the identity map are brought up to
+        date the same way ``update_fields`` does it, so a later read in this
+        session never sees the value from before the write.
+
+        Deliberately NOT ``session.execute(update(Position), rows)``. That ORM
+        bulk form goes out as an asyncpg executemany, which pipelines the rows
+        through ``transport.writelines()``. On Windows under the selector event
+        loop (the one ``tests/conftest.py`` installs) CPython's
+        ``_SelectorSocketTransport._write_send`` pops a buffer before
+        ``send()`` and drops it when the socket answers ``BlockingIOError``, so
+        PostgreSQL never receives those rows and nothing raises. Measured on a
+        2080-line project: the first fan-out applied 313 of its 346 UPDATE
+        statements, and this method then reported all of them as written. A single-row
+        UPDATE goes out through ``transport.write()``, which keeps what it
+        could not send.
+
+        Args:
+            rows: One ``{"id": ..., <attribute>: <value>, ...}`` per position.
+        """
+        if not rows:
+            return
+        for row in rows:
+            values = {name: value for name, value in row.items() if name != "id"}
+            await self.session.execute(update(Position).where(Position.id == row["id"]).values(**values))
+        await self.session.flush()
+        for row in rows:
+            instance = self.session.identity_map.get(identity_key(Position, row["id"]))
+            if instance is None:
+                continue
+            for name, value in row.items():
+                if name != "id":
+                    set_committed_value(instance, name, value)
+
+    async def list_content_keys_for_boq(self, boq_id: uuid.UUID) -> list[Row]:
+        """Return ``(id, ordinal, description, unit, quantity, unit_rate)`` for every position of a BOQ.
+
+        The duplicate-content check (BUG-B-014) compares only these columns, and
+        ``list_all_for_boq`` made it build a full ORM object and decode the
+        metadata of every row in the bill on every price edit. Same order as
+        ``list_all_for_boq`` (``sort_order, ordinal``), so the first colliding
+        ordinal reported is the one it reported.
+        """
+        stmt = (
+            select(
+                Position.id,
+                Position.ordinal,
+                Position.description,
+                Position.unit,
+                Position.quantity,
+                Position.unit_rate,
+            )
+            .where(Position.boq_id == boq_id)
+            .order_by(Position.sort_order, Position.ordinal)
+        )
+        return list((await self.session.execute(stmt)).all())
+
     async def reference_code_exists_in_project(
         self,
         project_id: uuid.UUID,
@@ -557,6 +833,35 @@ class PositionRepository:
         )
         result = (await self.session.execute(stmt)).scalar_one()
         return int(result) > 0
+
+    async def reference_codes_used_in_project(self, project_id: uuid.UUID, codes: Iterable[str]) -> set[str]:
+        """The subset of ``codes`` some position of the project already carries.
+
+        The batch form of :meth:`reference_code_exists_in_project`, for an
+        import that stamps a fresh code on every row: one query per 500 codes
+        instead of one per row.
+        """
+        wanted = sorted({c.strip() for c in codes if c and c.strip()})
+        used: set[str] = set()
+        for start in range(0, len(wanted), 500):
+            stmt = (
+                select(Position.reference_code)
+                .join(BOQ, BOQ.id == Position.boq_id)
+                .where(BOQ.project_id == project_id, Position.reference_code.in_(wanted[start : start + 500]))
+            )
+            used.update(code for code in (await self.session.execute(stmt)).scalars() if code)
+        return used
+
+    async def ordinals_taken(self, boq_id: uuid.UUID, ordinals: Iterable[str]) -> set[str]:
+        """The subset of ``ordinals`` some position of the BOQ already uses, one query per 500."""
+        wanted = sorted(set(ordinals))
+        taken: set[str] = set()
+        for start in range(0, len(wanted), 500):
+            stmt = select(Position.ordinal).where(
+                Position.boq_id == boq_id, Position.ordinal.in_(wanted[start : start + 500])
+            )
+            taken.update((await self.session.execute(stmt)).scalars())
+        return taken
 
 
 class MarkupRepository:
@@ -640,7 +945,10 @@ class ActivityLogRepository:
 
         Returns (entries, total_count).
         """
-        base = select(BOQActivityLog).where(BOQActivityLog.boq_id == boq_id)
+        base = select(BOQActivityLog).where(
+            BOQActivityLog.boq_id == boq_id,
+            BOQActivityLog.action.notin_(READ_ONLY_ACTIVITY_ACTIONS),
+        )
 
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self.session.execute(count_stmt)).scalar_one()
@@ -662,7 +970,10 @@ class ActivityLogRepository:
 
         Returns (entries, total_count).
         """
-        base = select(BOQActivityLog).where(BOQActivityLog.project_id == project_id)
+        base = select(BOQActivityLog).where(
+            BOQActivityLog.project_id == project_id,
+            BOQActivityLog.action.notin_(READ_ONLY_ACTIVITY_ACTIONS),
+        )
 
         count_stmt = select(func.count()).select_from(base.subquery())
         total = (await self.session.execute(count_stmt)).scalar_one()

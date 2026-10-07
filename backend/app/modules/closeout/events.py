@@ -76,7 +76,7 @@ def register_closeout_subscribers() -> None:
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
     for name in _STALE_EVENTS:
-        event_bus.subscribe(name, _mark_project_package_stale)
+        event_bus.subscribe_once(name, _mark_project_package_stale)
     try:
         setattr(event_bus, _SUBSCRIBED_FLAG, True)
     except (AttributeError, TypeError):

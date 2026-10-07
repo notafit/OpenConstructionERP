@@ -39,7 +39,8 @@ import { PageHeader } from '@/shared/ui/PageHeader';
 import { SectionIntro } from '@/features/validation';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
-import { apiGet, apiPost } from '@/shared/lib/api';
+import { apiPost } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { fetchAllPages } from '@/shared/lib/apiHelpers';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
@@ -59,6 +60,8 @@ import { NCR_STAGES, ncrStageIndex, ncrNextMoves } from './ncrFsm';
 import { ncrGuide } from './ncrGuide';
 import { InsightsPanel, InsightsToggleButton, useModuleInsights } from '@/features/insights';
 import { buildNCRInsights } from './ncrInsights';
+import { IssueHubLink } from '@/features/issues/IssueHubLink';
+import { RaiseBackCharge } from '@/features/cost-recovery/RaiseBackCharge';
 
 // English fallbacks for the computed `ncr.severity_*` keys. The default used to be
 // the raw value, so until the key lands in a locale the screen shows the bare
@@ -962,7 +965,7 @@ const NCRRow = React.memo(function NCRRow({
                   }}
                 >
                   <DollarSign size={14} className="mr-1" />
-                  {t('ncr.create_variation', { defaultValue: 'Create Variation' })}
+                  {t('ncr.create_variation', { defaultValue: 'Create Change Order' })}
                 </Button>
               )}
             </div>
@@ -976,6 +979,12 @@ const NCRRow = React.memo(function NCRRow({
                 defaultValue: 'Record a corrective action before this NCR can be closed.',
               })}
             </p>
+          )}
+
+          {ncr.cost_impact != null && ncr.cost_impact > 0 && (
+            <div className="mt-2" onClick={(e) => e.stopPropagation()}>
+              <RaiseBackCharge projectId={ncr.project_id} source={{ kind: 'ncr', id: ncr.id }} />
+            </div>
           )}
 
           {/* Related cross-links */}
@@ -1168,7 +1177,7 @@ export function NCRPage() {
   // Data
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1311,7 +1320,7 @@ export function NCRPage() {
       invalidateAll();
       addToast({
         type: 'success',
-        title: t('ncr.variation_created', { defaultValue: 'Variation created' }),
+        title: t('ncr.variation_created', { defaultValue: 'Change order created' }),
         message: `${data.code}: ${data.title}`,
       });
     },
@@ -1445,6 +1454,7 @@ export function NCRPage() {
           <>
             <InsightsToggleButton open={insights.open} onClick={insights.toggle} />
             <ModuleGuideButton content={ncrGuide} />
+            <IssueHubLink />
             <Button
               variant="primary"
               size="sm"

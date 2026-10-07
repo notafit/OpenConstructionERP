@@ -35,6 +35,7 @@ import {
 import { RequiresProject } from '@/shared/auth/RequiresProject';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
+import { OrderInvoicedSummary } from './OrderInvoicedSummary';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { ContactSearchInput } from '@/shared/ui/ContactSearchInput';
 import { apiGet, apiPost, apiPatch, type Page } from '@/shared/lib/api';
@@ -42,6 +43,7 @@ import { TruncationNotice } from '@/shared/ui/TruncationNotice';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useActiveProjectId } from '@/shared/hooks/useActiveProjectId';
+import { invalidateFinanceFigures } from '@/features/finance/financeQueryKeys';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { getPOMatchStatus, type POLineMatchTag } from './api';
 import { PORemovalDialog, removalVerbFor } from './PORemovalDialog';
@@ -56,6 +58,8 @@ import { POStatusPipeline } from './POStatusPipeline';
 import { DeliveryCountdownBadge } from './DeliveryCountdownBadge';
 import { RecordDeliveryModal } from './RecordDeliveryModal';
 import { fmtFixed } from '@/shared/lib/formatters';
+import { orderSource, rfqDeepLink } from '@/shared/lib/awardChainLinks';
+import { RelatedRecordLink } from '@/shared/ui/RelatedRecordLink';
 
 // English fallbacks for the computed `procurement.gr_status_*` keys. The default used to be
 // the raw value, so until the key lands in a locale the screen shows the bare
@@ -82,10 +86,16 @@ interface PurchaseOrder {
   // undefined, so MoneyDisplay rendered an em-dash for every PO. Match the
   // real wire contract here.
   amount_total: string | number;
+  // Net of VAT. The invoiced figure below is net too, so the two compare.
+  amount_subtotal?: string | number;
   currency_code: string;
   status: string;
   description: string;
   line_items_count: number;
+  // Payable invoices linked to this order (drafts and cancelled left out),
+  // net of VAT, and how many there are. Decimal-as-string.
+  invoiced_net?: string;
+  invoice_count?: number;
   // ── Retainage (Gap F) ──────────────────────────────────────────────────
   // retention_percent / retain_on_receipt are persisted; retainage_amount /
   // retainage_held are computed by the backend. All Decimal-as-string.
@@ -93,8 +103,17 @@ interface PurchaseOrder {
   retain_on_receipt?: boolean;
   retainage_amount?: string;
   retainage_held?: string;
+  // What the order was drafted from, when an award drafted it: an RFQ award
+  // stamps `origin: 'rfq_award'`, `rfq_id` and `rfq_number`. Read through
+  // `orderSource`, never field by field.
+  metadata?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
+}
+
+/** The DOM id of a purchase-order row, so a deep link can scroll to it. */
+function poRowId(poId: string): string {
+  return `po-row-${poId}`;
 }
 
 /**
@@ -371,9 +390,19 @@ export function ProcurementPage() {
     [location.state],
   );
 
+  // The query string is kept: a buy-list hand-off must not drop a `?po=` the
+  // reader arrived with.
   const clearIncomingBuyList = useCallback(() => {
-    navigate(location.pathname, { replace: true, state: null });
-  }, [navigate, location.pathname]);
+    navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
+  }, [navigate, location.pathname, location.search]);
+
+  // `?po=<id>` opens the register on one order: the purchase-order tab, the
+  // row scrolled to and marked. An awarded RFQ links to the order it drafted
+  // this way.
+  const focusPoId = useMemo(() => new URLSearchParams(location.search).get('po'), [location.search]);
+  useEffect(() => {
+    if (focusPoId) setActiveTab('purchase-orders');
+  }, [focusPoId]);
 
   // Module Insights panel. Charts the purchase orders THIS PAGE LOADED - the
   // register that carries each order's committed value, supplier and delivery
@@ -545,6 +574,7 @@ export function ProcurementPage() {
               projectId={projectId}
               incomingBuyList={incomingBuyList}
               onBuyListConsumed={clearIncomingBuyList}
+              focusPoId={focusPoId}
             />
           )}
           {activeTab === 'goods-receipts' && (
@@ -565,10 +595,12 @@ function PurchaseOrdersTab({
   projectId,
   incomingBuyList,
   onBuyListConsumed,
+  focusPoId,
 }: {
   projectId: string;
   incomingBuyList: POLineItemForm[];
   onBuyListConsumed: () => void;
+  focusPoId: string | null;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -608,6 +640,14 @@ function PurchaseOrdersTab({
      order; otherwise it POSTs a new one. */
   const [showCreate, setShowCreate] = useState(false);
   const [editingPO, setEditingPO] = useState<string | null>(null);
+  // The status of the order being edited. Once an order leaves draft its
+  // vendor, currency, lines and amounts are the ones it was approved with,
+  // and the server refuses a change to them with a 409
+  // (`_PO_EDITABLE_STATUSES` in procurement/service.py). The form locks those
+  // fields for such an order instead of letting the buyer type into a save
+  // that cannot succeed. Notes, dates, payment terms and type stay editable.
+  const [editingPOStatus, setEditingPOStatus] = useState<string | null>(null);
+  const figuresLocked = editingPO !== null && editingPOStatus !== null && editingPOStatus !== 'draft';
   // True only while the create modal is showing lines handed over from the
   // Resource Summary buy-list (F4 interop), so we can surface a one-line hint
   // telling the buyer to add a supplier + rates. Reset whenever the modal closes.
@@ -653,6 +693,7 @@ function PurchaseOrdersTab({
   const closeModal = () => {
     setShowCreate(false);
     setEditingPO(null);
+    setEditingPOStatus(null);
     setPrefilledFromBuyList(false);
     setPoForm({ ...emptyPoForm, items: [{ ...emptyLine }] });
     setPoBase(null);
@@ -801,7 +842,9 @@ function PurchaseOrdersTab({
   });
 
   /* ── PO edit ──
-     Every field except `status` is freely editable here. Status transitions go
+     On a draft every field except `status` is editable here; past draft the
+     form locks the figures the server holds fixed (`figuresLocked`), so they
+     are never in the diff below. Status transitions go
      through the dedicated workflow actions (approve / issue / cancel /
      create-invoice), so we deliberately omit `status` from this body.
      Removal is its own affordance: `PORemovalDialog` deletes a never-issued
@@ -872,6 +915,7 @@ function PurchaseOrdersTab({
       setPoTaxInput(tax);
       setPoErrors({});
       setEditingPO(po.id);
+      setEditingPOStatus(po.status);
       setShowCreate(true);
     },
     onError: (e: Error) =>
@@ -921,6 +965,7 @@ function PurchaseOrdersTab({
       apiPost(`/v1/procurement/${poId}/issue/`, {}),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['procurement-po', projectId] });
+      void invalidateFinanceFigures(queryClient);
       addToast({
         type: 'success',
         title: t('procurement.po_issued_toast', {
@@ -980,7 +1025,50 @@ function PurchaseOrdersTab({
     );
   }, [orders, search]);
 
-  if (isLoading) return <SkeletonTable rows={5} columns={6} />;
+  /* ── Deep link (?po=<id>) ──
+     The order is scrolled to and marked when it is on the page this tab
+     loaded. When it is not (a register longer than one page, or an order of
+     another project), it is fetched by id and named above the table, so the
+     link never lands on a register that silently does not show it.
+
+     The register in the cache can be up to two minutes old (the client's
+     staleTime), and the order a link names is usually newer than that: an
+     RFQ award drafts it a moment before the buyer clicks through. So before
+     an order is called off the page, the register is read again, once per
+     linked order, and the off-page lookup waits for that read. */
+  const focusOnPage = !!focusPoId && !!orders?.some((po) => po.id === focusPoId);
+  const [focusRecheck, setFocusRecheck] = useState<{ id: string; done: boolean } | null>(null);
+  const focusNeedsRecheck = !!focusPoId && !!orders && !focusOnPage && focusRecheck?.id !== focusPoId;
+  useEffect(() => {
+    if (!focusNeedsRecheck || !focusPoId) return;
+    setFocusRecheck({ id: focusPoId, done: false });
+    void refetch().finally(() =>
+      setFocusRecheck((cur) => (cur?.id === focusPoId ? { id: focusPoId, done: true } : cur)),
+    );
+  }, [focusNeedsRecheck, focusPoId, refetch]);
+  const focusRechecking =
+    !!focusPoId && !focusOnPage && !(focusRecheck?.id === focusPoId && focusRecheck.done);
+  const scrolledPoRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusPoId || !focusOnPage || scrolledPoRef.current === focusPoId) return;
+    const el = document.getElementById(poRowId(focusPoId));
+    if (!el) return;
+    scrolledPoRef.current = focusPoId;
+    el.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  }, [focusPoId, focusOnPage, filtered]);
+  const focusOffPage = useQuery({
+    queryKey: ['procurement-po-focus', focusPoId],
+    queryFn: () => apiGet<POResponse>(`/v1/procurement/${encodeURIComponent(focusPoId as string)}`),
+    enabled: !!focusPoId && !!orders && !focusOnPage && !focusRechecking,
+    retry: false,
+  });
+
+  // An empty cached register is the usual case for the first order of a
+  // project, which an award drafts; it is not "no purchase orders yet" until
+  // the re-read says so.
+  if (isLoading || (focusRechecking && !isError && orders?.length === 0)) {
+    return <SkeletonTable rows={5} columns={6} />;
+  }
 
   if (isError) {
     return (
@@ -1036,6 +1124,17 @@ function PurchaseOrdersTab({
             {/* F4 interop hint: shown only when the lines were pre-filled from
                 the Resource Summary buy-list, to explain the auto-opened modal
                 and prompt the buyer for the supplier + rates the buy-list omits. */}
+            {figuresLocked && (
+              <div
+                role="note"
+                className="rounded-lg border border-semantic-warning/30 bg-semantic-warning-bg px-3.5 py-2.5 text-xs text-content-secondary"
+              >
+                {t('procurement.edit_figures_locked', {
+                  defaultValue:
+                    'This order is past draft, so its vendor, currency, lines and tax stay as they were approved. Notes, delivery date, payment terms and order type can still change here. To correct the figures, return an approved order to draft, or raise a separate order for the difference.',
+                })}
+              </div>
+            )}
             {prefilledFromBuyList && !isEdit && (
               <div className="rounded-lg border border-oe-blue/30 bg-oe-blue/5 px-3.5 py-2.5 text-xs text-content-secondary">
                 {t('procurement.prefilled_from_buy_list', {
@@ -1060,14 +1159,25 @@ function PurchaseOrdersTab({
                   <label className="block text-sm font-medium text-content-primary mb-1.5">
                     {t('procurement.vendor', { defaultValue: 'Vendor' })}
                   </label>
-                  <ContactSearchInput
-                    value={poForm.vendor_contact_id}
-                    displayValue={poForm.vendor_display}
-                    onChange={(id, name) => setPoForm((f) => ({ ...f, vendor_contact_id: id, vendor_display: name }))}
-                    placeholder={t('procurement.search_vendor', { defaultValue: 'Search vendor...' })}
-                    showBrowse
-                    browseContactTypes={['supplier', 'subcontractor']}
-                  />
+                  {figuresLocked ? (
+                    <input
+                      type="text"
+                      readOnly
+                      disabled
+                      value={poForm.vendor_display || '-'}
+                      aria-label={t('procurement.vendor', { defaultValue: 'Vendor' })}
+                      className={clsx(inputCls, 'bg-surface-secondary/50 cursor-not-allowed')}
+                    />
+                  ) : (
+                    <ContactSearchInput
+                      value={poForm.vendor_contact_id}
+                      displayValue={poForm.vendor_display}
+                      onChange={(id, name) => setPoForm((f) => ({ ...f, vendor_contact_id: id, vendor_display: name }))}
+                      placeholder={t('procurement.search_vendor', { defaultValue: 'Search vendor...' })}
+                      showBrowse
+                      browseContactTypes={['supplier', 'subcontractor']}
+                    />
+                  )}
                 </div>
                 {/* Delivery date */}
                 <div>
@@ -1139,6 +1249,7 @@ function PurchaseOrdersTab({
                     <div className="flex flex-col gap-1">
                       <input
                         value={li.description}
+                        disabled={figuresLocked}
                         onChange={(e) => updateLineItem(idx, 'description', e.target.value)}
                         placeholder={t('procurement.item_desc_placeholder', { defaultValue: 'Item description' })}
                         aria-label={t('procurement.item_description_for', {
@@ -1152,12 +1263,14 @@ function PurchaseOrdersTab({
                         value={li.boq_position_id}
                         onChange={(boqPositionId) => setLinePosition(idx, boqPositionId)}
                         line={idx + 1}
+                        disabled={figuresLocked}
                       />
                     </div>
                     <input
                       type="number"
                       step="any"
                       value={li.quantity}
+                      disabled={figuresLocked}
                       onChange={(e) => updateLineItem(idx, 'quantity', e.target.value)}
                       placeholder="1"
                       aria-label={t('procurement.item_qty_for', {
@@ -1168,6 +1281,7 @@ function PurchaseOrdersTab({
                     />
                     <input
                       value={li.unit}
+                      disabled={figuresLocked}
                       onChange={(e) => updateLineItem(idx, 'unit', e.target.value)}
                       placeholder="pcs"
                       aria-label={t('procurement.item_unit_for', {
@@ -1180,6 +1294,7 @@ function PurchaseOrdersTab({
                       type="number"
                       step="0.01"
                       value={li.unit_rate}
+                      disabled={figuresLocked}
                       onChange={(e) => updateLineItem(idx, 'unit_rate', e.target.value)}
                       placeholder="0.00"
                       aria-label={t('procurement.item_rate_for', {
@@ -1203,7 +1318,8 @@ function PurchaseOrdersTab({
                     <button
                       type="button"
                       onClick={() => removeLineItem(idx)}
-                      className="flex h-9 w-8 items-center justify-center rounded-lg text-content-tertiary hover:text-semantic-error hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors"
+                      disabled={figuresLocked}
+                      className="flex h-9 w-8 items-center justify-center rounded-lg text-content-tertiary hover:text-semantic-error hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors disabled:opacity-40 disabled:pointer-events-none"
                       title={t('common.remove', { defaultValue: 'Remove' })}
                       aria-label={t('procurement.remove_line', {
                         defaultValue: 'Remove line {{line}}',
@@ -1214,15 +1330,17 @@ function PurchaseOrdersTab({
                     </button>
                   </div>
                 ))}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  icon={<Plus size={14} />}
-                  onClick={addLineItem}
-                  className="mt-1"
-                >
-                  {t('procurement.add_item', { defaultValue: 'Add Item' })}
-                </Button>
+                {!figuresLocked && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    icon={<Plus size={14} />}
+                    onClick={addLineItem}
+                    className="mt-1"
+                  >
+                    {t('procurement.add_item', { defaultValue: 'Add Item' })}
+                  </Button>
+                )}
               </div>
               {poErrors.items && <p className="mt-1.5 text-xs text-semantic-error">{poErrors.items}</p>}
 
@@ -1242,6 +1360,8 @@ function PurchaseOrdersTab({
                       type="number"
                       step="0.01"
                       value={poTaxInput}
+                      disabled={figuresLocked}
+                      aria-label={t('procurement.tax', { defaultValue: 'Tax' })}
                       onChange={(e) => setPoTaxInput(e.target.value)}
                       className={clsx(inputCls, 'h-8 text-xs pl-10 text-right')}
                       placeholder="0.00"
@@ -1269,6 +1389,8 @@ function PurchaseOrdersTab({
                     </label>
                     <select
                       value={poForm.currency}
+                      disabled={figuresLocked}
+                      aria-label={t('procurement.currency', { defaultValue: 'Currency' })}
                       onChange={(e) => setPoForm((f) => ({ ...f, currency: e.target.value }))}
                       className={inputCls}
                     >
@@ -1388,6 +1510,49 @@ function PurchaseOrdersTab({
         </div>
       </div>
 
+      {focusPoId && orders && !focusOnPage && (
+        <div
+          role="note"
+          data-testid="po-focus-notice"
+          className="mx-4 mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-oe-blue/30 bg-oe-blue/5 px-3.5 py-2.5 text-xs text-content-secondary"
+        >
+          {!focusRechecking && focusOffPage.data ? (
+            <>
+              <span>
+                {t('procurement.focus_po_off_page', {
+                  defaultValue: 'Purchase order {{number}} ({{status}}) is not on this page of the register.',
+                  number: focusOffPage.data.po_number,
+                  status: t(`procurement.po_status_${focusOffPage.data.status}`, {
+                    defaultValue: focusOffPage.data.status,
+                  }),
+                })}
+              </span>
+              {isManager && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => focusOffPage.data && openEditMut.mutate(focusOffPage.data.id)}
+                  disabled={openEditMut.isPending}
+                >
+                  {t('procurement.focus_po_open', { defaultValue: 'Open it' })}
+                </Button>
+              )}
+            </>
+          ) : !focusRechecking && focusOffPage.isError ? (
+            <span>
+              {t('procurement.focus_po_missing', {
+                defaultValue: 'The linked purchase order could not be found. It may have been deleted.',
+              })}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5">
+              <Loader2 size={12} className="animate-spin" />
+              {t('procurement.focus_po_loading', { defaultValue: 'Looking up the linked purchase order...' })}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Table */}
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
@@ -1423,15 +1588,42 @@ function PurchaseOrdersTab({
                   {t('procurement.no_po_match', { defaultValue: 'No matching purchase orders' })}
                 </td>
               </tr>
-            ) : filtered.map((po) => (
+            ) : filtered.map((po) => {
+              const source = orderSource(po.metadata);
+              const focused = po.id === focusPoId;
+              return (
               <tr
                 key={po.id}
-                className="border-b border-border-light hover:bg-surface-secondary/30 transition-colors"
+                id={poRowId(po.id)}
+                data-focused={focused ? 'true' : undefined}
+                aria-current={focused ? 'true' : undefined}
+                className={clsx(
+                  'border-b border-border-light hover:bg-surface-secondary/30 transition-colors',
+                  focused && 'bg-oe-blue/10',
+                )}
                 onMouseEnter={() => setMatchActive((m) => ({ ...m, [po.id]: true }))}
                 onFocus={() => setMatchActive((m) => ({ ...m, [po.id]: true }))}
               >
                 <td className="px-4 py-3 font-mono text-xs text-content-primary">
                   {po.po_number}
+                  {/* The RFQ whose award drafted this order, so the reviewer
+                      can check the draft against the quote it came from. */}
+                  {source.rfqId && (
+                    <div className="mt-1 font-sans">
+                      <RelatedRecordLink
+                        to={rfqDeepLink(source.rfqId)}
+                        title={t('procurement.from_rfq_hint', {
+                          defaultValue: 'Drafted from the award of this RFQ. Open the RFQ to check the quote.',
+                        })}
+                        data-testid="po-source-rfq"
+                      >
+                        {t('procurement.from_rfq', {
+                          defaultValue: 'From {{rfq}}',
+                          rfq: source.rfqNumber ?? t('procurement.from_rfq_unnamed', { defaultValue: 'RFQ' }),
+                        })}
+                      </RelatedRecordLink>
+                    </div>
+                  )}
                 </td>
                 <td className="px-4 py-3 text-content-secondary">
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -1480,6 +1672,14 @@ function PurchaseOrdersTab({
                       accepts string amounts and parses them internally, so no
                       Number() wrapping is needed here. */}
                   <MoneyDisplay amount={po.amount_total} currency={po.currency_code} />
+                  {(po.invoice_count ?? 0) > 0 && (
+                    <OrderInvoicedSummary
+                      className="mt-1"
+                      invoiced={po.invoiced_net}
+                      ordered={po.amount_subtotal}
+                      currency={po.currency_code}
+                    />
+                  )}
                 </td>
                 <td className="px-4 py-3 text-center">
                   <div className="flex flex-col items-center gap-1">
@@ -1646,7 +1846,8 @@ function PurchaseOrdersTab({
                   )}
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1784,8 +1985,8 @@ function GoodsReceiptsTab({
       apiPost(`/v1/procurement/goods-receipts/${grId}/confirm/`, {}),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['procurement-gr', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['procurement-po', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['finance', 'dashboard', projectId] });
+      // A confirmed receipt moves committed and actual: every finance figure.
+      void invalidateFinanceFigures(queryClient);
       addToast({
         type: 'success',
         title: t('procurement.gr_confirmed_toast', {

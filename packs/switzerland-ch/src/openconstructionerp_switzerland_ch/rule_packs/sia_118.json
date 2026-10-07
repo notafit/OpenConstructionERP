@@ -1,0 +1,20 @@
+{
+  "rule_pack_id": "sia_118",
+  "name": "SIA 118 — Allgemeine Bedingungen fuer Bauarbeiten",
+  "name_fr": "SIA 118 — Conditions generales pour travaux de construction",
+  "standard": "SIA 118:2013",
+  "jurisdiction": "CH",
+  "regulator": "SIA (Schweizerischer Ingenieur- und Architektenverein)",
+  "publication_year": 2013,
+  "applies_to": [
+    "contracts",
+    "tender",
+    "validation"
+  ],
+  "description": "Reference document for SIA 118, the Swiss standard form of general conditions for construction work, and for the terms the form leaves to the parties. SIA 118 fills the role the VOB/B fills in Germany but allocates risk, defects liability and payment differently, so a contract that names the form without settling those points is incomplete rather than covered by it. What the form requires a contract to settle is the edition in force, the basis for measurement (Ausmass), the defects-liability regime and acceptance procedure, payment terms and any retention, and a route for variations and obstruction notices. This document enables no automated check; see why_no_rules.",
+  "description_fr": "Document de reference sur la norme SIA 118, les conditions generales suisses pour les travaux de construction, et sur les points que la norme laisse aux parties. La SIA 118 joue le role que joue la VOB/B en Allemagne, mais repartit differemment les risques, la garantie pour les defauts et les paiements ; nommer la norme sans regler ces points laisse le contrat incomplet. La norme demande que soient regles l'edition applicable, la base du metre (Ausmass), le regime de garantie et la procedure de reception, les conditions de paiement et la retenue eventuelle, ainsi que le traitement des modifications et des avis d'empechement. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Swiss Baukostenplaner or quantity surveyor before they are relied on for a public submission. No article numbers, notice periods or guarantee periods are reproduced here; they must be read from the norm itself and from the contract in hand.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. The platform implements contract-terms checks for the UK regime only, and those rules read UK concepts. SIA 118 allocates risk, defects liability and payment differently, so borrowing a UK rule id would report a Swiss contract against the wrong regime, and a generic bill rule would claim SIA 118 was satisfied by arithmetic. Both are worse than the empty list this document ships.",
+  "enables_rule_ids": []
+}

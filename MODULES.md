@@ -6,7 +6,7 @@ map of every module that ships in the box.
 OpenConstructionERP is modular by design: every business feature (BOQ, BIM,
 takeoff, schedule, CDE, regional BOQ packs and more) is a self-contained
 module that can be enabled, disabled, installed, or replaced without touching
-the core. The current build loads 190 modules. You enable only the parts you
+the core. The current build loads 193 modules. You enable only the parts you
 need.
 
 This file is the single entry point. Deeper material lives alongside the code
@@ -16,7 +16,7 @@ it describes, and the links point there.
 
 ## 1. The module catalog
 
-All 190 modules that load in the current build, grouped by what they do for a
+All 193 modules that load in the current build, grouped by what they do for a
 construction team. The bold name is the module's display name; the code label
 is its backend folder under `backend/app/modules/`. The count is every directory
 under `backend/app/modules/` carrying a `manifest.py`, which is exactly what the
@@ -139,6 +139,8 @@ Plan the programme and track how it runs.
 Keep the commercial picture honest.
 
 - **Finance** `finance` - invoicing, payments, budgets and earned value.
+- **E-invoice** `einvoice` - EN 16931 electronic invoice library, CII and UBL syntaxes, exposed as a standalone validation and generation API.
+- **Public Funding** `funding` - grant and subsidy lifecycle from programme terms to application, award, drawn money and proof of use, with the deadlines and eligible-cost rules each programme imposes.
 - **Full EVM** `full_evm` - earned value with forecasting, S-curves and TCPI analysis.
 - **5D Cost Model** `costmodel` - S-curves, cash flow projection, earned value and budget tracking.
 - **Cost-Value Reconciliation & Cashflow** `cvr` - monthly reconciliation of cost against value earned with a cashflow forecast.
@@ -232,6 +234,7 @@ Talk, ask and decide around the work.
 
 - **Comments & Viewpoints** `collaboration` - threaded comments with mentions and viewpoints on any entity.
 - **Real-time collaboration locks** `collaboration_locks` - soft locks and presence so two people do not overwrite the same row.
+- **Global Presence** `global_presence` - who is online and which page they are on, held in memory and broadcast over one WebSocket room.
 - **Meetings** `meetings` - agendas, attendees, action items and status.
 - **Requests for Information** `rfi` - RFI questions, responses and cost or schedule impact.
 - **Submittals** `submittals` - shop drawings, product data and samples with review and approval.

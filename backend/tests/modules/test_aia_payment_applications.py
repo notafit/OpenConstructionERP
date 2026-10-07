@@ -23,6 +23,7 @@ import pytest_asyncio
 from fastapi import HTTPException
 
 from app.modules.contracts.aia import (
+    apply_retention_snapshot,
     build_g702_summary,
     build_g703,
     build_g703_line,
@@ -159,6 +160,42 @@ def test_g702_summary_rollup() -> None:
     assert summary["current_payment_due"] == Decimal("2375.00")
     # 9 = 3 - 6 = 10000 - 5225 = 4775
     assert summary["balance_to_finish"] == Decimal("4775.00")
+
+
+def test_g702_splits_retainage_into_completed_work_and_stored_material() -> None:
+    cl = _FakeContractLine("01", "Foundations", "10000")
+    pcl = _FakeClaimLine("2000", prior="3000", stored="500")
+    rows = build_g703([cl], {cl.id: pcl}, retainage_percent=Decimal("5"))
+    summary = build_g702_summary(rows, original_contract_sum=Decimal("10000"), change_orders_net=Decimal("0"))
+    # 5% of 5,000 of work and of 500 stored.
+    assert (summary["retainage_completed_work"], summary["retainage_stored_materials"]) == (
+        Decimal("250.00"),
+        Decimal("25.00"),
+    )
+
+
+def test_column_i_is_the_claims_line_5_and_the_lines_it_does_not_bill_take_the_rest() -> None:
+    a = _FakeContractLine("01", "Foundations", "6000")
+    b = _FakeContractLine("02", "Framing", "4000")
+    pcl = _FakeClaimLine("1000", prior="2000", stored="500")
+    pcl.retention_to_date = Decimal("270")
+    pcl.retention_stored_to_date = Decimal("50")
+    rows = build_g703([a, b], {a.id: pcl}, retainage_percent=Decimal("10"), prior_by_line={b.id: Decimal("1000")})
+    # Framing is not billed this period, and still counts what it billed before.
+    assert rows[1]["previous_value"] == Decimal("1000.00")
+
+    apply_retention_snapshot(rows, [a, b], {a.id: pcl}, held=Decimal("400"))
+    assert [row["retainage"] for row in rows] == [Decimal("320.00"), Decimal("80.00")]
+    assert (rows[0]["retainage_completed_work"], rows[0]["retainage_stored_materials"]) == (
+        Decimal("270.00"),
+        Decimal("50.00"),
+    )
+    summary = build_g702_summary(rows, original_contract_sum=Decimal("10000"), change_orders_net=Decimal("0"))
+    assert summary["retainage"] == Decimal("400.00")
+    assert (summary["retainage_completed_work"], summary["retainage_stored_materials"]) == (
+        Decimal("350.00"),
+        Decimal("50.00"),
+    )
 
 
 def test_g702_current_payment_due_floors_at_zero() -> None:

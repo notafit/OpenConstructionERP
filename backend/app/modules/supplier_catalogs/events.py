@@ -181,7 +181,7 @@ def register_subscribers() -> None:
     """Idempotently subscribe supplier-catalogs cross-module handlers."""
     if getattr(event_bus, _SUBSCRIBED_FLAG, False):
         return
-    event_bus.subscribe(MATERIAL_ADDED, _on_material_added)
-    event_bus.subscribe(VENDOR_RATED, _on_vendor_rated)
+    event_bus.subscribe_once(MATERIAL_ADDED, _on_material_added)
+    event_bus.subscribe_once(VENDOR_RATED, _on_vendor_rated)
     setattr(event_bus, _SUBSCRIBED_FLAG, True)
     _logger.info("Supplier Catalogs: 2 cross-module subscriber(s) registered")

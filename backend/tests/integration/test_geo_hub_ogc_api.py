@@ -527,10 +527,29 @@ class TestTileEndpointIsDiscoverable:
         The route worked before, but ``include_in_schema=False`` kept it out
         of the API description, so the only way to learn the URL was to read
         the source.
+
+        The canonical spelling is ``/basemap/...``. ``/tiles/...`` is the older
+        one, still served by the same handler but deliberately hidden from the
+        schema so the description advertises one name rather than two. This
+        test asked the schema for the hidden alias and therefore failed on
+        every run after the rename, while the thing it cares about - a
+        discoverable XYZ template - had been true the whole time. Both halves
+        are pinned here: the canonical path is published and self-describing,
+        and the alias still exists so QGIS connections saved against it keep
+        working.
         """
         schema = app_instance.openapi()
-        path = "/api/v1/geo-hub/tiles/{z}/{x}/{y}.png"
-        assert path in schema["paths"], "the XYZ tile route is not published"
-        description = schema["paths"][path]["get"].get("description", "")
-        assert "/api/v1/geo-hub/tiles/{z}/{x}/{y}.png" in description
-        assert "XYZ" in schema["paths"][path]["get"].get("summary", "")
+        path = "/api/v1/geo-hub/basemap/{z}/{x}/{y}.png"
+        assert path in schema["paths"], "the XYZ basemap route is not published"
+        operation = schema["paths"][path]["get"]
+        assert path in operation.get("description", "")
+        assert "XYZ" in operation.get("summary", "")
+
+        # Asked of ``served_paths`` rather than of ``app.routes``: from FastAPI
+        # 0.141 an included router is one marker entry in ``app.routes`` with
+        # no ``path`` of its own, so a scan of that list finds no module route
+        # at all and reports the alias missing while it serves.
+        from app.core.module_loader import served_paths
+
+        alias = "/api/v1/geo-hub/tiles/{z}/{x}/{y}.png"
+        assert alias in set(served_paths(app_instance)), "the older /tiles/ spelling must keep serving, hidden or not"

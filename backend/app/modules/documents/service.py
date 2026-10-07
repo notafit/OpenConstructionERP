@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,10 +39,24 @@ from app.modules.documents.models import Document, DocumentBIMLink, ProjectPhoto
 from app.modules.documents.repository import DocumentRepository, PhotoRepository, SheetRepository
 from app.modules.documents.schemas import (
     PHOTO_CATEGORIES,
+    DocumentBatchReferencesResponse,
     DocumentBIMLinkCreate,
+    DocumentReferenceItem,
+    DocumentReferencesResponse,
     DocumentUpdate,
     PhotoUpdate,
     SheetUpdate,
+)
+
+# The title block reader lived in this file; DISCIPLINE_PREFIX_MAP and
+# detect_sheet_info are still imported from here by existing callers.
+from app.modules.documents.sheet_fields import (
+    DISCIPLINE_PREFIX_MAP,  # noqa: F401
+    chain_key_is_bare,
+    compare_revisions,
+    detect_discipline_from_sheet_number,
+    detect_sheet_info,
+    sheet_chain_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -199,7 +214,7 @@ MAX_PHOTO_SIZE = 200 * 1024 * 1024  # 200MB
 # A photo's PIXEL count, not its byte size, is what OOMs the image decoder: a
 # ~150 MP image is only a few MB on disk (so it sails past MAX_PHOTO_SIZE) but
 # decodes to ~600 MB of uncompressed RGB, enough to OOM-kill the single-worker
-# container on the 2 GB target box while it blocks the event loop. Pillow ships
+# container on the 3 GB target box while it blocks the event loop. Pillow ships
 # NO pixel guard by default, so cap decoded pixels the same way geo_hub caps
 # rasters (raster_pipeline.MAX_RASTER_PIXELS). 64 MP is ~8000x8000, well above
 # any real construction-site phone or DSLR photo.
@@ -431,6 +446,119 @@ def _generate_photo_thumbnail(
     except Exception:
         logger.exception("Failed to generate photo thumbnail for %s", dest_path)
         return False
+
+
+def _remove_file(file_path_str: str) -> None:
+    """Unlink one stored file, best-effort: a failure leaves an orphan, not an error."""
+    try:
+        file_path = Path(file_path_str)
+        if file_path.exists():
+            file_path.unlink()
+            logger.info("File removed: %s", file_path)
+    except Exception:
+        logger.warning("Failed to remove file: %s", file_path_str)
+
+
+#: ``Session.info`` key holding the files a batch delete removes on commit.
+_PENDING_REMOVALS_KEY = "documents.pending_file_removals"
+#: ``Session.info`` flag set once the two listeners below are attached.
+_REMOVAL_LISTENERS_KEY = "documents.file_removal_listeners"
+
+
+def _remove_file_after_commit(session: AsyncSession, file_path_str: str) -> bool:
+    """Queue ``file_path_str`` to be unlinked once ``session`` commits.
+
+    A batch delete runs every document through :meth:`DocumentService.
+    delete_document` inside one request transaction. Unlinking inside that
+    loop removed each file before anything was durable, so a failure on a
+    later document, or at the commit itself, rolled every row back while the
+    earlier rows' files were already gone: documents restored pointing at
+    nothing, and bytes nobody can get back. Queued here, the files go only
+    when the rows they belonged to are gone for good.
+
+    A rollback empties the queue, so the files stay. That is the trade the
+    delete path makes everywhere: an orphaned file is recoverable, a document
+    row pointing at a deleted blob is not. Clearing on rollback also keeps a
+    later commit of the same session from removing files of a delete that
+    never happened, which a one-shot listener left armed would do.
+
+    One queue and one pair of listeners per session, not one per file: a
+    2000-document batch would otherwise stack 2000 listeners on one session.
+
+    Returns False when there is no transaction to wait for (or the session
+    cannot be inspected); the caller then removes the file at once, as before.
+    """
+    try:
+        in_transaction = session.in_transaction()
+        sync_session = session.sync_session
+    except Exception:  # noqa: BLE001 - a session that cannot be inspected
+        return False
+    if not in_transaction:
+        return False
+
+    info = sync_session.info
+    if not info.get(_REMOVAL_LISTENERS_KEY):
+        from sqlalchemy import event as sa_event
+
+        def _after_commit(session_: Any) -> None:
+            # Released SAVEPOINTs dispatch after_commit too, while the outer
+            # transaction is still open and nothing is durable yet.
+            if session_.in_nested_transaction():
+                return
+            for path in session_.info.pop(_PENDING_REMOVALS_KEY, None) or []:
+                _remove_file(path)
+
+        def _after_soft_rollback(session_: Any, _previous: Any) -> None:
+            kept = session_.info.pop(_PENDING_REMOVALS_KEY, None)
+            if kept:
+                logger.warning(
+                    "Delete rolled back; kept %d file(s) it would have removed",
+                    len(kept),
+                )
+
+        sa_event.listen(sync_session, "after_commit", _after_commit)
+        sa_event.listen(sync_session, "after_soft_rollback", _after_soft_rollback)
+        info[_REMOVAL_LISTENERS_KEY] = True
+
+    info.setdefault(_PENDING_REMOVALS_KEY, []).append(file_path_str)
+    return True
+
+
+#: Heaviest consequence first, so a delete prompt leads with what cannot be
+#: repaired.
+_IMPACT_ORDER = {"strands": 0, "unlinks": 1, "retains": 2}
+
+
+def _summarise_reference_counts(
+    counts: dict[str, int],
+) -> tuple[list[DocumentReferenceItem], dict[str, int]]:
+    """Turn ``{reference key: hits}`` into sorted items plus per-impact totals.
+
+    Shared by the single-document and the batch references answers so the two
+    can never classify or order the same counts differently.
+    """
+    from app.modules.documents.references import resolved_references
+
+    by_key = {ref.key: ref for ref in resolved_references()}
+    items: list[DocumentReferenceItem] = []
+    totals = {"strands": 0, "unlinks": 0, "retains": 0}
+    for key, hits in counts.items():
+        ref = by_key.get(key)
+        if ref is None or hits <= 0:  # pragma: no cover - keys come from the resolved set
+            continue
+        totals[ref.impact] += hits
+        items.append(
+            DocumentReferenceItem(
+                key=key,
+                module=ref.module,
+                model=ref.model,
+                impact=ref.impact,
+                count=hits,
+            )
+        )
+    # Then biggest, then by key so the order is stable.
+    items.sort(key=lambda item: (_IMPACT_ORDER[item.impact], -item.count, item.key))
+    return items, totals
 
 
 class DocumentService:
@@ -1125,16 +1253,100 @@ class DocumentService:
 
     # ── Delete ─────────────────────────────────────────────────────────────
 
+    async def get_references(self, document_id: uuid.UUID) -> DocumentReferencesResponse:
+        """Summarise what still points at a document, for the delete prompt.
+
+        Read-only, and deliberately not consulted by :meth:`delete_document`:
+        the links these counts describe are severable by design, so what the
+        caller does with the answer is a decision for the person confirming.
+        See :mod:`app.modules.documents.references` for how the set is
+        curated and why it is not derived from column names.
+        """
+        from app.modules.documents.references import count_references
+
+        counts = await count_references(self.session, document_id)
+        items, totals = _summarise_reference_counts(counts)
+        return DocumentReferencesResponse(
+            document_id=document_id,
+            total=sum(totals.values()),
+            strands=totals["strands"],
+            unlinks=totals["unlinks"],
+            retains=totals["retains"],
+            references=items,
+        )
+
+    async def get_references_batch(self, document_ids: list[uuid.UUID]) -> DocumentBatchReferencesResponse:
+        """:meth:`get_references` for every document of a bulk delete at once.
+
+        The caller has already narrowed ``document_ids`` to what the user may
+        read; this only counts. Per-document answers are the same as asking
+        about each document alone, and count links.
+
+        The batch totals and ``references`` count rows instead, each once
+        however many of the selected documents it holds: they feed the "N
+        records lose the attachment" headline, and a meeting holding two of
+        the selected drawings is one record losing something, not two.
+        Summing the per-document answers would say two. A module holding
+        three of the selected drawings still shows once with its rows together.
+        """
+        from app.modules.documents.references import count_references_many
+
+        unique_ids = list(dict.fromkeys(document_ids))
+        counted = await count_references_many(self.session, unique_ids)
+        per_document = counted.per_document
+
+        documents: list[DocumentReferencesResponse] = []
+        for doc_id in unique_ids:
+            counts = per_document.get(doc_id)
+            if not counts:
+                continue
+            items, totals = _summarise_reference_counts(counts)
+            documents.append(
+                DocumentReferencesResponse(
+                    document_id=doc_id,
+                    total=sum(totals.values()),
+                    strands=totals["strands"],
+                    unlinks=totals["unlinks"],
+                    retains=totals["retains"],
+                    references=items,
+                )
+            )
+
+        items, totals = _summarise_reference_counts(counted.rows_by_key)
+        # The documents that would strand something lead, as the items do.
+        documents.sort(key=lambda d: (-d.strands, -d.unlinks, -d.total, str(d.document_id)))
+        return DocumentBatchReferencesResponse(
+            checked=len(unique_ids),
+            referenced_documents=len(documents),
+            total=sum(totals.values()),
+            strands=totals["strands"],
+            unlinks=totals["unlinks"],
+            retains=totals["retains"],
+            references=items,
+            documents=documents,
+        )
+
     async def delete_document(
         self,
         document_id: uuid.UUID,
         user_id: str | None = None,
+        *,
+        batch: bool = False,
     ) -> None:
         """Delete a document and its file.
 
         DB record is deleted first so a failure there prevents orphan file removal.
         File removal failure is logged but not fatal - leaves an orphan file rather
         than an orphan DB record pointing to a missing file.
+
+        ``batch`` marks the activity entry as part of a bulk delete. The batch
+        endpoint runs every document through here so it publishes the deleted
+        event, hands takeoff its copy of the blob and removes the file exactly
+        as a single delete does, with one difference in timing: a batch holds
+        the deleted event and the file removal until its transaction commits.
+        A batch is many deletes in one transaction, so a failure late in it
+        rolls back rows whose files and links the earlier iterations would
+        otherwise already have removed.
         """
         document = await self.get_document(document_id)
         file_path_str = document.file_path
@@ -1145,12 +1357,15 @@ class DocumentService:
         # together with the document itself, but the event-bus publish
         # downstream carries the same payload for any external audit
         # collector that wants to retain "deleted" hits.
+        details: dict[str, Any] = {"name": doc_name}
+        if batch:
+            details["batch"] = True
         await record_activity(
             self.session,
             document_id,
             user_id,
             "deleted",
-            {"name": doc_name},
+            details,
         )
 
         # Delete DB record FIRST - this is the authoritative state
@@ -1159,17 +1374,31 @@ class DocumentService:
 
         # Publish documents.document.deleted so the vector indexer and
         # other subscribers can evict the row from their stores.
+        #
+        # A batch defers it to the commit. Its subscribers purge file links
+        # and search entries in sessions of their own, and a batch that fails
+        # on a later document rolls this row back: published at once, they
+        # would already have purged the links of a document that is restored.
         try:
-            from app.core.events import event_bus
+            from app.core.events import event_bus, publish_after_commit
 
-            event_bus.publish_detached(
-                "documents.document.deleted",
-                {
-                    "project_id": str(project_id) if project_id else "",
-                    "document_id": str(document_id),
-                },
-                source_module="oe_documents",
-            )
+            payload = {
+                "project_id": str(project_id) if project_id else "",
+                "document_id": str(document_id),
+            }
+            if batch:
+                publish_after_commit(
+                    self.session,
+                    "documents.document.deleted",
+                    payload,
+                    source_module="oe_documents",
+                )
+            else:
+                event_bus.publish_detached(
+                    "documents.document.deleted",
+                    payload,
+                    source_module="oe_documents",
+                )
         except Exception as exc:
             logger.debug("Failed to publish documents.document.deleted event: %s", exc)
 
@@ -1218,13 +1447,10 @@ class DocumentService:
         if file_path_str and await self._file_has_other_documents(document_id, file_path_str):
             return
 
-        try:
-            file_path = Path(file_path_str)
-            if file_path.exists():
-                file_path.unlink()
-                logger.info("File removed: %s", file_path)
-        except Exception:
-            logger.warning("Failed to remove file: %s", file_path_str)
+        # A batch removes its files on commit, see _remove_file_after_commit.
+        if batch and file_path_str and _remove_file_after_commit(self.session, file_path_str):
+            return
+        _remove_file(file_path_str)
 
     async def _file_has_other_documents(self, document_id: uuid.UUID, file_path: str) -> bool:
         """True when documents other than ``document_id`` point at ``file_path``.
@@ -1403,7 +1629,7 @@ class PhotoService:
             )
         if detected_photo_type is None or detected_photo_type not in ALLOWED_PHOTO_TYPES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="uploaded file content does not match an image format",
             )
 
@@ -1865,161 +2091,192 @@ class PhotoService:
                 logger.warning("Failed to remove photo thumbnail: %s", thumb_path_str)
 
 
-# ── Discipline prefix mapping ────────────────────────────────────────────
-
-DISCIPLINE_PREFIX_MAP: dict[str, str] = {
-    "A": "Architectural",
-    "S": "Structural",
-    "M": "Mechanical",
-    "E": "Electrical",
-    "P": "Plumbing",
-    "C": "Civil",
-    "L": "Landscape",
-}
-
 # Base directory for sheet thumbnails
 SHEET_THUMB_BASE = _upload_root() / "sheets"
 
+# Metadata flag on a sheet whose place in its revision stack was decided by
+# upload order because its revision label could not be compared with the one it
+# replaced. The register shows it as "check the revision order".
+REVISION_ORDER_UNCLEAR = "revision_order_unclear"
 
-def detect_discipline_from_sheet_number(sheet_number: str | None) -> str | None:
-    """Auto-detect discipline from sheet number prefix.
+# Metadata key listing the title block fields somebody changed in the edit form.
+# A re-read of the title blocks leaves exactly those alone.
+MANUALLY_EDITED = "manually_edited"
 
-    Common AEC convention: first letter indicates discipline.
-    E.g., "A-201" -> Architectural, "S-100" -> Structural.
+# Document metadata key for a drawing set's file name before sanitising.
+ORIGINAL_NAME = "original_name"
+
+# The fields the title block reader fills and the edit form can correct.
+_TITLE_BLOCK_FIELDS = ("sheet_number", "sheet_title", "revision", "revision_date", "scale")
+_HAND_EDITABLE_FIELDS = (*_TITLE_BLOCK_FIELDS, "discipline")
+# Plus the one that is not read from the drawing: which revision is current.
+# Set by hand it overrides the revision order, and a re-read keeps it.
+_HAND_SET_FIELDS = (*_HAND_EDITABLE_FIELDS, "is_current")
+
+
+def _title_key(title: str | None) -> str:
+    """A sheet title reduced to what two spellings of one title share."""
+    return " ".join((title or "").casefold().split())
+
+
+# PDFium, which renders the page thumbnails behind pdfplumber's
+# ``Page.to_image``, must not be called from two threads at once, not even on
+# two different documents. The page loop below runs in a worker thread, so two
+# drawing sets uploaded together would otherwise render side by side. The lock
+# covers the thumbnail render only; text extraction is pdfminer, pure Python,
+# and runs unserialised.
+_PDFIUM_RENDER_LOCK = threading.Lock()
+
+
+# Where a title block sits on a sheet: right of this fraction of the width and
+# below this fraction of the height, measured from the top-left corner the way
+# pdfplumber's coordinates are.
+_TITLE_BLOCK_REGION = (0.5, 0.55)
+
+
+def _title_block_text(page: Any) -> str | None:
+    """Text of the bottom-right region of a pdfplumber page, or None.
+
+    A revision or a date read there is the title block's, where the same label
+    anywhere else on the sheet can be a note, a revision table row or a
+    reference to another drawing. Best effort: a page whose characters cannot
+    be read falls back to its whole text in :func:`detect_sheet_info`.
+
+    Built from the characters the page's own ``extract_text`` has already
+    parsed, filtered by position, rather than from a cropped page: a crop is a
+    second ``Page`` with a second parse, and the split already holds its pages
+    to one parse at a time.
     """
-    if not sheet_number:
+    try:
+        from pdfplumber.utils import extract_text  # noqa: PLC0415
+
+        x0, top, x1, bottom = page.bbox
+        width, height = x1 - x0, bottom - top
+        from_left, from_top = _TITLE_BLOCK_REGION
+        left, upper = x0 + width * from_left, top + height * from_top
+        chars = [c for c in page.chars if c["x0"] >= left and c["top"] >= upper]
+        if not chars:
+            return None
+        return extract_text(chars) or None
+    except Exception:
         return None
-    prefix = sheet_number.strip()[0].upper()
-    return DISCIPLINE_PREFIX_MAP.get(prefix)
 
 
-# A title block lays its fields out in columns, and the text extractor joins
-# the cells that share a visual row into one line separated by runs of spaces.
-# So "SCALE: 1:50    DRAWN: AB    DATE: 2026-01-14" arrives as a single line and
-# a pattern that captures to the end of it captures three fields, not one.
-#
-# Two independent signals mark where the next field begins. A run of two or more
-# spaces is the column gap. A following label is the field name itself, and the
-# label carries no internal space so that "AS NOTED" is not mistaken for one.
-_FIELD_LABEL_BREAK = re.compile(r"[ \t]+(?=[A-Za-z][A-Za-z.]{0,14}[ \t]*[:=])")
-_COLUMN_GAP_BREAK = re.compile(r"[ \t]{2,}")
+def _read_sheet_pages(
+    pdf_path: Path,
+    thumb_dir: Path,
+    file_uuid: str,
+    safe_name: str,
+    original_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read every page of a drawing set: title-block fields and a thumbnail.
 
+    Synchronous on purpose: :meth:`SheetService.split_pdf_to_sheets` runs it in
+    a worker thread. A drawing set has no page limit, and each page costs a
+    text extraction plus a rendered thumbnail, so a two hundred page set is
+    many seconds of CPU that would otherwise hold the event loop and every
+    other request on the worker with it. It touches no session and returns
+    plain dicts, one per page in page order, which the caller turns into
+    ``Sheet`` rows on the loop.
 
-def _trim_title_block_value(value: str, *, cut_on_column_gap: bool) -> str:
-    """Cut a captured title block value where the next field starts.
+    A thumbnail that fails to render is logged and left out; the page still
+    gets its row. Any other failure propagates, and the caller maps it to 422.
 
-    Args:
-        value: The raw capture, already bounded to a single line.
-        cut_on_column_gap: Whether a run of two or more spaces also ends the
-            value. True for narrow-vocabulary fields like the scale, where such
-            a run can only be a column gap. False for free text like the sheet
-            title, where wide letter spacing inside one cell can produce the
-            same run and cutting on it would truncate a real title.
-
-    Returns:
-        The value up to the first break, stripped.
+    ``original_name`` is the file name as the user's machine had it. It is read
+    for number, revision and title only when the PDF holds a single page: then
+    it names that one drawing ("ARC_PT_01_R03.pdf"), while the name of a
+    multi-page set says nothing about any one of its pages.
     """
-    cuts = [m.start() for m in (_FIELD_LABEL_BREAK.search(value),) if m is not None]
-    if cut_on_column_gap:
-        gap = _COLUMN_GAP_BREAK.search(value)
-        if gap is not None:
-            cuts.append(gap.start())
-    return (value[: min(cuts)] if cuts else value).strip()
+    import pdfplumber
+
+    pages: list[dict[str, Any]] = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        filename = original_name if len(pdf.pages) == 1 else None
+        for page_idx, page in enumerate(pdf.pages):
+            page_number = page_idx + 1
+            try:
+                info = _page_fields(page, filename)
+
+                # Generate thumbnail
+                thumbnail_path_str: str | None = None
+                try:
+                    thumb_path = thumb_dir / f"{file_uuid}_page_{page_number}.png"
+                    with _PDFIUM_RENDER_LOCK:
+                        page_image = page.to_image(resolution=72)
+                        page_image.save(str(thumb_path), format="PNG")
+                    thumbnail_path_str = str(thumb_path)
+                except Exception:
+                    logger.warning(
+                        "Failed to generate thumbnail for page %d of %s",
+                        page_number,
+                        safe_name,
+                    )
+            finally:
+                # pdfplumber keeps every Page in ``pdf.pages`` and each one
+                # caches its parsed layout and objects until the document
+                # closes. Without this a two hundred page set holds every
+                # page's layout at once, once per concurrent upload, on a
+                # server whose floor is 3 GB.
+                page.close()
+
+            pages.append({"page_number": page_number, **info, "thumbnail_path": thumbnail_path_str})
+    return pages
 
 
-def detect_sheet_info(page_text: str) -> dict[str, str | None]:
-    """Extract sheet number, title, scale, and revision from page text.
-
-    Uses simple regex patterns on extracted text to find common title block fields.
-    Does NOT rely on external OCR services - works on already-extracted text.
-
-    Scale reads both the ratio forms ("1:50", '1/4" = 1\'-0"') and the written
-    ones ("NTS", "N.T.S.", "VARIES", "AS NOTED"). Revision date is not read at
-    all, which is why a split row's ``revision_date`` is always null.
-
-    Returns:
-        Dict with keys: sheet_number, sheet_title, scale, revision
-    """
-    result: dict[str, str | None] = {
-        "sheet_number": None,
-        "sheet_title": None,
-        "scale": None,
-        "revision": None,
+def _page_fields(page: Any, filename: str | None) -> dict[str, Any]:
+    """The title block fields of one pdfplumber page, as the ``Sheet`` columns hold them."""
+    info = detect_sheet_info(
+        page.extract_text() or "",
+        title_block_text=_title_block_text(page),
+        filename=filename,
+    )
+    return {
+        "sheet_number": info["sheet_number"],
+        "sheet_title": info["sheet_title"],
+        "discipline": detect_discipline_from_sheet_number(info["sheet_number"]),
+        "revision": info["revision"],
+        "revision_date": _iso_date_to_datetime(info["revision_date"]),
+        "scale": info["scale"],
     }
 
-    if not page_text:
-        return result
 
-    # Sheet number patterns: "A-201", "S-100", "M001", "E-2.01", "SHEET: A-201"
-    sheet_num_patterns = [
-        r"(?:SHEET\s*(?:NO\.?|NUMBER|#|:)\s*)([A-Z]\s*[-.]?\s*\d[\w.-]*)",
-        r"(?:DWG\s*(?:NO\.?|#|:)\s*)([A-Z]?\s*[-.]?\s*\d[\w.-]*)",
-        r"\b([A-Z]-\d{2,4}(?:\.\d+)?)\b",
-        r"\b([A-Z]\d{3,4})\b",
-    ]
-    for pattern in sheet_num_patterns:
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
-            result["sheet_number"] = match.group(1).strip()
-            break
+def _reread_pages(pdf_path: Path, page_numbers: set[int], original_name: str | None) -> dict[int, dict[str, Any]]:
+    """Title block fields of the given pages of a stored drawing set, by page number.
 
-    # Sheet title patterns: "TITLE: Floor Plan", "SHEET TITLE: ..."
-    title_patterns = [
-        r"(?:SHEET\s*TITLE|TITLE)\s*[:=]\s*(.+?)(?:\n|$)",
-        r"(?:DRAWING\s*TITLE)\s*[:=]\s*(.+?)(?:\n|$)",
-    ]
-    for pattern in title_patterns:
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
-            # Free text, so only a following label ends it. A run of spaces
-            # inside a title can be letter spacing rather than a column gap.
-            title = _trim_title_block_value(match.group(1), cut_on_column_gap=False)
-            if len(title) > 2:
-                result["sheet_title"] = title[:500]
-            break
+    The re-read's counterpart of :func:`_read_sheet_pages`, run in a worker
+    thread for the same reason, without the thumbnails, which are already on
+    disk. A page number the file no longer has is left out of the result.
+    """
+    import pdfplumber
 
-    # Scale patterns: "1:100", "1/4\" = 1'-0\"", "SCALE: 1:50"
-    #
-    # The labelled pattern is bounded to the label's own line. It used to allow
-    # \s inside the character class, which matches a newline, so the capture ran
-    # off the end of the line and the trailing \S* then took the first token of
-    # the next one. A title block reading "SCALE: 1:50" above "REV C" was stored
-    # as "1:50\nREV", and that string is what the sheet detail drawer prints.
-    # Horizontal whitespace only, on both sides of the separator, because a
-    # title block field and its value share a line and a scale value can contain
-    # spaces of its own ("1/4\" = 1'-0\"", "AS NOTED").
-    #
-    # The old pattern also had no "=" in its character class, so the imperial
-    # form was cut at the equals and stored as '1/4" ='. The third pattern below
-    # reads that form correctly but never ran, because the labelled pattern is
-    # tried first and the loop breaks on the first match.
-    scale_patterns = [
-        r"(?:SCALE)[ \t]*[:=][ \t]*([^\r\n]+?)[ \t]*(?:\r?\n|$)",
-        r"\b(1\s*:\s*\d{1,4})\b",
-        r"(1/\d+\"\s*=\s*1'[\s-]*0\")",
-    ]
-    for idx, pattern in enumerate(scale_patterns):
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
-            value = match.group(1)
-            if idx == 0:
-                # Only the labelled pattern can run into a neighbouring column;
-                # the two below are bounded by their own character sets.
-                value = _trim_title_block_value(value, cut_on_column_gap=True)
-            result["scale"] = value.strip()[:50]
-            break
+    fields: dict[int, dict[str, Any]] = {}
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        filename = original_name if len(pdf.pages) == 1 else None
+        for page_number in sorted(page_numbers):
+            if not 1 <= page_number <= len(pdf.pages):
+                continue
+            page = pdf.pages[page_number - 1]
+            try:
+                fields[page_number] = _page_fields(page, filename)
+            finally:
+                page.close()
+    return fields
 
-    # Revision patterns: "REV A", "REVISION: 3", "Rev. B"
-    rev_patterns = [
-        r"(?:REV(?:ISION)?\.?\s*(?:NO\.?|#|:)?\s*)([A-Z0-9]+)",
-    ]
-    for pattern in rev_patterns:
-        match = re.search(pattern, page_text, re.IGNORECASE)
-        if match:
-            result["revision"] = match.group(1).strip()[:50]
-            break
 
-    return result
+def _hand_edited(sheet: Sheet) -> set[str]:
+    """The fields of ``sheet`` somebody set in the edit form, see ``MANUALLY_EDITED``."""
+    names = (sheet.metadata_ or {}).get(MANUALLY_EDITED)
+    return set(names) if isinstance(names, list) else set()
+
+
+def _iso_date_to_datetime(value: str | None) -> datetime | None:
+    """A title block's ISO issue date as the midnight UTC instant the column stores."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).replace(tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 class SheetService:
@@ -2108,10 +2365,37 @@ class SheetService:
         sheet_id: uuid.UUID,
         data: SheetUpdate,
     ) -> Sheet:
-        """Update sheet metadata fields."""
+        """Update sheet metadata fields, and restack the sheet when that moves it.
+
+        A changed number or revision is a correction of what the title block
+        reader got wrong, so the stacking that reading produced is redone: the
+        sheet leaves the stack it was in, which gets its previous head back,
+        and joins the stack its corrected number names at the place its
+        corrected revision puts it. A payload that sets ``is_current`` itself is
+        taken as a manual override and is not restacked.
+
+        For a bare number ("TAVOLA 1"), which stacks only on a matching title,
+        a changed title restacks too; that is how two such sheets the reader
+        kept apart are joined by hand.
+
+        A number changed without a discipline in the same payload re-derives
+        the discipline, but only when the stored one was the derived one; a
+        discipline somebody typed is left alone.
+
+        Every title block field the payload actually changes, and
+        ``is_current``, is added to the sheet's ``manually_edited`` metadata, so
+        :meth:`reread_title_blocks` knows which values are a person's and
+        leaves them alone. A field sent
+        with the value it already has is not an edit of it, and neither is a
+        discipline derived from a corrected number.
+        """
         sheet = await self.get_sheet(sheet_id)
+        old_key = sheet_chain_key(sheet.sheet_number)
+        old_revision = sheet.revision
+        old_title = _title_key(sheet.sheet_title)
 
         fields = data.model_dump(exclude_unset=True)
+        edited = [name for name in _HAND_SET_FIELDS if name in fields and fields[name] != getattr(sheet, name)]
         if "metadata" in fields:
             _incoming = fields.pop("metadata")
             fields["metadata_"] = (
@@ -2119,38 +2403,314 @@ class SheetService:
                 if isinstance(_incoming, dict)
                 else _incoming
             )
+        if edited:
+            metadata = dict(fields.get("metadata_", sheet.metadata_) or {})
+            earlier = metadata.get(MANUALLY_EDITED)
+            earlier = earlier if isinstance(earlier, list) else []
+            metadata[MANUALLY_EDITED] = sorted({*earlier, *edited})
+            fields["metadata_"] = metadata
+        if (
+            "sheet_number" in fields
+            and "discipline" not in fields
+            and sheet.discipline == detect_discipline_from_sheet_number(sheet.sheet_number)
+        ):
+            fields["discipline"] = detect_discipline_from_sheet_number(fields["sheet_number"])
 
         if not fields:
             return sheet
 
         await self.repo.update_fields(sheet_id, **fields)
+
+        moved = self._moved_in_stack(sheet, old_key, old_revision, old_title)
+        if moved and "is_current" not in fields:
+            await self._restack(sheet)
+            await self.session.flush()
         await self.session.refresh(sheet)
 
-        logger.info("Sheet updated: %s (fields=%s)", sheet_id, list(fields.keys()))
+        logger.info("Sheet updated: %s (fields=%s, restacked=%s)", sheet_id, list(fields.keys()), moved)
         return sheet
 
+    @staticmethod
+    def _moved_in_stack(sheet: Sheet, old_key: str, old_revision: str | None, old_title: str) -> bool:
+        """Whether a sheet's new fields can put it somewhere else in the revision stacks."""
+        new_key = sheet_chain_key(sheet.sheet_number)
+        return (
+            new_key != old_key
+            or (sheet.revision or None) != (old_revision or None)
+            # A bare number stacks only on a matching title, so for one of
+            # those the title is part of what decides the stack.
+            or (chain_key_is_bare(new_key) and _title_key(sheet.sheet_title) != old_title)
+        )
+
+    async def reread_title_blocks(self, project_id: uuid.UUID) -> dict[str, Any]:
+        """Read every sheet of a project again from its stored PDF, and restack.
+
+        For a register imported before the title block reader was fixed: a
+        revision read as "ole", a number not read at all. Re-uploading the set
+        would fix the fields and add a second copy of every drawing, so this
+        reads the PDF the split already stored and corrects the rows in place.
+
+        Each title block field is replaced by what the reader finds now,
+        including by nothing when it finds nothing, unless it is listed in the
+        sheet's ``manually_edited`` metadata: a value somebody typed is theirs.
+        The discipline follows a re-read number only when it was the one
+        derived from the old number, as in :meth:`update_sheet`. Sheets whose
+        fields moved them are then restacked in upload order, the order the
+        split would have stacked them in.
+
+        A sheet whose document is gone, belongs to another project, or whose
+        file is missing or unreadable keeps what it has and is counted in
+        ``files_missing``.
+
+        A sheet made current or superseded by hand keeps that state through
+        the restack. Where the corrected revisions say otherwise, the hand
+        setting is kept, the restack's answer for every other sheet stands,
+        and the sheet is listed in ``current_conflicts`` rather than one of
+        the two being chosen silently: two current revisions of one drawing
+        is then what the register shows, and what somebody has to look at.
+
+        Returns:
+            ``sheets_checked``, ``sheets_updated``, ``fields_updated``,
+            ``files_missing`` and ``current_conflicts``, as
+            :class:`SheetRereadSummary` describes them.
+        """
+        sheets = await self.repo.all_for_project(project_id)
+        by_document: dict[str, list[Sheet]] = {}
+        for sheet in sheets:
+            by_document.setdefault(sheet.document_id, []).append(sheet)
+
+        doc_repo = DocumentRepository(self.session)
+        missing = 0
+        updated = 0
+        fields_updated = 0
+        before: dict[uuid.UUID, tuple[str, str | None, str]] = {}
+        for document_id, rows in by_document.items():
+            pages = await self._reread_document(doc_repo, project_id, document_id, {s.page_number for s in rows})
+            for sheet in rows:
+                read = pages.get(sheet.page_number) if pages is not None else None
+                if read is None:
+                    missing += 1
+                    continue
+                stack_fields = (sheet_chain_key(sheet.sheet_number), sheet.revision, _title_key(sheet.sheet_title))
+                changed = self._apply_reread(sheet, read)
+                if changed:
+                    updated += 1
+                    fields_updated += changed
+                    before[sheet.id] = stack_fields
+
+        # Restacked only once every sheet of the project has its new fields,
+        # so each restack sees the corrected numbers of all the others.
+        moved = [s for s in sheets if s.id in before and self._moved_in_stack(s, *before[s.id])]
+        held = {s.id: s.is_current for s in sheets if "is_current" in _hand_edited(s)}
+        await self.session.flush()
+        for sheet in moved:
+            await self._restack(sheet)
+            await self.session.flush()
+        conflicts = [s for s in sheets if s.id in held and s.is_current != held[s.id]]
+        for sheet in conflicts:
+            sheet.is_current = held[sheet.id]
+        if conflicts:
+            await self.session.flush()
+
+        logger.info(
+            "Title blocks re-read for project %s: %d sheets, %d updated, %d restacked, %d without a readable file, "
+            "%d current states kept by hand against the revision order",
+            project_id,
+            len(sheets),
+            updated,
+            len(moved),
+            missing,
+            len(conflicts),
+        )
+        return {
+            "sheets_checked": len(sheets),
+            "sheets_updated": updated,
+            "fields_updated": fields_updated,
+            "files_missing": missing,
+            "current_conflicts": [str(s.id) for s in conflicts],
+        }
+
+    async def _reread_document(
+        self,
+        doc_repo: DocumentRepository,
+        project_id: uuid.UUID,
+        document_id: str,
+        page_numbers: set[int],
+    ) -> dict[int, dict[str, Any]] | None:
+        """The re-read fields of one stored drawing set by page number, or None when it cannot be read."""
+        try:
+            document = await doc_repo.get_by_id(uuid.UUID(document_id))
+        except ValueError:
+            document = None
+        if document is None or document.project_id != project_id or not document.file_path:
+            return None
+        pdf_path = Path(document.file_path)
+        if not pdf_path.is_file():
+            return None
+        # Sets split before the original name was kept fall back to the stored one.
+        original_name = (document.metadata_ or {}).get(ORIGINAL_NAME) or document.name
+        try:
+            return await asyncio.to_thread(_reread_pages, pdf_path, page_numbers, original_name)
+        except Exception:
+            logger.warning("Could not re-read the title blocks of %s", pdf_path, exc_info=True)
+            return None
+
+    @staticmethod
+    def _apply_reread(sheet: Sheet, read: dict[str, Any]) -> int:
+        """Write a re-read's fields onto ``sheet`` where nobody edited them; return how many changed."""
+        hand_edited = _hand_edited(sheet)
+        derived_before = detect_discipline_from_sheet_number(sheet.sheet_number)
+
+        changed = 0
+        for name in _TITLE_BLOCK_FIELDS:
+            if name not in hand_edited and read[name] != getattr(sheet, name):
+                setattr(sheet, name, read[name])
+                changed += 1
+        # Derived from the number the row now has, which is the hand-typed one
+        # when the number was corrected in the form.
+        derived = detect_discipline_from_sheet_number(sheet.sheet_number)
+        if (
+            "discipline" not in hand_edited
+            and sheet.discipline in (None, derived_before)
+            and derived != sheet.discipline
+        ):
+            sheet.discipline = derived
+            changed += 1
+        return changed
+
     # ── Split PDF ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _same_drawing(incoming: Sheet, head: Sheet) -> bool:
+        """Whether ``head`` is an earlier revision of ``incoming``, given equal stack keys.
+
+        Equal keys settle it, except for a bare number: "TAVOLA 1" of the
+        architecture set and "TAVOLA 1" of the structures set share the key "1"
+        and are different drawings, because Italian sets commonly number each
+        discipline from 1. A bare number therefore also needs the titles to
+        agree, compared without case or spacing. Two bare numbers with no title
+        on either side stay apart; giving both the same title in the edit form
+        joins them, because a title edit on a bare number restacks.
+        """
+        if not chain_key_is_bare(sheet_chain_key(incoming.sheet_number)):
+            return True
+        title_a, title_b = _title_key(incoming.sheet_title), _title_key(head.sheet_title)
+        return bool(title_a) and title_a == title_b
+
+    async def _place_in_stack(self, sheet: Sheet, head: Sheet) -> int:
+        """Put ``sheet`` into the stack whose current row is ``head``.
+
+        The revision labels decide where it goes:
+
+        * Later than the head, or the same label again (a re-issue): it becomes
+          current, and the head is retired beneath it.
+        * Earlier than the head: it is history. It is linked in beneath the
+          newest row it is later than, walking down from the head, so an older
+          revision uploaded late never retires a newer one and the stack still
+          reads in revision order.
+        * Not comparable (02 against B, a missing label on one side): the
+          latest upload is current, as before revisions were compared, and the
+          sheet is flagged ``revision_order_unclear`` in its metadata so the
+          register can ask somebody to check. Two sheets with no label at all
+          are a plain re-upload and are not flagged.
+
+        Returns:
+            1 when the head was retired, otherwise 0.
+        """
+        if sheet.id is None:
+            sheet.id = uuid.uuid4()
+        metadata = dict(sheet.metadata_ or {})
+        metadata.pop(REVISION_ORDER_UNCLEAR, None)
+        order = compare_revisions(sheet.revision, head.revision)
+
+        if order is None or order >= 0:
+            sheet.previous_version_id = head.id
+            sheet.is_current = True
+            head.is_current = False
+            if order is None and (sheet.revision or head.revision):
+                metadata[REVISION_ORDER_UNCLEAR] = True
+            sheet.metadata_ = metadata
+            return 1
+
+        node = head
+        visited = {head.id, sheet.id}
+        while node.previous_version_id is not None and node.previous_version_id not in visited:
+            below = await self.repo.get_by_id(node.previous_version_id)
+            if below is None:
+                break
+            below_order = compare_revisions(sheet.revision, below.revision)
+            if below_order is None or below_order >= 0:
+                break
+            visited.add(below.id)
+            node = below
+        sheet.previous_version_id = node.previous_version_id
+        node.previous_version_id = sheet.id
+        sheet.is_current = False
+        sheet.metadata_ = metadata
+        return 0
+
+    def _current_head_for(self, sheet: Sheet, heads: dict[str, list[Sheet]]) -> Sheet | None:
+        """The latest current row that ``sheet`` would stack on, or None."""
+        for head in reversed(heads.get(sheet_chain_key(sheet.sheet_number), [])):
+            if head.id != sheet.id and self._same_drawing(sheet, head):
+                return head
+        return None
+
+    async def _restack(self, sheet: Sheet) -> None:
+        """Take ``sheet`` out of its stack and put it where its fields now say.
+
+        Leaving: whatever sat on top of it is linked to whatever sat beneath
+        it, and if it was the current row, the one beneath becomes current
+        again, because the sheet that retired it turns out not to be its next
+        revision. Joining: as for an upload, see :meth:`_place_in_stack`; with
+        no stack to join, the sheet is current on its own.
+        """
+        below_id = sheet.previous_version_id
+        above = await self.repo.successors_of(sheet.id)
+        for row in above:
+            row.previous_version_id = below_id
+        if sheet.is_current and below_id is not None and not any(row.is_current for row in above):
+            below = await self.repo.get_by_id(below_id)
+            if below is not None:
+                below.is_current = True
+        sheet.previous_version_id = None
+
+        heads = await self.repo.current_by_chain_key(sheet.project_id)
+        head = self._current_head_for(sheet, heads)
+        if head is None:
+            sheet.is_current = True
+            metadata = dict(sheet.metadata_ or {})
+            if metadata.pop(REVISION_ORDER_UNCLEAR, None) is not None:
+                sheet.metadata_ = metadata
+            return
+        await self._place_in_stack(sheet, head)
 
     async def _supersede_previous_sheets(
         self,
         project_id: uuid.UUID,
         sheets: list[Sheet],
     ) -> int:
-        """Point each incoming sheet at the one it replaces and retire that one.
+        """Stack each incoming sheet onto the sheet it is a revision of.
 
         Called with rows that are built but not yet inserted, so the links are
         written before the insert and the retirements ride the same flush.
 
         The rules, and why each one is the way it is:
 
-        A page with no readable ``sheet_number`` is never chained. There is no
-        key to chain it on, and treating "unreadable" as a value would collect
+        Two numbers stack when their ``sheet_chain_key`` agrees, which ignores
+        case, separators and leading zeros, so "A-101" and "A101" are one
+        drawing. A bare number also needs matching titles, see
+        :meth:`_same_drawing`. Where in the stack the incoming sheet lands is
+        decided by comparing revisions, see :meth:`_place_in_stack`: an older
+        revision uploaded late is kept as history and retires nothing.
+
+        A page with no readable ``sheet_number`` is never stacked. There is no
+        key to stack it on, and treating "unreadable" as a value would collect
         every unreadable page in the project into one bogus history.
 
         A number carried by two pages of the SAME upload is a fault in the
         drawing set, not something to resolve by guessing. The earlier page
-        takes the link, the predecessor retires because this upload does
-        supersede it, and the later page stays current and unlinked. The
+        takes the link, and the later page stays current and unlinked. The
         register then shows two current rows for that number, which is the
         truth about the file that was uploaded. It is logged, because the
         alternative is that it looks like our duplication rather than theirs.
@@ -2165,37 +2725,31 @@ class SheetService:
         Returns:
             How many existing sheets were retired.
         """
-        numbered = [s for s in sheets if s.sheet_number]
+        numbered = [s for s in sheets if sheet_chain_key(s.sheet_number)]
         if not numbered:
             return 0
 
-        predecessors = await self.repo.current_by_sheet_numbers(
-            project_id,
-            sorted({str(s.sheet_number) for s in numbered}),
-        )
-        if not predecessors:
+        heads = await self.repo.current_by_chain_key(project_id)
+        if not heads:
             return 0
 
-        claimed: set[str] = set()
+        claimed: set[uuid.UUID] = set()
         retired = 0
         for sheet in sorted(numbered, key=lambda s: s.page_number):
-            number = str(sheet.sheet_number)
-            previous = predecessors.get(number)
-            if previous is None:
+            head = self._current_head_for(sheet, heads)
+            if head is None:
                 continue
-            if number in claimed:
+            if head.id in claimed:
                 logger.warning(
                     "Sheet number %s appears on more than one page of this upload "
                     "for project %s; page %d is kept as a separate current sheet",
-                    number,
+                    sheet.sheet_number,
                     project_id,
                     sheet.page_number,
                 )
                 continue
-            claimed.add(number)
-            sheet.previous_version_id = previous.id
-            previous.is_current = False
-            retired += 1
+            claimed.add(head.id)
+            retired += await self._place_in_stack(sheet, head)
 
         return retired
 
@@ -2224,7 +2778,9 @@ class SheetService:
             they superseded.
         """
         try:
-            import pdfplumber
+            # Probed here, before the upload is staged, so a damaged install
+            # answers with the repair hint; the page loop imports it again.
+            import pdfplumber  # noqa: F401
         except ImportError:
             # pdfplumber is a base dependency and is in requirements-desktop.lock,
             # so a bundle that cannot import it is damaged rather than lean: the
@@ -2245,7 +2801,7 @@ class SheetService:
         # lands fully in RAM, then read the now-bounded bytes back for the split.
         try:
             async with stream_upload_to_temp(file, max_bytes=MAX_FILE_SIZE, suffix=".pdf") as staged:
-                content = staged.path.read_bytes()
+                content = await asyncio.to_thread(staged.path.read_bytes)
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -2257,7 +2813,7 @@ class SheetService:
         upload_dir = UPLOAD_BASE / str(project_id)
         upload_dir.mkdir(parents=True, exist_ok=True)
         pdf_path = upload_dir / f"{file_uuid}_{safe_name}"
-        pdf_path.write_bytes(content)
+        await asyncio.to_thread(pdf_path.write_bytes, content)
 
         # Also create a Document record for the uploaded PDF
         doc_repo = DocumentRepository(self.session)
@@ -2269,6 +2825,10 @@ class SheetService:
             mime_type="application/pdf",
             file_path=str(pdf_path),
             uploaded_by=user_id,
+            # The name as the user's machine had it: the title block reader
+            # falls back to it, and ``safe_name`` reads differently ("01 R03"
+            # becomes "01_R03"), so a re-read needs the one the split read.
+            metadata_={ORIGINAL_NAME: raw_name},
         )
         document = await doc_repo.create(document)
         document_id = str(document.id)
@@ -2277,57 +2837,37 @@ class SheetService:
         thumb_dir = SHEET_THUMB_BASE / str(project_id)
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
-        sheets: list[Sheet] = []
-
         try:
-            with pdfplumber.open(str(pdf_path)) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    page_number = page_idx + 1
-
-                    # Extract text for sheet info detection
-                    page_text = page.extract_text() or ""
-
-                    # Detect sheet info from text
-                    info = detect_sheet_info(page_text)
-                    sheet_number = info["sheet_number"]
-                    discipline = detect_discipline_from_sheet_number(sheet_number)
-
-                    # Generate thumbnail
-                    thumbnail_path_str: str | None = None
-                    try:
-                        page_image = page.to_image(resolution=72)
-                        thumb_filename = f"{file_uuid}_page_{page_number}.png"
-                        thumb_path = thumb_dir / thumb_filename
-                        page_image.save(str(thumb_path), format="PNG")
-                        thumbnail_path_str = str(thumb_path)
-                    except Exception:
-                        logger.warning(
-                            "Failed to generate thumbnail for page %d of %s",
-                            page_number,
-                            safe_name,
-                        )
-
-                    sheet = Sheet(
-                        project_id=project_id,
-                        document_id=document_id,
-                        page_number=page_number,
-                        sheet_number=sheet_number,
-                        sheet_title=info["sheet_title"],
-                        discipline=discipline,
-                        revision=info["revision"],
-                        scale=info["scale"],
-                        is_current=True,
-                        thumbnail_path=thumbnail_path_str,
-                        created_by=user_id,
-                    )
-                    sheets.append(sheet)
-
+            # Text extraction and a thumbnail render per page, with no page
+            # limit: off the event loop. Only the rows below touch the session.
+            pages = await asyncio.to_thread(_read_sheet_pages, pdf_path, thumb_dir, file_uuid, safe_name, raw_name)
         except Exception as exc:
             logger.exception("Failed to process PDF: %s", safe_name)
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Failed to process PDF file: {exc}",
             )
+
+        sheets: list[Sheet] = [
+            Sheet(
+                # Assigned here rather than at flush: the stacker links rows
+                # already in the register to these before they are inserted.
+                id=uuid.uuid4(),
+                project_id=project_id,
+                document_id=document_id,
+                page_number=page["page_number"],
+                sheet_number=page["sheet_number"],
+                sheet_title=page["sheet_title"],
+                discipline=page["discipline"],
+                revision=page["revision"],
+                revision_date=page["revision_date"],
+                scale=page["scale"],
+                is_current=True,
+                thumbnail_path=page["thumbnail_path"],
+                created_by=user_id,
+            )
+            for page in pages
+        ]
 
         # A revised drawing set arrives as a new PDF, so without this every
         # re-upload doubled the register: two rows per sheet number, both
@@ -2425,7 +2965,9 @@ class SheetService:
             # one project cannot probe another project's document ids.
             if doc is None or doc.project_id != project_id:
                 raise ValueError("Index document not found")
-            expected = parse_index_tables(doc.file_path, index_page)
+            # Table extraction over every page of the index PDF is CPU work
+            # with no page limit; it runs in a worker thread.
+            expected = await asyncio.to_thread(parse_index_tables, doc.file_path, index_page)
         else:
             raise ValueError("No index source provided")
 

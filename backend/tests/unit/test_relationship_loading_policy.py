@@ -116,7 +116,6 @@ KNOWN_DEFAULT_LAZY: frozenset[str] = frozenset(
         "service.ServiceWorkOrder.ticket",
         "service.ServiceWorkOrderItem.work_order",
         "site_inventory.StockMovement.item",
-        "site_prep.SitePrepItem.plan",
         "supplier_catalogs.CatalogEntry.price_list",
         "supplier_catalogs.GRLine.gr",
         "supplier_catalogs.POLine.po",

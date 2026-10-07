@@ -165,6 +165,7 @@ frontend/debug-bim/
 # which is the half that still applies if one is ever force-added.
 .claude/
 CLAUDE-DASHBOARDS.md
+AGENTS.md
 
 # Internal-only files: planning, strategy, QA artifacts, audits and runbooks.
 # Kept local, never published. Enforced by scripts/check_repo_hygiene.py at
@@ -272,6 +273,7 @@ frontend/scripts/.howto-i18n/
 # Smoke-sweep E2E run artefacts (regenerable test output, not source).
 frontend/qa-smoke/
 frontend/qa-smoke-report/
+frontend/qa-routes/
 frontend/*.log.err
 frontend/*.log.out
 qa-tests/v275-probe/shots*/
@@ -485,6 +487,15 @@ frontend/scripts/_i18n_*.py
 # in a commit is an unreadable diff rather than a leak, but the reason they are
 # untracked is that nothing reads them twice.
 /scratchpad_*
+# The same material again, under two names the patterns above do not reach: a
+# leading underscore instead of a leading slash-word, and a dotted directory
+# inside backend/. Both hold the `sitecustomize.py` shim that unwedges a local
+# interpreter plus one-off key-insertion scripts, and both were sitting
+# untracked and unignored, which is the state where a single `git add -A`
+# commits them. Ignored rather than deleted: the shim is still load-bearing
+# locally. The backend one, `.scratchpad/`, is ignored in backend/.gitignore,
+# because a line written here as `backend/...` does nothing for the wheel build.
+/_scratchpad_*
 # Module inventory dump: regenerated on demand for the marketing honeycomb,
 # not an input to anything in this repository.
 /modules.json

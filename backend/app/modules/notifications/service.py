@@ -294,6 +294,8 @@ class NotificationService:
         user_id: uuid.UUID | str,
         payload: dict[str, Any],
         channel: str = "inapp",
+        *,
+        deferred: list[tuple[str, dict[str, Any]]] | None = None,
     ) -> str:
         """Route an event for a user honouring their preference.
 
@@ -319,7 +321,7 @@ class NotificationService:
             cadence = pref.digest
 
         if cadence == "realtime":
-            await self._dispatch(event_type, uid, payload, channel)
+            await self._dispatch(event_type, uid, payload, channel, deferred=deferred)
             return "dispatched"
 
         # Queue for digest.
@@ -342,6 +344,8 @@ class NotificationService:
         user_id: uuid.UUID,
         payload: dict[str, Any],
         channel: str,
+        *,
+        deferred: list[tuple[str, dict[str, Any]]] | None = None,
     ) -> None:
         """Send a single notification through the requested channel.
 
@@ -364,15 +368,17 @@ class NotificationService:
             )
             return
 
-        await _safe_publish(
-            f"notifications.dispatch.{channel}",
-            {
-                "user_id": str(user_id),
-                "event_type": event_type,
-                "channel": channel,
-                "payload": payload,
-            },
-        )
+        name = f"notifications.dispatch.{channel}"
+        data = {
+            "user_id": str(user_id),
+            "event_type": event_type,
+            "channel": channel,
+            "payload": payload,
+        }
+        if deferred is not None:
+            deferred.append((name, data))
+            return
+        await _safe_publish(name, data)
 
     async def flush_digest_queue(
         self,
@@ -394,6 +400,31 @@ class NotificationService:
             NotificationDigestQueue.sent_at.is_(None),
         )
         rows = list((await self.session.execute(stmt)).scalars().all())
+        if not rows:
+            return 0
+
+        # Claim before sending. The in-process worker flushes every five
+        # minutes and the admin endpoint can flush on demand; two flushes that
+        # both read the same unsent rows used to both send the digest. The
+        # conditional UPDATE takes the row locks, so a concurrent flush waits
+        # for this one to commit and then finds nothing left to claim.
+        now = datetime.now(UTC)
+        claimed = set(
+            (
+                await self.session.execute(
+                    update(NotificationDigestQueue)
+                    .where(
+                        NotificationDigestQueue.id.in_([r.id for r in rows]),
+                        NotificationDigestQueue.sent_at.is_(None),
+                    )
+                    .values(sent_at=now)
+                    .returning(NotificationDigestQueue.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows = [r for r in rows if r.id in claimed]
         if not rows:
             return 0
 
@@ -439,11 +470,6 @@ class NotificationService:
                 )
             sent_total += len(group)
 
-        # Mark all flushed rows as sent.
-        now = datetime.now(UTC)
-        ids = [r.id for r in rows]
-        upd = update(NotificationDigestQueue).where(NotificationDigestQueue.id.in_(ids)).values(sent_at=now)
-        await self.session.execute(upd)
         await self.session.flush()
         logger.info(
             "Notification digest flush: channel=%s users=%d rows=%d",
@@ -481,6 +507,11 @@ KNOWN_EVENT_TYPES: list[dict[str, str]] = [
     {"event_type": "boq.boq.created", "module": "boq", "description": "BOQ created"},
     {"event_type": "boq.position.created", "module": "boq", "description": "BOQ position created"},
     {"event_type": "boq.position.updated", "module": "boq", "description": "BOQ position updated"},
+    {
+        "event_type": "boq.positions.resource_propagated",
+        "module": "boq",
+        "description": "Shared resource change applied to other BOQ positions",
+    },
     # Change orders
     {
         "event_type": "changeorders.approval.advanced",
@@ -596,5 +627,31 @@ KNOWN_EVENT_TYPES: list[dict[str, str]] = [
         "event_type": "deadlines.signing.overdue",
         "module": "deadlines",
         "description": "Signature session past its expiry",
+    },
+    {
+        "event_type": "deadlines.contracts_payment_plan_claim.overdue",
+        "module": "deadlines",
+        "description": "Reached payment milestone with no claim raised",
+    },
+    {
+        "event_type": "deadlines.contracts_payment_plan.overdue",
+        "module": "deadlines",
+        "description": "Payment-plan instalment past its due date",
+    },
+    {
+        "event_type": "deadlines.contracts_payment_plan.approaching",
+        "module": "deadlines",
+        "description": "Payment-plan instalment falling due soon",
+    },
+    # Records of modules built with the module builder that have a deadline.
+    {
+        "event_type": "deadlines.built_modules.overdue",
+        "module": "deadlines",
+        "description": "Record of a module you built, past its deadline",
+    },
+    {
+        "event_type": "deadlines.built_modules.approaching",
+        "module": "deadlines",
+        "description": "Record of a module you built, falling due soon",
     },
 ]

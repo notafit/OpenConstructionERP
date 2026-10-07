@@ -164,8 +164,8 @@ class TestPackagesWithinValue:
     def test_packages_worth_more_than_the_contract_are_reported(self) -> None:
         findings = checks.check_packages_within_value(_agreement(total_value="200000.00"))
         assert len(findings) == 1
-        assert findings[0].params["planned"] == "250000.00"
-        assert findings[0].params["total"] == "200000.00"
+        assert findings[0].params["planned"] == "250,000.00 EUR"
+        assert findings[0].params["total"] == "200,000.00 EUR"
 
     def test_a_cent_of_rounding_is_not_an_overrun(self) -> None:
         agreement = _agreement(

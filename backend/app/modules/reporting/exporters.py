@@ -419,6 +419,8 @@ def _export_xlsx(
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
+    from app.core.xlsx_branding import apply_company_header
+
     snapshot = data_snapshot or {}
 
     wb = Workbook()
@@ -537,6 +539,9 @@ def _export_xlsx(
     ws.column_dimensions[get_column_letter(1)].width = 32
     ws.column_dimensions[get_column_letter(2)].width = 60
     ws.freeze_panes = "A2"
+    # Company letterhead above the title block; a no-op without a company
+    # profile. No title of its own: the sheet already opens with one.
+    apply_company_header(ws)
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -577,7 +582,12 @@ def _export_pdf(
         TableStyle,
     )
 
-    from app.core.pdf_branding import branded_doc_metadata, branded_header_footer
+    from app.core.pdf_branding import (
+        branded_doc_metadata,
+        branded_footer,
+        branded_header_footer,
+        branded_letterhead,
+    )
     from app.core.pdf_fonts import BODY_FONT, BOLD_FONT, pdf_style_for_text, register_pdf_fonts
 
     register_pdf_fonts()
@@ -760,7 +770,17 @@ def _export_pdf(
         subject=tr(locale, "pdf_subject"),
         creator=meta["creator"],
     )
-    doc.build(flowables, onFirstPage=branded_header_footer, onLaterPages=branded_header_footer)
+    # The firm's letterhead heads page one when the company profile has one.
+    # It spans the margins, as the tables under it and the header band on the
+    # later pages do, centred over the frame's 6pt padding. It already carries
+    # the logo and the name, so page one keeps only the footer: the header
+    # band over it would print the logo twice.
+    letterhead = branded_letterhead(doc.width)
+    if letterhead is not None:
+        letterhead.hAlign = "CENTER"
+        flowables.insert(0, letterhead)
+    first_page = branded_header_footer if letterhead is None else branded_footer
+    doc.build(flowables, onFirstPage=first_page, onLaterPages=branded_header_footer)
     return buffer.getvalue()
 
 

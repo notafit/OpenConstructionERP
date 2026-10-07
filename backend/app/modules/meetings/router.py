@@ -14,11 +14,13 @@ Endpoints:
     GET    /{meeting_id}/export/pdf       - Export meeting minutes as PDF
 """
 
+import asyncio
 import io
 import logging
 import re
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
@@ -620,8 +622,15 @@ def _extract_meeting_data_heuristic(
 async def _extract_text_from_file(file_content: bytes, filename: str) -> str:
     """Extract text content from uploaded file based on extension.
 
-    Supports: .txt, .vtt, .srt, .docx, .pdf
+    Supports: .txt, .vtt, .srt, .docx, .pdf. Parsing a 50-page PDF or a long
+    DOCX takes seconds of CPU, so it runs in a worker thread rather than on
+    the event loop, where it stalled every other request for that long.
     """
+    return await asyncio.to_thread(_extract_text_sync, file_content, filename)
+
+
+def _extract_text_sync(file_content: bytes, filename: str) -> str:
+    """The parsing behind :func:`_extract_text_from_file`, run off the event loop."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
     if ext in ("txt", "vtt", "srt"):
@@ -656,7 +665,12 @@ async def _extract_text_from_file(file_content: bytes, filename: str) -> str:
             text_parts = []
             with pdfplumber.open(io.BytesIO(file_content)) as pdf:
                 for page in pdf.pages[:50]:  # Cap at 50 pages
-                    page_text = page.extract_text()
+                    try:
+                        page_text = page.extract_text()
+                    finally:
+                        # pdfplumber keeps every parsed page's layout until
+                        # the document closes; release each one as we go.
+                        page.close()
                     if page_text:
                         text_parts.append(page_text)
             return "\n".join(text_parts)
@@ -1719,16 +1733,12 @@ async def distribute_meeting_minutes(
 # ── PDF Export ───────────────────────────────────────────────────────────────
 
 
-@router.get(
-    "/{meeting_id}/export/pdf/",
-    dependencies=[Depends(RequirePermission("meetings.read"))],
-)
-async def export_meeting_pdf(
-    meeting_id: uuid.UUID,
-    session: SessionDep = None,  # type: ignore[assignment]
-    _user: CurrentUserId = None,  # type: ignore[assignment]
-) -> StreamingResponse:
-    """Export meeting minutes as a PDF document."""
+def _render_meeting_pdf(meeting: SimpleNamespace, project_name: str) -> bytes:
+    """Lay out the raw meeting record as PDF bytes.
+
+    Pure: ``meeting`` is a plain snapshot of the row taken on the event loop,
+    so this runs in a worker thread without touching the session.
+    """
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4
@@ -1743,8 +1753,13 @@ async def export_meeting_pdf(
         Table,
         TableStyle,
     )
-    from sqlalchemy import select
 
+    from app.core.pdf_branding import (
+        branded_appearance,
+        branded_doc_metadata,
+        branded_header_logo,
+        branded_letterhead,
+    )
     from app.core.pdf_fonts import (
         BODY_FONT,
         BOLD_FONT,
@@ -1753,20 +1768,9 @@ async def export_meeting_pdf(
         pdf_table_paragraph_rows,
         register_pdf_fonts,
     )
-    from app.modules.meetings.models import Meeting
-    from app.modules.projects.models import Project
+    from app.modules.meetings.pdf import draw_minutes_footer
 
     register_pdf_fonts()
-
-    result = await session.execute(select(Meeting).where(Meeting.id == meeting_id))
-    meeting = result.scalar_one_or_none()
-    if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found")
-    await verify_project_access(meeting.project_id, str(_user), session)
-
-    # Fetch project name
-    proj_result = await session.execute(select(Project.name).where(Project.id == meeting.project_id))
-    project_name = proj_result.scalar_one_or_none() or "Unknown Project"
 
     # ── Build PDF ────────────────────────────────────────────────────────
     PAGE_WIDTH, PAGE_HEIGHT = A4
@@ -1841,6 +1845,12 @@ async def export_meeting_pdf(
         return style_cell_label if col_index == 0 else None
 
     elements: list = []
+
+    # The firm's letterhead, when the company profile has one. The frame pads
+    # 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(USABLE_WIDTH - 12, doc_type="meeting_minutes")
+    if letterhead is not None:
+        elements.append(letterhead)
 
     # Header
     elements.append(Paragraph("Meeting Minutes", style_title))
@@ -1991,32 +2001,86 @@ async def export_meeting_pdf(
 
     # Build document
     buf = io.BytesIO()
+    look = branded_appearance(doc_type="meeting_minutes")
 
     def _header_footer(canvas_obj, doc):  # type: ignore[no-untyped-def]
+        # On a page that opens with the letterhead, the letterhead is the page's
+        # header: the running head and the logo above it would repeat it.
+        under_letterhead = letterhead is not None and doc.page == 1
         canvas_obj.saveState()
         canvas_obj.setFillColor(colors.HexColor("#999999"))
-        running_head = f"{project_name} - {meeting.title}"
-        canvas_obj.setFont(pdf_font_for_text(running_head), 7)
-        canvas_obj.drawString(MARGIN, PAGE_HEIGHT - 12 * mm, running_head)
-        canvas_obj.setFont(BODY_FONT, 7)
-        canvas_obj.drawRightString(
-            PAGE_WIDTH - MARGIN,
-            10 * mm,
-            f"Page {doc.page}",
-        )
+        if not under_letterhead:
+            running_head = f"{project_name} - {meeting.title}"
+            canvas_obj.setFont(pdf_font_for_text(running_head), 7)
+            canvas_obj.drawString(MARGIN, PAGE_HEIGHT - 12 * mm, running_head)
+        draw_minutes_footer(canvas_obj, doc, look, margin=MARGIN)
         canvas_obj.restoreState()
+        if not under_letterhead:
+            branded_header_logo(canvas_obj, doc)
 
     frame = Frame(MARGIN, MARGIN, USABLE_WIDTH, PAGE_HEIGHT - 2 * MARGIN, id="main")
-    doc = BaseDocTemplate(buf, pagesize=A4)
+    # The margins are the frame's, so the header logo, placed from the right
+    # margin, lines up with the text under it instead of reportlab's inch.
+    doc = BaseDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=MARGIN,
+        rightMargin=MARGIN,
+        topMargin=MARGIN,
+        bottomMargin=MARGIN,
+        **branded_doc_metadata(),
+    )
     doc.addPageTemplates([PageTemplate(id="main", frames=[frame], onPage=_header_footer)])
     doc.build(elements)
+    return buf.getvalue()
 
-    buf.seek(0)
+
+@router.get(
+    "/{meeting_id}/export/pdf/",
+    dependencies=[Depends(RequirePermission("meetings.read"))],
+)
+async def export_meeting_pdf(
+    meeting_id: uuid.UUID,
+    session: SessionDep = None,  # type: ignore[assignment]
+    _user: CurrentUserId = None,  # type: ignore[assignment]
+) -> StreamingResponse:
+    """Export meeting minutes as a PDF document."""
+    from sqlalchemy import select
+
+    from app.modules.meetings.models import Meeting
+    from app.modules.projects.models import Project
+
+    result = await session.execute(select(Meeting).where(Meeting.id == meeting_id))
+    meeting = result.scalar_one_or_none()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    await verify_project_access(meeting.project_id, str(_user), session)
+
+    # Fetch project name
+    proj_result = await session.execute(select(Project.name).where(Project.id == meeting.project_id))
+    project_name = proj_result.scalar_one_or_none() or "Unknown Project"
+
+    # Plain snapshot of the fields the renderer reads, so no ORM row crosses into
+    # the thread. Laying out the PDF is pure CPU, so it runs in a worker thread
+    # and the event loop keeps serving requests.
+    snapshot = SimpleNamespace(
+        title=meeting.title,
+        meeting_date=meeting.meeting_date,
+        location=meeting.location,
+        meeting_type=meeting.meeting_type,
+        meeting_number=meeting.meeting_number,
+        status=meeting.status,
+        attendees=meeting.attendees,
+        agenda_items=meeting.agenda_items,
+        action_items=meeting.action_items,
+    )
+    pdf_bytes = await asyncio.to_thread(_render_meeting_pdf, snapshot, project_name)
+
     safe_title = meeting.title.replace(" ", "_")[:50]
     filename = f"meeting_{meeting.meeting_number}_{safe_title}.pdf"
 
     return StreamingResponse(
-        buf,
+        io.BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={
             "Content-Disposition": attachment_disposition(filename),
@@ -2062,7 +2126,19 @@ async def export_minutes_pdf(
     project_name = proj_result.scalar_one_or_none() or "Unknown Project"
 
     content: dict = minutes.content if isinstance(minutes.content, dict) else {}
-    pdf_bytes = build_minutes_pdf(meeting, minutes, project_name)
+    # Plain snapshots of the fields the renderer reads, so no ORM row crosses into
+    # the thread. Laying out the PDF is pure CPU, so it runs in a worker thread.
+    meeting_snapshot = SimpleNamespace(
+        title=meeting.title,
+        meeting_date=meeting.meeting_date,
+        meeting_number=meeting.meeting_number,
+    )
+    minutes_snapshot = SimpleNamespace(
+        content=minutes.content,
+        status=minutes.status,
+        issued_at=minutes.issued_at,
+    )
+    pdf_bytes = await asyncio.to_thread(build_minutes_pdf, meeting_snapshot, minutes_snapshot, project_name)
     filename = minutes_pdf_filename(meeting, content)
     return StreamingResponse(
         io.BytesIO(pdf_bytes),

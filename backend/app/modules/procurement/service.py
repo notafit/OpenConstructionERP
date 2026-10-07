@@ -14,8 +14,10 @@ Event publishing (slice E):
 
 import logging
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError
@@ -51,16 +53,28 @@ from app.modules.procurement.repository import (
 from app.modules.procurement.schemas import (
     GRCreate,
     POCreate,
+    POItemCreate,
     POUpdate,
     ProcurementStatsResponse,
     ProjectDeliveryPerformanceResponse,
     SupplierDeliveryPerformance,
 )
+from app.modules.procurement.validators import line_label
 
 #: Rule set run against a purchase order. Registered in
 #: ``app.core.validation.rules.register_builtin_rules`` and passed explicitly by
 #: :meth:`ProcurementService._validate_po` -- a rule set nobody passes never runs.
 PROCUREMENT_RULE_SET = "procurement"
+
+#: Rule set run against a supplier invoice linked to a purchase order (amount
+#: still open on the order, quantity received). Warnings only, see
+#: ``procurement.validators.check_invoice_within_order``.
+INVOICE_PO_MATCH_RULE_SET = "invoice_po_match"
+
+
+def _line_key(description: object) -> str:
+    """How an invoice line is matched to an order line: its text, case and spacing ignored."""
+    return " ".join(str(description or "").split()).casefold()
 
 
 # ── Material Requisition FSM (R7) ─────────────────────────────────────────────
@@ -191,6 +205,29 @@ _VALID_PO_STATUSES = set(_PO_STATUS_TRANSITIONS.keys())
 #: ``committed_from_po`` marker in finance, and the compensating event has to
 #: fire for all three, not only for ``approved``.
 _PO_COMMITTED_STATUSES = frozenset({"approved", "issued", "partially_received"})
+
+#: The only status in which a purchase order's amounts, currency, vendor and
+#: line items may still change in place. Approval is given to a sum, a vendor
+#: and a list of lines, and finance takes the commitment at that moment and
+#: later releases exactly what it took. Changing the figures afterwards would
+#: walk around the approval, and it would leave the finance commitment and the
+#: committed cost report (which reads the live lines) telling two different
+#: stories about the same order.
+_PO_EDITABLE_STATUSES = frozenset({"draft"})
+
+#: What a purchase order that has left draft is told to do instead of editing
+#: its figures in place, by the status it is in. Every remedy is a path the
+#: status machine really offers from there.
+_PO_FROZEN_REMEDIES = {
+    "approved": "Return it to draft to correct it (in the same request if you like) and approve it again.",
+    "issued": (
+        "Cancel it and reopen it as a draft to correct it, or raise a separate purchase order "
+        "for the difference if deliveries or invoices already refer to it."
+    ),
+    "partially_received": "Raise a separate purchase order for the difference.",
+    "completed": "Raise a separate purchase order for the difference.",
+    "cancelled": "Reopen it as a draft to correct it, in the same request if you like.",
+}
 
 #: Holder kinds a removal refusal can name, in the order a reader wants them:
 #: what was delivered, what was billed, what was paid out, what asked for it.
@@ -384,6 +421,106 @@ def _to_decimal(value: object) -> Decimal:
         return Decimal(str(value or "0"))
     except (InvalidOperation, ValueError, TypeError):
         return Decimal("0")
+
+
+def _cents(value: object) -> Decimal:
+    """A money figure rounded to the cent, so ``"1800"`` and ``"1800.00"`` compare equal."""
+    return _to_decimal(value).quantize(Decimal("0.01"))
+
+
+def _plain(value: object) -> str:
+    """A quantity or rate as one canonical string, whatever trailing zeros it arrived with."""
+    return format(_to_decimal(value).normalize(), "f")
+
+
+def _po_line_signature(
+    description: object,
+    unit: object,
+    quantity: object,
+    unit_rate: object,
+    amount: object,
+    cost_line_id: object,
+    wbs_id: object,
+    cost_category: object,
+) -> tuple[str, ...]:
+    """Everything a purchase order line commits to, in a form that compares by value.
+
+    An amount of zero means "derive it", the same rule the write path applies,
+    so a line sent back without its amount matches the stored line it came from.
+    """
+    effective = _to_decimal(amount)
+    if effective == 0:
+        effective = _to_decimal(quantity) * _to_decimal(unit_rate)
+    return (
+        str(description or "").strip(),
+        str(unit or "").strip(),
+        _plain(quantity),
+        _plain(unit_rate),
+        str(_cents(effective)),
+        str(cost_line_id or ""),
+        str(wbs_id or ""),
+        str(cost_category or ""),
+    )
+
+
+def _frozen_po_changes(
+    po: PurchaseOrder,
+    fields: dict[str, Any],
+    new_items: list[POItemCreate] | None,
+    new_item_cost_line_ids: list[uuid.UUID | None],
+) -> list[str]:
+    """Name what a PATCH would really change among the figures approval fixed.
+
+    Only real changes count. A client that sends back the stored amounts, the
+    same currency in another case or the same lines in another order is not
+    changing anything, and is not refused for it.
+    """
+    changed: list[str] = []
+    if any(
+        name in fields and _cents(fields[name]) != _cents(getattr(po, name, None))
+        for name in ("amount_subtotal", "tax_amount", "amount_total")
+    ):
+        changed.append("amounts")
+    if (
+        "currency_code" in fields
+        and (fields["currency_code"] or "").strip().upper() != (po.currency_code or "").strip().upper()
+    ):
+        changed.append("currency")
+    if (
+        "vendor_contact_id" in fields
+        and str(fields["vendor_contact_id"] or "").strip().lower() != str(po.vendor_contact_id or "").strip().lower()
+    ):
+        changed.append("vendor")
+    if new_items is not None:
+        stored = sorted(
+            _po_line_signature(
+                it.description,
+                it.unit,
+                it.quantity,
+                it.unit_rate,
+                it.amount,
+                it.cost_line_id,
+                it.wbs_id,
+                it.cost_category,
+            )
+            for it in (po.items or [])
+        )
+        incoming = sorted(
+            _po_line_signature(
+                it.description,
+                it.unit,
+                it.quantity,
+                it.unit_rate,
+                it.amount,
+                cost_line_id,
+                it.wbs_id,
+                it.cost_category,
+            )
+            for it, cost_line_id in zip(new_items, new_item_cost_line_ids, strict=True)
+        )
+        if stored != incoming:
+            changed.append("line items")
+    return changed
 
 
 def _fmt_qty(value: object) -> str:
@@ -690,6 +827,8 @@ class ProcurementService:
                 "status": po.status,
                 "vendor_contact_id": str(po.vendor_contact_id) if po.vendor_contact_id else None,
                 "amount_total": po.amount_total,
+                # Net of VAT, the basis finance commits on (the budget is net).
+                "amount_subtotal": po.amount_subtotal,
                 "currency_code": po.currency_code,
                 "item_count": len(data.items),
             },
@@ -722,7 +861,7 @@ class ProcurementService:
         """
         _MAX_RETRIES = 5
         last_exc: IntegrityError | None = None
-        for _attempt in range(_MAX_RETRIES):
+        for _ in range(_MAX_RETRIES):
             po_number = explicit_po_number or await self.po_repo.next_po_number(
                 data.project_id,
             )
@@ -802,6 +941,10 @@ class ProcurementService:
         subtotal or tax are changed. A PATCH that moves the PO into
         ``approved`` runs the same blocking ``procurement`` rule set as
         :meth:`approve_po`, so approval cannot be reached ungated.
+
+        Outside draft the amounts, currency, vendor and line items are frozen
+        (409 naming the way to correct them), unless the same PATCH returns the
+        order to draft. ``issued`` is reached only through :meth:`issue_po`.
         """
         po = await self.get_po(po_id)  # 404 check
         prior_status = po.status
@@ -845,6 +988,78 @@ class ProcurementService:
             # remedy: one check, called from both.
             if new_status == "cancelled" and po.status != "cancelled":
                 await self._refuse_if_po_is_held(po, action="cancel")
+            # ``issued`` has its own verb, and the verb is what re-checks the
+            # vendor's hard block at the moment the order goes out, writes the
+            # audit row and tells the listeners. A PATCH straight into
+            # ``issued`` did none of the three, so it is refused and pointed
+            # at the verb rather than taught to repeat it.
+            if new_status == "issued" and po.status != "issued":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "A purchase order is issued through its issue action, which re-checks the vendor "
+                        "and records the issue. Use that action instead of changing the status directly."
+                    ),
+                )
+
+        # Guard the destructive replace: ``delete_by_po`` hard-deletes the
+        # existing PO line rows, and ``GoodsReceiptItem.po_item_id`` is an
+        # ``ON DELETE SET NULL`` FK back to them. So replacing items on a PO
+        # that already has goods receipts silently NULLs the po_item_id link
+        # on every received line, orphaning the received-quantity linkage and
+        # corrupting the over-receipt cap, the 3-way match, and the
+        # fully-received rollup (received quantities can no longer be tied to
+        # any PO line). Once deliveries exist the line items are no longer
+        # safe to mutate - refuse the replace with a 409. It is checked before
+        # anything is written and before the frozen-figures check below,
+        # because it is the more specific of the two explanations.
+        if data.items is not None and po.goods_receipts:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Cannot replace line items on a purchase order that already has goods receipts; "
+                    "the received quantities are linked to the existing line items."
+                ),
+            )
+
+        # Resolve the spine links before the existing rows are destroyed, for
+        # the same reason create_po resolves before the PO exists: a foreign
+        # position id must refuse the PATCH rather than take the old line items
+        # down with it. The frozen-figures check below compares the resolved
+        # links too, so it happens before that check as well.
+        #
+        # This replace is why the resolution cannot live only in create_po.
+        # The rows are rebuilt from scratch, so a rebuild that did not resolve
+        # would strip the cost line off every line of the order the first time
+        # somebody corrected a quantity, and that order would drop out of the
+        # committed report for good. The link has to be re-derived on every
+        # write that recreates the row, not only on the first one.
+        item_cost_line_ids: list[uuid.UUID | None] = []
+        if data.items is not None:
+            item_cost_line_ids = await resolve_cost_line_ids(
+                self.session,
+                po.project_id,
+                [(item.cost_line_id, item.boq_position_id) for item in data.items],
+            )
+
+        # Once an order leaves draft its amounts, currency, vendor and lines
+        # are the ones it was approved with, and finance holds a commitment for
+        # exactly that sum. A PATCH may still correct them on the way back to
+        # draft (the re-approval then gates and commits the corrected order),
+        # but not while the order stays approved, issued, received or
+        # cancelled. Notes, dates and payment terms stay editable throughout.
+        resulting_status = fields.get("status") or po.status
+        if po.status not in _PO_EDITABLE_STATUSES and resulting_status not in _PO_EDITABLE_STATUSES:
+            changed = _frozen_po_changes(po, fields, data.items, item_cost_line_ids)
+            if changed:
+                what = changed[0] if len(changed) == 1 else f"{', '.join(changed[:-1])} and {changed[-1]}"
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Purchase order {po.po_number} is {po.status.replace('_', ' ')}, so its {what} can no "
+                        f"longer change in place. {_PO_FROZEN_REMEDIES.get(po.status, '')}"
+                    ).strip(),
+                )
 
         # Recompute total if subtotal or tax changed
         new_subtotal = fields.get("amount_subtotal", po.amount_subtotal)
@@ -858,44 +1073,9 @@ class ProcurementService:
         if fields:
             await self.po_repo.update(po_id, **fields)
 
-        # Replace items if provided
+        # Replace items if provided. The goods-receipt refusal and the cost
+        # line resolution for this replace both run above, before any write.
         if data.items is not None:
-            # Guard the destructive replace: ``delete_by_po`` hard-deletes the
-            # existing PO line rows, and ``GoodsReceiptItem.po_item_id`` is an
-            # ``ON DELETE SET NULL`` FK back to them. So replacing items on a PO
-            # that already has goods receipts silently NULLs the po_item_id link
-            # on every received line, orphaning the received-quantity linkage and
-            # corrupting the over-receipt cap, the 3-way match, and the
-            # fully-received rollup (received quantities can no longer be tied to
-            # any PO line). Once deliveries exist the line items are no longer
-            # safe to mutate - refuse the replace with a 409. Header fields
-            # (notes, payment_terms, status, etc.) already applied above are
-            # unaffected; only the items[] payload is rejected.
-            if po.goods_receipts:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        "Cannot replace line items on a purchase order that already has goods receipts; "
-                        "the received quantities are linked to the existing line items."
-                    ),
-                )
-            # Resolve the spine links before the existing rows are destroyed,
-            # for the same reason create_po resolves before the PO exists: a
-            # foreign position id must refuse the PATCH rather than take the
-            # old line items down with it.
-            #
-            # This replace is why the resolution cannot live only in create_po.
-            # The rows are rebuilt from scratch, so a rebuild that did not
-            # resolve would strip the cost line off every line of the order the
-            # first time somebody corrected a quantity, and that order would
-            # drop out of the committed report for good. The link has to be
-            # re-derived on every write that recreates the row, not only on the
-            # first one.
-            item_cost_line_ids = await resolve_cost_line_ids(
-                self.session,
-                po.project_id,
-                [(item.cost_line_id, item.boq_position_id) for item in data.items],
-            )
             await self.po_item_repo.delete_by_po(po_id)
             item_amounts: list[Decimal] = []
             for idx, item_data in enumerate(data.items):
@@ -1024,6 +1204,8 @@ class ProcurementService:
                     "project_id": str(updated.project_id),
                     "po_number": updated.po_number,
                     "amount_total": updated.amount_total,
+                    # Net of VAT, the basis finance commits on (the budget is net).
+                    "amount_subtotal": updated.amount_subtotal,
                     "currency_code": updated.currency_code or "",
                     "approver_id": "",
                 },
@@ -1059,6 +1241,8 @@ class ProcurementService:
                         "project_id": str(updated.project_id),
                         "po_number": updated.po_number,
                         "amount_total": updated.amount_total,
+                        # Net of VAT, the basis finance commits on (the budget is net).
+                        "amount_subtotal": updated.amount_subtotal,
                         "currency_code": updated.currency_code or "",
                         "prior_status": prior_status,
                         "status": updated.status,
@@ -1402,7 +1586,7 @@ class ProcurementService:
         report = await self._validate_po(po, operation=operation)
         if report.has_errors:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={
                     "message": (
                         f"This purchase order has problems that must be fixed before you can "
@@ -1444,6 +1628,129 @@ class ProcurementService:
                 for r in report.results
             ],
         }
+
+    async def invoice_match_payload(
+        self,
+        po_id: uuid.UUID,
+        *,
+        invoice_net: object,
+        lines: Sequence[dict[str, object]],
+        exclude_invoice_id: uuid.UUID | None = None,
+        invoice_ref: str | None = None,
+    ) -> dict[str, object]:
+        """Build what the ``invoice_po_match`` rules read for one invoice against its order.
+
+        "Invoiced before" is every other invoice linked to the order that the
+        dashboard counts as invoiced, in the order's currency, so re-checking
+        an invoice that is already saved does not count it twice.
+
+        An invoice line belongs to the order line with the same description.
+        When the order has a single line, every invoice line belongs to it,
+        which covers the common "one material, one order" case where the
+        supplier's wording differs from the buyer's. Lines that match nothing
+        are left to the amount check.
+        """
+        from app.modules.finance.cost_position import INVOICED_STATUSES
+
+        po = await self.get_po(po_id)
+        currency = (po.currency_code or "").strip().upper()
+        items = list(po.items or [])
+        by_key = {_line_key(item.description): item for item in items}
+
+        def _item_for(description: object) -> PurchaseOrderItem | None:
+            if len(items) == 1:
+                return items[0]
+            return by_key.get(_line_key(description))
+
+        invoiced_before_net = Decimal("0")
+        invoiced_before: dict[uuid.UUID, Decimal] = {}
+        for inv in await self.po_repo.linked_payable_invoices(po_id, po.project_id):
+            if inv.id == exclude_invoice_id or inv.status not in INVOICED_STATUSES:
+                continue
+            if (inv.currency_code or "").strip().upper() != currency:
+                continue
+            invoiced_before_net += _to_decimal(inv.amount_subtotal)
+            for line in inv.line_items or []:
+                item = _item_for(line.description)
+                if item is not None:
+                    invoiced_before[item.id] = invoiced_before.get(item.id, Decimal("0")) + _to_decimal(line.quantity)
+
+        invoiced_now: dict[uuid.UUID, Decimal] = {}
+        for line in lines:
+            item = _item_for(line.get("description"))
+            if item is not None:
+                invoiced_now[item.id] = invoiced_now.get(item.id, Decimal("0")) + _to_decimal(line.get("quantity"))
+
+        received: dict[uuid.UUID, Decimal] = {}
+        has_receipts = False
+        for gr in po.goods_receipts or []:
+            if gr.status != "confirmed":
+                continue
+            has_receipts = True
+            for gr_item in gr.items or []:
+                if gr_item.po_item_id is not None:
+                    received[gr_item.po_item_id] = received.get(gr_item.po_item_id, Decimal("0")) + _to_decimal(
+                        gr_item.quantity_received
+                    )
+
+        return {
+            "po_number": po.po_number,
+            "currency_code": po.currency_code or "",
+            "po_net": po.amount_subtotal,
+            "invoiced_before_net": str(invoiced_before_net),
+            "invoice_net": str(invoice_net or "0"),
+            "invoice_ref": invoice_ref or "",
+            "has_receipts": has_receipts,
+            "received_net": str(
+                sum(
+                    (received.get(item.id, Decimal("0")) * _to_decimal(item.unit_rate) for item in items),
+                    Decimal("0"),
+                )
+            ),
+            "lines": [
+                {
+                    "label": line_label(idx, {"description": item.description}),
+                    "unit": item.unit or "",
+                    "ordered": item.quantity,
+                    "received": str(received.get(item.id, Decimal("0"))),
+                    "invoiced_before": str(invoiced_before.get(item.id, Decimal("0"))),
+                    "invoiced": str(invoiced_now.get(item.id, Decimal("0"))),
+                }
+                for idx, item in enumerate(items)
+            ],
+        }
+
+    async def check_invoice_against_po(
+        self,
+        po_id: uuid.UUID,
+        *,
+        invoice_net: object,
+        lines: Sequence[dict[str, object]],
+        exclude_invoice_id: uuid.UUID | None = None,
+        invoice_ref: str | None = None,
+    ) -> dict[str, object]:
+        """Run the ``invoice_po_match`` rules for an invoice about to be saved (read-only).
+
+        Warnings, never a refusal: the person entering the invoice sees what
+        does not match and decides.
+        """
+        payload = await self.invoice_match_payload(
+            po_id,
+            invoice_net=invoice_net,
+            lines=lines,
+            exclude_invoice_id=exclude_invoice_id,
+            invoice_ref=invoice_ref,
+        )
+        po = await self.get_po(po_id)
+        report = await validation_engine.validate(
+            data=payload,
+            rule_sets=[INVOICE_PO_MATCH_RULE_SET],
+            target_type="invoice",
+            target_id=str(exclude_invoice_id or po_id),
+            project_id=str(po.project_id),
+            metadata={"locale": get_locale(), "operation": "invoice_check"},
+        )
+        return self._po_report_to_dict(report)
 
     async def validate_po(self, po_id: uuid.UUID) -> dict[str, object]:
         """Run the procurement rule set and return the report (read-only).
@@ -1524,6 +1831,8 @@ class ProcurementService:
                 "project_id": str(updated.project_id),
                 "po_number": updated.po_number,
                 "amount_total": updated.amount_total,
+                # Net of VAT, the basis finance commits on (the budget is net).
+                "amount_subtotal": updated.amount_subtotal,
                 "currency_code": updated.currency_code or "",
                 "approver_id": approver_id or "",
             },
@@ -1592,6 +1901,8 @@ class ProcurementService:
                 "project_id": str(updated.project_id),
                 "po_number": updated.po_number,
                 "amount_total": updated.amount_total,
+                # Net of VAT, the basis finance commits on (the budget is net).
+                "amount_subtotal": updated.amount_subtotal,
                 "currency_code": updated.currency_code or "",
             },
         )
@@ -2146,19 +2457,11 @@ class ProcurementService:
         # ── Invoiced quantities - best-effort, optional finance module ──
         invoiced_by_sort: dict[int, Decimal] = {}
         try:
-            from app.modules.finance.models import Invoice, InvoiceLineItem
+            from app.modules.finance.models import InvoiceLineItem
 
-            # Find invoices whose JSON metadata.po_id == this PO id. Fetch the
-            # id AND metadata_ together so the link filter needs no second pass
-            # over the same id set (previously a separate ``meta_stmt`` re-read
-            # the metadata for every id this query already returned).
-            inv_stmt = _select(Invoice.id, Invoice.metadata_).where(
-                Invoice.project_id == po.project_id,
-                Invoice.invoice_direction == "payable",
-            )
-            inv_rows = (await self.session.execute(inv_stmt)).all()
+            # The column or the legacy metadata stamp, whichever the invoice has.
             linked_invoice_ids: set[uuid.UUID] = {
-                inv_id for inv_id, meta in inv_rows if isinstance(meta, dict) and str(meta.get("po_id")) == str(po_id)
+                inv.id for inv in await self.po_repo.linked_payable_invoices(po_id, po.project_id)
             }
             if linked_invoice_ids:
                 # Pull line items only for the invoices actually linked to this
@@ -2457,7 +2760,7 @@ class ProcurementService:
                     .where(GoodsReceipt.status == "confirmed")
                 )
             ).all()
-            gr_ids = [gr_id for gr_id, _po_id, _rd in gr_rows]
+            gr_ids = [gr_id for gr_id, _, _ in gr_rows]
 
             # -- Sum ordered / received per receipt from its line items ------
             ordered_by_gr: dict[uuid.UUID, Decimal] = {}
@@ -2532,6 +2835,93 @@ class ProcurementService:
 
         return True
 
+    async def committed_by_position(
+        self,
+        project_id: uuid.UUID,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """One page of the committed rollup per BOQ position, and its size.
+
+        Joins PO items -> cost spine -> BOQ positions to show what has been
+        ordered against each estimated line item.
+
+        The page and the total come off one list rather than out of two
+        queries. The collapse from cost line to bill position happens here in
+        Python and not in SQL - several cost lines can name the same position,
+        so the number of rows the caller will see is not known until they have
+        been folded together. A second query counting distinct positions would
+        have to repeat that fold, and the day the two folds stopped agreeing
+        the total would be wrong with nothing to notice it. Building the whole
+        list, counting it and slicing the page out of it cannot drift, because
+        there is only one list.
+
+        The sort is explicit for the same reason the slice needs it: the rows
+        arrive in whatever order the database returned them, which it is free
+        to change between two identical requests. Paging an unordered set
+        skips rows and repeats others.
+
+        Args:
+            project_id: The project whose purchase orders are read.
+            limit: How many positions the page holds.
+            offset: How many positions to skip before it starts.
+
+        Returns:
+            The page, and the number of positions with commitments in all.
+        """
+        from sqlalchemy import select
+
+        from app.modules.procurement.cost_spine import positions_for_cost_lines
+        from app.modules.procurement.models import PurchaseOrder, PurchaseOrderItem
+
+        # Every live PO line in the project, with the cost line it commits
+        # against. The amounts are added up below rather than by SQL, because
+        # they are stored as text and the portable way to sum text here is
+        # ``numeric_value``, which goes through double precision. That is
+        # acceptable for a quantity and wrong for money, which this repository
+        # carries as Decimal from end to end.
+        stmt = (
+            select(
+                PurchaseOrderItem.cost_line_id,
+                PurchaseOrderItem.quantity,
+                PurchaseOrderItem.amount,
+            )
+            .join(PurchaseOrder, PurchaseOrderItem.po_id == PurchaseOrder.id)
+            .where(PurchaseOrder.project_id == project_id)
+            .where(PurchaseOrder.status != "cancelled")
+            .where(PurchaseOrderItem.cost_line_id.is_not(None))
+        )
+        committed = (await self.session.execute(stmt)).all()
+
+        cost_line_ids = [row.cost_line_id for row in committed if row.cost_line_id]
+        position_map = await positions_for_cost_lines(self.session, cost_line_ids) if cost_line_ids else {}
+
+        # Keyed by the position id as text, and normalised on the way in. The
+        # map answers with a UUID while the fallback is a cost line id already
+        # in text, so a dict accepting both spellings would file one position
+        # under two keys and split its rollup in half without ever failing.
+        totals: dict[str, tuple[Decimal, Decimal]] = {}
+        for row in committed:
+            cost_line_id = str(row.cost_line_id)
+            position_id = str(position_map.get(cost_line_id, cost_line_id))
+            committed_qty, committed_value = totals.get(position_id, (Decimal("0"), Decimal("0")))
+            totals[position_id] = (
+                committed_qty + _to_decimal(row.quantity),
+                committed_value + _to_decimal(row.amount),
+            )
+
+        ordered = sorted(totals.items())
+        rows = [
+            {
+                "boq_position_id": position_id,
+                "committed_qty": str(committed_qty),
+                "committed_value": str(committed_value),
+            }
+            for position_id, (committed_qty, committed_value) in ordered[offset : offset + limit]
+        ]
+        return rows, len(ordered)
+
 
 # ── MaterialRequisitionService ────────────────────────────────────────────────
 
@@ -2589,7 +2979,7 @@ class MaterialRequisitionService:
         """
         _MAX_RETRIES = 5
         last_exc: IntegrityError | None = None
-        for _attempt in range(_MAX_RETRIES):
+        for _ in range(_MAX_RETRIES):
             req_number = await self._next_req_number(project_id)
             req = MaterialRequisition(
                 project_id=project_id,

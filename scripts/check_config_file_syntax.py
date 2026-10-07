@@ -108,7 +108,10 @@ def check_paths(paths: list[str]) -> list[tuple[str, str]]:
 def main() -> int:
     paths = _tracked()
     if not paths:
-        print("ERROR: no tracked YAML or JSON file was found, so this gate proved nothing", file=sys.stderr)
+        print(
+            "ERROR: no tracked YAML or JSON file was found, so this gate proved nothing",
+            file=sys.stderr,
+        )
         return 1
 
     jsonc = [path for path in paths if is_jsonc(path)]
@@ -117,7 +120,10 @@ def main() -> int:
     json_files = [path for path in checked if path.endswith(JSON_SUFFIX)]
 
     if len(jsonc) != EXPECTED_JSONC:
-        print(f"ERROR: {len(jsonc)} {JSONC_PREFIX}*.json file(s) found, {EXPECTED_JSONC} expected:", file=sys.stderr)
+        print(
+            f"ERROR: {len(jsonc)} {JSONC_PREFIX}*.json file(s) found, {EXPECTED_JSONC} expected:",
+            file=sys.stderr,
+        )
         for path in jsonc:
             print(f"  {path}", file=sys.stderr)
         print(

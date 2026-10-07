@@ -124,7 +124,7 @@ def _resolve_forecast_method(requested: str) -> str:
     if canonical is None:
         allowed = ", ".join(sorted(FORECAST_METHOD_ALIASES))
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Unknown forecast method '{requested}'. Choose one of: {allowed}.",
         )
     return canonical
@@ -282,7 +282,9 @@ class EVMService:
         stmt = (
             select(EVMSnapshot)
             .where(EVMSnapshot.project_id == project_id)
-            .order_by(EVMSnapshot.snapshot_date.desc())
+            # Two rows can share a date (a person's figure recorded beside an
+            # older automatic one); the newest is the day's figure.
+            .order_by(EVMSnapshot.snapshot_date.desc(), EVMSnapshot.created_at.desc())
             .limit(1)
         )
         result = await self.session.execute(stmt)
@@ -393,7 +395,9 @@ class EVMService:
 
         # Fetch all snapshots ordered by date
         snap_stmt = (
-            select(EVMSnapshot).where(EVMSnapshot.project_id == project_id).order_by(EVMSnapshot.snapshot_date.asc())
+            select(EVMSnapshot)
+            .where(EVMSnapshot.project_id == project_id)
+            .order_by(EVMSnapshot.snapshot_date.asc(), EVMSnapshot.created_at.asc())
         )
         snap_result = await self.session.execute(snap_stmt)
         snapshots = list(snap_result.scalars().all())
@@ -1230,7 +1234,7 @@ class EVMBaselineService:
             )
         except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             ) from exc
 

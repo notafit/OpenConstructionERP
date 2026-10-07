@@ -206,7 +206,10 @@ def _fixture(tmp: str, pyproject_edit=None, dockerfile_edit=None) -> tuple[str, 
     dockerfile_copy = os.path.join(tmp, "Dockerfile.unified")
     shutil.copyfile(PYPROJECT, pyproject_copy)
     shutil.copyfile(DOCKERFILE, dockerfile_copy)
-    for path, edit in ((pyproject_copy, pyproject_edit), (dockerfile_copy, dockerfile_edit)):
+    for path, edit in (
+        (pyproject_copy, pyproject_edit),
+        (dockerfile_copy, dockerfile_edit),
+    ):
         if edit is None:
             continue
         with open(path, encoding="utf-8") as handle:
@@ -257,17 +260,24 @@ def selftest() -> int:
         pyproject, dockerfile = _fixture(tmp, pyproject_edit=_map_line_adder(HELD_BACK))
         found = check(pyproject, dockerfile)
         if len(found) != 1 or HELD_BACK not in found[0] or "never copied" not in found[0]:
-            print("selftest FAILED: a map entry with no COPY was not reported, got:", found)
+            print(
+                "selftest FAILED: a map entry with no COPY was not reported, got:",
+                found,
+            )
             return 1
 
         # Direction two: the Dockerfile copies a pack the map does not name.
         # The image builds, and ships a pack that is held back on purpose.
         pyproject, dockerfile = _fixture(
-            tmp, dockerfile_edit=_line_adder(f"COPY packs/{HELD_BACK}/src/ packs/{HELD_BACK}/src/")
+            tmp,
+            dockerfile_edit=_line_adder(f"COPY packs/{HELD_BACK}/src/ packs/{HELD_BACK}/src/"),
         )
         found = check(pyproject, dockerfile)
         if len(found) != 1 or HELD_BACK not in found[0] or "ships it publicly" not in found[0]:
-            print("selftest FAILED: a COPY with no map entry was not reported, got:", found)
+            print(
+                "selftest FAILED: a COPY with no map entry was not reported, got:",
+                found,
+            )
             return 1
 
         # Agreeing with each other is not enough on its own: a pair that names
@@ -279,7 +289,10 @@ def selftest() -> int:
         )
         found = check(pyproject, dockerfile)
         if len(found) != 1 or "no such path exists" not in found[0]:
-            print("selftest FAILED: an agreed pair naming a path not in the tree was accepted, got:", found)
+            print(
+                "selftest FAILED: an agreed pair naming a path not in the tree was accepted, got:",
+                found,
+            )
             return 1
 
         # A comment naming a pack must not satisfy the check, which is the

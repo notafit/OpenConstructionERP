@@ -3,9 +3,15 @@
 
 On the subcontractor payment portal and the cost value reconciliation screen,
 the English word "application" means a formal claim for work done in a period,
-the same sense as applying for planning permission. This product has no
-software-application meaning: every English string containing the word is the
-claim sense.
+the same sense as applying for planning permission.
+
+That sentence used to end "this product has no software-application meaning:
+every English string containing the word is the claim sense", and it was true
+when it was written. It is not true now. The funding module asks for grants,
+where an application is a request for money nobody has awarded yet rather than
+a claim for money already earned, and the settings screen has an application
+server. What settles which sense is meant is the screen, not the word, which is
+the rule the scope below is built on.
 
 Seventeen locales had translated it as a phone app anyway. Spanish said
 "Aplicaciones de pago", Croatian "Primjene placanja", French "application de
@@ -68,6 +74,21 @@ answer to "which spelling means software" has to be stored per language.
 which really is the software, and it is the one string on that screen where the
 app reading is correct. A sweep that went by the word rather than the meaning
 would have broken it.
+
+The scope has been narrowed once, and only once, against the direction of
+everything above. A key named merely for an application used to enter the scope
+from anywhere, which was right while the claim was the only sense in the
+product. With the funding module it stopped being right, and the check reported
+four Filipino grant strings for saying aplikasyon, which is that language's
+ordinary word for a formal application and is what the same file uses for a
+building permit. Filipino keeps the two apart the way this check asks: its
+payment portal says paghahabol, a claim. So the bare word in a key name is
+evidence only on a payment screen now, the same condition the third signal
+already carried. It took the scope from 114 keys to 110 and removed nothing but
+those four. Narrowing a scope is how a check of this kind goes quietly useless,
+so it is worth saying what was not done: the funding namespace is not excluded,
+and English there that says payment application is still the claim and is still
+checked.
 """
 
 from __future__ import annotations
@@ -138,7 +159,31 @@ CLAIM_SENSE = re.compile(
 
 # Keys named for the claim whose English never spells it out. cvr.col_application
 # is the single word "Application"; no text pattern will ever reach it.
-KEY_NAMED = re.compile(r"payapp|payment_app|application", re.I)
+#
+# Two patterns, because the two halves of the old one carried different weights.
+# `payapp` and `payment_app` name the claim wherever they appear and need no
+# context to be read. The bare word does not, and that only became visible when
+# the product grew a second sense of it.
+KEY_NAMED_CLAIM = re.compile(r"payapp|payment_app", re.I)
+# The bare word in a key name is evidence only where the screen settles what it
+# means, which is the same rule BARE_APPLICATION already lives by below.
+#
+# A grant application is not a payment application. One asks for money that has
+# not been awarded, the other claims money already earned, and the funding
+# module is full of the first: `funding.new_application`, `funding.tab_appli-
+# cations`, `funding.obligation_kind.application_deadline`. Every language
+# translates those with its own word for a request, Antrag, demande, solicitud,
+# candidatura, zayavka, and the check reported four Filipino strings for using
+# aplikasyon, which is the ordinary Filipino word for a formal application and
+# is what that file also uses for a building permit. Filipino separates the two
+# senses correctly, in the way the check was built to require: the payment
+# portal says paghahabol, a claim, and `cvr.col_application` says it too.
+#
+# Narrowing the signal rather than naming the module is deliberate. A funding
+# string that genuinely says "payment application" in English is still caught by
+# CLAIM_SENSE, so what moved out of scope is a word in a key name, not a
+# namespace, and nothing about this depends on the funding module existing.
+KEY_NAMED_BARE = re.compile(r"application", re.I)
 
 # On these screens the bare word is unambiguous. "Applications", "Gross applied"
 # and "App #" are all the claim, and outside a payment screen none of them would
@@ -205,10 +250,17 @@ def english_scope(locales_dir: str, playbooks_dir: str | None = None) -> set[str
     signal misses a key called `cvr.col_application` whose English is the single
     word "Application". The name signal misses a sentence about progress claims
     in a key called `subcontractors.intro_body`.
+
+    The name signal comes in two strengths. A key named payapp or payment_app
+    is the claim anywhere; a key named merely for an application is the claim
+    only on a payment screen, because elsewhere in this product the word now
+    also means asking for a grant. See KEY_NAMED_BARE.
     """
     src = english_source(locales_dir, playbooks_dir)
     by_text = {k for k, v in src.items() if CLAIM_SENSE.search(v)}
-    by_name = {k for k in src if KEY_NAMED.search(k)}
+    by_name = {
+        k for k in src if KEY_NAMED_CLAIM.search(k) or (KEY_NAMED_BARE.search(k) and k.startswith(PAYMENT_SCREENS))
+    }
     by_screen = {k for k, v in src.items() if k.startswith(PAYMENT_SCREENS) and BARE_APPLICATION.search(v)}
     return (by_text | by_name | by_screen) - set(EXCLUDED_BY_DESIGN)
 
@@ -285,10 +337,61 @@ def selftest() -> int:
             print("selftest FAILED: still reporting after the values were corrected")
             return 1
         # An English string that is not about the claim must not be pulled in.
-        _write(os.path.join(tmp, "en.ts"), '  "settings.mobile": "Download the mobile application",\n')
-        _write(os.path.join(tmp, "xx.ts"), '  "settings.mobile": "Descargue la aplicacion movil",\n')
+        _write(
+            os.path.join(tmp, "en.ts"),
+            '  "settings.mobile": "Download the mobile application",\n',
+        )
+        _write(
+            os.path.join(tmp, "xx.ts"),
+            '  "settings.mobile": "Descargue la aplicacion movil",\n',
+        )
         if check(tmp):
             print("selftest FAILED: guarded a string that is genuinely about software")
+            return 1
+        # Asking for a grant is not claiming for work done, and a key named for
+        # an application away from a payment screen is the first, not the
+        # second. Filipino writes both with aplikasyon, the way English writes
+        # both with application, and marking that wrong would be marking the
+        # language wrong.
+        _write(
+            os.path.join(tmp, "en.ts"),
+            '  "funding.new_application": "New application",\n',
+        )
+        _write(
+            os.path.join(tmp, "xx.ts"),
+            '  "funding.new_application": "Bagong aplikasyon",\n',
+        )
+        if check(tmp):
+            print("selftest FAILED: reported a grant application as a payment application")
+            return 1
+        # The same key name on a payment screen is the claim again, so the
+        # narrowing above has to be the screen and not the word. Without this
+        # the check could be switched off entirely and still pass the case
+        # before it.
+        _write(
+            os.path.join(tmp, "en.ts"),
+            '  "cvr.new_application": "New application",\n',
+        )
+        _write(
+            os.path.join(tmp, "xx.ts"),
+            '  "cvr.new_application": "Bagong aplikasyon",\n',
+        )
+        if len(check(tmp)) != 1:
+            print("selftest FAILED: a key named for an application on a payment screen stopped being checked")
+            return 1
+        # And the funding namespace is not excluded, only the weaker of the two
+        # name signals is. English that says payment application is the claim
+        # wherever it is written, so this must still fire.
+        _write(
+            os.path.join(tmp, "en.ts"),
+            '  "funding.retention_note": "Deduct retention on the next payment application",\n',
+        )
+        _write(
+            os.path.join(tmp, "xx.ts"),
+            '  "funding.retention_note": "Deduzca la retencion en la proxima aplicacion de pago",\n',
+        )
+        if len(check(tmp)) != 1:
+            print("selftest FAILED: the claim sense stopped being checked inside the funding namespace")
             return 1
 
     # A key whose English exists only in a playbook, never in en.ts. This is the
@@ -298,13 +401,19 @@ def selftest() -> int:
         loc, books = os.path.join(tmp, "l"), os.path.join(tmp, "p")
         os.makedirs(loc)
         os.makedirs(books)
-        _write(os.path.join(loc, "en.ts"), '  "unrelated.key": "Nothing to do with money",\n')
+        _write(
+            os.path.join(loc, "en.ts"),
+            '  "unrelated.key": "Nothing to do with money",\n',
+        )
         _write(
             os.path.join(books, "a.playbook.ts"),
             '  descKey: "cases.bill_the_month.desc",\n'
             '  descDefault: "Raise the progress claim and send it for certification.",\n',
         )
-        _write(os.path.join(loc, "xx.ts"), '  "cases.bill_the_month.desc": "Crea la aplicacion de pago del mes.",\n')
+        _write(
+            os.path.join(loc, "xx.ts"),
+            '  "cases.bill_the_month.desc": "Crea la aplicacion de pago del mes.",\n',
+        )
         if check(loc):
             print("selftest FAILED: found a playbook key without being given playbooks")
             return 1
@@ -352,7 +461,9 @@ def selftest() -> int:
         "selftest ok: fires outside payportal and cvr, reaches keys whose English "
         "lives only in a playbook, ignores back_to_app, catches the French noun "
         "without touching the French verb or a variable name, leaves genuine "
-        "software strings alone, goes quiet once corrected"
+        "software strings alone, leaves a grant application alone while still "
+        "checking the same key name on a payment screen and the claim sense "
+        "inside the funding namespace, goes quiet once corrected"
     )
     return 0
 

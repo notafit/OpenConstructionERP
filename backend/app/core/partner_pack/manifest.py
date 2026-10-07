@@ -388,7 +388,11 @@ class PartnerPackManifest(BaseModel):
         reviewed, and the answer for them is a real question. Deleting this as
         dead code re-opens the hole for every pack we do not author.
 
-        The import is deferred because ``discovery`` imports this module.
+        The import is deferred because ``discovery`` imports this module. The
+        answer comes from ``pack_carries_file``, which asks ``read_pack_file``
+        once per slug and path and keeps the yes/no until ``reset_cache()``:
+        asked afresh, the flags cost about five seconds of CPU per
+        ``GET /installed`` over 43 packs, a call the header makes on every page.
 
         Args:
             relpath: Declared path inside the pack package, or None.
@@ -398,9 +402,9 @@ class PartnerPackManifest(BaseModel):
         """
         if not relpath:
             return False
-        from app.core.partner_pack.discovery import read_pack_file
+        from app.core.partner_pack.discovery import pack_carries_file
 
-        return read_pack_file(self.slug, relpath) is not None
+        return pack_carries_file(self.slug, relpath)
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serialise for the /api/v1/partner-pack/current endpoint.

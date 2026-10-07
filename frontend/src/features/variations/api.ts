@@ -199,6 +199,13 @@ export interface VariationDashboard {
   eot_claims_open: number;
   final_account_status: string;
   currency: string;
+  cost_impact_by_currency: Record<string, string>;
+  cost_impact_unconverted_by_currency: Record<string, string>;
+  daywork_value_by_currency: Record<string, string>;
+  daywork_value_unconverted_by_currency: Record<string, string>;
+  multi_currency: boolean;
+  pending_vr_cost_total: string | null;
+  agreed_vo_cost_total: string | null;
 }
 
 /* ── Create payloads ────────────────────────────────────────────────────── */
@@ -667,6 +674,18 @@ export function updateVO(
 
 export function deleteVO(id: string): Promise<void> {
   return apiDelete(`/v1/variations/variation-orders/${id}`);
+}
+
+/**
+ * Create a Change Order linked to a standalone VO that has none yet.
+ *
+ * Returns the refreshed VO with `reference_change_order_id` populated.
+ */
+export function createLinkedCO(voId: string): Promise<VariationOrder> {
+  return apiPost<VariationOrder>(
+    `/v1/variations/variation-orders/${voId}/create-linked-co`,
+    {},
+  );
 }
 
 /* ── Daywork ───────────────────────────────────────────────────────────── */

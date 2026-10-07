@@ -65,9 +65,9 @@ def _register_handlers() -> None:
     Idempotent in practice - the bus dedups by callable identity, and the
     module loader imports this module exactly once per process.
     """
-    event_bus.subscribe("schedule_advanced.takt.schedule.created", _on_takt_schedule_created)
-    event_bus.subscribe("schedule_advanced.takt.activities_imported", _on_takt_activities_imported)
-    event_bus.subscribe("schedule_advanced.takt.cycle_updated", _on_takt_cycle_updated)
+    event_bus.subscribe_once("schedule_advanced.takt.schedule.created", _on_takt_schedule_created)
+    event_bus.subscribe_once("schedule_advanced.takt.activities_imported", _on_takt_activities_imported)
+    event_bus.subscribe_once("schedule_advanced.takt.cycle_updated", _on_takt_cycle_updated)
 
 
 _register_handlers()

@@ -41,6 +41,11 @@ export interface BudgetLine {
   description: string;
   planned_amount: number;
   committed_amount: number;
+  /**
+   * True when committed_amount is this line's share of the purchase orders
+   * and contracts on its cost line; the API refuses a typed value then.
+   */
+  committed_from_documents?: boolean;
   actual_amount: number;
   forecast_amount: number;
   /**
@@ -378,7 +383,7 @@ export const costModelApi = {
       `/v1/costmodel/projects/${projectId}/5d/contract-exposure/`,
     ),
   getBudgetLines: (projectId: string) =>
-    apiGet<BudgetLine[]>(`/v1/costmodel/projects/${projectId}/5d/budget-lines/`),
+    apiGet<BudgetLine[]>(`/v1/costmodel/projects/${projectId}/5d/budget-lines/?limit=1000`),
   /**
    * Record field progress for the BOQ position behind a budget line. The
    * backend progress module turns the percent into EVM earned value on the

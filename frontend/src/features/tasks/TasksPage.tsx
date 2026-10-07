@@ -37,7 +37,10 @@ import { PlanningCrossLinks } from '@/features/schedule/PlanningCrossLinks';
 import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useCreateShortcut } from '@/shared/hooks/useCreateShortcut';
-import { apiGet, extractErrorMessageFromBody, triggerDownload } from '@/shared/lib/api';
+import { extractErrorMessageFromBody, triggerDownload } from '@/shared/lib/api';
+import { AssigneePicker } from '@/features/contacts/AssigneePicker';
+import { assigneeFields } from './assignee';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -214,6 +217,10 @@ interface TaskFormData {
   task_type: TaskType;
   priority: TaskPriority;
   assigned_to: string;
+  /** Set when the assignee was picked from the users list. */
+  assignee_user_id: string;
+  /** Set when the assignee was picked from contacts. */
+  assignee_contact_id: string;
   due_date: string;
 }
 
@@ -223,6 +230,8 @@ const EMPTY_FORM: TaskFormData = {
   task_type: 'task',
   priority: 'normal',
   assigned_to: '',
+  assignee_user_id: '',
+  assignee_contact_id: '',
   due_date: '',
 };
 
@@ -248,6 +257,9 @@ export function taskFormData(task?: Task | null): TaskFormData {
       task.assigned_to_name ||
       (typeof meta.assignee_name === 'string' ? meta.assignee_name : '') ||
       '',
+    assignee_user_id: task.responsible_id || '',
+    assignee_contact_id:
+      !task.responsible_id && typeof meta.assignee_contact_id === 'string' ? meta.assignee_contact_id : '',
     due_date: task.due_date || '',
   };
 }
@@ -482,12 +494,20 @@ function AddTaskModal({
               <label className="block text-sm font-medium text-content-primary mb-1.5">
                 {t('tasks.field_assignee', { defaultValue: 'Assignee' })}
               </label>
-              <input
-                value={form.assigned_to}
-                onChange={(e) => set('assigned_to', e.target.value)}
-                className={inputCls}
+              <AssigneePicker
+                value={{
+                  name: form.assigned_to,
+                  userId: form.assignee_user_id,
+                  contactId: form.assignee_contact_id,
+                }}
+                onChange={(next) => {
+                  set('assigned_to', next.name);
+                  set('assignee_user_id', next.userId);
+                  set('assignee_contact_id', next.contactId);
+                }}
+                inputClassName={inputCls}
                 placeholder={t('tasks.assignee_placeholder', {
-                  defaultValue: 'Name or email',
+                  defaultValue: 'Select assignee',
                 })}
               />
             </div>
@@ -976,7 +996,7 @@ export function TasksPage() {
   // Data
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<Project[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<Project[]>(),
     staleTime: 5 * 60_000,
   });
 
@@ -1003,6 +1023,7 @@ export function TasksPage() {
             task_type: typeFilter || undefined,
           }),
     enabled: myTasksOnly || !!projectId,
+    refetchOnWindowFocus: true,
   });
 
   // The board reads rows; the notice at the foot of it reads the count they
@@ -1124,16 +1145,24 @@ export function TasksPage() {
         addToast({ type: 'error', title: t('requiresProject.title'), message: t('common.select_project_first', { defaultValue: 'Please select a project first' }) });
         return;
       }
-      const assignee = formData.assigned_to.trim();
-      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(assignee);
+      const assignee = assigneeFields(formData);
+      // A new task has nothing to clear, so only the keys in use go.
+      const assigneePart =
+        'metadata' in assignee
+          ? {
+              responsible_id: assignee.responsible_id ?? undefined,
+              metadata: assignee.metadata.assignee_name
+                ? { assignee_name: assignee.metadata.assignee_name }
+                : undefined,
+            }
+          : { assignee_contact_id: assignee.assignee_contact_id };
       createMut.mutate({
         project_id: projectId,
         title: formData.title,
         description: formData.description || undefined,
         task_type: formData.task_type,
         priority: formData.priority,
-        responsible_id: isUuid ? assignee : undefined,
-        metadata: assignee && !isUuid ? { assignee_name: assignee } : undefined,
+        ...assigneePart,
         due_date: formData.due_date || undefined,
       });
     },
@@ -1142,35 +1171,10 @@ export function TasksPage() {
 
   const editMut = useMutation({
     mutationFn: ({ id, data }: { id: string; data: TaskFormData }) => {
-      const assignee = data.assigned_to.trim();
-      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(assignee);
-      const baseMeta = (editingTask?.metadata ?? {}) as Record<string, unknown>;
-      // The assignee field is a single text input prefilled with the user's
-      // DISPLAY NAME (the form has no UUID). If the user did not touch it, the
-      // field still equals that display name, so naively writing
-      // responsible_id=null would silently demote a real-user assignment to
-      // free text and break my-tasks linkage + notifications. Detect the
-      // unchanged case and preserve the original responsible_id UUID.
-      const originalDisplay =
-        editingTask?.assigned_to_name ||
-        (typeof baseMeta.assignee_name === 'string' ? (baseMeta.assignee_name as string) : '') ||
-        '';
-      const unchangedRealUser =
-        !!editingTask?.responsible_id && !isUuid && assignee === originalDisplay.trim();
-
-      // Preserve any non-task metadata the task already carried (e.g.
-      // `source`, DWG pins) and only overwrite the assignee_name slot.
-      const { assignee_name: _drop, ...keepMeta } = baseMeta;
-      const metadata: Record<string, unknown> = { ...keepMeta };
-      // Keep the display-name mirror only when the assignee is a free-text name
-      // (not a preserved real-user link).
-      if (assignee && !isUuid && !unchangedRealUser) metadata.assignee_name = assignee;
-
-      const responsible_id = unchangedRealUser
-        ? editingTask!.responsible_id
-        : isUuid
-          ? assignee
-          : null;
+      // The form carries the picked user's or contact's id next to the name
+      // it shows, so an untouched assignee keeps its link without guessing
+      // from the display text.
+      const assignee = assigneeFields(data);
 
       // Only what the user actually edited goes back. Writing the whole form
       // on every save rewrites fields nobody opened with the values they held
@@ -1186,9 +1190,14 @@ export function TasksPage() {
       if (data.due_date !== base.due_date) patch.due_date = data.due_date || null;
       // The assignee drives both the link and its display-name mirror, so the
       // two travel together or not at all.
-      if (data.assigned_to !== base.assigned_to) {
-        patch.responsible_id = responsible_id;
-        patch.metadata = metadata;
+      if (
+        data.assigned_to !== base.assigned_to ||
+        data.assignee_user_id !== base.assignee_user_id ||
+        data.assignee_contact_id !== base.assignee_contact_id
+      ) {
+        // The route merges metadata, so the task's other keys (source, DWG
+        // pins) stay as they are.
+        Object.assign(patch, assignee);
       }
       return updateTask(id, patch);
     },

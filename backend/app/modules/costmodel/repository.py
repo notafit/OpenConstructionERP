@@ -86,6 +86,32 @@ def _amount_in_base(
     return amount * rate
 
 
+def _to_money(raw: str | None) -> Decimal:
+    """Parse a stored money string, 0 for blank or junk (as ``_amount_in_base``)."""
+    return _amount_in_base(raw, "", "", {})
+
+
+def _base_to_line_currency(
+    amount: Decimal, line_currency: str, base_currency: str, fx_rates: dict[str, str]
+) -> Decimal:
+    """Inverse of ``_amount_in_base`` for one amount: base units back to the line's.
+
+    Uses the same rules, so a line with no usable rate keeps the amount as is,
+    exactly as ``_amount_in_base`` kept it on the way in.
+    """
+    code = (line_currency or "").strip().upper()
+    base = (base_currency or "").strip().upper()
+    if not code or not base or code == base:
+        return amount
+    try:
+        rate = Decimal(str(fx_rates.get(code)))
+    except (InvalidOperation, ValueError, TypeError):
+        return amount
+    if not rate.is_finite() or rate <= 0:
+        return amount
+    return amount / rate
+
+
 # ── CostSnapshot repository ─────────────────────────────────────────────────
 
 
@@ -308,6 +334,120 @@ class BudgetLineRepository:
                     fx[code] = rate
         return base, fx
 
+    async def _spine_committed_by_cost_line(self, project_id: uuid.UUID) -> dict[str, Decimal]:
+        """Live committed value per cost line, in the project base currency.
+
+        See ``CostSpineRepository.committed_by_cost_line`` for which purchase
+        orders and contracts count. A cost line is present in the result only
+        when at least one such document exists, which is what the aggregators
+        use to decide that the line's commitment comes from the documents
+        rather than from a hand-typed ``committed_amount``. Extracted so unit
+        tests can stub it.
+        """
+        return await CostSpineRepository(self.session).committed_by_cost_line(project_id)
+
+    async def _committed_in_base(
+        self,
+        project_id: uuid.UUID,
+        lines: list[BudgetLine],
+        base: str,
+        fx: dict[str, str],
+    ) -> tuple[list[Decimal], Decimal, set[int]]:
+        """Resolve each budget line's committed amount in the base currency.
+
+        ``BudgetLine.committed_amount`` is only ever written by hand, while
+        issued purchase orders and signed contracts linked to the Cost Spine
+        carry the real commitment. To count every commitment exactly once:
+
+        - a budget line whose cost line has committed documents takes its
+          share of the documents' value, and its manual ``committed_amount``
+          is ignored (the documents supersede the estimate typed earlier);
+        - every other budget line keeps its manual ``committed_amount``.
+
+        When several budget lines share one cost line, the documents' value
+        is split in proportion to their planned amounts (equally when none
+        is planned) in whole cents, the last line taking the remainder so the
+        shares add up exactly. Document value on a cost line with no budget line in the
+        project is returned separately as the unbudgeted commitment.
+
+        Returns:
+            ``(per_line, unbudgeted, from_documents)`` where ``per_line`` is
+            aligned with ``lines`` and ``from_documents`` holds the indexes
+            whose value came from purchase orders and contracts.
+        """
+        spine = await self._spine_committed_by_cost_line(project_id)
+
+        per_line: list[Decimal] = []
+        groups: dict[str, list[int]] = {}
+        for idx, line in enumerate(lines):
+            line_ccy = (line.currency or "").strip().upper()
+            key = str(line.cost_line_id) if getattr(line, "cost_line_id", None) is not None else None
+            if key is not None and key in spine:
+                groups.setdefault(key, []).append(idx)
+                per_line.append(Decimal("0"))
+            else:
+                per_line.append(_amount_in_base(line.committed_amount, line_ccy, base, fx))
+
+        cent = Decimal("0.01")
+        for key, indexes in groups.items():
+            # Shares are whole cents with the remainder on the last line, so
+            # the per-line table adds up to the dashboard to the cent.
+            total = spine[key].quantize(cent)
+            weights = [
+                max(
+                    _amount_in_base(lines[i].planned_amount, (lines[i].currency or "").strip().upper(), base, fx),
+                    Decimal("0"),
+                )
+                for i in indexes
+            ]
+            weight_sum = sum(weights, Decimal("0"))
+            if weight_sum <= 0:
+                weights = [Decimal("1")] * len(indexes)
+                weight_sum = Decimal(len(indexes))
+            allocated = Decimal("0")
+            for pos, i in enumerate(indexes):
+                if pos == len(indexes) - 1:
+                    share = total - allocated
+                else:
+                    share = (total * weights[pos] / weight_sum).quantize(cent)
+                    allocated += share
+                per_line[i] = share
+
+        unbudgeted = sum((value for key, value in spine.items() if key not in groups), Decimal("0"))
+        from_documents = {i for indexes in groups.values() for i in indexes}
+        return per_line, unbudgeted, from_documents
+
+    async def effective_committed(
+        self, project_id: uuid.UUID
+    ) -> tuple[dict[uuid.UUID, Decimal], Decimal, set[uuid.UUID]]:
+        """Committed per budget line as the 5D dashboard counts it.
+
+        For readers that work line by line (the budget-line table, the
+        portfolio outturn, the BI drill-down) so their rows add up to the
+        dashboard. Each value is in the line's own currency: a manual value is
+        returned as stored, a share of purchase orders and contracts is
+        converted back from the base currency through the same fx rate.
+
+        Returns:
+            ``(by_line_id, unbudgeted, from_documents)``; ``unbudgeted`` is the
+            document value on cost lines without a budget line, in the project
+            base currency, and ``from_documents`` holds the ids of the lines
+            whose committed comes from purchase orders and contracts (the
+            lines where a hand-typed committed has no effect).
+        """
+        lines = await self._list_lines_for_rollup(project_id)
+        base, fx = await self._project_fx_context(project_id)
+        per_line, unbudgeted, from_documents = await self._committed_in_base(project_id, lines, base, fx)
+        out: dict[uuid.UUID, Decimal] = {}
+        document_line_ids: set[uuid.UUID] = set()
+        for idx, (line, value) in enumerate(zip(lines, per_line, strict=True)):
+            if idx in from_documents:
+                out[line.id] = _base_to_line_currency(value, (line.currency or "").strip().upper(), base, fx)
+                document_line_ids.add(line.id)
+            else:
+                out[line.id] = _to_money(line.committed_amount)
+        return out, unbudgeted, document_line_ids
+
     async def aggregate_by_project(self, project_id: uuid.UUID) -> dict[str, str]:
         """Aggregate budget line totals for a project, currency-aware.
 
@@ -321,6 +461,11 @@ class BudgetLineRepository:
         kept as-is rather than zeroed, so a forgotten project-level rate
         surfaces as an obviously-wrong total instead of vanishing.
 
+        Committed comes from the linked purchase orders and contracts where
+        they exist and from the manual column otherwise (see
+        ``_committed_in_base``); document value on a cost line without a
+        budget line is included in the total.
+
         Returns:
             Dict with keys ``total_planned``, ``total_committed``,
             ``total_actual``, ``total_forecast`` (string sums in the
@@ -328,18 +473,19 @@ class BudgetLineRepository:
         """
         lines = await self._list_lines_for_rollup(project_id)
         base, fx = await self._project_fx_context(project_id)
+        committed, unbudgeted, _ = await self._committed_in_base(project_id, lines, base, fx)
 
         totals = {
             "planned": Decimal("0"),
-            "committed": Decimal("0"),
+            "committed": unbudgeted,
             "actual": Decimal("0"),
             "forecast": Decimal("0"),
         }
 
-        for line in lines:
+        for line, line_committed in zip(lines, committed, strict=True):
             line_ccy = (line.currency or "").strip().upper()
             totals["planned"] += _amount_in_base(line.planned_amount, line_ccy, base, fx)
-            totals["committed"] += _amount_in_base(line.committed_amount, line_ccy, base, fx)
+            totals["committed"] += line_committed
             totals["actual"] += _amount_in_base(line.actual_amount, line_ccy, base, fx)
             totals["forecast"] += _amount_in_base(line.forecast_amount, line_ccy, base, fx)
 
@@ -350,12 +496,25 @@ class BudgetLineRepository:
             "total_forecast": str(totals["forecast"]),
         }
 
-    async def aggregate_by_category(self, project_id: uuid.UUID) -> list[dict[str, str]]:
+    async def aggregate_by_category(
+        self,
+        project_id: uuid.UUID,
+        *,
+        include_unbudgeted_commitments: bool = False,
+    ) -> list[dict[str, str]]:
         """Aggregate budget lines grouped by category, currency-aware.
 
         Same conversion semantics as ``aggregate_by_project``: per-row
         ``currency`` is converted to the project base via ``fx_rates``
-        before summing. See that method's docstring for the rationale.
+        before summing, and committed follows ``_committed_in_base``. See
+        that method's docstring for the rationale.
+
+        Args:
+            project_id: Target project.
+            include_unbudgeted_commitments: Add document value on cost lines
+                that have no budget line to the uncategorized (``""``) group,
+                so committed surfaces sum to the dashboard total. Off for
+                callers that only read ``planned``.
 
         Returns:
             List of dicts with keys ``category``, ``planned``,
@@ -364,24 +523,27 @@ class BudgetLineRepository:
         """
         lines = await self._list_lines_for_rollup(project_id)
         base, fx = await self._project_fx_context(project_id)
+        committed, unbudgeted, _ = await self._committed_in_base(project_id, lines, base, fx)
+
+        def _empty() -> dict[str, Decimal]:
+            return {
+                "planned": Decimal("0"),
+                "committed": Decimal("0"),
+                "actual": Decimal("0"),
+                "forecast": Decimal("0"),
+            }
 
         buckets: dict[str, dict[str, Decimal]] = {}
-        for line in lines:
+        for line, line_committed in zip(lines, committed, strict=True):
             cat = line.category or ""
             line_ccy = (line.currency or "").strip().upper()
-            bucket = buckets.setdefault(
-                cat,
-                {
-                    "planned": Decimal("0"),
-                    "committed": Decimal("0"),
-                    "actual": Decimal("0"),
-                    "forecast": Decimal("0"),
-                },
-            )
+            bucket = buckets.setdefault(cat, _empty())
             bucket["planned"] += _amount_in_base(line.planned_amount, line_ccy, base, fx)
-            bucket["committed"] += _amount_in_base(line.committed_amount, line_ccy, base, fx)
+            bucket["committed"] += line_committed
             bucket["actual"] += _amount_in_base(line.actual_amount, line_ccy, base, fx)
             bucket["forecast"] += _amount_in_base(line.forecast_amount, line_ccy, base, fx)
+        if include_unbudgeted_commitments and unbudgeted != 0:
+            buckets.setdefault("", _empty())["committed"] += unbudgeted
 
         return [
             {
@@ -1038,3 +1200,155 @@ class CostSpineRepository:
         for (cost_key, _cl_key), (value, _ccy) in per_line_max.items():
             out[cost_key] = out.get(cost_key, Decimal("0")) + value
         return out
+
+    async def committed_by_cost_line(self, project_id: uuid.UUID) -> dict[str, Decimal]:
+        """What the project is bound to pay per cost line, FX-converted.
+
+        Combines purchase orders and contracts under the rules the 5D
+        committed figures use:
+
+        - purchase orders count when issued, partially received or completed;
+        - contracts with a subcontractor count at their line value (a client
+          contract is what the project earns, not what it owes), except that drafts and
+          cancelled or void contracts bind nobody (0) and a terminated contract
+          is bound only for what was certified before it ended (the latest
+          certified or paid claim's cumulative value per contract line);
+        - a purchase order raised from the same award as a contract on the
+          same cost line (matching ``tender_package_id`` or ``bid_package_id``
+          in both metadata) is the same commitment seen twice, so the pair
+          counts as the contract plus only the part of the order above it.
+
+        A cost line appears in the result only when at least one counting
+        document exists.
+        """
+        from app.modules.contracts.models import Contract, ContractLine, ProgressClaim, ProgressClaimLine
+        from app.modules.procurement.models import PurchaseOrder, PurchaseOrderItem
+
+        base, fx = await self._fx_context(project_id)
+
+        po_stmt = (
+            select(
+                PurchaseOrderItem.cost_line_id,
+                PurchaseOrderItem.amount,
+                PurchaseOrder.currency_code,
+                PurchaseOrder.metadata_,
+            )
+            .join(PurchaseOrder, PurchaseOrder.id == PurchaseOrderItem.po_id)
+            .where(
+                PurchaseOrder.project_id == project_id,
+                PurchaseOrder.status.in_(_PO_COMMITTED_STATUSES),
+                PurchaseOrderItem.cost_line_id.is_not(None),
+            )
+        )
+        po_rows: dict[str, list[tuple[Decimal, frozenset[str]]]] = {}
+        for cost_line_id, amount, ccy, meta in (await self.session.execute(po_stmt)).all():
+            value = _amount_in_base(amount, (ccy or "").strip().upper(), base, fx)
+            po_rows.setdefault(str(cost_line_id), []).append((value, _award_tokens(meta)))
+
+        contract_stmt = (
+            select(
+                ContractLine.cost_line_id,
+                ContractLine.id,
+                ContractLine.total_value,
+                Contract.currency,
+                Contract.status,
+                Contract.metadata_,
+            )
+            .join(Contract, Contract.id == ContractLine.contract_id)
+            .where(
+                Contract.project_id == project_id,
+                Contract.counterparty_type == "subcontractor",
+                ContractLine.cost_line_id.is_not(None),
+                Contract.status.not_in(_CONTRACT_UNBOUND_STATUSES),
+            )
+        )
+        contract_result = (await self.session.execute(contract_stmt)).all()
+
+        terminated_line_ids = [row[1] for row in contract_result if (row[4] or "").strip().lower() == "terminated"]
+        certified: dict[uuid.UUID, Decimal] = {}
+        if terminated_line_ids:
+            claim_stmt = (
+                select(ProgressClaimLine.contract_line_id, func.max(ProgressClaimLine.cumulative_completed_value))
+                .join(ProgressClaim, ProgressClaim.id == ProgressClaimLine.progress_claim_id)
+                .where(
+                    ProgressClaimLine.contract_line_id.in_(terminated_line_ids),
+                    ProgressClaim.status.in_(_CLAIM_CERTIFIED_STATUSES),
+                )
+                .group_by(ProgressClaimLine.contract_line_id)
+            )
+            for contract_line_id, cumulative in (await self.session.execute(claim_stmt)).all():
+                certified[contract_line_id] = Decimal(str(cumulative)) if cumulative is not None else Decimal("0")
+
+        contract_rows: dict[str, list[tuple[Decimal, frozenset[str]]]] = {}
+        for cost_line_id, contract_line_id, total_value, ccy, status_, meta in contract_result:
+            if (status_ or "").strip().lower() == "terminated":
+                raw = str(certified.get(contract_line_id, Decimal("0")))
+            else:
+                raw = str(total_value) if total_value is not None else "0"
+            value = _amount_in_base(raw, (ccy or "").strip().upper(), base, fx)
+            contract_rows.setdefault(str(cost_line_id), []).append((value, _award_tokens(meta)))
+
+        out: dict[str, Decimal] = {}
+        for key in po_rows.keys() | contract_rows.keys():
+            out[key] = _combine_po_and_contracts(po_rows.get(key, []), contract_rows.get(key, []))
+        return out
+
+
+#: Purchase-order states that bind the project to pay.
+_PO_COMMITTED_STATUSES = ("issued", "partially_received", "completed")
+
+#: Contract states that bind nobody yet or any longer. ``cancelled`` and
+#: ``void`` are not in the contract FSM today; listing them keeps a future or
+#: imported status from counting by default.
+_CONTRACT_UNBOUND_STATUSES = ("draft", "cancelled", "void")
+
+#: Progress-claim states that certify value, for terminated contracts.
+_CLAIM_CERTIFIED_STATUSES = ("certified", "paid")
+
+#: Metadata keys that name the award a PO or contract was raised from.
+_AWARD_KEYS = ("tender_package_id", "bid_package_id")
+
+
+def _award_tokens(meta: object) -> frozenset[str]:
+    """The award provenance a PO or contract carries, as comparable tokens."""
+    if not isinstance(meta, dict):
+        return frozenset()
+    return frozenset(f"{key}:{str(meta[key]).strip()}" for key in _AWARD_KEYS if str(meta.get(key) or "").strip())
+
+
+def _combine_po_and_contracts(
+    pos: list[tuple[Decimal, frozenset[str]]],
+    contracts: list[tuple[Decimal, frozenset[str]]],
+) -> Decimal:
+    """Sum one cost line's commitments, counting an award's PO and contract once.
+
+    Contracts sharing an award token form one award group; the POs whose
+    tokens meet that group are the same award. The group counts as
+    ``max(contract, po)``: the contract, plus only the part of the order above
+    it. Everything without a shared award is added as is.
+    """
+    total = Decimal("0")
+    groups: list[tuple[Decimal, set[str]]] = []
+    for value, tokens in contracts:
+        if not tokens:
+            total += value
+            continue
+        for idx, (group_value, group_tokens) in enumerate(groups):
+            if group_tokens & tokens:
+                groups[idx] = (group_value + value, group_tokens | tokens)
+                break
+        else:
+            groups.append((value, set(tokens)))
+
+    matched_po = [Decimal("0")] * len(groups)
+    for value, tokens in pos:
+        for idx, (_group_value, group_tokens) in enumerate(groups):
+            if tokens and group_tokens & tokens:
+                matched_po[idx] += value
+                break
+        else:
+            total += value
+
+    for (group_value, _tokens), po_value in zip(groups, matched_po, strict=True):
+        total += max(group_value, po_value)
+    return total

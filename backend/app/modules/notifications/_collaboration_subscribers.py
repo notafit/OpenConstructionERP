@@ -174,7 +174,7 @@ def register_collaboration_notification_subscribers() -> None:
     existing = event_bus.list_handlers().get("collaboration.comment.created", [])
     if _on_collaboration_comment_created.__qualname__ in existing:
         return
-    event_bus.subscribe("collaboration.comment.created", _on_collaboration_comment_created)
+    event_bus.subscribe_once("collaboration.comment.created", _on_collaboration_comment_created)
     logger.info("Notifications: subscribed to collaboration.comment.created")
 
 

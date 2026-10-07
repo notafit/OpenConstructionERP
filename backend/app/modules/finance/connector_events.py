@@ -135,7 +135,7 @@ async def _run_connector_sync_job(job_run: JobRun, payload: dict[str, Any]) -> d
 def register_connector_subscribers() -> None:
     """Subscribe the auto-push dispatcher to the invoice lifecycle events."""
     for name in _AUTO_PUSH_EVENTS:
-        event_bus.subscribe(name, _dispatch_auto_push)
+        event_bus.subscribe_once(name, _dispatch_auto_push)
     logger.info("Finance connectors: subscribed to %d auto-push event(s)", len(_AUTO_PUSH_EVENTS))
 
 

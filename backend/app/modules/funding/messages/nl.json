@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "Het werk aan deze maatregel is op {start} begonnen, vóór de indiening van de aanvraag op {filed} - de meeste programma's financieren helemaal niets meer zodra de maatregel is gestart",
+      "unevidenced": "Het werk is vroeg begonnen, op {start}, en volgens het dossier heeft de instantie dat toegestaan, maar er wordt geen schriftelijke toestemming genoemd",
+      "evidence": "Leg de referentie van de schriftelijke toestemming voor een vroege start vast, zodat het dossier voor zichzelf spreekt",
+      "suggestion": "Controleer de programmavoorwaarden voordat u meer uitgeeft. Is de vroege start schriftelijk toegestaan, leg dat dan vast; zo niet, overleg dan met de instantie voordat de aanvraag verder gaat"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "Uitbetaling {draw} omvat kosten van vóór {period_start}, de dag waarop de uitvoeringsperiode begint",
+      "after": "Uitbetaling {draw} omvat kosten van na {period_end}, de dag waarop de uitvoeringsperiode eindigt",
+      "spans": "Uitbetaling {draw} valt aan beide kanten buiten de uitvoeringsperiode van {period_start} tot {period_end}",
+      "suggestion": "Zet de kosten buiten de uitvoeringsperiode in een eigen uitbetaling en bespreek ze met de instantie, in plaats van beide in één verzoek op te nemen"
+    },
+    "own_share_is_covered": {
+      "fail": "Het programma vereist een eigen bijdrage van {rate} procent, dat is {required}, maar in de aanvraag staat {recorded}",
+      "suggestion": "Geef vóór het indienen aan waar de rest van de eigen bijdrage vandaan komt, want het programma berekent die over de subsidiabele kostenbasis en niet over het projecttotaal"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "De {count} aanvragen voor dit project komen samen op een steunintensiteit van {intensity} procent van de subsidiabele kosten, boven het maximum van {cap} procent dat het strengste van hun programma's stelt",
+      "suggestion": "Publieke financiering stapelt zich op over programma's en bestuurslagen heen. Verlaag het bedrag van één aanvraag, of ga na of de maatregelen kunnen worden gescheiden zodat elke maatregel zijn eigen kosten draagt"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "De uitvoeringsperiode is op {period_end} afgelopen en er is nog niet begonnen aan de eindverantwoording",
+      "late": "De eindverantwoording moest uiterlijk op {due} worden ingediend en is op {submitted} ingediend",
+      "overdue": "De eindverantwoording moest uiterlijk op {due} worden ingediend en is nog niet ingediend",
+      "suggestion": "Dien in wat er is, in plaats van te wachten tot alles compleet is. De meeste instanties verlengen een termijn op verzoek, maar geen enkele verlengt een termijn die al is verstreken"
+    },
+    "errors": {
+      "application_not_found": "Aanvraag niet gevonden",
+      "programme_code_taken": "Er bestaat in dit land al een programma met deze referentie",
+      "programme_not_found": "Programma niet gevonden",
+      "programme_has_applications": "Dit programma heeft aanvragen en kan niet worden verwijderd. Sluit het in plaats daarvan.",
+      "application_code_taken": "Er bestaat in dit project al een aanvraag met deze referentie",
+      "approved_application_not_deletable": "Een toegekende aanvraag kan niet worden verwijderd. Zet de status in plaats daarvan op Ingetrokken of Gesloten.",
+      "approval_needs_period_end": "Voor een toekenning is het einde van de uitvoeringsperiode nodig, omdat alle latere termijnen vanaf die datum worden berekend",
+      "draw_needs_approval": "Er kan alleen geld worden opgevraagd voor een toegekende aanvraag",
+      "draw_not_found": "Uitbetaling niet gevonden",
+      "paid_draw_not_deletable": "Een uitbetaling met de status Uitbetaald kan niet worden verwijderd",
+      "proof_not_found": "Verantwoording niet gevonden",
+      "obligation_not_found": "Termijn niet gevonden",
+      "eligible_exceeds_amount": "Het subsidiabele deel mag niet hoger zijn dan het bedrag",
+      "allocation_not_found": "Kostenpost niet gevonden"
+    }
+  }
+}

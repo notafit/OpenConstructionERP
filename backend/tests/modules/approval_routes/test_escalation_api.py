@@ -5,9 +5,10 @@
 Exercises the escalation service end to end against real rows: a breached step
 past its grace window escalates up the route's approver chain to the next
 authority, the verdict surfaces severity / level / next target, a step still
-within the grace window or with no SLA does not escalate, and the background
-monitor walks the ladder one target per sweep without ever escalating to the
-same authority twice.
+within the grace window or with no SLA does not escalate, an authority who can
+already decide the step through an out-of-office delegation is stepped over
+rather than escalated to, and the background monitor walks the ladder one
+target per sweep without ever escalating to the same authority twice.
 """
 
 from __future__ import annotations
@@ -132,6 +133,56 @@ async def test_escalates_to_next_authority_past_grace(session: AsyncSession) -> 
     assert view.severity == "critical"
     assert view.chain_length == 2
     assert view.current_holder == str(holder)
+
+
+@pytest.mark.asyncio
+async def test_escalation_steps_over_an_entitled_delegate(session: AsyncSession) -> None:
+    """An authority who can already decide the step is not an escalation target.
+
+    The same ladder is read in both directions: with no delegation the stuck
+    step escalates to the next authority, and once that authority holds an
+    active delegation from the step's approver - which lets them decide the
+    step today - the escalation goes past them to the one above. A chain that
+    excluded nobody would fail the second half; one that excluded everybody
+    would fail the first.
+    """
+    svc = ApprovalRouteService(session)
+    project_id, owner_id = await _seed(session)
+    holder = await _approver(session)
+    second = await _approver(session)
+    third = await _approver(session)
+
+    # No delegation: the ladder escalates to the next authority up.
+    plain_id, plain_route = await _make_ladder(
+        session, svc, project_id, owner_id, [holder, second, third], sla_hours=1, age_hours=100
+    )
+    plain = await _evaluate(session, plain_id, plain_route, now=datetime.now(UTC))
+    assert plain.should_escalate is True
+    assert plain.next_target == str(second)
+    assert plain.chain_length == 2
+    assert plain.current_holder == str(holder)
+
+    # The step's approver goes out of office and delegates to that same next
+    # authority, who can now decide the step; escalating to them would hand
+    # them what they already hold.
+    await svc.create_delegation(
+        delegator_id=holder,
+        delegate_id=second,
+        project_id=None,
+        starts_at=None,
+        ends_at=None,
+        reason="out of office",
+        created_by=holder,
+    )
+    delegated_id, delegated_route = await _make_ladder(
+        session, svc, project_id, owner_id, [holder, second, third], sla_hours=1, age_hours=100
+    )
+    delegated = await _evaluate(session, delegated_id, delegated_route, now=datetime.now(UTC))
+    assert delegated.should_escalate is True
+    assert delegated.next_target == str(third)
+    assert delegated.chain_length == 1
+    # The delegate is who the step waits on now, and who a breach nudge reaches.
+    assert delegated.current_holder == str(second)
 
 
 @pytest.mark.asyncio

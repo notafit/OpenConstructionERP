@@ -53,6 +53,7 @@ import { getErrorMessage } from '@/shared/lib/api';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useToastStore } from '@/stores/useToastStore';
 import { useTabKeyboardNav } from '@/shared/hooks/useTabKeyboardNav';
+import { isDateOnlyPast } from '@/shared/lib/dates';
 import {
   fetchInvestigations,
   fetchJSAs,
@@ -114,6 +115,7 @@ import {
   type PermitPrerequisites,
 } from './api';
 import { hseAdvancedGuide } from './hseAdvancedGuide';
+import { PPECompanyRegisterNote } from './PPECompanyRegisterNote';
 
 // English fallbacks for the computed `hse_advanced.permit_status_*` keys. The default used to be
 // the raw value, so until the key lands in a locale the screen shows the bare
@@ -586,7 +588,7 @@ export function HSEAdvancedPage() {
     orientation: 'horizontal',
   });
 
-  const tabs: { key: HSETab; label: string; icon: React.ReactNode }[] = [
+  const tabs: { key: HSETab; label: string; icon: React.ReactNode; hint?: string }[] = [
     {
       key: 'incidents',
       label: t('hse_advanced.tab_incidents', { defaultValue: 'Incidents' }),
@@ -611,6 +613,7 @@ export function HSEAdvancedPage() {
       key: 'ppe',
       label: t('hse_advanced.tab_ppe', { defaultValue: 'PPE' }),
       icon: <HardHat size={15} />,
+      hint: t('hse_advanced.ppe_company_register', { defaultValue: 'Company-wide register' }),
     },
     {
       key: 'audits',
@@ -702,6 +705,7 @@ export function HSEAdvancedPage() {
                 aria-controls={`hse-panel-${tb.key}`}
                 tabIndex={isActive ? 0 : -1}
                 onClick={() => setTab(tb.key)}
+                title={tb.hint}
                 className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all whitespace-nowrap ${
                   isActive
                     ? 'border-oe-blue text-oe-blue'
@@ -961,18 +965,13 @@ function HSEKpiStrip({ projectId }: { projectId: string }) {
       (it) => it.status !== 'completed' && it.status !== 'abandoned',
     ).length;
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
     const overdueCapas = capas.filter((c) => {
       if (c.status === 'completed' || c.status === 'cancelled') {
         return false;
       }
       // Backend CAPA field is target_date (not due_date).
       if (!c.target_date) return false;
-      const due = new Date(c.target_date);
-      if (Number.isNaN(due.getTime())) return false;
-      due.setHours(0, 0, 0, 0);
-      return due.getTime() < today.getTime();
+      return isDateOnlyPast(c.target_date);
     }).length;
 
     const activePermits = permits.filter((p) => p.status === 'active').length;
@@ -3109,23 +3108,27 @@ function PPETab({ projectId }: { projectId: string }) {
   }
   if (!data || data.length === 0) {
     return (
-      <EmptyState
-        icon={<HardHat size={28} strokeWidth={1.5} />}
-        title={t('hse_advanced.no_ppe', { defaultValue: 'No PPE issued yet' })}
-        description={t('hse_advanced.no_ppe_desc', {
-          defaultValue:
-            'Log PPE issued to workers - hard hats, harnesses, respirators, hearing protection. Tracks expiry, return-by dates and inventory.',
-        })}
-        action={{
-          label: t('hse_advanced.new_ppe', { defaultValue: 'Issue PPE' }),
-          onClick: () => setShowCreate(true),
-        }}
-      />
+      <>
+        <PPECompanyRegisterNote />
+        <EmptyState
+          icon={<HardHat size={28} strokeWidth={1.5} />}
+          title={t('hse_advanced.no_ppe', { defaultValue: 'No PPE issued yet' })}
+          description={t('hse_advanced.no_ppe_desc', {
+            defaultValue:
+              'Log PPE issued to workers - hard hats, harnesses, respirators, hearing protection. Tracks expiry, return-by dates and inventory.',
+          })}
+          action={{
+            label: t('hse_advanced.new_ppe', { defaultValue: 'Issue PPE' }),
+            onClick: () => setShowCreate(true),
+          }}
+        />
+      </>
     );
   }
 
   return (
     <>
+      <PPECompanyRegisterNote />
       <div className="mb-4">
         <FilterChips<'all' | 'issued' | 'expiring'>
           value={filter}

@@ -185,6 +185,15 @@ class VariationRequestRepository(_BaseRepo):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def pending_vr_cost_sum(self, project_id: uuid.UUID) -> Decimal:
+        """SQL ``SUM(estimated_cost_impact)`` over pending VRs (draft/submitted/under_review)."""
+        stmt = select(func.coalesce(func.sum(VariationRequest.estimated_cost_impact), 0)).where(
+            VariationRequest.project_id == project_id,
+            VariationRequest.status.in_(["draft", "submitted", "under_review"]),
+        )
+        val = (await self.session.execute(stmt)).scalar_one()
+        return Decimal(str(val or 0))
+
 
 class VariationBOQTraceRepository(_BaseRepo):
     """Provenance rows for the lines of a variation request's own bill."""

@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import {
   AlertTriangle,
   ArrowDown,
@@ -23,6 +24,7 @@ import clsx from 'clsx';
 import { Button, WideModal, WideModalSection } from '@/shared/ui';
 import { useToastStore } from '@/stores/useToastStore';
 import { apiGet } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { approvalRoutesKeys, createRoute, getMeta, updateRoute } from './api';
 import { kindLabel } from './labels';
 import type {
@@ -199,16 +201,17 @@ export function RouteEditor({
 
   const { data: projects = [] } = useQuery({
     queryKey: ['projects'],
-    queryFn: () => apiGet<ProjectResult[]>('/v1/projects/'),
+    queryFn: () => fetchProjectList<ProjectResult[]>(),
     staleTime: 5 * 60_000,
     enabled: open,
   });
+  const canListUsers = useHasPermission('users.list');
   const { data: users = [] } = useQuery({
     queryKey: ['users-search'],
     queryFn: () =>
       apiGet<UserResult[]>('/v1/users/?limit=100&is_active=true'),
     staleTime: 60_000,
-    enabled: open,
+    enabled: open && canListUsers,
   });
 
   const createMut = useMutation({

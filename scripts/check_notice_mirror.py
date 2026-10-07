@@ -152,7 +152,10 @@ def main() -> int:
         print("index not checked: no git index entry for one or both copies (disk compared only)")
     elif idx_root != idx_wheel:
         failed = True
-        print("[FAIL] NOTICE and backend/NOTICE have drifted in the git index.", file=sys.stderr)
+        print(
+            "[FAIL] NOTICE and backend/NOTICE have drifted in the git index.",
+            file=sys.stderr,
+        )
         print(
             "\nThe files may agree on disk, but a commit is built from the index, and the\n"
             "staged copies do not match. This is what `git commit --only -- NOTICE` does:\n"

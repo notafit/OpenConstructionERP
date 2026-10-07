@@ -205,6 +205,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # Full history, not the default depth-1 checkout. Several tests in
+          # the unit tree prove a past defect by reading a file as it stood
+          # before the commit that fixed it, so that commit has to be
+          # reachable; with a shallow checkout they fail outright rather than
+          # skip, which is deliberate - a red proof that cannot read its own
+          # evidence is worth more as a failure than as a silent pass. ci.yml
+          # checks out this way already and they are green there. Measured on
+          # the 2026-09-22 nightly: six of them were red on every job in this
+          # workflow, three in tests/unit/test_locale_resolution.py and three
+          # in tests/unit/test_generated_documents_render_chinese.py, and the
+          # assertion message named this as the cause.
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7
@@ -407,6 +420,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # Full history, not the default depth-1 checkout. Several tests in
+          # the unit tree prove a past defect by reading a file as it stood
+          # before the commit that fixed it, so that commit has to be
+          # reachable; with a shallow checkout they fail outright rather than
+          # skip, which is deliberate - a red proof that cannot read its own
+          # evidence is worth more as a failure than as a silent pass. ci.yml
+          # checks out this way already and they are green there. Measured on
+          # the 2026-09-22 nightly: six of them were red on every job in this
+          # workflow, three in tests/unit/test_locale_resolution.py and three
+          # in tests/unit/test_generated_documents_render_chinese.py, and the
+          # assertion message named this as the cause.
+          fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v7

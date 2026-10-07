@@ -31,7 +31,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import { Button, Input, Logo, CountryFlag } from '@/shared/ui';
 import { safeNextPath } from './nextPath';
-import { useAuthStore } from '@/stores/useAuthStore';
+import { readRememberChoice, saveRememberChoice, useAuthStore } from '@/stores/useAuthStore';
 import { extractErrorMessageFromBody } from '@/shared/lib/api';
 import { loginFailureKindFromResponse } from './loginError';
 import { AuthBackground } from './AuthBackground';
@@ -71,9 +71,8 @@ export function LoginPageNext() {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [rememberMe, setRememberMe] = useState(
-    () => localStorage.getItem('oe_remember') === '1',
-  );
+  // Checked unless the user unchecked it last time they signed in here.
+  const [rememberMe, setRememberMe] = useState(readRememberChoice);
   const [langOpen, setLangOpen] = useState(false);
   const [demoOpen, setDemoOpen] = useState(true);
   const [demoLoading, setDemoLoading] = useState<string | null>(null);
@@ -164,6 +163,7 @@ export function LoginPageNext() {
         return;
       }
       const data = await res.json();
+      saveRememberChoice(rememberMe);
       setTokens(data.access_token, data.refresh_token, rememberMe, email);
       navigate(nextPath, { replace: true });
     } catch {
@@ -204,6 +204,12 @@ export function LoginPageNext() {
 
       if (!res.ok) {
         const data = await res.json().catch(() => null);
+        // A real administrator exists, so the server no longer opens the
+        // demo administrator without a password (app.core.demo_admin).
+        if (data?.detail?.error === 'demo_admin_superseded') {
+          setError(t('auth.demo_admin_superseded', 'This installation has an administrator. Please sign in with your own account.'));
+          return;
+        }
         const parsed = extractErrorMessageFromBody(data);
         setError(parsed || t('auth.demo_login_failed', 'Demo login failed. Please try again.'));
         return;

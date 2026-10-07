@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "csa_s16",
+  "name": "CSA S16 — Design of Steel Structures",
+  "name_fr-CA": "CSA S16 — Règles de calcul des charpentes en acier",
+  "standard": "CSA S16:19",
+  "jurisdiction": "CA",
+  "regulator": "CSA Group",
+  "publication_year": 2019,
+  "applies_to": [
+    "projects",
+    "boq",
+    "validation"
+  ],
+  "description": "Reference document for CSA S16 limit-states design as it bears on structural-steel BOQ positions. What the standard requires to be specified: grade designation (CSA G40.20/G40.21 — 300W, 350W, 350A, 350AT, HSS Class C/H, etc.), member type (W/HSS/L/channel), welding procedure references (CSA W47.1 / W59), bolting class (A325 / A490 / ASTM F3125), fire-protection rating and surface preparation per SSPC. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur le calcul aux états limites CSA S16 tel qu'il s'applique aux postes BOQ en charpente d'acier. Ce que la norme exige de préciser : désignation de nuance (CSA G40.20/G40.21 — 300W, 350W, 350A, 350AT, HSS classe C/H, etc.), type de profilé (W/HSS/L/U), références de procédures de soudage (CSA W47.1 / W59), classe de boulonnage (A325 / A490 / ASTM F3125), résistance au feu et préparation de surface SSPC. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. Design of steel structures is settled in the structural model and its calculations; the engine reads quantities and prices. Pointing a generic bill rule at this standard would suggest the steel design had been checked when the only thing checked is arithmetic.",
+  "enables_rule_ids": []
+}

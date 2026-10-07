@@ -21,10 +21,18 @@ resolves only when those packs agree - the three US packs all declare
 ``imperial``, so ``"US"`` is unambiguous, while a disagreement would return
 ``None``. Anything unrecognised also returns ``None``, which callers must
 treat as "not configured" rather than as a default.
+
+The same lookup serves a pack's ``progress_billing`` figures (retention,
+release events, stored materials, subcontractor payment evidence, billing
+cycle, change-line codes) through :func:`resolve_progress_billing`. Those are
+money figures, so that resolver is stricter still: it reads national packs
+only and a block keyed by the exact country, so a pack that claims several
+countries can never lend one country's figures to another.
 """
 
 from __future__ import annotations
 
+import copy
 import importlib
 from functools import lru_cache
 from typing import Any
@@ -54,6 +62,19 @@ PACK_CONFIG_MODULES: tuple[str, ...] = (
 #: ignored rather than passed through, so a typo cannot reach a rule that
 #: branches on the value.
 _KNOWN_MEASUREMENT_SYSTEMS: frozenset[str] = frozenset({"metric", "imperial"})
+
+#: The sub-keys of a country's ``progress_billing`` block that
+#: :func:`resolve_progress_billing` returns. The answer always carries all of
+#: them (``None`` where the pack writes nothing), and a key a pack adds beyond
+#: these does not leak into the contract by accident.
+PROGRESS_BILLING_KEYS: tuple[str, ...] = (
+    "retention_policy",
+    "release_events",
+    "stored_materials",
+    "sub_payment_requirements",
+    "billing_cycle",
+    "change_line_code_format",
+)
 
 
 @lru_cache(maxsize=1)
@@ -135,3 +156,114 @@ def resolve_measurement_system(*, country_code: str | None = None, region: str |
     if len(declared) != 1:
         return None
     return declared.pop()
+
+
+def _normalise_code(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _is_national(config: dict[str, Any]) -> bool:
+    """A state or provincial pack names its ``parent_pack``; a national one does not."""
+    return not config.get("parent_pack")
+
+
+def _progress_billing_block(config: dict[str, Any], country: str) -> dict[str, Any] | None:
+    """Return the pack's ``progress_billing`` figures for exactly ``country``, or ``None``."""
+    blocks = config.get("progress_billing")
+    if not isinstance(blocks, dict):
+        return None
+    block = blocks.get(country)
+    if not isinstance(block, dict):
+        return None
+    figures = {key: block.get(key) for key in PROGRESS_BILLING_KEYS}
+    return figures if any(value is not None for value in figures.values()) else None
+
+
+def _subdivision_retainage(country: str, subdivision_code: str | None) -> dict[str, Any] | None:
+    """Return the retainage rules of the one subdivision pack matching the code, or ``None``."""
+    wanted = _normalise_code(subdivision_code)
+    if not wanted:
+        return None
+    matches = [
+        config
+        for config in pack_configs()
+        if not _is_national(config)
+        and _normalise_code(config.get("subdivision_code")) == wanted
+        and any(_normalise_code(code) == country for code in config.get("countries") or ())
+    ]
+    if len(matches) != 1:
+        return None
+    pack = matches[0]
+    state_rules = pack.get("state_rules")
+    rules = state_rules.get("retainage") if isinstance(state_rules, dict) else None
+    return {
+        "subdivision_code": pack.get("subdivision_code"),
+        "region_code": pack.get("region_code"),
+        "retainage": copy.deepcopy(rules) if isinstance(rules, list) else [],
+    }
+
+
+def resolve_progress_billing(
+    *,
+    country_code: str | None = None,
+    region: str | None = None,
+    subdivision_code: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the progress billing figures a project's national pack declares.
+
+    Only national packs answer (a pack with a ``parent_pack`` is a state or
+    province and never votes), and only from the block keyed by the exact
+    country, so a pack that claims DE, AT and CH answers for DE alone when
+    only DE is written. ``region`` is consulted only when no country is given,
+    and then only when the matching packs claim exactly one country between
+    them: a region such as ``"DACH"`` names a market, not a country, and
+    picking one of its countries would be a guess. Packs that write nothing
+    for the country stay silent; packs that write different figures for it
+    cancel each other out and the answer is ``None``.
+
+    Args:
+        country_code: The project's ISO 3166-1 alpha-2 country code.
+        region: The project's region marker, used only when ``country_code``
+            is blank.
+        subdivision_code: ISO 3166-2 code such as ``"US-CA"``. When exactly
+            one subdivision pack of the resolved country carries it, that
+            pack's retainage rules are attached; nothing else changes.
+
+    Returns:
+        ``None`` when no national pack answers. Otherwise a new dict (a deep
+        copy, safe to mutate) with ``country_code`` (the country whose block
+        answered), one entry per :data:`PROGRESS_BILLING_KEYS` holding the
+        pack's value or ``None``, and ``subdivision``: ``None`` when no
+        subdivision was given or none matched, else ``{"subdivision_code",
+        "region_code", "retainage": [<the subdivision pack's retainage
+        rules>]}``. ``None`` is not a default and callers must not substitute
+        another country's figures for it.
+
+    Inside the figures, ``retention_policy.stored_materials_rate`` of ``None``
+    means stored materials are retained at the tier rate, with no separate
+    rate; ``cap`` of ``None`` means the pack suggests no cap and the contract's
+    agreed security sum governs. A figure under a ``public_client_`` key binds
+    public awarding authorities only and must not be applied to every
+    contract.
+    """
+    country = _normalise_code(country_code)
+    if country:
+        candidates = [config for config in packs_for_country(country) if _is_national(config)]
+    else:
+        candidates = [config for config in packs_for_region(region) if _is_national(config)]
+        claimed = {_normalise_code(code) for config in candidates for code in config.get("countries") or ()}
+        claimed.discard("")
+        if len(claimed) != 1:
+            return None
+        country = claimed.pop()
+
+    answers = [
+        block for block in (_progress_billing_block(config, country) for config in candidates) if block is not None
+    ]
+    if not answers or any(answer != answers[0] for answer in answers[1:]):
+        return None
+    return {
+        "country_code": country,
+        **copy.deepcopy(answers[0]),
+        "subdivision": _subdivision_retainage(country, subdivision_code),
+    }

@@ -28,9 +28,11 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { UpdateNotification } from '../UpdateChecker';
+import { useAuthStore } from '@/stores/useAuthStore';
 
-const DISMISS_KEY = 'oe_update_dismissed_version_session';
+import { UpdateInlineNotice, UpdateNotification } from '../UpdateChecker';
+
+const DISMISS_KEY = 'oe_update_dismissed_version';
 const ENDPOINT = '/api/system/version-check';
 
 /** What the endpoint answers, with only the interesting field varied. */
@@ -77,7 +79,6 @@ function urlsAsked(mock: ReturnType<typeof vi.fn>): string[] {
 
 beforeEach(() => {
   localStorage.clear();
-  sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -94,6 +95,22 @@ describe('where the update notice gets its answer', () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     expect(urlsAsked(fetchMock)).toContain(ENDPOINT);
     expect(urlsAsked(fetchMock).some((u) => u.includes('api.github.com'))).toBe(false);
+  });
+
+  it("sends the session's token, because the endpoint answers signed-in callers only", async () => {
+    useAuthStore.setState({ accessToken: 'token-for-the-notice' });
+    try {
+      const fetchMock = answering(versionCheck());
+      vi.stubGlobal('fetch', fetchMock);
+
+      renderNotice();
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+      const init = fetchMock.mock.calls[0]?.[1] as { headers?: Record<string, string> } | undefined;
+      expect(init?.headers?.Authorization).toBe('Bearer token-for-the-notice');
+    } finally {
+      useAuthStore.setState({ accessToken: null });
+    }
   });
 
   it('shows the newer version the server names', async () => {
@@ -224,6 +241,49 @@ describe('the advice matches the build the reader is running', () => {
       expect(document.body.textContent).toContain('pip install --upgrade openconstructionerp'),
     );
   });
+
+  // P-17. The browser upgrade is off unless the server switches it on, and a
+  // demo account never gets it. The button used to be offered to any admin and
+  // ran pip in the environment the server runs from.
+  it('offers no Apply button while the server has the browser upgrade switched off', async () => {
+    vi.stubGlobal(
+      'fetch',
+      answering(versionCheck({ runtime_upgrade_allowed: false, runtime_upgrade_blocked: 'disabled' })),
+    );
+    renderNotice();
+    fireEvent.click(await screen.findByRole('button', { name: /15\.1\.0/ }));
+
+    const note = await screen.findByTestId('update-runtime-blocked');
+    expect(note.textContent).toContain('ALLOW_RUNTIME_UPGRADE=true');
+    expect(screen.queryByTestId('update-apply-now')).toBeNull();
+    // The command card still tells them what to run.
+    expect(document.body.textContent).toContain('pip install --upgrade openconstructionerp');
+  });
+
+  it('tells a demo account why it cannot update, without a button', async () => {
+    vi.stubGlobal(
+      'fetch',
+      answering(versionCheck({ runtime_upgrade_allowed: false, runtime_upgrade_blocked: 'demo_account' })),
+    );
+    renderNotice();
+    fireEvent.click(await screen.findByRole('button', { name: /15\.1\.0/ }));
+
+    const note = await screen.findByTestId('update-runtime-blocked');
+    expect(note.textContent).toMatch(/demo/i);
+    expect(screen.queryByTestId('update-apply-now')).toBeNull();
+  });
+
+  it('offers the Apply button where the server allows it', async () => {
+    vi.stubGlobal(
+      'fetch',
+      answering(versionCheck({ runtime_upgrade_allowed: true, runtime_upgrade_blocked: null })),
+    );
+    renderNotice();
+    fireEvent.click(await screen.findByRole('button', { name: /15\.1\.0/ }));
+
+    expect(await screen.findByTestId('update-apply-now')).toBeTruthy();
+    expect(screen.queryByTestId('update-runtime-blocked')).toBeNull();
+  });
 });
 
 describe('the excerpt reads as prose', () => {
@@ -268,7 +328,7 @@ describe('a dismissal is about one version', () => {
     // reads "Dismiss" rather than its key.
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
     await waitFor(() => expect(screen.queryByText(/v15\.1\.0/)).toBeNull());
-    expect(sessionStorage.getItem(DISMISS_KEY)).toBe('15.1.0');
+    expect(localStorage.getItem(DISMISS_KEY)).toBe('15.1.0');
     first.unmount();
 
     renderNotice(client);
@@ -276,12 +336,115 @@ describe('a dismissal is about one version', () => {
   });
 
   it('speaks up again when a later version appears', async () => {
-    sessionStorage.setItem(DISMISS_KEY, '15.1.0');
+    localStorage.setItem(DISMISS_KEY, '15.1.0');
     vi.stubGlobal('fetch', answering(versionCheck({ latest_version: '15.2.0' })));
 
     renderNotice();
 
     expect(await screen.findByText(/v15\.2\.0/)).toBeTruthy();
+  });
+});
+
+describe('what a dismiss key covers', () => {
+  /** Render the sidebar card against `offered` with `key` already stored, and
+   *  answer whether it shows once the server's answer has arrived. */
+  async function shownWith(key: string, offered: string, current = '17.7.1'): Promise<boolean> {
+    localStorage.setItem(DISMISS_KEY, key);
+    const fetchMock = answering(versionCheck({ current_version: current, latest_version: offered }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { container, client } = renderNotice();
+    // Wait for the answer itself, so "hidden" means dismissed and never
+    // "not rendered yet".
+    await waitFor(() =>
+      expect(client.getQueryData(['system-version-check'])).toMatchObject({ latest_version: offered }),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    return container.textContent !== '';
+  }
+
+  it('hides "v17.7.1 -> v18.0.0" for the key 18.0.0 (the reported case)', async () => {
+    expect(await shownWith('18.0.0', '18.0.0')).toBe(false);
+  });
+
+  it('hides it for the key v18.0.0, which is how the card prints the version', async () => {
+    expect(await shownWith('v18.0.0', '18.0.0')).toBe(false);
+  });
+
+  it('hides it for 18.0, the same release written short', async () => {
+    expect(await shownWith('18.0', '18.0.0')).toBe(false);
+  });
+
+  it('hides it for a key written with JSON.stringify', async () => {
+    expect(await shownWith('"18.0.0"', '18.0.0')).toBe(false);
+  });
+
+  it('hides it when the dismissed version is newer than the one offered', async () => {
+    // The server's cache can answer an older release than one this browser
+    // already dismissed; that is not a reason to speak up again.
+    expect(await shownWith('18.0.1', '18.0.0')).toBe(false);
+  });
+
+  it('shows 18.0.0 to a reader who dismissed 17.8.3', async () => {
+    expect(await shownWith('17.8.3', '18.0.0')).toBe(true);
+  });
+
+  it('shows 18.0.10 to a reader who dismissed 18.0.9, which a text compare hides', async () => {
+    expect(await shownWith('18.0.9', '18.0.10')).toBe(true);
+  });
+
+  it('shows the card when the key names no version at all', async () => {
+    expect(await shownWith('yes', '18.0.0')).toBe(true);
+  });
+});
+
+describe('the Settings and About line', () => {
+  function renderLine(client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
+    return render(
+      <QueryClientProvider client={client}>
+        <UpdateInlineNotice />
+      </QueryClientProvider>,
+    );
+  }
+
+  it('is one line with the release link and no dismiss button of its own', async () => {
+    vi.stubGlobal('fetch', answering(versionCheck()));
+
+    renderLine();
+
+    const link = await screen.findByRole('link', { name: 'Details' });
+    expect(link.getAttribute('href')).toContain('/releases/tag/v15.1.0');
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('stays away once the version on offer was dismissed', async () => {
+    localStorage.setItem(DISMISS_KEY, '15.1.0');
+    const fetchMock = answering(versionCheck());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = renderLine(client);
+
+    await waitFor(() => expect(client.getQueryData(['system-version-check'])).toBeTruthy());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.textContent).toBe('');
+  });
+
+  it('goes when the sidebar card is dismissed on the same page', async () => {
+    vi.stubGlobal('fetch', answering(versionCheck()));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <UpdateNotification />
+        <UpdateInlineNotice />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByRole('link', { name: 'Details' });
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    await waitFor(() => expect(screen.queryByRole('link', { name: 'Details' })).toBeNull());
+    expect(screen.queryByText(/15\.1\.0/)).toBeNull();
   });
 });
 

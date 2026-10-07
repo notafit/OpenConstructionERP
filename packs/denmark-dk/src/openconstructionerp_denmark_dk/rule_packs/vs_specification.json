@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "vs_specification",
+  "name": "V&S — Vejledende Beskrivelser",
+  "standard": "V&S (current edition)",
+  "jurisdiction": "DK",
+  "regulator": "Molio (formerly Byggecentrum)",
+  "publication_year": 2023,
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for the V&S descriptions, the Danish standard structure for specification text and work item coding. The structure asks that a specification item carries a work item code in the form the edition defines, that quantities are measured by the rule the item states, that the material specification is present and that the item is assigned to a discipline. None of that is implemented as a rule. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Danish quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared five ids under the vs prefix (description_code_required, valid_code_format, quantity_measurement_rule, material_specification_present, discipline_assignment_valid), and the engine defines none of them and registers no rule set by that name. A generic description-present or unit-present check is not a V&S check, and naming one here would claim the standard was satisfied by arithmetic. The universal BOQ hygiene checks run on every project regardless of this document and are not claimed here.",
+  "enables_rule_ids": []
+}

@@ -1,0 +1,19 @@
+{
+  "rule_pack_id": "ccdc_5a",
+  "name": "CCDC 5A — Construction Management Contract for Services (2025)",
+  "name_fr-CA": "CCDC 5A — Contrat de gérance de construction pour services (2025)",
+  "standard": "CCDC 5A-2025",
+  "jurisdiction": "CA",
+  "regulator": "Canadian Construction Documents Committee",
+  "publication_year": 2025,
+  "applies_to": [
+    "projects",
+    "tendering",
+    "validation"
+  ],
+  "description": "Reference document for the construction-management-for-fee structure under CCDC 5A-2025. What the form requires a project to settle: Construction Manager fee basis defined, scope of advisory services documented, Trade Contractor procurement rules referenced, Owner-Trade Contractor agreements (CCDC 17-2025) tied back, and Ready-for-Takeover milestone defined. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur la structure de gérance pour honoraires selon CCDC 5A-2025. Ce que la formule exige : base d'honoraires du Gérant définie, étendue des services-conseils documentée, règles d'approvisionnement des Entrepreneurs spécialisés référencées, contrats Maître-Entrepreneur spécialisé (CCDC 17-2025) rattachés, et jalon Prêt-pour-prise-en-charge défini. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. A construction management form allocates roles rather than prices, and the platform validates a priced bill; there is no registered rule that reads who carries which obligation under it. An invented id here would be a promise about the part of the contract the engine never opens.",
+  "enables_rule_ids": []
+}

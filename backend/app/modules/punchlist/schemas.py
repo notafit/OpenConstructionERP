@@ -6,6 +6,7 @@ Defines create, update, response, status transition, and summary schemas
 for punch list items.
 """
 
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -13,10 +14,30 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.calendar_day import CalendarDay
+
 # Upper bound for money fields - far above any realistic rework cost yet within
 # Decimal's precision so quantize() below can never raise InvalidOperation on a
 # finite-but-absurd input. Mirrors changeorders/schemas.py:_MONEY_MAX.
 _MONEY_MAX = Decimal("1e15")
+
+_CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def _normalise_rework_currency(v: str | None) -> str:
+    """Upper-case an ISO 4217 code and refuse anything that is not one.
+
+    The column is NOT NULL and QMS groups rework money by this code, so a null
+    would fail at flush as a 500 and a lower-case spelling would split one
+    currency into two buckets. Omitting the field keeps the stored code.
+    """
+    if v is None:
+        raise ValueError("rework_cost_currency cannot be null; omit it to keep the current currency")
+    code = v.strip().upper()
+    if not _CURRENCY_CODE_RE.match(code):
+        raise ValueError(f"rework_cost_currency must be a three-letter ISO 4217 code, got {v!r}")
+    return code
+
 
 # ── Punch Item schemas ──────────────────────────────────────────────────
 
@@ -27,6 +48,7 @@ class PunchItemCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     project_id: UUID
+    contract_id: UUID | None = None
     title: str = Field(..., min_length=1, max_length=255)
     description: str = Field(default="", max_length=5000)
     document_id: str | None = Field(default=None, max_length=36)
@@ -38,7 +60,7 @@ class PunchItemCreate(BaseModel):
         pattern=r"^(low|medium|high|critical)$",
     )
     assigned_to: str | None = Field(default=None, max_length=36)
-    due_date: datetime | None = None
+    due_date: CalendarDay | None = None
     category: str | None = Field(
         default=None,
         pattern=r"^(structural|mechanical|electrical|architectural|fire_safety|plumbing|finishing|hvac|exterior|landscaping|general)$",
@@ -72,14 +94,21 @@ class PunchItemCreate(BaseModel):
             raise ValueError("rework_cost must be non-negative")
         if d >= _MONEY_MAX:
             raise ValueError("rework_cost is outside the supported range")
-        # Normalise: round to 4 dp, drop trailing zeros
-        return str(d.quantize(Decimal("0.0001")).normalize())
+        # Normalise: round to 4 dp, drop trailing zeros. Fixed-point format,
+        # because str() of a normalised 900 is "9E+2".
+        return format(d.quantize(Decimal("0.0001")).normalize(), "f")
+
+    @field_validator("rework_cost_currency")
+    @classmethod
+    def _validate_rework_cost_currency(cls, v: str) -> str:
+        return _normalise_rework_currency(v)
 
 
 class PunchItemUpdate(BaseModel):
     """Partial update for a punch list item."""
 
     model_config = ConfigDict(str_strip_whitespace=True)
+    contract_id: UUID | None = None
 
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=5000)
@@ -92,7 +121,7 @@ class PunchItemUpdate(BaseModel):
         pattern=r"^(low|medium|high|critical)$",
     )
     assigned_to: str | None = Field(default=None, max_length=36)
-    due_date: datetime | None = None
+    due_date: CalendarDay | None = None
     category: str | None = Field(
         default=None,
         pattern=r"^(structural|mechanical|electrical|architectural|fire_safety|plumbing|finishing|hvac|exterior|landscaping|general)$",
@@ -120,7 +149,12 @@ class PunchItemUpdate(BaseModel):
             raise ValueError("rework_cost must be non-negative")
         if d >= _MONEY_MAX:
             raise ValueError("rework_cost is outside the supported range")
-        return str(d.quantize(Decimal("0.0001")).normalize())
+        return format(d.quantize(Decimal("0.0001")).normalize(), "f")
+
+    @field_validator("rework_cost_currency")
+    @classmethod
+    def _validate_rework_cost_currency(cls, v: str | None) -> str:
+        return _normalise_rework_currency(v)
 
 
 class PunchItemResponse(BaseModel):
@@ -130,6 +164,7 @@ class PunchItemResponse(BaseModel):
 
     id: UUID
     project_id: UUID
+    contract_id: UUID | None = None
     title: str
     description: str = ""
     document_id: str | None = None
@@ -143,7 +178,7 @@ class PunchItemResponse(BaseModel):
     #: name someone typed. Null when the raw value is already a name, when it
     #: points at no contact, and when the contacts module is not installed.
     assigned_to_name: str | None = None
-    due_date: datetime | None = None
+    due_date: CalendarDay | None = None
     category: str | None = None
     trade: str | None = None
     photos: list[str] = Field(default_factory=list)

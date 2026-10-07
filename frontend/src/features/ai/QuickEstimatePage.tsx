@@ -5,6 +5,7 @@
 import React, { useState, useCallback, useRef, useEffect, useId, useMemo, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useHasPermission } from '@/shared/lib/permissionGates';
 import { useNavigate, useSearchParams, useLocation, Link } from 'react-router-dom';
 import { useFocusTrap } from '@/shared/hooks/useFocusTrap';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
@@ -52,6 +53,7 @@ import { useToastStore } from '@/stores/useToastStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { aiApi, type QuickEstimateRequest, type EstimateJobResponse, type EstimateItem, type CadExtractResponse, type EnrichResult, type EnrichedItem, type CostMatch, type CadColumnsResponse, type CadGroupResponse, type CadDynamicGroup, type CadGroupElementsResponse } from './api';
 import { apiGet, apiPost } from '@/shared/lib/api';
+import { fetchProjectList } from '@/shared/lib/projectList';
 import { hasLlmKey } from '@/features/ai-estimator/useAiReadiness';
 import {
   fmtList,
@@ -334,11 +336,15 @@ function RecentEstimatesPanel({
   busy?: boolean;
 }) {
   const { t } = useTranslation();
+  // The history endpoint sits behind ai.estimate (editor and above); a role
+  // below that has no history to show and would only collect a 403.
+  const canEstimate = useHasPermission('ai.estimate');
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['ai-estimates-history', reloadKey],
     queryFn: () => aiApi.listEstimates({ limit: 8 }),
     retry: false,
     staleTime: 30_000,
+    enabled: canEstimate,
   });
 
   const fmtMoney = (v: number | string, currency: string): string => {
@@ -360,6 +366,7 @@ function RecentEstimatesPanel({
   // Hide the whole panel when there is genuinely nothing yet (keeps the
   // first-run page clean) but still surface load errors so a broken history
   // endpoint is not silent.
+  if (!canEstimate) return null;
   if (!isLoading && !isError && (!data || data.items.length === 0)) return null;
 
   return (
@@ -433,8 +440,11 @@ function RecentEstimatesPanel({
                           <>
                             <span aria-hidden="true">·</span>
                             <span>
-                              {job.items_count}{' '}
-                              {t('ai.items', { defaultValue: 'items' })}
+                              {t('ai.items_count', {
+                                count: job.items_count,
+                                defaultValue_one: '{{count}} item',
+                                defaultValue: '{{count}} items',
+                              })}
                             </span>
                           </>
                         )}
@@ -541,7 +551,7 @@ function SaveToBOQDialog({ open, onClose, onSave, saving, enrichedMatches = 0, e
 
   const { data: projects } = useQuery({
     queryKey: ['projects-list-simple'],
-    queryFn: () => apiGet<ProjectSummary[]>('/v1/projects/?page_size=100'),
+    queryFn: () => fetchProjectList<ProjectSummary[]>(),
     enabled: open,
     staleTime: 5 * 60_000,
   });
@@ -973,7 +983,11 @@ function QuantityTablesResult({ data }: { data: CadExtractResponse }) {
                 {group.category}
               </span>
               <span className="text-xs text-content-tertiary">
-                {group.items.length} {group.items.length === 1 ? 'type' : 'types'}
+                {t('ai.cad_types_count', {
+                  count: group.items.length,
+                  defaultValue_one: '{{count}} type',
+                  defaultValue_other: '{{count}} types',
+                })}
               </span>
               <div className="flex items-center gap-3 text-xs text-content-tertiary ml-3">
                 {group.totals.count > 0 && (
@@ -2088,7 +2102,12 @@ export function QuickEstimatePage() {
       if (currency) request.currency = currency;
       if (standard) request.standard = standard;
       if (buildingType) request.project_type = buildingType;
-      if (areaM2 && Number(areaM2) > 0) request.area_m2 = Number(areaM2);
+      if (areaM2 && Number(areaM2) > 0) {
+        // Backend expects metric m². When the user enters sq ft, convert back.
+        request.area_m2 = displayQty.system === 'imperial'
+          ? Number(areaM2) / 10.7639
+          : Number(areaM2);
+      }
 
       setResult(null);
       textEstimateRun.run(request);
@@ -2562,7 +2581,7 @@ export function QuickEstimatePage() {
 
   const { data: cadProjectsList } = useQuery({
     queryKey: ['projects-list-simple-cad'],
-    queryFn: () => apiGet<ProjectSummary[]>('/v1/projects/?page_size=100'),
+    queryFn: () => fetchProjectList<ProjectSummary[]>(),
     enabled: !!cadGroupResult,
     staleTime: 5 * 60_000,
   });
@@ -3162,7 +3181,7 @@ export function QuickEstimatePage() {
                       htmlFor={areaM2Id}
                       className="text-xs font-medium text-content-tertiary uppercase tracking-wide"
                     >
-                      {t('ai.area', { defaultValue: 'Area (m\u00b2)' })}
+                      {t('ai.area', { defaultValue: displayQty.system === 'imperial' ? 'Area (sq ft)' : 'Area (m\u00b2)' })}
                     </label>
                     <input
                       id={areaM2Id}

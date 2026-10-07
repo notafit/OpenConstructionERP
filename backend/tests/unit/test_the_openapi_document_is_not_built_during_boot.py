@@ -60,7 +60,7 @@ def test_a_value_that_is_not_an_opt_in_is_not_treated_as_one() -> None:
 def test_production_does_not_build_a_document_it_will_not_serve() -> None:
     """``openapi_url`` is ``None`` in production and takes /api/docs with it.
 
-    Asking for the prime there would spend the whole build on a 2 GB VPS to fill
+    Asking for the prime there would spend the whole build on a 3 GB server to fill
     a cache with no reader, in the window where a healthcheck timeout turns into
     a restart loop. The opt-in does not override that.
     """

@@ -287,7 +287,13 @@ class ModuleIndex:
     the tests can hand it a tree that does not exist on disk.
     """
 
-    def __init__(self, tracked: set[str], on_disk: set[str], untracked: set[str], prefix: str = SOURCE_PREFIX) -> None:
+    def __init__(
+        self,
+        tracked: set[str],
+        on_disk: set[str],
+        untracked: set[str],
+        prefix: str = SOURCE_PREFIX,
+    ) -> None:
         self.prefix = prefix
         self.tracked = tracked
         self.on_disk = on_disk
@@ -593,7 +599,10 @@ def main() -> int:
         population += f"; {counts['unreadable']} could not be decoded as UTF-8"
 
     if findings:
-        print(f"ERROR: {len(findings)} import(s) in {where} name a module git does not have:", file=sys.stderr)
+        print(
+            f"ERROR: {len(findings)} import(s) in {where} name a module git does not have:",
+            file=sys.stderr,
+        )
         for finding in sorted(findings, key=lambda item: (item.path, item.line, item.module)):
             print(finding.render(), file=sys.stderr)
         print(

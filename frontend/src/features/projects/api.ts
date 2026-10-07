@@ -1,6 +1,7 @@
 // DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { apiGet, apiPost, apiPatch, apiDelete } from '@/shared/lib/api';
+import { fetchProjectList, fetchProjectListByStatus } from '@/shared/lib/projectList';
 
 export interface ProjectAddress {
   street?: string | null;
@@ -12,6 +13,8 @@ export interface ProjectAddress {
    *  the client doesn't re-hit Nominatim on every project open. */
   lat?: number | null;
   lng?: number | null;
+  /** OC-11: precision of the geocoded location (city/street/address). */
+  location_precision?: 'city' | 'street' | 'address' | 'region' | 'country' | null;
 }
 
 /** RFC 37 §3 — single FX rate row attached to a project.
@@ -39,6 +42,9 @@ export interface Project {
   address?: ProjectAddress | null;
   /** ISO 3166-1 alpha-2 country code (drives the AIA G702/G703 gate). */
   country_code?: string | null;
+  /** ISO 3166-2 state or province (e.g. US-CA). Rules set below the country,
+   *  such as a cap on a home-improvement deposit, read it. */
+  subdivision_code?: string | null;
   /**
    * True when this project may use AIA G702/G703 payment applications
    * (US/CA/AU only). Computed server-side from the project country; the
@@ -56,6 +62,8 @@ export interface Project {
   default_vat_rate?: string | null;
   /** RFC 37 #93 — project-scoped custom units (synced across browsers). */
   custom_units?: string[];
+  /** Optional budget target / estimate ceiling (decimal-string). */
+  budget_estimate?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -71,6 +79,10 @@ export interface CreateProjectData {
   regional_factor?: number;
   /** Optional postal address — used to anchor the project map + weather. */
   address?: ProjectAddress | null;
+  /** ISO 3166-1 alpha-2 country code resolved from address or manual input. */
+  country_code?: string | null;
+  /** ISO 3166-2 state or province, e.g. US-CA; null clears it. */
+  subdivision_code?: string | null;
   /** Phase-12 expansion fields — all optional on the backend schema. */
   project_code?: string | null;
   project_type?: string | null;
@@ -248,16 +260,16 @@ export interface ProjectStatusHistoryEntry {
 export const projectsApi = {
   // NOTE: kept as a zero-arg fn so it can be passed straight as a
   // react-query `queryFn` (callers do `queryFn: projectsApi.list`). For a
-  // server-side status filter use `listByStatus` instead.
-  list: () => apiGet<Project[]>('/v1/projects/'),
+  // server-side status filter use `listByStatus` instead. Both read every
+  // page; the server's default page is 50 projects.
+  list: () => fetchProjectList<Project[]>(),
   /**
    * List projects filtered by status. Pass a concrete status (e.g.
    * 'archived') to return only those, or 'all' to include every status
    * (archived projects are excluded by the default `list`). The backend
    * accepts the `status` query param added for #274.
    */
-  listByStatus: (status: string) =>
-    apiGet<Project[]>(`/v1/projects/?status=${encodeURIComponent(status)}`),
+  listByStatus: (status: string) => fetchProjectListByStatus<Project[]>(status),
   get: (id: string) => apiGet<Project>(`/v1/projects/${id}`),
   create: (data: CreateProjectData) => apiPost<Project>('/v1/projects/', data),
   update: (id: string, data: UpdateProjectData) =>

@@ -1,0 +1,22 @@
+{
+  "rule_pack_id": "jis_construction",
+  "name": "JIS — Japanese Industrial Standards for Construction",
+  "standard": "JIS A series (construction)",
+  "jurisdiction": "JP",
+  "description": "Validates BOQ items and specifications against key JIS (Japanese Industrial Standards) for construction materials and methods. Covers JIS A 5308 (ready-mixed concrete), JIS G 3112 (reinforcing steel bars), JIS A 6901 (gypsum boards), JIS A 5430 (fibre cement boards), and related material standards. Checks that specification clauses cite the applicable JIS number and that material grades match the JIS classification.",
+  "applies_to": ["boq", "estimate", "validation"],
+  "enables_rule_ids": [
+    "jis.standard_reference_present",
+    "jis.standard_version_current",
+    "jis.a5308_concrete_grade_specified",
+    "jis.a5308_slump_specified",
+    "jis.g3112_rebar_grade_specified",
+    "jis.g3101_steel_grade_if_applicable",
+    "jis.a6901_gypsum_board_type_specified",
+    "jis.a5430_fibre_cement_type_specified",
+    "jis.material_grade_matches_jis",
+    "jis.test_certificate_requirement_noted"
+  ],
+  "regulator": "JISC (Japanese Industrial Standards Committee)",
+  "publication_year": 2024
+}

@@ -1,0 +1,256 @@
+// DDC-CWICR-OE: DataDrivenConstruction · OpenConstructionERP
+// Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
+/**
+ * Client for the GAEB site phases: X31 measured quantities and X89 invoices.
+ *
+ * Shapes mirror ``backend/app/modules/boq/gaeb_exchange_router.py``. Money and
+ * quantities are decimal strings on the wire and stay strings here, so a
+ * figure is shown exactly as the server computed it.
+ */
+import i18n from '@/app/i18n';
+import {
+  apiGet,
+  apiPost,
+  activeLanguageTag,
+  extractErrorMessageFromBody,
+  fetchWithAuth,
+  triggerDownload,
+} from '@/shared/lib/api';
+import { fmtList } from '@/shared/lib/formatters';
+import { importFailureFromBody } from './importFailureText';
+import { missingInvoiceFieldLabel } from './gaebInvoiceFieldText';
+
+export interface X31MatchedItem {
+  oz: string;
+  quantity: string | null;
+  row_count: number;
+  rows: string[];
+  position_id: string;
+  ordinal: string;
+  description: string;
+  unit: string;
+  matched_via: string;
+  current_quantity: string;
+  current_measured_quantity: string | null;
+  proposed_quantity: string;
+  difference_to_quantity: string;
+  unchanged: boolean;
+  /** Lines of the measurement sheet the position has now; applying replaces them all with one. */
+  current_sheet_lines: number;
+  /** `gaeb_x31` for a sheet an earlier X31 wrote, `manual` otherwise, null without a sheet. */
+  current_sheet_source: string | null;
+  /** The position version the preview read, sent back so an edit made since is refused. */
+  position_version: number | null;
+}
+
+export interface X31UnmatchedItem {
+  oz: string;
+  quantity: string | null;
+  row_count: number;
+  reason: string;
+  candidates?: string[];
+}
+
+export interface X31Preview {
+  file_name: string;
+  method: string;
+  project_name: string;
+  boq_name: string;
+  items_in_file: number;
+  matched: X31MatchedItem[];
+  unmatched: X31UnmatchedItem[];
+  positions_not_in_file: number;
+}
+
+export interface X31ApplyResult {
+  applied: string[];
+  unchanged: string[];
+  errors: { position_id: string; error: string }[];
+  set_boq_quantity: boolean;
+}
+
+export interface X89CheckLine {
+  oz: string;
+  /** `item`, or `markup` for a discount or surcharge (MarkupItem). */
+  kind?: 'item' | 'markup';
+  description: string;
+  unit: string;
+  bill_qty: string | null;
+  unit_price: string | null;
+  amount: string;
+  position_id: string | null;
+  expected_amount: string | null;
+  difference: string;
+  issues: string[];
+  markup_percent?: string | null;
+  markup_base?: string | null;
+  bill_markup?: string;
+}
+
+export interface X89TotalsCheck {
+  key: string;
+  stated: string | null;
+  computed: string;
+  matches: boolean;
+}
+
+export interface X89CheckReport {
+  file_name: string;
+  header: Record<string, string>;
+  currency: string;
+  /** The currency the bill is priced in, which the expected figures are in. */
+  bill_currency?: string;
+  currency_mismatch?: boolean;
+  items_in_file: number;
+  lines: X89CheckLine[];
+  invoiced_total: string;
+  expected_total: string;
+  total_difference: string;
+  issue_counts: Record<string, number>;
+  totals_check: X89TotalsCheck[];
+  positions_not_invoiced: number;
+}
+
+export interface InvoiceParty {
+  name: string;
+  street: string;
+  postcode: string;
+  city: string;
+  country: string;
+  tax_no: string;
+  vat_id: string;
+}
+
+export interface ClaimInvoicePreview {
+  claim_id: string;
+  claim_number: string;
+  contract_code: string;
+  invoice_type: string;
+  invoice_date: string | null;
+  period_start: string | null;
+  period_end: string | null;
+  currency: string;
+  line_count: number;
+  figures: {
+    net: string;
+    vat_rate: string;
+    vat_amount: string;
+    gross: string;
+    retention: string;
+    /** Retention released and billed on this claim, paid with it. */
+    release?: string;
+    payable: string;
+    /** Net less retention plus release: what the claim's net due should equal. */
+    outstanding_before_vat?: string;
+  };
+  /** The claim's own net due, beside which `outstanding_before_vat` is shown. */
+  claim_net_due?: string;
+  vat_source: string;
+  creator: InvoiceParty;
+  recipient: InvoiceParty;
+  missing: string[];
+  warnings: { code: string; detail: string; reason?: string }[];
+  /** Lines that could not keep their own OZ, and the OZ they are written under. */
+  remapped?: { ordinal: string; written_as: string; reason: string }[];
+}
+
+async function failure(res: Response, fallback: string): Promise<Error> {
+  const body = await res.json().catch(() => null);
+  if (body && typeof body === 'object' && 'detail' in body) {
+    const detail = (body as { detail: unknown }).detail;
+    if (detail && typeof detail === 'object' && 'code' in detail
+      && detail.code === 'gaeb_invoice_fields_missing' && 'missing' in detail && Array.isArray(detail.missing)) {
+      const labels = detail.missing.filter((field): field is string => typeof field === 'string')
+        .map((field) => missingInvoiceFieldLabel(i18n.t.bind(i18n), field));
+      return new Error(`${i18n.t('contracts.gaeb_invoice.missing_title')} ${fmtList(labels)}`);
+    }
+  }
+  return new Error(importFailureFromBody(body, i18n.t.bind(i18n), fallback) ?? extractErrorMessageFromBody(body) ?? fallback);
+}
+
+/** fetchWithAuth refreshes tokens, but raw GAEB transfers must name the UI language. */
+function languageHeaders(): Record<string, string> {
+  const language = activeLanguageTag();
+  return language ? { 'Accept-Language': language } : {};
+}
+
+function exportFailed(status: number): string {
+  return i18n.t('boq.gaeb_site.export_failed', { defaultValue: 'Export failed ({{status}})', status });
+}
+
+async function upload<T>(url: string, file: File): Promise<T> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetchWithAuth(url, { method: 'POST', body: form, headers: languageHeaders() });
+  if (!res.ok) {
+    throw await failure(
+      res,
+      i18n.t('boq.gaeb_site.upload_failed', { defaultValue: 'Upload failed ({{status}})', status: res.status }),
+    );
+  }
+  return (await res.json()) as T;
+}
+
+/** Read an X31 and get proposals per OZ. Writes nothing. */
+export function previewX31(boqId: string, file: File): Promise<X31Preview> {
+  return upload<X31Preview>(`/api/v1/boq/boqs/${encodeURIComponent(boqId)}/import/gaeb-x31/preview/`, file);
+}
+
+/** Write the proposals a person confirmed. */
+export function applyX31(
+  boqId: string,
+  body: {
+    file_name: string;
+    set_boq_quantity: boolean;
+    items: { position_id: string; quantity: string; oz: string; rows: string[]; version?: number | null }[];
+  },
+): Promise<X31ApplyResult> {
+  return apiPost<X31ApplyResult>(`/v1/boq/boqs/${encodeURIComponent(boqId)}/import/gaeb-x31/apply/`, body);
+}
+
+/** Download the bill's measured quantities (or bill quantities) as X31. */
+export async function downloadX31(
+  boqId: string,
+  basis: 'measured' | 'quantity',
+  fallbackName: string,
+): Promise<{ written: number; skipped: number }> {
+  const res = await fetchWithAuth(
+    `/api/v1/boq/boqs/${encodeURIComponent(boqId)}/export/gaeb-x31/?basis=${basis}`,
+    { headers: languageHeaders() },
+  );
+  if (!res.ok) throw await failure(res, exportFailed(res.status));
+  const blob = await res.blob();
+  triggerDownload(blob, `${fallbackName}.X31`);
+  return {
+    written: Number(res.headers.get('X-GAEB-Written') ?? '0') || 0,
+    skipped: Number(res.headers.get('X-GAEB-Skipped') ?? '0') || 0,
+  };
+}
+
+/** Check a received X89 against the bill. Writes nothing. */
+export function checkX89(boqId: string, file: File): Promise<X89CheckReport> {
+  return upload<X89CheckReport>(`/api/v1/boq/boqs/${encodeURIComponent(boqId)}/check/gaeb-x89/`, file);
+}
+
+function claimQuery(vatRate: string): string {
+  const trimmed = vatRate.trim().replace(',', '.');
+  return trimmed ? `?vat_rate=${encodeURIComponent(trimmed)}` : '';
+}
+
+/** What the X89 of a progress claim will say, and what it still lacks. */
+export function previewClaimInvoice(claimId: string, vatRate = ''): Promise<ClaimInvoicePreview> {
+  return apiGet<ClaimInvoicePreview>(
+    `/v1/boq/claims/${encodeURIComponent(claimId)}/gaeb-x89/preview/${claimQuery(vatRate)}`,
+  );
+}
+
+/** Download the X89 of a progress claim. */
+export async function downloadClaimInvoice(claimId: string, fallbackName: string, vatRate = ''): Promise<void> {
+  const res = await fetchWithAuth(
+    `/api/v1/boq/claims/${encodeURIComponent(claimId)}/export/gaeb-x89/${claimQuery(vatRate)}`,
+    { headers: languageHeaders() },
+  );
+  if (!res.ok) throw await failure(res, exportFailed(res.status));
+  const blob = await res.blob();
+  triggerDownload(blob, `${fallbackName}.X89`);
+}

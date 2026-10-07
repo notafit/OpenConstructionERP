@@ -34,6 +34,7 @@ Endpoints (mounted at /api/v1/cvr):
       GET    /payment-applications/{app_id}      - get application
       PATCH  /payment-applications/{app_id}      - update application
       DELETE /payment-applications/{app_id}      - delete application
+      GET    /progress-claims/?project_id=X      - claims an application can be raised from
 
 Reads need cvr.read; writes (create / update / delete) need cvr.write; striking a
 report final is the manager-level cvr.finalize. Mutating handlers commit
@@ -71,6 +72,7 @@ from app.modules.cvr.schemas import (
     PaymentApplicationListResponse,
     PaymentApplicationResponse,
     PaymentApplicationUpdate,
+    ProgressClaimOptionListResponse,
 )
 from app.modules.cvr.service import CvrService
 
@@ -505,6 +507,23 @@ async def list_payment_applications(
         items=[_payapp_to_response(a) for a in applications],
         total=total,
     )
+
+
+@router.get(
+    "/progress-claims/",
+    response_model=ProgressClaimOptionListResponse,
+    dependencies=[Depends(RequirePermission("cvr.read"))],
+)
+async def list_progress_claim_options(
+    user_id: CurrentUserId,
+    session: SessionDep,
+    project_id: uuid.UUID = Query(...),
+    service: CvrService = Depends(_get_service),
+) -> ProgressClaimOptionListResponse:
+    """Contract progress claims of the project, for the payment application picker."""
+    await verify_project_access(project_id, user_id, session)
+    claims = await service.list_progress_claims_for_project(project_id)
+    return ProgressClaimOptionListResponse(items=claims, total=len(claims))
 
 
 @router.post(

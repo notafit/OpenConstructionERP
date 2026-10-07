@@ -1,0 +1,159 @@
+{
+  "common": {
+    "ok": "OK"
+  },
+  "pay_application": {
+    "period_present": {
+      "fail": "Claim {claim} has no period end date, so it cannot be placed in order among the contract's claims",
+      "suggestion": "Enter the last day of the period this claim covers"
+    },
+    "period_order": {
+      "fail": "Claim {claim} starts on {period_from} and ends on {period_to}, so its period ends before it begins",
+      "suggestion": "Correct the period start or end so the start comes first"
+    },
+    "period_overlap": {
+      "fail": "Claim {claim} starts on {period_from}, but the previous claim {previous} runs to {previous_to}, so both claims bill the same days",
+      "suggestion": "Start this claim on the day after the previous claim's period ends"
+    },
+    "period_gap": {
+      "fail": "Claim {claim} starts on {period_from}, but the previous claim {previous} ended on {previous_to}, so no claim bills the days in between (unbilled days: {days})",
+      "suggestion": "Start this claim on the day after the previous claim's period ends, or check that a claim is not missing"
+    },
+    "period_unparsed": {
+      "fail": "Claim {claim} records the {field} as '{value}', which cannot be read as a date",
+      "suggestion": "Enter the date as year, month and day, for example 2026-03-31",
+      "fields": {
+        "period_start": "period start",
+        "period_end": "period end",
+        "claim_date": "application date"
+      }
+    },
+    "line_overbilled": {
+      "fail": "Line {line} is billed at {billed} to date, more than its scheduled value of {scheduled}; run Populate from progress again or lower this period's amount on the line",
+      "suggestion": "Populate from progress bills each line only for what is new since the earlier claims. If the line's scope really grew, record the change order that increases its scheduled value first"
+    },
+    "percent_regressed": {
+      "fail": "Line {line} is at {percent}% complete to date, which is {requested}, less than the {previous} the earlier claims already billed on it, so nothing is billed on it this period",
+      "suggestion": "Check the percent complete on this line, or correct the earlier claim that overstated it"
+    },
+    "errors": {
+      "submission_blocked": "This payment application cannot be submitted until these are resolved: {findings}",
+      "rules_unavailable": "The payment application rules are not loaded on this deployment, so this claim cannot be checked before it is submitted.",
+      "later_claim_already_issued": "Claim {claims} comes after this one and has already gone out. It was built while this claim was a draft, so it already applies for this work. Delete this draft, or move its period after the last claim that went out"
+    },
+    "totals_match_lines": {
+      "fail": "Claim {claim} asks for {gross}, but the lines behind it add up to {lines_total}: the claim was not worked out again after its lines changed",
+      "suggestion": "Save any line of this claim, or run Populate from progress again, and its totals follow"
+    },
+    "totals_below_lines": {
+      "fail": "Claim {claim} bills {gross} from recorded cost, less than the {lines_total} its own lines add up to: the breakdown cannot ask for more than the claim does",
+      "suggestion": "On a claim billed from cost the lines are a breakdown of the money, not the source of it. Lower or remove the lines that overstate it, or generate the claim again from the cost of work so the two agree"
+    },
+    "prior_matches_earlier_claims": {
+      "line_fail": "Claim {claim} carries {stored} as previously billed on line {line}, but the earlier claims bill {now} on it now",
+      "total_fail": "Claim {claim} carries {stored} as previously certified, but the earlier claims certify {now} now",
+      "suggestion": "Generate this claim again so it reads what the claims before it bill today"
+    },
+    "within_nte_cap": {
+      "fail": "Claim {claim} bills {this} on top of the {billed} already billed, which is over the not-to-exceed cap of {cap}",
+      "suggestion": "Bill up to the cap on this claim and agree a change order for the rest"
+    },
+    "retention_matches_policy": {
+      "fail": "Claim {claim} holds {held} in retention, but its retention policy gives {expected} now: an earlier claim, a release or the policy changed after this claim was worked out",
+      "suggestion": "Run Populate from progress again, or save any line of this claim, and its retention is worked out again"
+    },
+    "retention_above_cap": {
+      "fail": "Claim {claim} holds {held} in retention, above the {percent}% cap its retention policy sets, which is {cap} on this contract",
+      "suggestion": "Work the claim out again, or raise the cap on the contract's retention policy if the parties agreed a higher one",
+      "state_cap_unread": "Claim {claim}: its retention policy sets no cap, and {country} limits retainage by state law. No state could be resolved because the project carries no subdivision code, so no statutory cap was checked",
+      "state_cap_suggestion": "Write the state's limit into the contract's retention policy as a cap, and every claim on this contract is checked against it"
+    },
+    "retention_release_within_held": {
+      "fail": "The releases billed up to claim {claim} pay back {released}, more than the {accrued} of retention held up to it",
+      "suggestion": "Void the release that is too large, or bill it on a later claim once more retention is held"
+    },
+    "sov_reconciles_contract_sum": {
+      "fail": "The schedule of values adds up to {scheduled}, but the contract sum to date is {contract_sum}: the lines this claim is billed against leave {difference} of the contract without a line",
+      "suggestion": "Add or correct schedule of values lines until they add up to the contract sum",
+      "suggestion_reconcile": "{count} approved change orders or variations moved the contract sum before they reached the schedule of values. Use Reconcile change orders on the contract to add a line for each"
+    }
+  },
+  "retention_release": {
+    "documents_attached": {
+      "fail": "This release needs the {document}, and none is attached",
+      "suggestion": "Register the document on the contract, attach it to the release and approve it again"
+    },
+    "within_available": {
+      "fail": "This release pays back {amount}, but only {available} of retention is still held and not committed to another release",
+      "suggestion": "Void this release and propose it again, so it is sized on the retention held now"
+    },
+    "document_roles": {
+      "certificate_substantial_completion": "certificate of substantial completion",
+      "acceptance_protocol": "acceptance record",
+      "affidavit_payment_of_debts": "affidavit that debts and claims are paid",
+      "affidavit_release_of_liens": "affidavit of release of liens",
+      "consent_of_surety": "consent of surety",
+      "final_lien_waiver": "final lien waiver",
+      "final_invoice": "final invoice"
+    },
+    "errors": {
+      "approval_blocked": "This retention release cannot be approved until these are resolved: {findings}",
+      "rules_unavailable": "The retention release rules are not loaded on this deployment, so this release cannot be checked before it is approved."
+    }
+  },
+  "aia": {
+    "g703": {
+      "billed_not_on_a_schedule_line": "Billed work not carried by any schedule of values line"
+    }
+  },
+  "sov_reconcile": {
+    "errors": {
+      "not_active": "Change orders are reconciled onto the schedule of values of an active contract only; this contract is {status}",
+      "preview_stale": "The list of change orders to reconcile has changed since you opened it. Open the preview again and confirm what it shows now"
+    }
+  },
+  "compliance_gate": {
+    "errors": {
+      "signature_blocked": "This contract cannot be signed until these are resolved: {findings}"
+    }
+  },
+  "payment_plan": {
+    "triggers": {
+      "completion": "completion",
+      "approval": "approval"
+    },
+    "total_within_contract": {
+      "fail": "The instalments add up to {scheduled}, more than the contract sum of {total}",
+      "suggestion": "Reduce the instalments so they add up to no more than the contract sum"
+    },
+    "percent_sum": {
+      "fail": "The instalments add up to {scheduled} of the contract sum of {total} ({percent}%), so part of the price has no instalment",
+      "suggestion": "Add an instalment for the rest of the contract sum, or adjust the amounts"
+    },
+    "completion_trigger_linked": {
+      "fail": "Instalment {milestone} falls due on {trigger}, but it is not linked to a schedule activity, so its date will not move with the work",
+      "suggestion": "Link the instalment to the schedule milestone it waits for"
+    },
+    "schedule_done_plan_pending": {
+      "fail": "The schedule shows {milestone} reached, but instalment {instalment} is still pending, so it cannot be claimed",
+      "suggestion": "Mark the instalment reached, or check why the contract is not active"
+    },
+    "client_visible_requires_active": {
+      "fail": "Instalment {milestone} is shown to the client, but the contract is {status}; the client sees the plan of an active or completed contract only",
+      "suggestion": "Hide the instalment from the client until the contract is in force"
+    },
+    "consumer_deposit_cap": {
+      "fail": "The up-front payment of {deposit} is above the {ceiling} that {reference} allows in {jurisdiction} (source: {source_url}, checked {checked_on}, not reviewed by a lawyer)",
+      "suggestion": "Reduce the deposit, or confirm with counsel that an exemption applies to this contract",
+      "below_threshold": {
+        "fail": "The contract sum is at or below the amount from which {reference} limits deposits in {jurisdiction}, so the deposit was not checked (source: {source_url})"
+      },
+      "other_currency": {
+        "fail": "The contract is in {currency}, but {reference} states its limit in {limit_currency}, so the deposit in {jurisdiction} was not checked (source: {source_url})"
+      },
+      "unchecked": {
+        "suggestion": "If the statute applies to this contract, check the deposit against it by hand"
+      }
+    }
+  }
+}

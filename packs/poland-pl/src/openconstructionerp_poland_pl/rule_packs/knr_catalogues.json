@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "knr_catalogues",
+  "name": "KNR / KNNR — Norm Catalogues for Cost Estimation",
+  "standard": "KNR (Katalog Nakladow Rzeczowych) / KNNR",
+  "jurisdiction": "PL",
+  "description": "Validates cost estimates against the KNR (Katalog Nakladow Rzeczowych) and KNNR (Kosztorysowe Normy Nakladow Rzeczowych) norm catalogues. Checks that BOQ items reference valid KNR/KNNR catalogue entries, that labour norms (roboczogodziny, r-g), material consumption norms, and equipment norms follow the catalogue tables, and that the kosztorys (estimate) structure conforms to the investor estimate regulation.",
+  "applies_to": ["estimate", "boq", "validation"],
+  "enables_rule_ids": [
+    "knr.catalogue_reference_present",
+    "knr.catalogue_entry_format_valid",
+    "knr.labour_norm_rg_documented",
+    "knr.material_consumption_documented",
+    "knr.equipment_norm_documented",
+    "knr.kosztorys_inwestorski_structure_valid",
+    "knr.kosztorys_ofertowy_structure_valid",
+    "knr.narzuty_indirect_costs_documented",
+    "knr.zysk_profit_rate_documented",
+    "knr.koszty_posrednie_rate_documented",
+    "knr.analiza_cen_for_non_catalogue_items",
+    "knr.edition_year_documented"
+  ],
+  "regulator": "Ministerstwo Rozwoju i Technologii",
+  "publication_year": 2024
+}

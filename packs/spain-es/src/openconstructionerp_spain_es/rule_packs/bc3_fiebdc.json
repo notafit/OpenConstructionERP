@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "bc3_fiebdc",
+  "name": "BC3 / FIEBDC-3 — Construction Cost Exchange Format",
+  "standard": "FIEBDC-3 / BC3",
+  "jurisdiction": "ES",
+  "description": "Validates BOQ items and cost data exchanged in BC3 (FIEBDC-3) format. Checks file structure compliance, that capitulo (chapter) numbering is consistent, that unit descriptions and measurement rules follow the BC3 coding conventions, that decomposed prices (precios descompuestos) have labour, material and equipment components, and that the base de precios source is declared.",
+  "applies_to": ["boq", "estimate", "tender", "validation"],
+  "enables_rule_ids": [
+    "bc3.file_structure_valid",
+    "bc3.capitulo_numbering_consistent",
+    "bc3.unidad_obra_code_format_valid",
+    "bc3.descripcion_not_empty",
+    "bc3.unidad_medida_specified",
+    "bc3.precio_descompuesto_present",
+    "bc3.mano_obra_component_present",
+    "bc3.material_component_present",
+    "bc3.maquinaria_component_if_applicable",
+    "bc3.base_precios_source_declared",
+    "bc3.mediciones_present",
+    "bc3.resumen_presupuesto_consistent"
+  ],
+  "regulator": "FIEBDC (Formato de Intercambio Estandar de Bases de Datos de Construccion)",
+  "publication_year": 2020
+}

@@ -38,13 +38,13 @@ what it holds and the value is carried through as
 
 from __future__ import annotations
 
-import io
 import logging
 import re
 from datetime import date, datetime
 from typing import Any
 
 from app.modules.boq.importers._base import ImportedBOQ, ImportedPosition
+from app.modules.boq.importers._encoding import dot_groups_thousands
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +107,16 @@ def _number(value: object) -> float | None:
     if not text:
         return None
     text = text.replace(" ", "").replace(" ", "").replace(" ", "")
+    # A typed price often keeps its currency: "12 500 Ft", "12500 HUF".
+    text = re.sub(r"(?i)(?:ft|huf)\.?$", "", text)
     # A comma is the decimal separator; a dot in the same string is a thousands
-    # separator and goes. With no comma, a dot is the decimal separator.
-    if "," in text:
+    # separator and goes. With no comma, dots between groups of three digits
+    # are thousands too ("12.500" is twelve thousand five hundred forint, and
+    # read as a decimal point it priced the line at a thousandth); any other
+    # dot is the decimal separator.
+    if dot_groups_thousands(text):
+        text = text.replace(".", "")
+    elif "," in text:
         text = text.replace(".", "").replace(",", ".")
     try:
         return float(text)
@@ -134,6 +141,43 @@ _BUILDING_COLUMNS: dict[str, tuple[str, ...]] = {
     "combined_total": ("netto a+d osszesen",),
     "note": ("megjegyzes",),
 }
+
+
+def _dot_notes(
+    row: tuple[Any, ...], columns: dict[str, int], fields: tuple[str, ...], row_index: int, sheet: str
+) -> list[dict[str, Any]]:
+    """A note for every typed cell whose dots :func:`_number` read as thousands.
+
+    Only where that changed the number, so "1.250.000" passes without one.
+    The same shape the spreadsheet importer writes, so the import dialog words
+    both alike.
+    """
+    notes: list[dict[str, Any]] = []
+    for field in fields:
+        cell = _at(row, columns, field)
+        if not dot_groups_thousands(cell):
+            continue
+        text = str(cell).strip()
+        read = _number(cell)
+        try:
+            plain: float | None = float(text)
+        except ValueError:
+            plain = None
+        if read is None or read == plain:
+            continue
+        notes.append(
+            {
+                "row": row_index,
+                "sheet": sheet,
+                "severity": "info",
+                "code": "dot_read_as_thousands",
+                "column": field,
+                "text": text,
+                "value": read,
+                "message": f"'{text}' was read as {read:g}: the dot separates thousands in this bill.",
+            }
+        )
+    return notes
 
 
 def _at(row: tuple[Any, ...], columns: dict[str, int], field: str) -> Any:
@@ -316,6 +360,9 @@ def _parse_building(workbook: Any) -> ImportedBOQ:
                 result.skipped += 1
                 continue
 
+            result.warnings.extend(
+                _dot_notes(row, columns, ("quantity", "material_unit_rate", "fee_unit_rate"), row_index, sheet_name)
+            )
             hu = _building_hu(sheet_name, code, row, columns)
             hu["material_unit_rate"] = material or 0.0
             hu["fee_unit_rate"] = fee or 0.0
@@ -498,7 +545,15 @@ def _parse_infrastructure(workbook: Any) -> ImportedBOQ:
             unit_rate = _number(_at(row, columns, "unit_rate"))
 
             hu: dict[str, Any] = {"profile": "infrastructure", "sheet": sheet_name}
-            for field in ("structure_code", "row_number", "item_number", "building_number", "start", "finish"):
+            for field in (
+                "structure_code",
+                "row_number",
+                "item_number",
+                "building_number",
+                "work_process",
+                "start",
+                "finish",
+            ):
                 value = _text(_at(row, columns, field))
                 if value:
                     hu[field] = value
@@ -512,6 +567,7 @@ def _parse_infrastructure(workbook: Any) -> ImportedBOQ:
             if tags:
                 hu["tags"] = tags
 
+            result.warnings.extend(_dot_notes(row, columns, ("quantity", "unit_rate"), row_index, sheet_name))
             unit = _text(_at(row, columns, "unit"))
             # A coding file carries no prices at all and still has a unit
             # on every real line, so the unit is what separates an item
@@ -564,16 +620,16 @@ def detect_profile(workbook: Any) -> str | None:
 
 
 def parse_hungarian_workbook(content: bytes) -> ImportedBOQ | None:
-    """Parse an ``.xlsx`` upload if it is a Hungarian bill, else ``None``.
+    """Parse an ``.xlsx`` or ``.xls`` upload if it is a Hungarian bill, else ``None``.
 
     Never raises. A workbook that opens but is not one of the two shapes is
     not this module's, and one that will not open at all is the generic
     reader's problem to report, with its own error text.
     """
-    from openpyxl import load_workbook
+    from app.modules.boq.importers._workbook import open_workbook
 
     try:
-        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        workbook = open_workbook(content)
     except Exception:  # noqa: BLE001 - the generic reader reports this properly
         return None
 

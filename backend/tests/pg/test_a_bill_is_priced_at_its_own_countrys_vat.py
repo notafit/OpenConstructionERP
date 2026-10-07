@@ -4,8 +4,8 @@
 
 The defect
 ----------
-``DEFAULT_MARKUP_TEMPLATES`` is keyed by region and fifty countries map onto
-forty-two regions, so a region that serves several markets carries one VAT
+``DEFAULT_MARKUP_TEMPLATES`` is keyed by region and fifty-one countries map onto
+forty-three regions, so a region that serves several markets carries one VAT
 number and it is one member's. A bill on a project that set no rate of its own
 took that number: Austria was invoiced at Germany's 19 against its own 20,
 Switzerland at 19 against its own 8.1, Saudi Arabia at the Gulf's 5 against its
@@ -22,16 +22,17 @@ by a rule that grows on its own.
 
 Three populations, counted apart
 -------------------------------
-"No disagreements" over the whole set would read as forty-five countries
-verified when it is thirty-four verified, ten unmeasured and one asserted
+"No disagreements" over the whole set would read as forty-six countries
+verified when it is thirty-five verified, nine unmeasured and two asserted
 against a different number. A country with no row in the seed cannot be
 checked against the seed, so it is reported as unmeasured rather than as
 agreement, and every denominator is printed beside the verdict.
 
-The third population is one country and it is the interesting one. China's
-seed row carries the headline 13 and its bill is priced at the 9 tier
-construction is charged at, so the rule the other thirty-four obey would move
-a Chinese bill to a number that is right about the wrong question. It is named
+The third population is the interesting one. China's seed row carries the
+headline 13 and its bill is priced at the 9 tier construction is charged at,
+so the rule the other thirty-five obey would move a Chinese bill to a number
+that is right about the wrong question. Ireland is the same shape on a shared
+stack: standard 23, construction 13.5, seeded from the UK's 20. Both are named
 in ``CONSTRUCTION_TIER_COUNTRIES`` and asserted against the tier instead.
 
 Gated by ``OE_TEST_DB=pg`` (see conftest): it needs stored Project, BOQ and
@@ -85,7 +86,6 @@ pytestmark = pytest.mark.asyncio
 _NO_SEED_ROW: dict[str, str] = {
     "AR": "sole country of region AR, whose line carries Argentina's own 21",
     "CL": "sole country of region CL, whose line carries Chile's own 19",
-    "GR": "sole country of region GR, whose line carries Greece's own 24",
     "ID": "sole country of region ID, whose line carries Indonesia's own 11",
     "KE": "sole country of region KE, whose line carries Kenya's own 16",
     "MA": "sole country of region MA, whose line carries Morocco's own 20",
@@ -144,7 +144,14 @@ async def _install_tax_seed(session) -> int:
     return len(rows)
 
 
-async def _bill_for(session, country: str | None, *, vat: str | None = None, base_date: str | None = None) -> BOQ:
+async def _bill_for(
+    session,
+    country: str | None,
+    *,
+    vat: str | None = None,
+    base_date: str | None = None,
+    tax_date: str | None = None,
+) -> BOQ:
     """A stored project in one country and an empty bill on it."""
     tag = uuid.uuid4().hex[:8]
     owner = User(email=f"vat-{tag}@example.test", hashed_password="x", full_name="VAT")
@@ -161,7 +168,7 @@ async def _bill_for(session, country: str | None, *, vat: str | None = None, bas
     session.add(project)
     await session.flush()
 
-    boq = BOQ(project_id=project.id, name=f"Bill {tag}", base_date=base_date)
+    boq = BOQ(project_id=project.id, name=f"Bill {tag}", base_date=base_date, tax_date=tax_date)
     session.add(boq)
     await session.flush()
     return boq
@@ -260,7 +267,7 @@ async def test_a_construction_tier_survives_its_countrys_headline_rate(pg_sessio
     answering the question rather than a table answering a different one.
     """
     await _install_tax_seed(pg_session)
-    assert set(CONSTRUCTION_TIER_COUNTRIES) == {"CN"}, (
+    assert set(CONSTRUCTION_TIER_COUNTRIES) == {"CN", "IE"}, (
         "a country was added to or removed from the construction-tier set without this test "
         "being told which rate its bill should carry"
     )
@@ -278,7 +285,10 @@ async def test_a_construction_tier_survives_its_countrys_headline_rate(pg_sessio
         f"a Chinese bill was seeded at {line.percentage}. Construction is charged at {tier} there; "
         f"{_seed_rate('CN')} is the headline rate and answers a different question."
     )
-    assert line.metadata_.get("vat_rate_source") == "region_template"
+    # Read from the seed's VAT_RED row since Ireland made the tier a lookup of
+    # its own; the stack's 9 and the seed's 9 agree, and the line says which
+    # one it was.
+    assert line.metadata_.get("vat_rate_source") == "country_seed"
 
     stated = await _bill_for(pg_session, "CN", vat="6")
     await BOQService(pg_session).apply_default_markups(stated.id)
@@ -288,6 +298,112 @@ async def test_a_construction_tier_survives_its_countrys_headline_rate(pg_sessio
 
     for country, reason in CONSTRUCTION_TIER_COUNTRIES.items():
         assert reason.strip(), f"{country} claims a construction tier with no reason, which claims nothing"
+
+
+@pytest.mark.parametrize(
+    ("base_date", "expected"),
+    [
+        # The date that separates every wrong answer: Ireland's standard rate
+        # was 21 then, the UK stack it is seeded from carries 20, and today's
+        # standard rate is 23. Only the construction tier is 13.5.
+        ("2020-10-01", "13.5"),
+        (None, "13.5"),
+        ("2026-Q1", "13.5"),
+    ],
+)
+async def test_an_irish_bill_is_charged_the_construction_rate(pg_session, base_date, expected) -> None:
+    """Ireland is seeded from the UK stack and owes neither its 20 nor its own standard 23."""
+    await _install_tax_seed(pg_session)
+    assert _seed_rate("IE") == Decimal("23"), "Ireland's standard rate moved, so this proves nothing"
+    uk_line = [line for line in resolve_region_lines("UK", vat_rate=None) if line["category"] == "tax"][0]
+    assert Decimal(str(uk_line["percentage"])) == Decimal("20")
+
+    boq = await _bill_for(pg_session, "IE", base_date=base_date)
+    await BOQService(pg_session).apply_default_markups(boq.id)
+    lines = await _tax_lines(pg_session, boq.id)
+    assert len(lines) == 1
+    assert Decimal(lines[0].percentage) == Decimal(expected), (
+        f"an Irish bill dated {base_date!r} was charged {lines[0].percentage}; construction services "
+        f"are charged at the 13.5 reduced rate"
+    )
+    assert lines[0].metadata_["vat_rate_source"] == "country_seed"
+    assert lines[0].metadata_["vat_override"] is True
+
+
+async def test_an_irish_project_that_states_its_rate_keeps_it(pg_session) -> None:
+    """A project override still wins over the tier, as it does over every seeded rate."""
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, "IE", vat="23")
+    await BOQService(pg_session).apply_default_markups(boq.id)
+    line = (await _tax_lines(pg_session, boq.id))[0]
+    assert Decimal(line.percentage) == Decimal("23")
+    assert line.metadata_["vat_rate_source"] == "project"
+
+
+async def test_an_irish_bill_on_an_unseeded_install_falls_back_to_the_stack(pg_session) -> None:
+    """No tier row on file: the UK stack's line stands and says so, rather than nothing at all."""
+    boq = await _bill_for(pg_session, "IE")
+    await BOQService(pg_session).apply_default_markups(boq.id)
+    line = (await _tax_lines(pg_session, boq.id))[0]
+    assert Decimal(line.percentage) == Decimal("20")
+    assert line.metadata_["vat_rate_source"] == "region_template"
+
+
+@pytest.mark.parametrize(
+    ("country", "base_date", "stand_in"),
+    [
+        # Switzerland's rows start in 2018, so a 2017 bill has no Swiss rate on
+        # file and the DACH stack's line, Germany's 19, stands in.
+        ("CH", "2017-06-30", "19"),
+        # Ireland's construction tier starts in 2003; the UK stack's 20 stands in.
+        ("IE", "2002-06-30", "20"),
+    ],
+)
+async def test_a_bill_dated_before_its_countrys_rates_says_its_tax_is_a_stand_in(
+    pg_session, caplog, country, base_date, stand_in
+) -> None:
+    """No rate can be shown right for a date before the history, so the bill says so.
+
+    It still seeds, at the region's line, because refusing to price a project
+    is worse. What changed is that this is no longer silent: the line carries
+    the day nothing answered, and the log names the bill.
+    """
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, country, base_date=base_date)
+    with caplog.at_level(logging.WARNING, logger="app.modules.boq.service"):
+        await BOQService(pg_session).apply_default_markups(boq.id)
+
+    line = (await _tax_lines(pg_session, boq.id))[0]
+    assert Decimal(line.percentage) == Decimal(stand_in)
+    assert line.metadata_["vat_rate_source"] == "region_template"
+    assert line.metadata_["vat_rate_unresolved_on"] == base_date
+    reported = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING and str(boq.id) in r.getMessage()
+    ]
+    assert reported and base_date in reported[0]
+
+
+async def test_a_country_with_no_rates_on_file_is_not_reported_as_a_gap(pg_session, caplog) -> None:
+    """Argentina has no seed row at all, which is a known absence and not a missing date."""
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, "AR", base_date="2017-06-30")
+    with caplog.at_level(logging.WARNING, logger="app.modules.boq.service"):
+        await BOQService(pg_session).apply_default_markups(boq.id)
+
+    line = (await _tax_lines(pg_session, boq.id))[0]
+    assert line.metadata_["vat_rate_source"] == "region_template"
+    assert "vat_rate_unresolved_on" not in line.metadata_
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING and str(boq.id) in r.getMessage()]
+
+
+async def test_a_resolved_bill_carries_no_gap_marker(pg_session) -> None:
+    """The control: a Swiss bill inside the history is resolved and says nothing extra."""
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, "CH", base_date="2023-06-30")
+    await BOQService(pg_session).apply_default_markups(boq.id)
+    line = (await _tax_lines(pg_session, boq.id))[0]
+    assert Decimal(line.percentage) == Decimal("7.7")
+    assert "vat_rate_unresolved_on" not in line.metadata_
 
 
 async def test_a_country_with_no_single_tax_line_keeps_its_own_rates(pg_session) -> None:
@@ -484,6 +600,46 @@ async def test_a_russian_bill_priced_to_2025_is_taxed_at_2025s_rate(pg_session) 
         )
 
 
+@pytest.mark.parametrize("tax_date", [None, "2025-12-31"])
+async def test_a_duplicate_preserves_its_price_base_and_tax_date(pg_session, tax_date) -> None:
+    """Reapplying the tax template to a copy must keep its source's tax point."""
+    await _install_tax_seed(pg_session)
+    source = await _bill_for(pg_session, "RU", base_date="2025-06", tax_date=tax_date)
+    service = BOQService(pg_session)
+    duplicate = await service.duplicate_boq(source.id)
+    assert duplicate.base_date == "2025-06"
+    assert duplicate.tax_date == tax_date
+    await service.apply_default_markups(duplicate.id)
+    line = (await _tax_lines(pg_session, duplicate.id))[0]
+    assert Decimal(line.percentage) == Decimal("20")
+
+
+async def test_a_bill_priced_at_2025_rates_for_2026_works_is_taxed_on_its_tax_date(pg_session) -> None:
+    """The price base and the tax date are two days, and the tax date decides the tax.
+
+    A bill indexed to 2025 prices for works carried out in 2026 states
+    ``base_date`` 2025 and ``tax_date`` 2026, and is charged 2026's 22. The
+    same bill without a tax date is charged 20 as before, read back off the
+    stored line in both cases.
+    """
+    await _install_tax_seed(pg_session)
+
+    for base_date, tax_date, expected in (
+        ("2025-06", "2026-01-01", "22"),
+        ("2025-Q2", "2026", "22"),
+        ("2026-Q1", "2025-12-31", "20"),
+        ("2025-06", None, "20"),
+    ):
+        boq = await _bill_for(pg_session, "RU", base_date=base_date, tax_date=tax_date)
+        await BOQService(pg_session).apply_default_markups(boq.id)
+        line = (await _tax_lines(pg_session, boq.id))[0]
+        assert Decimal(line.percentage) == Decimal(expected), (
+            f"a Russian bill with base date {base_date!r} and tax date {tax_date!r} was charged "
+            f"{line.percentage} rather than {expected}"
+        )
+        assert line.metadata_["vat_rate_source"] == "country_seed"
+
+
 async def test_a_base_date_nothing_can_read_is_dated_today_and_says_so(pg_session, caplog) -> None:
     """The fallback stayed; the silence did not.
 
@@ -590,3 +746,64 @@ async def test_a_broken_seed_row_falls_back_loudly(pg_session, caplog) -> None:
     assert "rate_not_numeric" in warnings[0].getMessage(), (
         f"the warning must name which rule the row breaks, got {warnings[0].getMessage()!r}"
     )
+
+
+async def test_a_croatian_bill_gets_exactly_one_pdv_line_at_25(pg_session) -> None:
+    """A Croatian bill charges PDV once, at 25.
+
+    Croatia first had no stack, and the neutral one it was seeded with carried
+    no tax line, so the resolved 25 had nowhere to go and the bill showed no
+    VAT at all. Its stack is now that one PDV line, and applying the defaults
+    again replaces the stack rather than adding a second line.
+    """
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, "HR")
+    service = BOQService(pg_session)
+
+    await service.apply_default_markups(boq.id)
+    await service.apply_default_markups(boq.id)
+    lines = await _tax_lines(pg_session, boq.id)
+
+    assert [(line.name, Decimal(line.percentage)) for line in lines] == [("PDV", Decimal("25"))]
+    # The HR stack's only line, so it sits on the direct cost; see the HR block.
+    assert lines[0].apply_to == "direct_cost"
+    assert lines[0].metadata_["vat_rate_source"] == "country_seed"
+
+
+@pytest.mark.parametrize("region", [None, "HR"])
+async def test_a_troskovnik_gets_its_tax_and_no_overhead_on_rates_that_already_hold_it(pg_session, region) -> None:
+    """Croatia's regional template adds PDV and nothing else.
+
+    A troškovnik is priced on all-in unit rates, overhead and profit inside
+    every rate. Before Croatia had a stack of its own, "Apply regional
+    template" seeded the neutral one, English Site Overhead, Head Office
+    Overhead, Profit and Contingency on top of those rates, so the bill counted
+    its overhead and profit twice. Checked both ways a bill reaches the
+    template: from the project's country and by picking the region by name.
+    """
+    from app.modules.boq.schemas import PositionCreate
+
+    await _install_tax_seed(pg_session)
+    boq = await _bill_for(pg_session, "HR")
+    service = BOQService(pg_session)
+    for ordinal, quantity, rate in (("1.1", 1, "18500"), ("2.1", 1450, "9.8"), ("6.1", 180, "32")):
+        await service.add_position(
+            PositionCreate(
+                boq_id=boq.id,
+                ordinal=ordinal,
+                description=f"Stavka {ordinal}",
+                unit="m3",
+                quantity=quantity,
+                unit_rate=rate,
+            )
+        )
+
+    await service.apply_default_markups(boq.id, region)
+
+    markups = list((await pg_session.execute(select(BOQMarkup).where(BOQMarkup.boq_id == boq.id))).scalars().all())
+    assert [(m.category, m.name, Decimal(m.percentage)) for m in markups] == [("tax", "PDV", Decimal("25"))]
+
+    breakdown = await service.get_cost_breakdown(boq.id)
+    net = Decimal("18500") + Decimal("1450") * Decimal("9.8") + Decimal("180") * Decimal("32")
+    assert breakdown.direct_cost == net
+    assert breakdown.grand_total == net * Decimal("1.25")

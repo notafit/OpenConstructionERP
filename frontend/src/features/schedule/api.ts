@@ -19,8 +19,127 @@ export interface Schedule {
   start_date: string | null;
   end_date: string | null;
   status: string;
+  /**
+   * Free-form; generation from a BOQ records its outcome under
+   * `boq_generation`. The API names the field `metadata_` (the response
+   * model serialises by alias).
+   */
+  metadata_?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+/** A BOQ as the project's BOQ list returns it, reduced to what the link picker shows. */
+export interface BoqSummary {
+  id: string;
+  name: string;
+  /** detailed, budget, conceptual, order_of_magnitude ... as the bill was saved; often unset. */
+  estimate_type?: string | null;
+}
+
+/** Why one position's duration is an estimate, or why it was left out of a generated plan. */
+export interface GenerationNote {
+  position_id: string;
+  ordinal: string;
+  description: string;
+  note:
+    | 'estimated_from_unit'
+    | 'cost_share'
+    | 'default_duration'
+    | 'spans_works'
+    | 'skipped_zero_qty'
+    | 'empty_section_dropped'
+    | 'blank_row_dropped';
+  days?: number | null;
+  basis?: {
+    unit: string;
+    rate: number;
+    hours: number;
+    gang: number;
+    hours_per_day: number;
+    capped_by_price?: boolean;
+    hours_from_unit?: number;
+  } | null;
+}
+
+/** What generating from a bill would write; nothing is written until a person confirms. */
+export interface GenerationPreview {
+  boq_id: string;
+  boq_name: string;
+  boq_estimate_type: string | null;
+  activity_count: number;
+  positions_scheduled: number;
+  /** Positions priced as a lump sum: each becomes one bar. */
+  lump_sum_positions: number;
+  summary_count: number;
+  estimated_count: number;
+  skipped_count: number;
+  note_counts: Record<string, number>;
+  crews: number;
+  /** Workers on each position whose bill gives hours but no crew, at least. */
+  workers_per_position?: number;
+  /** True when the generator chose that number (the fewest that fit), false when the request did. */
+  workers_assumed?: boolean;
+  /** Positions the number applies to; a crew the bill names is kept. */
+  positions_without_workers?: number;
+  /** The window the workers were fitted to; ``default`` when no end date was given. */
+  fitted_window?: { days: number; end: string; default: boolean; fits?: boolean } | null;
+  compressed_pct: number | null;
+  fits: boolean;
+  planned_start: string;
+  planned_end: string;
+  requested_end: string | null;
+  warnings: Array<Record<string, unknown>>;
+  existing_activity_count: number;
+  existing_started_count: number;
+  /** Contract payment instalments that move to the same milestone in the new plan. */
+  instalments_relinked?: number;
+  /** Contract payment instalments that lose their milestone and go back to their contract dates. */
+  instalments_unlinked?: number;
+  notes: GenerationNote[];
+}
+
+/** What deleting a schedule takes with it. */
+export interface ScheduleDeleteImpact {
+  activity_count: number;
+  baseline_count: number;
+  /** Payment instalments linked to its activities; they stay and go back to their contract dates. */
+  payment_milestone_count: number;
+  /** Whether this caller may delete it; the confirmation is not offered otherwise. */
+  can_delete?: boolean;
+  blocked_reason?: 'permission_denied' | 'schedule_has_baselines' | 'schedule_not_archived' | null;
+}
+
+/** The body of a generation or its preview. */
+export interface GenerateFromBoqOptions {
+  /** Calendar days from the start, both included; omitted = no window, the plan takes what the work needs. */
+  totalProjectDays?: number | null;
+  /** The day the plan starts, written to the schedule with the plan. */
+  startDate?: string | null;
+  replace?: boolean;
+  /** Workers per position where the bill gives no crew, 1 to 20; omitted = the fewest that fit. */
+  workersPerPosition?: number | null;
+}
+
+function generateBody(boqId: string, options: GenerateFromBoqOptions) {
+  return {
+    boq_id: boqId,
+    ...(options.totalProjectDays != null ? { total_project_days: options.totalProjectDays } : {}),
+    ...(options.startDate ? { start_date: options.startDate } : {}),
+    ...(options.replace ? { replace: true } : {}),
+    ...(options.workersPerPosition != null ? { workers_per_position: options.workersPerPosition } : {}),
+  };
+}
+
+/** A BOQ position reduced to what the link picker shows. */
+export interface BoqPositionLite {
+  id: string;
+  boq_id: string;
+  parent_id: string | null;
+  ordinal: string;
+  description: string;
+  unit: string;
+  quantity: string | number;
 }
 
 export interface Activity {
@@ -46,6 +165,13 @@ export interface Activity {
    *  when it inherits the project default. A backend change surfaces this on
    *  the gantt/activity response; read it defensively (undefined == Default). */
   calendar_id?: string | null;
+  /** Contact responsible for the activity. */
+  assignee_id?: string | null;
+  /** That contact's name, resolved by the server (Gantt payload), so it shows
+   *  for every viewer, not only one whose contact list holds it. */
+  assignee_name?: string | null;
+  /** A milestone the client sees in the portal's upcoming milestones. */
+  client_visible?: boolean;
   color: string;
   sort_order: number;
   /** Activity metadata passthrough. BOQ-generated activities carry
@@ -390,82 +516,88 @@ export type EvmWarningKey =
   | 'physical_manual_pct_is_subjective'
   | 'all_steps_zero_weight';
 
+/**
+ * The progress panel's view of one activity. No single progress response
+ * carries every field, so the panel merges each response into this view
+ * rather than replacing it.
+ */
 export interface TypedActivityView {
+  percent_complete_type: PercentCompleteType;
+  progress_pct: number;
+  remaining_duration: number | null;
+  status: string;
+  forecast_finish?: string | null;
+  /** Decimal-as-string unit quantities. */
+  installed_units?: string | null;
+  budgeted_units?: string | null;
+  suspended_at?: string | null;
+  suspend_reason?: string | null;
+}
+
+/** ProgressResultResponse: the typed-progress PATCH answers with this flat object. */
+export interface TypedProgressResponse {
+  activity_id: string;
+  percent_complete_type: PercentCompleteType;
+  percent_complete: number;
+  remaining_duration: number;
+  forecast_finish: string;
+  status: string;
+  evm_warnings: EvmWarningKey[];
+  installed_units: string | null;
+  budgeted_units: string | null;
+  suspended_at: string | null;
+  suspend_reason: string | null;
+}
+
+/** PercentTypePreviewResponse: both the preview and the committing PUT answer with it. */
+export interface PercentTypePreviewResponse {
+  activity_id: string;
+  percent_complete_type: PercentCompleteType;
+  evm_warnings: EvmWarningKey[];
+}
+
+/** ActivityProgressStateResponse: suspend, resume and calendar answer with it. */
+export interface ActivityProgressState {
   id: string;
   schedule_id: string;
-  name: string;
-  progress_pct: string | null;
+  status: string;
+  progress_pct: number;
   percent_complete_type: PercentCompleteType;
   remaining_duration: number | null;
-  budgeted_units: string | null;
-  installed_units: string | null;
+  start_date: string;
+  end_date: string;
   calendar_id: string | null;
-  status: string;
   suspended_at: string | null;
   resumed_at: string | null;
   suspend_reason: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  forecast_finish?: string | null;
-}
-
-export interface TypedProgressResponse {
-  activity: TypedActivityView;
-  evm_warnings: EvmWarningKey[];
-  forecast_finish: string | null;
-  remaining_duration: number | null;
-}
-
-export interface PercentTypePreviewResponse {
-  percent_complete_type: PercentCompleteType;
-  evm_warnings: EvmWarningKey[];
-}
-
-export interface SuspendResumeResponse {
-  activity: TypedActivityView;
-  forecast_finish: string | null;
 }
 
 export interface ActivityStep {
   id: string;
   activity_id: string;
   name: string;
-  /** Decimal-as-string weight (>= 0). */
-  weight: string;
-  /** Decimal-as-string percent (0..100). */
-  percent_complete: string;
+  /** Weight (>= 0); a plain ratio, sent as a number. */
+  weight: number;
+  /** Percent (0..100); a plain ratio, sent as a number. */
+  percent_complete: number;
   is_milestone: boolean;
   sort_order: number;
 }
 
 export interface PlannedValuePreview {
+  schedule_id: string;
   as_of: string;
   /** Decimal-as-string time-phased PV. */
   planned_value: string;
+  /** Decimal-as-string method-aware EV. */
+  earned_value: string;
   /** Decimal-as-string BAC (Σ planned cost). */
   budget_at_completion: string;
-}
-
-export interface EvmSnapshotSummary {
-  snapshot_date: string;
-  bac: string;
-  pv: string;
-  ev: string;
-  ac: string;
-  sv: string;
-  cv: string;
-  spi: string;
-  cpi: string;
-}
-
-export interface DataDateAdvanceResponse {
-  schedule_id: string;
-  data_date: string;
-  snapshot: EvmSnapshotSummary;
+  activity_count: number;
 }
 
 export interface TypedProgressBody {
-  type?: PercentCompleteType;
+  percent_complete_type?: PercentCompleteType;
   percent?: number;
   installed_units?: number;
   budgeted_units?: number;
@@ -826,10 +958,11 @@ export const scheduleApi = {
    * and dropped `.total` — so the server could count the full set and the
    * client would still have no idea it had been handed a slice.
    */
-  listSchedules: (projectId: string, opts?: { limit?: number; offset?: number }) => {
+  listSchedules: (projectId: string, opts?: { limit?: number; offset?: number; archiveState?: 'current' | 'archived' | 'all' }) => {
     const qs = new URLSearchParams({ project_id: projectId });
     if (opts?.limit != null) qs.set('limit', String(opts.limit));
     if (opts?.offset != null) qs.set('offset', String(opts.offset));
+    if (opts?.archiveState) qs.set('archive_state', opts.archiveState);
     return apiGet<Page<Schedule>>(`/v1/schedule/schedules/?${qs}`);
   },
   getSchedule: (id: string) => apiGet<Schedule>(`/v1/schedule/schedules/${id}`),
@@ -837,31 +970,71 @@ export const scheduleApi = {
     apiPost<Schedule>('/v1/schedule/schedules/', data),
   updateSchedule: (id: string, data: { name?: string; description?: string; start_date?: string; end_date?: string; status?: string }) =>
     apiPatch<Schedule>(`/v1/schedule/schedules/${id}`, data),
+  /** The legacy DELETE is deliberately reversible: it archives, never purges. */
+  deleteSchedule: (id: string) => apiDelete(`/v1/schedule/schedules/${id}`),
+  archiveSchedule: (id: string) => apiDelete(`/v1/schedule/schedules/${id}`),
+  restoreSchedule: (id: string) => apiPost<Schedule>(`/v1/schedule/schedules/${id}/restore/`, {}),
+  purgeSchedule: (id: string) => apiDelete(`/v1/schedule/schedules/${id}/permanent/`),
+  /** Activities, baselines and linked payment instalments a delete reaches, for the confirmation. */
+  getDeleteImpact: (id: string) =>
+    apiGet<ScheduleDeleteImpact>(`/v1/schedule/schedules/${id}/delete-impact/`),
 
   // Activities
   getGantt: (scheduleId: string) =>
     apiGet<GanttData>(`/v1/schedule/schedules/${scheduleId}/gantt/`),
   createActivity: (scheduleId: string, data: Partial<Activity>) =>
     apiPost<Activity>(`/v1/schedule/schedules/${scheduleId}/activities/`, data),
+  /** The WBS code that continues the numbering under ``parentId`` (top level when omitted). */
+  suggestWbsCode: (scheduleId: string, parentId?: string) =>
+    apiGet<{ wbs_code: string }>(
+      `/v1/schedule/schedules/${scheduleId}/next-wbs-code/${parentId ? `?parent_id=${encodeURIComponent(parentId)}` : ''}`,
+    ),
   updateActivity: (activityId: string, data: Partial<Activity>) =>
     apiPatch<Activity>(`/v1/schedule/activities/${activityId}`, data),
-  deleteActivity: (activityId: string) =>
-    apiDelete(`/v1/schedule/activities/${activityId}`),
+  /** `cascade` deletes a summary with every activity under it; without it the children move up one level. */
+  deleteActivity: (activityId: string, cascade = false) =>
+    apiDelete(`/v1/schedule/activities/${activityId}${cascade ? '?cascade=true' : ''}`),
   clearActivities: (scheduleId: string) =>
     apiDelete<{ schedule_id: string; deleted: number }>(
       `/v1/schedule/schedules/${scheduleId}/activities/`,
     ),
   linkPosition: (activityId: string, positionId: string) =>
-    apiPost(`/v1/schedule/activities/${activityId}/link-position/`, { boq_position_id: positionId }),
+    apiPost<Activity>(`/v1/schedule/activities/${activityId}/link-position/`, { boq_position_id: positionId }),
+  unlinkPosition: (activityId: string, positionId: string) =>
+    apiDelete<Activity>(
+      `/v1/schedule/activities/${activityId}/link-position/${encodeURIComponent(positionId)}/`,
+    ),
+  /** The project's BOQs, for picking which bill to link positions from. */
+  listProjectBoqs: (projectId: string) =>
+    apiGet<BoqSummary[]>(`/v1/boq/boqs/?project_id=${encodeURIComponent(projectId)}`),
+  /** Every position of one BOQ; the whole bill comes back, so a filter over it is complete. */
+  getBoqPositions: (boqId: string) =>
+    apiGet<{ positions: BoqPositionLite[] }>(`/v1/boq/boqs/${encodeURIComponent(boqId)}`).then(
+      (b) => b.positions ?? [],
+    ),
+  /** One position by id, for a link that is not in the BOQ currently open in the picker. */
+  getBoqPosition: (positionId: string) =>
+    apiGet<BoqPositionLite>(`/v1/boq/positions/${encodeURIComponent(positionId)}`),
   updateProgress: (activityId: string, progressPct: number) =>
     apiPatch(`/v1/schedule/activities/${activityId}/progress/`, { progress_pct: progressPct }),
 
   // CPM & BOQ Generation
-  generateFromBOQ: (scheduleId: string, boqId: string, totalProjectDays?: number) =>
-    apiPost<Activity[]>(`/v1/schedule/schedules/${scheduleId}/generate-from-boq/`, {
-      boq_id: boqId,
-      ...(totalProjectDays != null ? { total_project_days: totalProjectDays } : {}),
+  /**
+   * `replace` deletes the schedule's activities first, in the same transaction;
+   * without it a populated schedule answers 409 `schedule_has_activities`.
+   * A bill of thousands of positions takes a while, so the call is long-running.
+   */
+  generateFromBOQ: (scheduleId: string, boqId: string, options: GenerateFromBoqOptions = {}) =>
+    apiPost<Activity[]>(`/v1/schedule/schedules/${scheduleId}/generate-from-boq/`, generateBody(boqId, options), {
+      longRunning: true,
     }),
+  /** What a generation would write, and nothing written: counts, dates and per-position notes. */
+  previewGenerateFromBOQ: (scheduleId: string, boqId: string, options: GenerateFromBoqOptions = {}) =>
+    apiPost<GenerationPreview>(
+      `/v1/schedule/schedules/${scheduleId}/generate-from-boq/preview/`,
+      generateBody(boqId, options),
+      { longRunning: true },
+    ),
   calculateCPM: (scheduleId: string) =>
     apiPost<CriticalPathResponse>(`/v1/schedule/schedules/${scheduleId}/calculate-cpm/`),
   getRiskAnalysis: (scheduleId: string) =>
@@ -888,6 +1061,11 @@ export const scheduleApi = {
   /** Delete a dependency edge. */
   deleteRelationship: (relationshipId: string) =>
     apiDelete(`/v1/schedule/relationships/${encodeURIComponent(relationshipId)}`),
+  /** Delete the link between two activities without knowing its id (at most one per pair). */
+  deleteRelationshipBetween: (scheduleId: string, predecessorId: string, successorId: string) =>
+    apiDelete(
+      `/v1/schedule/schedules/${encodeURIComponent(scheduleId)}/relationships/?predecessor_id=${encodeURIComponent(predecessorId)}&successor_id=${encodeURIComponent(successorId)}`,
+    ),
   /** Recompute activity dates from the dependency network (CPM); returns the moved activities. */
   reschedule: (scheduleId: string) =>
     apiPost<Activity[]>(`/v1/schedule/schedules/${encodeURIComponent(scheduleId)}/reschedule/`),
@@ -987,31 +1165,31 @@ export const scheduleApi = {
     ),
   /** Preview the EVM-distortion warnings a percent-type change would raise. */
   previewPercentType: (activityId: string, type: PercentCompleteType) =>
-    apiPost<PercentTypePreviewResponse, { type: PercentCompleteType }>(
+    apiPost<PercentTypePreviewResponse, { percent_complete_type: PercentCompleteType }>(
       `/v1/schedule/activities/${encodeURIComponent(activityId)}/percent-type/preview/`,
-      { type },
+      { percent_complete_type: type },
     ),
-  /** Commit a percent-complete type change and recompute the activity. */
+  /** Commit a percent-complete type change; answers with the warnings it raised. */
   setPercentType: (activityId: string, type: PercentCompleteType) =>
-    apiPut<TypedProgressResponse, { type: PercentCompleteType }>(
+    apiPut<PercentTypePreviewResponse, { percent_complete_type: PercentCompleteType }>(
       `/v1/schedule/activities/${encodeURIComponent(activityId)}/percent-type/`,
-      { type },
+      { percent_complete_type: type },
     ),
   /** Set (calendarId) or clear (null) an activity's per-activity calendar. */
   setActivityCalendar: (activityId: string, calendarId: string | null) =>
-    apiPut<TypedProgressResponse, { calendar_id: string | null }>(
+    apiPut<ActivityProgressState, { calendar_id: string | null }>(
       `/v1/schedule/activities/${encodeURIComponent(activityId)}/calendar/`,
       { calendar_id: calendarId },
     ),
   /** Suspend an in_progress / not_started activity (freezes remaining duration). */
   suspendActivity: (activityId: string, reason: string, effectiveDate?: string) =>
-    apiPost<SuspendResumeResponse, { reason: string; effective_date?: string }>(
+    apiPost<ActivityProgressState, { reason: string; effective_date?: string }>(
       `/v1/schedule/activities/${encodeURIComponent(activityId)}/suspend/`,
       { reason, ...(effectiveDate ? { effective_date: effectiveDate } : {}) },
     ),
   /** Resume a suspended activity (reschedules from the frozen remaining duration). */
   resumeActivity: (activityId: string, effectiveDate?: string) =>
-    apiPost<SuspendResumeResponse, { effective_date?: string }>(
+    apiPost<ActivityProgressState, { effective_date?: string }>(
       `/v1/schedule/activities/${encodeURIComponent(activityId)}/resume/`,
       effectiveDate ? { effective_date: effectiveDate } : {},
     ),
@@ -1039,10 +1217,13 @@ export const scheduleApi = {
     apiGet<PlannedValuePreview>(
       `/v1/schedule/schedules/${encodeURIComponent(scheduleId)}/planned-value/?as_of=${encodeURIComponent(asOf)}`,
     ),
-  /** Advance the data date; refreshes the time-phased PV/EV snapshot. */
+  /**
+   * Advance the data date. There is no dedicated route: the schedule PATCH
+   * takes ``data_date`` and records the EVM snapshot when the date moves.
+   */
   advanceDataDate: (scheduleId: string, dataDate: string) =>
-    apiPut<DataDateAdvanceResponse, { data_date: string }>(
-      `/v1/schedule/schedules/${encodeURIComponent(scheduleId)}/data-date/`,
+    apiPatch<Schedule & { data_date: string | null }, { data_date: string }>(
+      `/v1/schedule/schedules/${encodeURIComponent(scheduleId)}`,
       { data_date: dataDate },
     ),
 

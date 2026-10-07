@@ -173,6 +173,9 @@ def _make_service() -> Any:
     svc.session = SimpleNamespace(
         refresh=AsyncMock(),
         execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+        # A new agreement reads its project's country for the retention default;
+        # no project here, so it falls back to the platform figure.
+        get=AsyncMock(return_value=None),
         add=lambda _o: None,
         flush=AsyncMock(),
         rollback=AsyncMock(),
@@ -659,7 +662,12 @@ class TestDashboardSingleRetentionAndPaymentsQuery:
         )
 
         svc = _make_service()
-        with patch("app.modules.subcontractors.service.event_bus.publish_detached"):
+        # Activating an agreement asks finance to sync the budget; this test
+        # counts the dashboard's own queries on an in-memory session.
+        with (
+            patch("app.modules.subcontractors.service.event_bus.publish_detached"),
+            patch("app.modules.finance.service.FinanceService.sync_project_budget", AsyncMock(), create=True),
+        ):
             sub_id = uuid.uuid4()
             sub_row = Subcontractor(
                 legal_name="Acme",

@@ -3,6 +3,7 @@
 Add boq.import_preview.* keys to all required locale files.
 29 keys, 42 locales.
 """
+
 import re
 import sys
 from pathlib import Path
@@ -41,9 +42,11 @@ EN_KEYS = {
     "boq.import_preview.warnings_title": "{{count}} warning(s)",
 }
 
+
 # Extract interpolation tokens from a string
 def get_tokens(s):
-    return set(re.findall(r'\{\{[^}]+\}\}', s))
+    return set(re.findall(r"\{\{[^}]+\}\}", s))
+
 
 # Translations: {locale: {key_suffix: value}}
 # key_suffix is the part after "boq.import_preview."
@@ -534,7 +537,7 @@ TRANSLATIONS = {
         "col_description": "תיאור",
         "col_ordinal": "סעיף / קוד",
         "col_quantity": "כמות",
-        "col_total": "סה\"כ",
+        "col_total": 'סה"כ',
         "col_unit": "יחידה",
         "col_unit_rate": "מחיר יחידה",
         "confirm_button": "ייבוא",
@@ -1344,15 +1347,20 @@ KEY_SUFFIXES = list(EN_KEYS.keys())
 # Remove the "boq.import_preview." prefix for lookup in TRANSLATIONS dict
 SUFFIX_MAP = {k: k.replace("boq.import_preview.", "") for k in KEY_SUFFIXES}
 
+
 def validate_tokens(locale, suffix, value):
     full_key = f"boq.import_preview.{suffix}"
     en_value = EN_KEYS[full_key]
     en_tokens = get_tokens(en_value)
     tr_tokens = get_tokens(value)
     if en_tokens != tr_tokens:
-        print(f"  TOKEN MISMATCH [{locale}] {full_key}: EN={en_tokens} TR={tr_tokens}", file=sys.stderr)
+        print(
+            f"  TOKEN MISMATCH [{locale}] {full_key}: EN={en_tokens} TR={tr_tokens}",
+            file=sys.stderr,
+        )
         return False
     return True
+
 
 def build_block(locale, trans):
     lines = []
@@ -1369,6 +1377,7 @@ def build_block(locale, trans):
         escaped = value.replace('"', '\\"')
         lines.append(f'    "{full_key}": "{escaped}",')
     return "\n".join(lines), ok
+
 
 def process_locale(locale):
     filepath = LOCALES_DIR / f"{locale}.ts"
@@ -1406,6 +1415,7 @@ def process_locale(locale):
     print(f"  OK: {locale} ({len(SUFFIX_MAP)} keys added)")
     return True
 
+
 def main():
     locales = list(TRANSLATIONS.keys())
     print(f"Processing {len(locales)} locales...")
@@ -1419,6 +1429,7 @@ def main():
         sys.exit(1)
     else:
         print(f"\nDone. {len(locales)} locales updated.")
+
 
 if __name__ == "__main__":
     main()

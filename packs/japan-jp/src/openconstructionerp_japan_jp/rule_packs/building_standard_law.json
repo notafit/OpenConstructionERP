@@ -1,0 +1,24 @@
+{
+  "rule_pack_id": "building_standard_law",
+  "name": "Building Standards Act (Kenchiku Kijun Ho)",
+  "standard": "Building Standards Act (Act No. 201 of 1950, as amended)",
+  "jurisdiction": "JP",
+  "description": "Validates project documentation against the Japanese Building Standards Act (Kenchiku Kijun Ho). Checks building use classification, floor area ratio (yousekiritsu) and building coverage ratio (kenpeiritsu), fire resistance ratings for fireproof / quasi-fireproof structures, structural calculation method classification (Route 1/2/3 or time-history analysis), and confirmation application (kakunin shinsei) documentation requirements.",
+  "applies_to": ["estimate", "validation", "submittals"],
+  "enables_rule_ids": [
+    "bsl.building_use_classified",
+    "bsl.yousekiritsu_floor_area_ratio_set",
+    "bsl.kenpeiritsu_building_coverage_set",
+    "bsl.height_limit_documented",
+    "bsl.fire_resistance_class_set",
+    "bsl.taikakozo_fireproof_if_required",
+    "bsl.structural_calculation_route_specified",
+    "bsl.structural_calculation_route3_peer_review",
+    "bsl.setback_requirements_documented",
+    "bsl.kakunin_shinsei_referenced",
+    "bsl.building_officer_or_designated_body_named",
+    "bsl.barrier_free_provisions_if_applicable"
+  ],
+  "regulator": "MLIT (Ministry of Land, Infrastructure, Transport and Tourism)",
+  "publication_year": 2024
+}

@@ -9,6 +9,7 @@ session + repositories.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -25,6 +26,13 @@ from app.core.events import event_bus, publish_after_commit
 from app.core.i18n import get_locale
 from app.core.json_merge import merge_metadata
 from app.core.money import money_quantum
+from app.core.pdf_branding import (
+    DEFAULT_BRAND,
+    branded_cover_brand,
+    branded_doc_metadata,
+    branded_header_logo,
+    branded_letterhead,
+)
 from app.core.pdf_fonts import (
     BODY_FONT,
     BOLD_FONT,
@@ -828,6 +836,53 @@ def _ensure_transition(
         )
 
 
+# ── Removal guards ──────────────────────────────────────────────────────
+#
+# Developments, plots, buyers and sales contracts sit on top of long cascade
+# chains: a plot takes its sales contracts with it, those take their payment
+# schedules and every instalment, a development takes its plots, buyers, escrow
+# accounts and broker commissions. Every record in those chains that holds money
+# or that another party relies on is kept read-only by its own service method,
+# and a delete one or two levels up used to remove it anyway. The deletes below
+# now count what they would take and refuse with a 409 that names each kind,
+# while a record with nothing of the sort under it still deletes as before.
+
+#: Instalment states that record money taken or formally forgiven.
+_SETTLED_INSTALMENT_STATUSES = ("paid", "waived")
+
+#: How a removal refusal names each kind of dependent record, singular and plural.
+_REMOVAL_HOLDER_LABELS: dict[str, tuple[str, str]] = {
+    "sales_contract": ("sales contract past draft", "sales contracts past draft"),
+    "settled_instalment": ("paid or waived instalment", "paid or waived instalments"),
+    "reservation_deposit": ("reservation with a deposit", "reservations with a deposit"),
+    "handover": ("completed handover", "completed handovers"),
+    "warranty_claim": ("warranty claim", "warranty claims"),
+    "escrow_transaction": ("escrow transaction", "escrow transactions"),
+    "settled_escrow_transaction": (
+        "matched or disputed escrow transaction",
+        "matched or disputed escrow transactions",
+    ),
+    "commission_accrual": ("broker commission accrual", "broker commission accruals"),
+    "locked_selection": ("locked option selection", "locked option selections"),
+}
+
+
+def _refuse_removal(what: str, holders: dict[str, int], remedy: str) -> None:
+    """Raise a 409 naming every kind of record that still depends on ``what``.
+
+    Does nothing when ``holders`` is empty, so a caller can hand it the counts
+    unconditionally.
+    """
+    if not holders:
+        return
+    parts = [f"{count} {_REMOVAL_HOLDER_LABELS[kind][0 if count == 1 else 1]}" for kind, count in holders.items()]
+    described = parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"{what} cannot be deleted. Records that depend on it: {described}. {remedy}",
+    )
+
+
 # ── Pure helpers ────────────────────────────────────────────────────────
 
 
@@ -1544,8 +1599,101 @@ class PropertyDevService:
         await self.developments.update_fields(dev_id, **fields)
         return await self.get_development(dev_id)
 
+    async def _count_removal_holders(self, checks: list[tuple[str, Any]]) -> dict[str, int]:
+        """Run each ``(kind, count statement)`` pair and keep the kinds that found rows."""
+        holders: dict[str, int] = {}
+        for kind, stmt in checks:
+            count = int((await self.session.execute(stmt)).scalar_one() or 0)
+            if count:
+                holders[kind] = count
+        return holders
+
+    @staticmethod
+    def _plot_removal_checks(plot_ids: Any) -> list[tuple[str, Any]]:
+        """Count what deleting these plots would cascade away that holds money or a party's record.
+
+        ``plot_ids`` is anything ``in_`` accepts: a list of ids or a select of them.
+        """
+        from sqlalchemy import func, or_, select
+
+        settled = or_(Instalment.amount_paid > 0, Instalment.status.in_(_SETTLED_INSTALMENT_STATUSES))
+        return [
+            (
+                "sales_contract",
+                select(func.count())
+                .select_from(SalesContract)
+                .where(SalesContract.plot_id.in_(plot_ids), SalesContract.status != "draft"),
+            ),
+            (
+                "settled_instalment",
+                select(func.count())
+                .select_from(Instalment)
+                .join(PaymentSchedule, Instalment.schedule_id == PaymentSchedule.id)
+                .join(SalesContract, PaymentSchedule.sales_contract_id == SalesContract.id)
+                .where(SalesContract.plot_id.in_(plot_ids), settled),
+            ),
+            (
+                "reservation_deposit",
+                select(func.count())
+                .select_from(Reservation)
+                .where(Reservation.plot_id.in_(plot_ids), Reservation.deposit_amount > 0),
+            ),
+            (
+                "handover",
+                select(func.count())
+                .select_from(Handover)
+                .where(
+                    Handover.plot_id.in_(plot_ids),
+                    or_(Handover.completed_at.is_not(None), Handover.keys_handed_over_at.is_not(None)),
+                ),
+            ),
+            (
+                "warranty_claim",
+                select(func.count()).select_from(WarrantyClaim).where(WarrantyClaim.plot_id.in_(plot_ids)),
+            ),
+        ]
+
     async def delete_development(self, dev_id: uuid.UUID) -> None:
-        await self.get_development(dev_id)
+        """Delete a development that has not yet taken money or made commitments.
+
+        Refused (409) while any of its plots carries a sales contract past
+        draft, a paid or waived instalment, a reservation deposit, a completed
+        handover or a warranty claim, or while the development itself has
+        escrow movements, broker commission accruals or a locked buyer
+        selection. The cascade would take every one of them with it.
+        """
+        from sqlalchemy import func, select
+
+        development = await self.get_development(dev_id)
+        checks = self._plot_removal_checks(select(Plot.id).where(Plot.development_id == dev_id))
+        checks += [
+            (
+                "escrow_transaction",
+                select(func.count())
+                .select_from(EscrowTransaction)
+                .join(EscrowAccount, EscrowTransaction.escrow_account_id == EscrowAccount.id)
+                .where(EscrowAccount.development_id == dev_id),
+            ),
+            (
+                "commission_accrual",
+                select(func.count())
+                .select_from(CommissionAccrual)
+                .join(CommissionAgreement, CommissionAccrual.agreement_id == CommissionAgreement.id)
+                .where(CommissionAgreement.development_id == dev_id),
+            ),
+            (
+                "locked_selection",
+                select(func.count())
+                .select_from(BuyerSelection)
+                .join(Buyer, BuyerSelection.buyer_id == Buyer.id)
+                .where(Buyer.development_id == dev_id, BuyerSelection.status == "locked"),
+            ),
+        ]
+        _refuse_removal(
+            f"Development {development.code}",
+            await self._count_removal_holders(checks),
+            "Set the development to completed or paused instead, which keeps these records.",
+        )
         await self.developments.delete(dev_id)
 
     # ── House Type ──────────────────────────────────────────────────────
@@ -1905,7 +2053,18 @@ class PropertyDevService:
         return await self.get_plot(plot_id)
 
     async def delete_plot(self, plot_id: uuid.UUID) -> None:
-        await self.get_plot(plot_id)
+        """Delete a plot that has no sales history.
+
+        Refused (409) while the plot carries a sales contract past draft, a
+        paid or waived instalment, a reservation deposit, a completed handover
+        or a warranty claim, all of which the delete would cascade away.
+        """
+        plot = await self.get_plot(plot_id)
+        _refuse_removal(
+            f"Plot {plot.plot_number}",
+            await self._count_removal_holders(self._plot_removal_checks([plot_id])),
+            "A plot with a sales history stays in the register so that history keeps its plot.",
+        )
         await self.plots.delete(plot_id)
 
     async def reserve_plot(self, plot_id: uuid.UUID, data: PlotReserveRequest) -> tuple[Plot, Buyer]:
@@ -2154,7 +2313,40 @@ class PropertyDevService:
         return updated
 
     async def delete_buyer(self, b_id: uuid.UUID) -> None:
-        await self.get_buyer(b_id)
+        """Delete a buyer that no contract, locked selection or warranty claim depends on.
+
+        The buyer's contract parties, option selections and warranty claims are
+        deleted with it, so the delete is refused (409) while the buyer is a
+        party to a sales contract past draft, holds a locked option selection
+        or has raised a warranty claim.
+        """
+        from sqlalchemy import func, select
+
+        buyer = await self.get_buyer(b_id)
+        checks: list[tuple[str, Any]] = [
+            (
+                "sales_contract",
+                select(func.count())
+                .select_from(ContractParty)
+                .join(SalesContract, ContractParty.sales_contract_id == SalesContract.id)
+                .where(ContractParty.buyer_id == b_id, SalesContract.status != "draft"),
+            ),
+            (
+                "locked_selection",
+                select(func.count())
+                .select_from(BuyerSelection)
+                .where(BuyerSelection.buyer_id == b_id, BuyerSelection.status == "locked"),
+            ),
+            (
+                "warranty_claim",
+                select(func.count()).select_from(WarrantyClaim).where(WarrantyClaim.buyer_id == b_id),
+            ),
+        ]
+        _refuse_removal(
+            f"Buyer {buyer.full_name}".rstrip(),
+            await self._count_removal_holders(checks),
+            "Cancel the buyer instead if the sale fell through, which keeps these records.",
+        )
         await self.buyers.delete(b_id)
 
     async def convert_buyer_to_contracted(self, buyer_id: uuid.UUID, data: BuyerContractRequest) -> Buyer:
@@ -2292,13 +2484,41 @@ class PropertyDevService:
         sel = await self.get_selection(s_id)
         fields = _dump(data, sel)
         new_status = fields.get("status")
+        # Locking stamps locked_at and tells production through its event, so
+        # it happens only through lock_selection.
+        if new_status == "locked" and sel.status != "locked":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A selection is locked only through the lock action, which stamps the lock date.",
+            )
+        # A locked or cancelled selection is the agreed record; the item
+        # methods already freeze its lines, and only cancelling a locked one
+        # remains open to a PATCH.
+        if sel.status in {"locked", "cancelled"} and set(fields) - {"status"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Selection is {sel.status}",
+            )
         if new_status:
             _ensure_transition("selection", sel.status, new_status, allowed_selection_transitions)
         await self.selections.update_fields(s_id, **fields)
         return await self.get_selection(s_id)
 
     async def delete_selection(self, s_id: uuid.UUID) -> None:
-        await self.get_selection(s_id)
+        """Delete an option selection that has not been locked.
+
+        A locked selection is the priced choice the buyer agreed to, and its
+        items are already frozen by the item methods, so it is refused (409).
+        """
+        sel = await self.get_selection(s_id)
+        if sel.status == "locked":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "A locked option selection cannot be deleted, it records the options and prices "
+                    "the buyer agreed to. Cancel it instead, which keeps it on record."
+                ),
+            )
         await self.selections.delete(s_id)
 
     async def add_selection_item(self, selection_id: uuid.UUID, data: BuyerSelectionItemCreate) -> BuyerSelectionItem:
@@ -3108,7 +3328,10 @@ class PropertyDevService:
             ],
         }
 
-        zip_bytes = build_handover_package_zip(
+        # Compressing every certificate, document and photo into the archive is
+        # pure CPU, so it runs in a worker thread off the event loop.
+        zip_bytes = await asyncio.to_thread(
+            build_handover_package_zip,
             plot_number=plot_number,
             date_iso=date_iso,
             manifest_text="\n".join(manifest) + "\n",
@@ -3922,6 +4145,32 @@ class PropertyDevService:
                 status_code=409,
                 detail="Only draft SalesContracts can be deleted",
             )
+        # A draft is not necessarily free of money: converting a reservation
+        # creates the draft with an active schedule, and an instalment can be
+        # marked paid while the contract is still a draft. The schedule and its
+        # instalments cascade with the contract, so a draft that has taken
+        # money is refused as well.
+        from sqlalchemy import func, or_, select
+
+        settled = await self._count_removal_holders(
+            [
+                (
+                    "settled_instalment",
+                    select(func.count())
+                    .select_from(Instalment)
+                    .join(PaymentSchedule, Instalment.schedule_id == PaymentSchedule.id)
+                    .where(
+                        PaymentSchedule.sales_contract_id == spa_id,
+                        or_(Instalment.amount_paid > 0, Instalment.status.in_(_SETTLED_INSTALMENT_STATUSES)),
+                    ),
+                )
+            ]
+        )
+        _refuse_removal(
+            f"Sales contract {spa.contract_number}",
+            settled,
+            "Cancel it instead, which keeps the payment record.",
+        )
         await self.sales_contracts.delete(spa_id)
 
     async def send_spa_for_signature(
@@ -4197,7 +4446,9 @@ class PropertyDevService:
         schedule already exists for this SPA and is in ``active`` or
         ``completed`` state, the request fails 409 to avoid clobbering
         paid lines. A ``suspended``/``cancelled`` schedule is rebuilt in
-        place (its instalments are removed and re-created).
+        place (its instalments are removed and re-created), unless any of
+        its instalments is paid or waived: a schedule in any state that
+        records money is refused with 409.
         """
         if template_key not in PAYMENT_SCHEDULE_TEMPLATES:
             raise HTTPException(
@@ -4206,6 +4457,28 @@ class PropertyDevService:
             )
         spa = await self.get_spa(contract_id)
         existing = await self.payment_schedules.get_for_contract(spa.id)
+        if existing is not None:
+            # A rebuild deletes every instalment row and recreates them unpaid,
+            # so a row that records money taken or forgiven must never reach
+            # it, whatever state the schedule is in. The status check below
+            # used to be the only guard, and its own message told the user to
+            # suspend the schedule first, after which the rebuild erased the
+            # paid rows it had just protected.
+            existing_status = existing.status
+            settled_rows = sum(
+                1
+                for r in await self.instalments.list_for_schedule(existing.id)
+                if r.status in _SETTLED_INSTALMENT_STATUSES or (r.amount_paid and Decimal(str(r.amount_paid)) > 0)
+            )
+            if settled_rows:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"PaymentSchedule in status '{existing_status}' has {settled_rows} paid or waived "
+                        f"instalment{'' if settled_rows == 1 else 's'}, and rebuilding it would erase them. "
+                        "Create a new SPA revision for the new terms instead."
+                    ),
+                )
         if existing is not None and existing.status in {"active", "completed"}:
             # The convert-reservation-to-spa flow always creates a default
             # ``active`` 1-line schedule (so finance has *something* to
@@ -4225,7 +4498,7 @@ class PropertyDevService:
                     status_code=409,
                     detail=(
                         f"PaymentSchedule in status '{existing.status}' is "
-                        "live with paid instalments - suspend it first or "
+                        "live - suspend it first or "
                         "create a new SPA revision."
                     ),
                 )
@@ -4534,6 +4807,14 @@ class PropertyDevService:
                 status_code=409,
                 detail=f"Instalment in status '{ins.status}' - no demand",
             )
+        # A suspended or cancelled schedule is not collecting, so no demand
+        # letter goes to the buyer under it.
+        schedule = await self.get_payment_schedule(ins.schedule_id)
+        if schedule.status in {"suspended", "cancelled"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Payment schedule in status '{schedule.status}' - no demand",
+            )
         # Snapshot every field the event payload below needs before any
         # update_fields() call in this function can expire this row - a
         # read off ``ins`` afterwards trips MissingGreenlet under
@@ -4581,6 +4862,14 @@ class PropertyDevService:
 
     async def waive_instalment(self, ins_id: uuid.UUID, data: InstalmentWaiveRequest) -> Instalment:
         ins = await self.get_instalment(ins_id)
+        # Same conflict guard as cancel_reservation(): a repeat waive would
+        # otherwise overwrite waiver_reason/waived_at and publish
+        # instalment.waived twice for one waiver.
+        if ins.status == "waived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Instalment in status '{ins.status}' cannot be waived",
+            )
         _ensure_transition(
             "instalment",
             ins.status,
@@ -6282,6 +6571,73 @@ async def _svc_reconcile_escrow_transaction(
     return updated  # type: ignore[return-value]
 
 
+#: Reconciliation states in which an escrow transaction is part of the ledger
+#: the bank statement and the regulator report agree on (or argue about), and
+#: so can no longer be removed. An unreconciled entry is still a data-entry
+#: record and may be deleted to correct a mistake.
+_SETTLED_ESCROW_STATES = ("matched", "disputed")
+
+
+async def _svc_delete_escrow_transaction(
+    svc: PropertyDevService,
+    tx_id: uuid.UUID,
+) -> None:
+    """Delete an escrow transaction that has not been matched to the bank yet.
+
+    A matched or disputed transaction is refused (409). Its amount and
+    direction are already immutable (the update schema does not carry them),
+    so deleting the row was the one way left to change the escrow balance
+    after the bank had confirmed it.
+    """
+    tx = await svc.escrow_transactions.get_by_id(tx_id)
+    if tx is None:
+        raise HTTPException(status_code=404, detail=translate("errors.escrow_not_found", locale=get_locale()))
+    if tx.reconciliation_state in _SETTLED_ESCROW_STATES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"An escrow transaction in reconciliation state '{tx.reconciliation_state}' cannot be deleted, "
+                "it is part of the ledger the bank statement was matched against. Record a correcting "
+                "transaction in the opposite direction instead."
+            ),
+        )
+    await svc.escrow_transactions.delete(tx_id)
+
+
+async def _svc_delete_escrow_account(
+    svc: PropertyDevService,
+    account_id: uuid.UUID,
+) -> None:
+    """Delete an escrow account whose ledger holds nothing the bank has confirmed.
+
+    The account's transactions cascade with it, so the delete is refused (409)
+    while any of them is matched or disputed, the same rows
+    :func:`_svc_delete_escrow_transaction` refuses one at a time.
+    """
+    from sqlalchemy import func, select
+
+    account = await _svc_get_escrow_account(svc, account_id)
+    holders = await svc._count_removal_holders(
+        [
+            (
+                "settled_escrow_transaction",
+                select(func.count())
+                .select_from(EscrowTransaction)
+                .where(
+                    EscrowTransaction.escrow_account_id == account_id,
+                    EscrowTransaction.reconciliation_state.in_(_SETTLED_ESCROW_STATES),
+                ),
+            )
+        ]
+    )
+    _refuse_removal(
+        f"Escrow account {account.regulator_account_number or account.iban}".rstrip(),
+        holders,
+        "Deactivate the account instead, which keeps its ledger.",
+    )
+    await svc.escrow_accounts.delete(account_id)
+
+
 async def _svc_compute_escrow_balance(
     svc: PropertyDevService,
     account_id: uuid.UUID,
@@ -6619,7 +6975,7 @@ def _render_regulator_pdf(
         topMargin=2 * cm,
         bottomMargin=2 * cm,
         title=f"{regulator} Quarterly Disclosure",
-        author="OpenConstructionERP / DataDrivenConstruction",
+        **branded_doc_metadata(),
     )
     styles = getSampleStyleSheet()
     styles["Title"].fontName = BOLD_FONT
@@ -6703,15 +7059,30 @@ def _render_regulator_pdf(
     )
     story.append(table)
     story.append(Spacer(1, 0.8 * cm))
+    # The developer files this under its own name, so the credit line follows
+    # the same brand chain as the letterhead and the footer elsewhere.
+    brand = branded_cover_brand()
+    credit = "OpenConstructionERP (DataDrivenConstruction)" if brand == DEFAULT_BRAND else _esc(brand)
     story.append(
         Paragraph(
-            "<i>This disclosure is generated by OpenConstructionERP "
-            "(DataDrivenConstruction). All figures are derived from the "
+            f"<i>This disclosure is generated by {credit}. All figures are derived from the "
             "live property_dev module ledger as of the report timestamp.</i>",
-            styles["Italic"],
+            pdf_style_for_text(styles["Italic"], brand),
         )
     )
-    doc.build(story)
+
+    # The developer's letterhead, when the company profile has one. The frame
+    # pads 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(doc.width - 12)
+    if letterhead is not None:
+        story.insert(0, letterhead)
+
+    def _first_page(canvas: Any, page_doc: Any) -> None:
+        # A letterhead already carries the logo; the header copy would print it twice.
+        if letterhead is None:
+            branded_header_logo(canvas, page_doc)
+
+    doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
     return buf.getvalue()
 
 
@@ -6786,7 +7157,8 @@ async def _svc_generate_regulator_report(
         summary["regulator_law"] = "ФЗ № 214 от 30.12.2004"
     else:
         title = f"{regulator} Disclosure"
-    pdf_bytes = _render_regulator_pdf(
+    pdf_bytes = await asyncio.to_thread(
+        _render_regulator_pdf,
         regulator=title,
         development_name=dev.name or dev.code,
         development_code=dev.code,
@@ -6845,6 +7217,10 @@ PropertyDevService.create_escrow_transaction = (  # type: ignore[attr-defined]
 PropertyDevService.reconcile_escrow_transaction = (  # type: ignore[attr-defined]
     _svc_reconcile_escrow_transaction
 )
+PropertyDevService.delete_escrow_transaction = (  # type: ignore[attr-defined]
+    _svc_delete_escrow_transaction
+)
+PropertyDevService.delete_escrow_account = _svc_delete_escrow_account  # type: ignore[attr-defined]
 PropertyDevService.compute_escrow_balance = _svc_compute_escrow_balance  # type: ignore[attr-defined]
 PropertyDevService.create_price_matrix = _svc_create_price_matrix  # type: ignore[attr-defined]
 PropertyDevService.get_price_matrix = _svc_get_price_matrix  # type: ignore[attr-defined]
@@ -6957,6 +7333,11 @@ async def _svc_generate_document(
             detail=f"Unknown doc_type: {doc_type}",
         )
 
+    # The entity graph is read here, on the event loop with its session; each
+    # render below then runs in a worker thread. Laying out a contract and
+    # embedding a logo is seconds of CPU, and the bulk regenerate path calls
+    # this up to 500 times in one request, which on the loop froze every other
+    # user of the worker until the batch was done.
     if doc_type == "reservation_receipt":
         if reservation_id is None:
             raise HTTPException(status_code=400, detail="reservation_id required")
@@ -6974,7 +7355,8 @@ async def _svc_generate_document(
             buyer = await svc.buyers.get_by_id(reservation.buyer_id)
             if buyer is not None:
                 buyers.append(buyer)
-        return render_reservation_receipt_pdf(
+        return await asyncio.to_thread(
+            render_reservation_receipt_pdf,
             reservation,
             plot,
             development,
@@ -7007,7 +7389,8 @@ async def _svc_generate_document(
                 b = await svc.buyers.get_by_id(p.buyer_id)
                 if b is not None:
                     buyer_lookup[p.buyer_id] = b
-        return render_sales_contract_pdf(
+        return await asyncio.to_thread(
+            render_sales_contract_pdf,
             contract,
             payment_schedule,
             instalments,
@@ -7034,7 +7417,8 @@ async def _svc_generate_document(
             )
         plot = await svc.plots.get_by_id(contract.plot_id)
         development = await svc.developments.get_by_id(plot.development_id) if plot is not None else None
-        return render_payment_receipt_pdf(
+        return await asyncio.to_thread(
+            render_payment_receipt_pdf,
             instalment,
             contract,
             payment_method or "",
@@ -7081,7 +7465,8 @@ async def _svc_generate_document(
             open_snags = int((await svc.session.execute(cnt_stmt)).scalar() or 0)
         except Exception:  # noqa: BLE001 - best-effort snag count
             open_snags = int(_attr(handover, "snag_count_at_handover", 0) or 0)
-        return render_handover_certificate_pdf(
+        return await asyncio.to_thread(
+            render_handover_certificate_pdf,
             handover,
             contract,
             open_snags,
@@ -7105,7 +7490,8 @@ async def _svc_generate_document(
         stmt = _select(_SC).where(_SC.plot_id == handover.plot_id).order_by(_SC.revision_number.desc())
         rows = (await svc.session.execute(stmt)).scalars().all()
         contract = next(iter(rows), None)
-        return render_warranty_certificate_pdf(
+        return await asyncio.to_thread(
+            render_warranty_certificate_pdf,
             contract,
             handover,
             int(structural_warranty_years),
@@ -7127,7 +7513,8 @@ async def _svc_generate_document(
         if plot is None:
             raise HTTPException(status_code=404, detail=translate("errors.plot_not_found", locale=get_locale()))
         development = await svc.developments.get_by_id(plot.development_id)
-        return render_no_objection_certificate_pdf(
+        return await asyncio.to_thread(
+            render_no_objection_certificate_pdf,
             contract,
             plot,
             development,

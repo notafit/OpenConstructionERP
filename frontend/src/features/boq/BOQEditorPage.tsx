@@ -5,11 +5,11 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 // lucide-react icons used by sub-components (BOQToolbar, BOQGrid, etc.) — none needed directly here
-import { Database, Download, ExternalLink, X, Sparkles, AlertTriangle as WarnTriangle, Lock, Copy, Wallet, Keyboard, GitCompare, RefreshCw, ShieldCheck, FlaskConical, Send, Percent } from 'lucide-react';
+import { Database, Download, ExternalLink, X, Sparkles, AlertTriangle as WarnTriangle, Lock, Copy, Wallet, Keyboard, GitCompare, RefreshCw, ShieldCheck, FlaskConical, Send, Percent, CheckCircle, ArrowLeft, LayoutList, SlidersHorizontal } from 'lucide-react';
 import { Button, Badge, Breadcrumb, ModuleHelpButton, ModuleGuideButton, ConfirmDialog, DismissibleInfo, IntroRichText } from '@/shared/ui';
 import { useConfirm } from '@/shared/hooks/useConfirm';
 import { useProgressStore } from '@/shared/ui/GlobalProgress';
-import { apiGet, apiPost, triggerDownload, extractErrorMessageFromBody, getErrorMessage } from '@/shared/lib/api';
+import { activeLanguageTag, apiGet, apiPost, apiPatch, triggerDownload, extractErrorMessageFromBody, getErrorMessage } from '@/shared/lib/api';
 import {
   readVectorCount,
   pollVectorIndexLanded,
@@ -20,12 +20,15 @@ import { toNum } from '@/shared/lib/money';
 import { useToastStore } from '@/stores/useToastStore';
 import { useRecentStore } from '@/stores/useRecentStore';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { useHasPermission } from '@/shared/lib/permissionGates';
+import { useBackendModuleOff } from '@/shared/hooks/useBackendModuleOff';
 import { useBIMLinkSelectionStore } from '@/stores/useBIMLinkSelectionStore';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { usePreferencesStore, useNumberLocale } from '@/stores/usePreferencesStore';
 import { useDisplayQuantity } from '@/shared/hooks/useDisplayQuantity';
 import {
   boqApi,
+  billDirectCost,
   exportablePositions,
   groupPositionsIntoSections,
   isEmptyPosition,
@@ -33,23 +36,27 @@ import {
   getPositionDepth,
   normalizePositions,
   normalizePosition,
+  type BOQWithPositions,
   type Position,
   type CreatePositionData,
   type UpdatePositionData,
   type Markup,
   type ActivityEntry,
   type CostAutocompleteItem,
-  type CopilotAction,
-  type CopilotResource,
   DEFAULT_MAX_NESTING_DEPTH,
 } from './api';
 import { resourceSplitMoneyTotals, nextResourceSplitMode, type ResourceSplitMode } from './grid/columnDefs';
 import { ApiError } from '@/shared/lib/api';
 import { projectsApi, type Project, type ProjectFxRate } from '@/features/projects/api';
 import { fetchBIMModels } from '@/features/bim/api';
+import { buildLinkFromModelUrl, buildQuantityRulesUrl } from '@/features/bim/quantityRuleLinks';
 // AutocompleteInput used in sub-components, not directly here
 // import { AutocompleteInput } from './AutocompleteInput';
 import { AIChatPanel } from './AIChatPanel';
+import { importLanded, importToastText, type ImportToastResult } from './importToastText';
+import { importProgressText, isImportJob, waitForImportJob, type ImportProgress } from './importJob';
+import { alreadyImported, importFailureFromBody, importFailureText } from './importFailureText';
+import { toolbarImportRoute } from './importRoute';
 import { AICostFinderPanel } from './AICostFinderPanel';
 import { AISmartPanel } from './AISmartPanel';
 import { AIPositionCopilot } from './AIPositionCopilot';
@@ -58,6 +65,7 @@ import { AIPositionCopilot } from './AIPositionCopilot';
 import { VersionHistoryDrawer } from './VersionHistoryDrawer';
 import { ModelLinkPanel } from './ModelLinkPanel';
 import { ModelLinkReviewPanel } from './ModelLinkReviewPanel';
+import { ChangeReviewButton, ChangeReviewPanel } from './ChangeReviewPanel';
 import { BOQCompareDrawer } from './BOQCompareDrawer';
 import { CostBreakdownPanel } from './CostBreakdownPanel';
 import { EstimateClassification } from './EstimateClassification';
@@ -66,6 +74,7 @@ import { CommentDrawer, type CommentEntry } from './CommentDrawer';
 import { PriceAnalysisPanel } from './PriceAnalysisPanel';
 import { PositionActualsDrawer } from '@/features/costmodel/PositionActualsDrawer';
 import { MeasurementDrawer } from './MeasurementDrawer';
+import { GaebSiteExchangeDialog } from './GaebSiteExchangeDialog';
 import { VariationTraceDrawer } from './VariationTraceDrawer';
 import type { VariationLineTraceBadge } from './grid/cellRenderers';
 import { getVariationRequestBOQ, type VariationBOQTrace } from '@/features/variations/api';
@@ -74,18 +83,18 @@ import { SensitivityChart } from './SensitivityChart';
 import { CostRiskPanel } from './CostRiskPanel';
 import { MarkupPanel } from './MarkupPanel';
 import BOQGrid from './BOQGrid';
-import { exportBOQToExcel } from './exportExcel';
-import { generateBOQPdf } from './pdfReport';
 import type { BOQGridHandle } from './BOQGrid';
 import { allResourcesExpanded, type ResourceExpansionState } from './resourceExpansion';
 import { BatchActionBar } from './BatchActionBar';
 import { ScenarioDialog } from './ScenarioDialog';
 import { SendToTenderDialog } from './SendToTenderDialog';
+import { CostPlanDialog, offersCostPlan } from '@/features/cost-plan';
 import { ImportPreviewDialog } from './ImportPreviewDialog';
 import { BOQFilterBar, type BoqFilterKind } from './BOQFilterBar';
 import { BOQOutline } from './BOQOutline';
 import type { TenderPackageRef } from './api';
 import { boqGuide } from './boqGuide';
+import { isTextEntryElement, resolveBoqShortcut } from './boqShortcuts';
 // evaluateFormula used in BOQGrid, not directly here
 // import { evaluateFormula } from './grid/cellEditors';
 
@@ -100,9 +109,10 @@ import {
   getCurrencyCode,
   createFormatter,
   fmtWithCurrency,
-  resourceAwareTotalInBase,
+  catalogComponentAmounts,
   convertToBase,
   computeQualityScore,
+  isResourceDrivenRate,
   type QualityBreakdown,
   type Tip,
 } from './boqHelpers';
@@ -119,12 +129,22 @@ import { BOQVariablesDialog } from './BOQVariablesDialog';
 import { CostPerAreaBenchmark } from './CostPerAreaBenchmark';
 import { RenumberDialog, type RenumberScheme, type RenumberCustom } from './RenumberDialog';
 import { LinkedPositionsModal } from './LinkedPositionsModal';
+import { repointedMetadata } from './repointedMetadata';
 import { fmtList } from '@/shared/lib/formatters';
 
 /* ── Re-exports for tests ────────────────────────────────────────────── */
 
 export { getVatRate, getCurrencySymbol, computeQualityScore };
 export type { QualityBreakdown };
+
+/**
+ * How the editor lands a `?highlight=` link: the first try waits for the grid
+ * to take the rows, then a few more a quarter second apart (about three
+ * seconds in all) in case the rows arrive after the bill.
+ */
+const URL_HIGHLIGHT_FIRST_MS = 300;
+const URL_HIGHLIGHT_RETRY_MS = 250;
+const URL_HIGHLIGHT_TRIES = 12;
 
 /**
  * Issue #136 — next collision-free ordinal for a sub-section nested under
@@ -156,6 +176,32 @@ function computeNextSubOrdinal(all: Position[], parentOrdinal: string): string {
   return candidate;
 }
 
+/**
+ * `select` for the BOQ query. Module level on purpose: React Query reruns an
+ * inline `select` on every render of the page, and this one normalises every
+ * position and then deep-compares the whole bill against the previous result.
+ * With a stable function it runs once per cache write instead of once per
+ * render, which on a large bill was a noticeable share of the pause after
+ * each saved price.
+ */
+function selectNormalizedBoq(data: BOQWithPositions): BOQWithPositions {
+  return { ...data, positions: normalizePositions(data.positions) };
+}
+
+/**
+ * The bill as the server sent it, minus the lines this page has deleted.
+ *
+ * A delete leaves the grid at once but reaches the server only after the undo
+ * window, and any refetch in between (every added line causes one) still
+ * carries the line. Filtering the fetched bill, rather than the rendered one,
+ * keeps the cache itself honest, so the line does not come back after the
+ * DELETE has gone out either.
+ */
+function withoutDeletedRows(data: BOQWithPositions, deletedIds: ReadonlySet<string>): BOQWithPositions {
+  if (deletedIds.size === 0 || !Array.isArray(data?.positions)) return data;
+  return { ...data, positions: data.positions.filter((p) => !deletedIds.has(p.id)) };
+}
+
 /* ══════════════════════════════════════════════════════════════════════ */
 /*  BOQEditorPage                                                        */
 /* ══════════════════════════════════════════════════════════════════════ */
@@ -171,9 +217,12 @@ export function BOQEditorPage() {
 
   /* ── Data fetching ─────────────────────────────────────────────────── */
 
-  const { data: boq, isLoading } = useQuery({
+  /** Lines deleted on this page, pending or sent, which no refetch may bring back. */
+  const deletedIdsRef = useRef<Set<string>>(new Set());
+
+  const { data: boq, isLoading, isError } = useQuery({
     queryKey: ['boq', boqId],
-    queryFn: () => boqApi.get(boqId!),
+    queryFn: async () => withoutDeletedRows(await boqApi.get(boqId!), deletedIdsRef.current),
     enabled: !!boqId,
     // Keep data fresh for 5 minutes — prevents refetch while user is
     // editing cells in AG Grid (refetch destroys the cell editor and
@@ -184,10 +233,7 @@ export function BOQEditorPage() {
     // serves cached responses; bail out fast if we're offline and there's no cache.
     networkMode: 'offlineFirst',
     retry: (count) => navigator.onLine && count < 2,
-    select: (data) => ({
-      ...data,
-      positions: normalizePositions(data.positions),
-    }),
+    select: selectNormalizedBoq,
   });
 
   /* ── Load project for region/currency/locale settings ────────────── */
@@ -245,9 +291,11 @@ export function BOQEditorPage() {
   // the demo projects at all.
   const locale = useNumberLocale();
   // Issue #270 - the user's measurement-system preference, threaded into the
-  // client-side Excel/PDF exports so quantities + unit labels print in the
-  // chosen system (storage stays metric-canonical; only the export boundary
-  // converts).
+  // client-side PDF export so quantities + unit labels print in the chosen
+  // system (storage stays metric-canonical; only the export boundary
+  // converts). The PDF only: this said "Excel/PDF" while the Excel call never
+  // passed it, and Excel is now the server's, which documents itself as
+  // canonical metric whatever this preference says.
   const measurementSystem = usePreferencesStore((s) => s.measurementSystem);
   // Issue #287: display<->metric conversion seam for batch write actions. The
   // grid renders/edits in the chosen system while storage stays canonical, so
@@ -499,7 +547,7 @@ export function BOQEditorPage() {
   /** Stable ref for trackedDelete — allows keyboard shortcut access before declaration. */
   const trackedDeleteRef = useRef<((id: string) => void) | null>(null);
   /** Stable ref for handleExport — allows keyboard shortcut access before declaration. */
-  const handleExportRef = useRef<((format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => void) | null>(null);
+  const handleExportRef = useRef<((format: string) => void) | null>(null);
   /** Stable ref for the AI-copilot toggle (Alt+I) — set after declaration so
    *  the keyboard handler can reach it without widening its dependency array. */
   const toggleAICopilotRef = useRef<(() => void) | null>(null);
@@ -710,6 +758,8 @@ export function BOQEditorPage() {
             propagated_to?: number;
             unlinked?: boolean;
             resource_propagated_to?: number;
+            locked_skipped?: number;
+            locked_boqs?: { id: string; name: string }[];
           }
         | undefined;
 
@@ -754,6 +804,31 @@ export function BOQEditorPage() {
         });
       }
 
+      // (a3) Linked lines in LOCKED bills are never rewritten: an approved
+      // bill keeps its money until someone unlocks or revises it. Say how
+      // many kept the old definition and in which bills, so the estimator
+      // does not assume the whole project follows the new one.
+      if (prop && typeof prop.locked_skipped === 'number' && prop.locked_skipped > 0) {
+        const bills = Array.isArray(prop.locked_boqs)
+          ? prop.locked_boqs.map((b) => b.name)
+          : [];
+        addToast(
+          {
+            type: 'warning',
+            title: t('boq.link_locked_skipped_title', {
+              defaultValue: 'Locked estimates left unchanged',
+            }),
+            message: t('boq.link_locked_skipped_msg', {
+              defaultValue:
+                '{{count}} linked position(s) in locked estimates kept the old definition: {{bills}}. Unlock those estimates or create a revision to take the change.',
+              count: prop.locked_skipped,
+              bills: fmtList(bills, 'prose'),
+            }),
+          },
+          { duration: 9000 },
+        );
+      }
+
       // (b) Editing a linked INSTANCE's definition diverged it — the backend
       // auto-unlinked it (link_role now null) and attached a quality
       // warning. Surface that PROMINENTLY so the user knows this position no
@@ -792,6 +867,12 @@ export function BOQEditorPage() {
       addToast({ type: 'error', title: t('boq.update_failed', { defaultValue: 'Failed to update position' }), message: err.message });
     },
   });
+  // The mutation RESULT object is new on every render (and on every state
+  // change of the mutation), so a callback that lists `updateMutation` as a
+  // dependency is rebuilt constantly and takes BOQGrid with it. React Query v5
+  // keeps `mutate` itself stable for the life of the component and always
+  // runs the latest options, so the handlers handed to the grid depend on it.
+  const updatePositionMutate = updateMutation.mutate;
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => {
@@ -811,16 +892,20 @@ export function BOQEditorPage() {
     // delete, rapid sequential deletes) and bring back rows that were
     // optimistically removed but whose API call is still in flight.
     // Sidecar queries (rollups / activity feed) are safe to refresh.
+    onMutate: (id: string) => {
+      deletedIdsRef.current.add(id);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['boq-cost-breakdown', boqId] });
       queryClient.invalidateQueries({ queryKey: ['boq-resource-summary', boqId] });
       queryClient.invalidateQueries({ queryKey: ['boq-markups', boqId] });
       queryClient.invalidateQueries({ queryKey: ['boq-activity', boqId] });
     },
-    onError: (err: Error) => {
+    onError: (err: Error, id: string) => {
       // The server rejected the delete — re-sync the BOQ so the row
       // reappears (otherwise the user sees a phantom-deleted position
       // that's still on the server).
+      deletedIdsRef.current.delete(id);
       queryClient.invalidateQueries({ queryKey: ['boq', boqId] });
       addToast({ type: 'error', title: t('boq.delete_failed', { defaultValue: 'Failed to delete position' }), message: err.message });
     },
@@ -858,15 +943,15 @@ export function BOQEditorPage() {
     mutationFn: () => apiPost(`/v1/boq/boqs/${boqId}/lock/`, {}),
     onSuccess: () => {
       invalidateAll();
+      // The lock itself makes the bill the project budget (server side), so
+      // the toast no longer offers "Create Budget" as a next step.
       addToast(
         {
           type: 'success',
           title: t('boq.locked_success', { defaultValue: 'Estimate locked' }),
-          message: t('boq.locked_next', { defaultValue: 'Estimate locked. Create project budget?' }),
-          action: {
-            label: t('boq.create_budget', { defaultValue: 'Create Budget' }),
-            onClick: () => createBudgetMutation.mutate(),
-          },
+          message: t('boq.locked_budget_seeded', {
+            defaultValue: 'Estimate locked. Its total is now the project budget.',
+          }),
         },
         { duration: 8000 },
       );
@@ -917,6 +1002,13 @@ export function BOQEditorPage() {
         {},
       ),
     onSuccess: (data) => {
+      if (!data.created && !data.budget_lines_created) {
+        addToast({
+          type: 'info',
+          title: t('boq.budget_up_to_date', { defaultValue: 'The project budget already includes this estimate' }),
+        });
+        return;
+      }
       addToast({
         type: 'success',
         title: t('boq.budget_created', { defaultValue: 'Budget created' }),
@@ -986,6 +1078,8 @@ export function BOQEditorPage() {
    */
   const trackedDelete = useCallback(
     (posId: string) => {
+      // The Delete key reaches here as well; a locked bill keeps its lines.
+      if (boq?.is_locked) return;
       const posToDelete = boq?.positions.find((p) => p.id === posId);
       if (!posToDelete) {
         deleteMutation.mutate(posId);
@@ -1017,7 +1111,9 @@ export function BOQEditorPage() {
       redoStackRef.current = [];
       setUndoRedoVersion((v) => v + 1);
 
-      // Optimistically remove the position from the query cache
+      // Optimistically remove the position from the query cache, and keep it
+      // out of every refetch until the delete lands or is undone.
+      deletedIdsRef.current.add(posId);
       queryClient.setQueryData(['boq', boqId], (old: unknown) => {
         if (!old || typeof old !== 'object') return old;
         const data = old as { positions: Position[]; [key: string]: unknown };
@@ -1039,11 +1135,13 @@ export function BOQEditorPage() {
               if (pending && pending.toastId === toastId) {
                 clearTimeout(pending.timeoutId);
                 pendingDeleteRef.current = null;
+                deletedIdsRef.current.delete(posId);
 
                 // Restore the position in the query cache
                 queryClient.setQueryData(['boq', boqId], (old: unknown) => {
                   if (!old || typeof old !== 'object') return old;
                   const data = old as { positions: Position[]; [key: string]: unknown };
+                  if (data.positions.some((p) => p.id === posId)) return data;
                   return {
                     ...data,
                     positions: [...data.positions, snapshot],
@@ -1075,7 +1173,7 @@ export function BOQEditorPage() {
 
       pendingDeleteRef.current = { timeoutId, positionSnapshot: snapshot, toastId };
     },
-    [deleteMutation, boq?.positions, queryClient, boqId, addToast, removeToast, t],
+    [deleteMutation, boq?.positions, boq?.is_locked, queryClient, boqId, addToast, removeToast, t],
   );
 
   // Bind ref so the keyboard handler can call trackedDelete without a
@@ -1372,27 +1470,52 @@ export function BOQEditorPage() {
     };
   }, [queryClient]);
 
-  // Scroll to and highlight a position when ?highlight=pos_id is in URL
-  // Works with both AG Grid rows (div[row-id]) and legacy table rows (tr[data-position-id])
+  // Scroll to and highlight a position when ?highlight=pos_id is in URL.
+  // The grid virtualises its rows, so a row below the fold has no DOM node
+  // to find: the jump goes through the grid's own handle, which looks the row
+  // up in its model and scrolls it into view. Links land here from change
+  // orders (the section an approval appended, always the last rows of the
+  // bill) and from progress, so the target is often far down. The rows can
+  // arrive a moment after the bill does, hence a few tries; the parameter is
+  // dropped once the row was found, or once the tries are spent on a row that
+  // is not in this bill. A legacy table row (tr[data-position-id]) is still
+  // honoured for surfaces that render one.
   useEffect(() => {
     if (!highlightPositionId || !boq) return;
-    const timer = setTimeout(() => {
-      const row = (
-        document.querySelector(`div.ag-row[row-id="${highlightPositionId}"]`) ??
-        document.querySelector(`tr[data-position-id="${highlightPositionId}"]`)
-      ) as HTMLElement | null;
+    let tries = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const dropParam = () =>
+      setSearchParams((prev) => {
+        prev.delete('highlight');
+        return prev;
+      }, { replace: true });
+    const land = () => {
+      tries += 1;
+      if (boqGridRef.current?.scrollToPosition(highlightPositionId)) {
+        dropParam();
+        return;
+      }
+      // Position ids are uuids; anything else in the parameter is not one and
+      // must not reach a selector, where a quote would make it throw.
+      const row = /^[\w-]+$/.test(highlightPositionId)
+        ? (document.querySelector(`tr[data-position-id="${highlightPositionId}"]`) as HTMLElement | null)
+        : null;
       if (row) {
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
         row.classList.add('ring-2', 'ring-oe-blue', 'ring-inset', 'bg-oe-blue-subtle');
         setTimeout(() => {
           row.classList.remove('ring-2', 'ring-oe-blue', 'ring-inset', 'bg-oe-blue-subtle');
         }, 3000);
+        dropParam();
+        return;
       }
-      setSearchParams((prev) => {
-        prev.delete('highlight');
-        return prev;
-      }, { replace: true });
-    }, 500);
+      if (tries >= URL_HIGHLIGHT_TRIES) {
+        dropParam();
+        return;
+      }
+      timer = setTimeout(land, URL_HIGHLIGHT_RETRY_MS);
+    };
+    timer = setTimeout(land, URL_HIGHLIGHT_FIRST_MS);
     return () => clearTimeout(timer);
   }, [highlightPositionId, boq, setSearchParams]);
 
@@ -1434,9 +1557,9 @@ export function BOQEditorPage() {
       // Clear redo stack on new action
       redoStackRef.current = [];
       setUndoRedoVersion((v) => v + 1);
-      updateMutation.mutate({ id: posId, data: newData });
+      updatePositionMutate({ id: posId, data: newData });
     },
-    [updateMutation],
+    [updatePositionMutate],
   );
 
   /* ── Per-position AI copilot ──────────────────────────────────────── */
@@ -1476,131 +1599,49 @@ export function BOQEditorPage() {
   };
 
   /**
-   * Mirror a copilot {@link CopilotAction} into the grid cache + undo stack via
-   * ``trackedUpdate`` so every copilot change is Ctrl+Z-undoable and the row
+   * Mirror a copilot review into the grid cache + undo stack via
+   * ``trackedUpdate`` so the accepted changes are Ctrl+Z-undoable and the row
    * repaints immediately.
    *
-   * IMPORTANT — no double-apply: the backend already persisted ``auto_applied``
-   * actions AND confirmed ``needs_review`` applies (the dock POSTs the latter
-   * to /copilot/apply itself). This handler therefore only mirrors into the
-   * client; it never issues its own write beyond the trackedUpdate PATCH that
-   * keeps the optimistic cache in sync. The PATCH is idempotent with the
-   * server's stored value, so re-sending the same after-state is safe.
-   *
-   * For ``add_resources`` we append to the position's CURRENT resources (read
-   * from the cache, not the snapshot the dock passed) and recompute unit_rate =
-   * Σ(quantity × unit_rate) over every resource — the exact rollup
-   * ``handleCostDbAddResource`` uses — so money/qty never drift.
+   * The server already wrote every accepted suggestion (the copilot never
+   * writes on its own; the user accepted these in the review list). ``after``
+   * is the server's position once ALL of them landed, so it is mirrored as ONE
+   * undo entry: the fields that differ from the cached row, old values from
+   * that row. Deriving the after-state from the server instead of re-applying
+   * each suggestion on the client keeps several suggestions accepted together
+   * (two resource additions, a rate and a quantity) from overwriting each
+   * other. The follow-up PATCH re-sends values the server already holds.
    */
-  const handleCopilotApplyAction = useCallback(
-    (action: CopilotAction, fallbackPosition: Position) => {
-      // Prefer the live cache row; fall back to the snapshot the dock handed us.
-      const pos =
-        boq?.positions.find((p) => p.id === fallbackPosition.id) ?? fallbackPosition;
-      const posId = pos.id;
+  const handleCopilotReviewApplied = useCallback(
+    (after: Position) => {
+      const next = normalizePosition(after);
+      const pos = boq?.positions.find((p) => p.id === next.id);
+      if (!pos) return;
 
-      const payload = action.payload ?? {};
-
-      const num = (bag: Record<string, unknown>, key: string): number | undefined => {
-        const v = bag[key];
-        if (typeof v === 'number' && Number.isFinite(v)) return v;
-        if (typeof v === 'string' && v.trim() !== '') {
-          const n = Number(v);
-          if (Number.isFinite(n)) return n;
-        }
-        return undefined;
-      };
-      const str = (bag: Record<string, unknown>, key: string): string | undefined => {
-        const v = bag[key];
-        return typeof v === 'string' ? v : undefined;
-      };
-
-      switch (action.action_type) {
-        case 'update_description': {
-          const description = str(payload, 'description');
-          if (description == null) return;
-          trackedUpdate(
-            posId,
-            { description },
-            { description: pos.description },
-          );
-          break;
-        }
-        case 'set_quantity': {
-          const quantity = num(payload, 'quantity');
-          if (quantity == null) return;
-          const unit = str(payload, 'unit');
-          const newData: UpdatePositionData = { quantity };
-          const oldData: UpdatePositionData = { quantity: pos.quantity };
-          if (unit != null && unit !== pos.unit) {
-            newData.unit = unit;
-            oldData.unit = pos.unit;
-          }
-          trackedUpdate(posId, newData, oldData);
-          break;
-        }
-        case 'set_unit_rate': {
-          const unitRate = num(payload, 'unit_rate');
-          if (unitRate == null) return;
-          const currency = str(payload, 'currency');
-          const newData: UpdatePositionData = { unit_rate: unitRate };
-          const oldData: UpdatePositionData = { unit_rate: pos.unit_rate };
-          // A catalog price carries its own currency — stamp it onto metadata
-          // so the row prices in the catalog's native currency (same contract
-          // as handleCostDbAddResource's currencyStamp).
-          if (currency && currency.trim()) {
-            newData.metadata = { ...(pos.metadata ?? {}), currency };
-            oldData.metadata = pos.metadata ?? {};
-          }
-          trackedUpdate(posId, newData, oldData);
-          break;
-        }
-        case 'add_resources': {
-          const incoming = Array.isArray(payload.resources)
-            ? (payload.resources as CopilotResource[])
-            : [];
-          if (incoming.length === 0) return;
-          const existing = [
-            ...((pos.metadata?.resources ?? []) as Array<Record<string, unknown>>),
-          ];
-          const newResources: Array<Record<string, unknown>> = incoming.map((r) => {
-            const quantity = Number(r.quantity) || 0;
-            const unitRate = Number(r.unit_rate) || 0;
-            const entry: Record<string, unknown> = {
-              name: r.name,
-              type: r.type || 'material',
-              unit: r.unit,
-              quantity,
-              unit_rate: unitRate,
-              total: Math.round(quantity * unitRate * 100) / 100,
-            };
-            if (r.code) entry.code = r.code;
-            if (r.currency && r.currency.trim()) entry.currency = r.currency;
-            return entry;
-          });
-          const merged = [...existing, ...newResources];
-          // Recompute unit_rate = Σ(quantity × unit_rate) over ALL resources —
-          // identical to handleCostDbAddResource so the rollup stays correct.
-          let computedRate = 0;
-          for (const r of merged) {
-            computedRate +=
-              ((r.quantity as number) ?? 0) * ((r.unit_rate as number) ?? 0);
-          }
-          computedRate = Math.round(computedRate * 100) / 100;
-          const newMeta: Record<string, unknown> = {
-            ...(pos.metadata ?? {}),
-            resources: merged,
-          };
-          trackedUpdate(
-            posId,
-            { unit_rate: computedRate, metadata: newMeta },
-            { unit_rate: pos.unit_rate, metadata: pos.metadata ?? {} },
-          );
-          break;
-        }
-        default:
-          break;
+      const newData: UpdatePositionData = {};
+      const oldData: UpdatePositionData = {};
+      if (next.description !== pos.description) {
+        newData.description = next.description;
+        oldData.description = pos.description;
       }
+      if (next.unit !== pos.unit) {
+        newData.unit = next.unit;
+        oldData.unit = pos.unit;
+      }
+      if (next.quantity !== pos.quantity) {
+        newData.quantity = next.quantity;
+        oldData.quantity = pos.quantity;
+      }
+      if (next.unit_rate !== pos.unit_rate) {
+        newData.unit_rate = next.unit_rate;
+        oldData.unit_rate = pos.unit_rate;
+      }
+      if (JSON.stringify(next.metadata ?? {}) !== JSON.stringify(pos.metadata ?? {})) {
+        newData.metadata = next.metadata ?? {};
+        oldData.metadata = pos.metadata ?? {};
+      }
+      if (Object.keys(newData).length === 0) return;
+      trackedUpdate(next.id, newData, oldData);
     },
     [boq?.positions, trackedUpdate],
   );
@@ -1623,11 +1664,11 @@ export function BOQEditorPage() {
           position={pos}
           isOpen
           onClose={() => setAiCopilotOpen(false)}
-          onApplyAction={handleCopilotApplyAction}
+          onReviewApplied={handleCopilotReviewApplied}
         />
       );
     },
-    [boqId, boq?.positions, handleCopilotApplyAction],
+    [boqId, boq?.positions, handleCopilotReviewApplied],
   );
 
   /* ── Batch action handlers ──────────────────────────────────────── */
@@ -1681,15 +1722,21 @@ export function BOQEditorPage() {
   /**
    * Excel-style fill: write an exact unit_rate / quantity onto every selected
    * leaf position. Goes through trackedUpdate so each row keeps its own undo
-   * entry and recompute. Section rows are skipped (they carry no money).
+   * entry and recompute. Section rows are skipped (they carry no money), and
+   * so is the Unit Rate of a position that derives it from its resources.
    */
   const handleBatchSetValue = useCallback(
     (ids: string[], field: 'unit_rate' | 'quantity', value: number) => {
       if (!boq) return;
       let count = 0;
+      let derived = 0;
       for (const id of ids) {
         const pos = boq.positions.find((p) => p.id === id);
         if (!pos || isSection(pos)) continue;
+        if (isResourceDrivenRate(field, pos)) {
+          derived++;
+          continue;
+        }
         // Issue #287: the batch value is typed in the DISPLAYED measurement
         // system. Convert it to metric-canonical storage against each
         // position's own unit before writing. Identity for the metric system /
@@ -1709,11 +1756,18 @@ export function BOQEditorPage() {
       setSelectedPositionIds([]);
       boqGridRef.current?.clearSelection();
       addToast({
-        type: 'success',
+        type: derived > 0 ? 'warning' : 'success',
         title: t('boq.batch_set_value_done', {
           defaultValue: 'Updated {{count}} positions',
           count: String(count),
         } as Record<string, string>),
+        message:
+          derived > 0
+            ? t('boq.derived_rates_skipped', {
+                defaultValue: 'Unit rates calculated from resources were left as they are: {{count}}',
+                count: derived,
+              })
+            : undefined,
       });
     },
     [boq, trackedUpdate, addToast, t, displayQuantity],
@@ -1983,136 +2037,90 @@ export function BOQEditorPage() {
 
   /** Container ref for keyboard shortcut listener. */
   const editorContainerRef = useRef<HTMLDivElement>(null);
+  // The Delete key asks the same role gate as the grid's delete controls.
+  const canDeletePositions = useHasPermission('boq.delete');
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      // Skip shortcuts when user is editing a cell / input / textarea
-      const tag = (document.activeElement?.tagName ?? '').toLowerCase();
-      const isEditing =
-        tag === 'input' || tag === 'textarea' || tag === 'select' ||
-        (document.activeElement as HTMLElement)?.isContentEditable === true;
+      // Which keystroke means what lives in boqShortcuts.ts, including why an
+      // AltGr character is never a shortcut and why export / import / lock
+      // wait until the cell editor is closed. This only carries it out.
+      const action = resolveBoqShortcut(e, {
+        // Focus in a cell editor or any other text entry. The event target is
+        // asked too: in the capture phase it is the element being typed into.
+        isEditing: isTextEntryElement(document.activeElement) || isTextEntryElement(e.target),
+        hasSelection: selectedPositionIds.length > 0,
+        canDelete: canDeletePositions,
+      });
+      if (!action) return;
 
-      // F1 — show shortcuts overlay (always works, even during editing)
-      if (e.key === 'F1') {
-        e.preventDefault();
-        setShowShortcuts((v) => !v);
-        return;
-      }
-
-      // Ctrl+Shift+? — show shortcuts overlay (always works)
-      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === '?') {
-        e.preventDefault();
-        setShowShortcuts((v) => !v);
-        return;
-      }
-
-      // Ctrl+Z / Cmd+Z = Undo
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 'z') {
-        e.preventDefault();
-        handleUndo();
-        return;
-      }
-      // Ctrl+Y / Ctrl+Shift+Z / Cmd+Shift+Z = Redo
-      if (
-        ((e.ctrlKey || e.metaKey) && e.key === 'y') ||
-        ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z') ||
-        ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'Z')
-      ) {
-        e.preventDefault();
-        handleRedo();
-        return;
-      }
-      // Ctrl+Shift+V = Paste from Excel modal
-      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
-        e.preventDefault();
-        setExcelPasteOpen(true);
-        return;
-      }
-      // Ctrl+Enter / Cmd+Enter = Add new position
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault();
-        addPositionRef.current?.();
-        return;
-      }
-
-      // App-level Ctrl-shortcuts must fire even while editing a cell
-      // (same as Ctrl+S in spreadsheets) — guard placed below them.
-      // #153 guard — e.key can be undefined for synthetic / IME events.
-      const k = (e.key ?? '').toLowerCase();
-      const codeLetter = (e.code ?? '').startsWith('Key') ? (e.code ?? '').slice(3).toLowerCase() : '';
-      const isCmd = e.ctrlKey || e.metaKey;
-
-      // Ctrl+E = Open export menu (use e.code so non-US keyboard layouts
-      // still match — e.g. AZERTY where 'e' is at a different KeyE slot
-      // but the physical key is the same).
-      if (isCmd && !e.shiftKey && (k === 'e' || codeLetter === 'e')) {
-        e.preventDefault();
-        e.stopPropagation();
-        handleExportRef.current?.('excel');
-        return;
-      }
-      // Ctrl+I = Open import dialog
-      if (isCmd && !e.shiftKey && (k === 'i' || codeLetter === 'i')) {
-        e.preventDefault();
-        e.stopPropagation();
-        setShowImportPreview(true);
-        return;
-      }
-      // Ctrl+L = Toggle lock/unlock
-      if (isCmd && !e.shiftKey && (k === 'l' || codeLetter === 'l')) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (boq?.is_locked) {
-          handleUnlock();
-        } else {
-          handleLock();
-        }
-        return;
-      }
-      // Ctrl+/ = Toggle AI chat panel. e.code can be 'Slash' (US) or
-      // 'IntlRo'/'Minus' on other layouts — match e.key as primary and
-      // e.code='Slash' as the layout-aware fallback.
-      if (isCmd && (e.key === '/' || e.code === 'Slash')) {
-        e.preventDefault();
-        e.stopPropagation();
-        setAiChatOpen((prev) => {
-          if (!prev) { setCostFinderOpen(false); setSmartPanelOpen(false); }
-          return !prev;
-        });
-        return;
-      }
-
-      // Guard remaining shortcuts — don't fire when editing cells
-      if (isEditing) return;
-
-      // Alt+I = Toggle the per-position AI copilot dock on the active row.
-      // Alt (not Ctrl/Cmd) keeps it clear of Ctrl+I (import). Match e.code so
-      // non-US layouts still hit the physical I key.
-      if (e.altKey && !isCmd && !e.shiftKey && (k === 'i' || codeLetter === 'i')) {
-        e.preventDefault();
-        e.stopPropagation();
-        toggleAICopilotRef.current?.();
-        return;
-      }
-
-      // Delete / Backspace = delete selected position(s). Fires the same
-      // tracked-delete pipeline as the context menu / batch-bar, so undo
-      // toast + 5s deferred API call still apply.
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPositionIds.length > 0) {
-        e.preventDefault();
-        for (const id of selectedPositionIds) {
-          trackedDeleteRef.current?.(id);
-        }
-        return;
-      }
-
-      // Ctrl+D = Duplicate selected position
-      if (isCmd && !e.shiftKey && (k === 'd' || codeLetter === 'd')) {
-        e.preventDefault();
-        if (selectedPositionIds.length === 1) {
-          duplicatePositionRef.current?.(selectedPositionIds[0]!);
-        }
-        return;
+      switch (action) {
+        case 'toggle_shortcuts':
+          e.preventDefault();
+          setShowShortcuts((v) => !v);
+          return;
+        case 'undo':
+          e.preventDefault();
+          handleUndo();
+          return;
+        case 'redo':
+          e.preventDefault();
+          handleRedo();
+          return;
+        case 'paste_from_excel':
+          e.preventDefault();
+          setExcelPasteOpen(true);
+          return;
+        case 'add_position':
+          e.preventDefault();
+          addPositionRef.current?.();
+          return;
+        case 'export_excel':
+          e.preventDefault();
+          e.stopPropagation();
+          handleExportRef.current?.('excel');
+          return;
+        case 'import':
+          e.preventDefault();
+          e.stopPropagation();
+          setShowImportPreview(true);
+          return;
+        case 'toggle_lock':
+          e.preventDefault();
+          e.stopPropagation();
+          if (boq?.is_locked) {
+            handleUnlock();
+          } else {
+            handleLock();
+          }
+          return;
+        case 'toggle_ai_chat':
+          e.preventDefault();
+          e.stopPropagation();
+          setAiChatOpen((prev) => {
+            if (!prev) { setCostFinderOpen(false); setSmartPanelOpen(false); }
+            return !prev;
+          });
+          return;
+        case 'toggle_ai_copilot':
+          e.preventDefault();
+          e.stopPropagation();
+          toggleAICopilotRef.current?.();
+          return;
+        case 'delete_selected':
+          // Same tracked-delete pipeline as the context menu / batch bar, so
+          // the undo toast and the 5 s deferred API call still apply.
+          e.preventDefault();
+          for (const id of selectedPositionIds) {
+            trackedDeleteRef.current?.(id);
+          }
+          return;
+        case 'duplicate':
+          e.preventDefault();
+          if (selectedPositionIds.length === 1) {
+            duplicatePositionRef.current?.(selectedPositionIds[0]!);
+          }
+          return;
       }
     }
 
@@ -2120,7 +2128,7 @@ export function BOQEditorPage() {
     // these app-level shortcuts before we see them.
     document.addEventListener('keydown', handleKeyDown, true);
     return () => document.removeEventListener('keydown', handleKeyDown, true);
-  }, [handleUndo, handleRedo, selectedPositionIds, handleLock, handleUnlock, boq?.is_locked]);
+  }, [handleUndo, handleRedo, selectedPositionIds, handleLock, handleUnlock, boq?.is_locked, canDeletePositions]);
 
   /* ── Activity panel ───────────────────────────────────────────────── */
 
@@ -2142,8 +2150,14 @@ export function BOQEditorPage() {
   /* ── Export / Version History state ─────────────────────────────────── */
 
   const [showVersionHistory, setShowVersionHistory] = useState(false);
-  const [exportWarning, setExportWarning] = useState<{ format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3'; score: number } | null>(null);
+  const [exportWarning, setExportWarning] = useState<{ format: string; score: number } | null>(null);
   const [gaebPreviewOpen, setGaebPreviewOpen] = useState(false);
+  // Which GAEB phase the preview dialog is confirming. The dialog used to
+  // export X83 whichever menu item opened it.
+  const [gaebExportFormat, setGaebExportFormat] = useState<'gaeb' | 'gaeb_x84'>('gaeb');
+  // GAEB site phases (X31 measured quantities, X89 invoice check).
+  const [gaebSiteOpen, setGaebSiteOpen] = useState(false);
+  const [gaebSiteFile, setGaebSiteFile] = useState<File | null>(null);
 
   /* ── Computed data ─────────────────────────────────────────────────── */
 
@@ -2287,27 +2301,10 @@ export function BOQEditorPage() {
 
   const directCost = useMemo(() => {
     if (!boq) return 0;
-    // Issue #111 (skolodi follow-up) — rebase per-position currencies into
-    // the project base before summing. ``resourceAwareTotalInBase`` covers
-    // BOTH a position-level ``metadata.currency`` (verified #131 path) AND
-    // the previously-missed case: a position with NO metadata.currency but
-    // foreign-currency ``metadata.resources`` (its stored total was built
-    // from Σ(r.qty×r.rate) with no FX, so summing it raw added a USD
-    // resource into an ARS project as if "1 USD = 1 ARS").
-    return boq.positions.reduce((sum, p) => {
-      return (
-        sum +
-        resourceAwareTotalInBase(
-          p as unknown as {
-            total?: number | string | null;
-            quantity?: number | string | null;
-            metadata?: Record<string, unknown> | null;
-          },
-          currencyCode,
-          fxRates,
-        )
-      );
-    }, 0);
+    // Issue #111 (skolodi follow-up): each line is rebased into the project
+    // base currency before it is summed, and section headers are left out
+    // (a change-order section stores its lines' sum on the header).
+    return billDirectCost(boq.positions, currencyCode, fxRates);
   }, [boq, currencyCode, fxRates]);
 
   const markupTotals = useMemo(() => {
@@ -2343,9 +2340,10 @@ export function BOQEditorPage() {
   /* Client-side VAT / gross. This chain is NOT authoritative and must not be
    * printed under a "Grand Total" label — ``vatRate`` resolves a single tax
    * markup, so a BOQ with two tax lines (Brazil BDI) or a fixed-amount tax
-   * loses the rest. It stays client-side because the grid footer and the
-   * client Excel/PDF exports need net / VAT / gross as three separate rows
-   * that react to a cell edit instantly, which a server round-trip cannot do.
+   * loses the rest. It stays client-side because the grid footer needs
+   * net / VAT / gross as three separate rows that react to a cell edit
+   * instantly, which a server round-trip cannot do. Nothing that leaves the
+   * page reads it: every export, the PDF included, is the server's.
    * The authority for the total of everything is the server's
    * ``cost-breakdown.grand_total`` (see the ``costBreakdown`` query above),
    * which is what the toolbar card, the Markup panel and the Cost Breakdown
@@ -2638,7 +2636,8 @@ export function BOQEditorPage() {
 
   const handleAddPosition = useCallback(
     (parentId?: string) => {
-      if (!boqId) return;
+      // A locked bill takes no new line; the keyboard shortcut reaches here too.
+      if (!boqId || boq?.is_locked) return;
       const allPositions = boq?.positions ?? [];
 
       /* Generate the next ordinal using the standard "gap-of-10" scheme
@@ -2779,7 +2778,7 @@ export function BOQEditorPage() {
         boq_id: boqId,
         ordinal,
         description: '',
-        unit: 'm2',
+        unit: measurementSystem === 'imperial' ? 'ft2' : 'm2',
         quantity: 0,
         unit_rate: 0,
         parent_id: parentId,
@@ -2862,7 +2861,7 @@ export function BOQEditorPage() {
         boq_id: boqId,
         ordinal: provisionalOrdinal,
         description: '',
-        unit: 'm2',
+        unit: measurementSystem === 'imperial' ? 'ft2' : 'm2',
         quantity: 0,
         unit_rate: 0,
         parent_id: targetParent,
@@ -2893,6 +2892,8 @@ export function BOQEditorPage() {
     ordinal: string;
   } | null>(null);
   const [modelReviewOpen, setModelReviewOpen] = useState(false);
+  // Positions whose drawing or BIM model moved on since they were measured.
+  const [changeReviewOpen, setChangeReviewOpen] = useState(false);
 
   const handleModelLink = useCallback(
     (positionId: string) => {
@@ -2902,6 +2903,34 @@ export function BOQEditorPage() {
     [boq],
   );
 
+  // Both ways into the model end in a BIM Hub write: linking elements
+  // (POST /bim_hub/links/) and applying rules (POST /bim_hub/quantity-maps/
+  // apply/) need bim.create. A role without it, or BIM Hub switched off, would
+  // only reach a refusal, so neither entry point is offered then.
+  const canCreateBimLinks = useHasPermission('bim.create');
+  const backendModuleOff = useBackendModuleOff();
+  const offerModelEntryPoints = canCreateBimLinks && !backendModuleOff('oe_bim_hub');
+
+  // Pick elements in the 3D model for one position: the BIM page opens on the
+  // project's model in a "link to this position" mode, and the usual
+  // Add-to-BOQ dialog there offers this position first.
+  const handleLinkFromModel = useCallback(
+    (positionId: string) => {
+      if (!boq || !bimModelId) return;
+      const pos = (boq.positions ?? []).find((p) => p.id === positionId);
+      navigate(
+        buildLinkFromModelUrl({
+          projectId: boq.project_id,
+          modelId: bimModelId,
+          boqId: boq.id,
+          positionId,
+          label: pos ? `${pos.ordinal} ${pos.description}`.trim() : '',
+        }),
+      );
+    },
+    [boq, bimModelId, navigate],
+  );
+
   // ── Feature 2: estimate baseline / line-level compare ──────────────────
   const [compareOpen, setCompareOpen] = useState(false);
 
@@ -2909,6 +2938,12 @@ export function BOQEditorPage() {
   // signal that re-opens the (collapsible) markup panel below the grid.
   const [scenarioOpen, setScenarioOpen] = useState(false);
   const [tenderOpen, setTenderOpen] = useState(false);
+  // NRM 1 elemental cost plan of this bill, read-only, opened over the editor.
+  const [costPlanOpen, setCostPlanOpen] = useState(false);
+  const showCostPlan = useMemo(
+    () => offersCostPlan(project?.classification_standard, positions),
+    [project?.classification_standard, positions],
+  );
   const [markupOpenSignal, setMarkupOpenSignal] = useState(0);
 
   // Top-level sections inside the current selection. Empty means the tender
@@ -2919,6 +2954,21 @@ export function BOQEditorPage() {
         .filter((p) => selectedPositionIds.includes(p.id) && isSection(p) && !p.parent_id)
         .map((p) => p.id),
     [boq?.positions, selectedPositionIds],
+  );
+
+  // The rows the send-to-tender dialog offers as scope: every top-level row,
+  // in bill order, so one section can be tendered on its own.
+  const tenderScopeRows = useMemo(
+    () =>
+      (boq?.positions ?? [])
+        .filter((p) => !p.parent_id)
+        .sort((a, b) =>
+          a.sort_order !== b.sort_order
+            ? a.sort_order - b.sort_order
+            : (a.ordinal ?? '').localeCompare(b.ordinal ?? '', undefined, { numeric: true }),
+        )
+        .map((p) => ({ id: p.id, ordinal: p.ordinal ?? '', description: p.description ?? '' })),
+    [boq?.positions],
   );
 
   const handleJumpToMarkups = useCallback(() => {
@@ -3001,88 +3051,54 @@ export function BOQEditorPage() {
 
   /** Actually perform the export (download file). */
   const doExport = useCallback(
-    async (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => {
-      // Client-side Excel export via SheetJS
-      if (format === 'excel' && positions.length > 0) {
-        try {
-          const markupTotalsForExport = markupTotals.map((m) => ({
-            name: m.name,
-            percentage: m.percentage,
-            amount: m.amount,
-          }));
-          await exportBOQToExcel({
-            boqTitle: boq?.name ?? 'BOQ',
-            projectName: project?.name,
-            classificationStandard: project?.classification_standard,
-            region: project?.region,
-            // Use the project base currency ISO code (was a stray ``boq.currency``
-            // that doesn't exist \u2192 always fell back to "\u20ac"). Issue #150: also
-            // thread the base currency + FX rates so foreign-currency resources
-            // are converted to base in the export exactly as in the grid.
-            currency: currencyCode,
-            baseCurrency: currencyCode,
-            fxRates,
-            positions,
-            markupTotals: markupTotalsForExport,
-            netTotal,
-            vatRate,
-            vatAmount,
-            grossTotal,
-          });
-          addToast({ type: 'success', title: t('boq.file_downloaded', { defaultValue: 'File downloaded' }) });
-          return;
-        } catch {
-          // Fall through to server-side export
-        }
-      }
-
-      // Client-side PDF export via jsPDF (skip for very large BOQs to avoid
-      // browser memory issues — let the server handle them with a simplified report)
-      const LARGE_BOQ_THRESHOLD = 500;
-      const nonSectionPositions = positions.filter((p) => !isSection(p));
-      if (format === 'pdf' && nonSectionPositions.length > 0 && nonSectionPositions.length <= LARGE_BOQ_THRESHOLD) {
-        try {
-          const markupTotalsForExport = markupTotals.map((m) => ({
-            name: m.name,
-            percentage: m.percentage,
-            amount: m.amount,
-          }));
-          generateBOQPdf({
-            boqTitle: boq?.name ?? 'BOQ',
-            projectName: project?.name,
-            date: new Date().toISOString(),
-            currency: currencySymbol,
-            // Issue #150 — convert foreign-currency resources to the project
-            // base in the PDF totals exactly as the grid does. ``directCost``
-            // (passed above) is already resource-aware base-converted.
-            baseCurrency: currencyCode,
-            fxRates,
-            positions,
-            markupTotals: markupTotalsForExport,
-            directCost,
-            netTotal,
-            vatRate,
-            vatAmount,
-            grossTotal,
-            locale,
-            // Issue #270 - emit quantities + unit labels in the user's system.
-            measurementSystem,
-          });
-          addToast({ type: 'success', title: t('boq.file_downloaded', { defaultValue: 'File downloaded' }) });
-          return;
-        } catch {
-          // Fall through to server-side export
-        }
-      }
-
+    async (format: string) => {
+      /* Every format is asked of the server: Excel, CSV, GAEB, BC3 and PDF.
+       * The server is the only place the company letterhead, the header block
+       * the importers read back, the Position ID column, per-row currencies
+       * and the frozen FX table are written, and the only place the money is
+       * authoritative. The PDF used to be drawn here in the browser from the
+       * client net / VAT / gross chain, which takes its tax from the first
+       * percentage tax markup only, so a second or a fixed tax line vanished
+       * from a printed estimate the grid itself totalled correctly. */
       const token = useAuthStore.getState().accessToken;
-      const r = await fetch(`/api/v1/boq/boqs/${boqId}/export/${format}/`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
-      });
+      // Map frontend format names to API endpoints and query params
+      const exportFormat = format === 'gaeb_x84' ? 'gaeb' : format;
+      const params = new URLSearchParams();
+      // The route reads the phase from ``?format=``. It used to be sent as
+      // ``?phase=84``, which the route ignores, so "with prices" downloaded
+      // the unpriced X83.
+      if (format === 'gaeb_x84') params.set('format', 'x84');
+      if (format === 'pdf') {
+        // Issue #270: quantities and unit labels in the reader's system, as
+        // the browser PDF printed them. The resources under each line are
+        // what the browser PDF printed too; the server leaves them out, and
+        // says so on the page, when they would take the bill past its PDF
+        // row budget (pdf_export.resource_rows_fit).
+        params.set('measurement_system', measurementSystem);
+        params.set('include_resources', 'true');
+      }
+      const query = params.toString();
+      let r: Response;
+      try {
+        r = await fetch(`/api/v1/boq/boqs/${boqId}/export/${exportFormat}/${query ? `?${query}` : ''}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+      } catch {
+        // No response at all (offline, server down): say so, rather than
+        // leaving the click without an answer.
+        addToast({
+          type: 'error',
+          title: t('boq.export_failed', { defaultValue: 'Export failed' }),
+          message: t('boq.export_unreachable', {
+            defaultValue: 'The server could not be reached. Check your connection and try again.',
+          }),
+        });
+        return;
+      }
       if (r.ok) {
         const blob = await r.blob();
         const extensions: Record<string, string> = {
-          excel: 'xlsx', csv: 'csv', pdf: 'pdf', gaeb: 'xml', bc3: 'bc3',
+          excel: 'xlsx', csv: 'csv', pdf: 'pdf', gaeb: 'x83', gaeb_x84: 'x84', bc3: 'bc3',
         };
         triggerDownload(blob, `${boq?.name ?? 'boq'}.${extensions[format] ?? format}`);
         addToast({ type: 'success', title: t('boq.file_downloaded', { defaultValue: 'File downloaded' }) });
@@ -3090,7 +3106,9 @@ export function BOQEditorPage() {
         let errorMsg = t('boq.export_failed', { defaultValue: 'Export failed' });
         try {
           const errBody = await r.json();
-          if (errBody?.detail) {
+          // A string only: a validation error's ``detail`` is a list, and a
+          // list is not a title.
+          if (typeof errBody?.detail === 'string' && errBody.detail) {
             errorMsg = errBody.detail;
           }
         } catch {
@@ -3099,14 +3117,17 @@ export function BOQEditorPage() {
         addToast({ type: 'error', title: errorMsg });
       }
     },
-    [boqId, boq, positions, markups, directCost, netTotal, addToast, t, measurementSystem],
+    /* Everything the body reads. The project and the money are not among them
+     * any more: the server reads both for itself. */
+    [boqId, boq, addToast, t, measurementSystem],
   );
 
   /** Pre-export validation check: warn if quality < 60%, GAEB preview before export. */
   const handleExport = useCallback(
-    (format: 'excel' | 'csv' | 'pdf' | 'gaeb' | 'bc3') => {
+    (format: string) => {
       // Show GAEB confirmation dialog before quality check
-      if (format === 'gaeb') {
+      if (format === 'gaeb' || format === 'gaeb_x84') {
+        setGaebExportFormat(format);
         setGaebPreviewOpen(true);
         return;
       }
@@ -3127,11 +3148,11 @@ export function BOQEditorPage() {
     setGaebPreviewOpen(false);
     const score = qualityBreakdown.score;
     if (score < 60) {
-      setExportWarning({ format: 'gaeb', score });
+      setExportWarning({ format: gaebExportFormat, score });
     } else {
-      doExport('gaeb');
+      doExport(gaebExportFormat);
     }
-  }, [qualityBreakdown.score, doExport]);
+  }, [qualityBreakdown.score, doExport, gaebExportFormat]);
 
   const [isValidating, setIsValidating] = useState(false);
   const [lastValidationScore, setLastValidationScore] = useState<number | null>(null);
@@ -3152,27 +3173,29 @@ export function BOQEditorPage() {
       const result = await r.json();
       const scoreNum = typeof result?.score === 'number' ? Math.round(result.score * 100) : null;
       setLastValidationScore(scoreNum);
-      const errors: Array<{ rule_id: string; message: string }> = result?.errors ?? [];
-      const warnings: Array<{ rule_id: string; message: string }> = result?.warnings ?? [];
-      const passed: number = result?.passed?.length ?? 0;
+      const counts = result?.counts ?? {};
+      const errorCount: number = counts.errors ?? 0;
+      const warningCount: number = counts.warnings ?? 0;
+      const passedCount: number = counts.passed ?? 0;
 
-      const toastType = errors.length > 0 ? 'error' : warnings.length > 0 ? 'warning' : 'success';
+      const toastType = errorCount > 0 ? 'error' : warningCount > 0 ? 'warning' : 'success';
 
       // Build human-readable summary
       const parts: string[] = [];
       if (scoreNum != null) {
         parts.push(t('boq.validation_score', { defaultValue: 'Quality score: {{score}}%', score: scoreNum }));
       }
-      if (errors.length > 0) {
-        parts.push(t('boq.validation_errors', { defaultValue: '{{count}} errors found', count: errors.length }));
-        // Show first 2 error messages
-        errors.slice(0, 2).forEach(e => parts.push(`  - ${e.message}`));
+      if (errorCount > 0) {
+        parts.push(t('boq.validation_errors', { defaultValue: '{{count}} errors found', count: errorCount }));
+        // Show first 2 error messages from results array
+        const resultItems: Array<{ status: string; message: string }> = result?.results ?? [];
+        resultItems.filter(r => r.status === 'error').slice(0, 2).forEach(e => parts.push(`  - ${e.message}`));
       }
-      if (warnings.length > 0) {
-        parts.push(t('boq.validation_warnings', { defaultValue: '{{count}} warnings', count: warnings.length }));
+      if (warningCount > 0) {
+        parts.push(t('boq.validation_warnings', { defaultValue: '{{count}} warnings', count: warningCount }));
       }
-      if (errors.length === 0 && warnings.length === 0) {
-        parts.push(t('boq.validation_all_passed', { defaultValue: 'All {{count}} checks passed', count: passed }));
+      if (errorCount === 0 && warningCount === 0) {
+        parts.push(t('boq.validation_all_passed', { defaultValue: 'All {{count}} checks passed', count: passedCount }));
       }
 
       addToast({
@@ -3185,6 +3208,10 @@ export function BOQEditorPage() {
         message: parts.join('\n'),
       });
       invalidateAll();
+      // The run is now stored as a validation report (when the user may
+      // create one), so every reader of reports, the validation page and the
+      // dashboard's cross-project card included, has to read it again.
+      queryClient.invalidateQueries({ queryKey: ['validation'] });
     } catch (err) {
       addToast({
         type: 'error',
@@ -3198,7 +3225,7 @@ export function BOQEditorPage() {
       setIsValidating(false);
       useProgressStore.getState().done();
     }
-  }, [boqId, addToast, t, invalidateAll]);
+  }, [boqId, addToast, t, invalidateAll, queryClient]);
 
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [showRecalcConfirm, setShowRecalcConfirm] = useState(false);
@@ -3363,12 +3390,12 @@ export function BOQEditorPage() {
       // Recalculate unit_rate from remaining resources, currency-converted
       // into the project base (never blend currencies).
       const computedRate = perUnitRateInBase(resources);
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { unit_rate: computedRate, metadata: newMeta },
       });
     },
-    [boq?.positions, updateMutation, perUnitRateInBase],
+    [boq?.positions, updatePositionMutate, perUnitRateInBase],
   );
 
   /** Apply one or more field updates to a resource in a single mutation.
@@ -3393,12 +3420,12 @@ export function BOQEditorPage() {
       // Convert each resource subtotal into the project base before summing
       // (a resource may be priced in a foreign currency) — never blend.
       const derivedUnitRate = perUnitRateInBase(resources);
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { unit_rate: derivedUnitRate, metadata: newMeta },
       });
     },
-    [boq?.positions, updateMutation, perUnitRateInBase],
+    [boq?.positions, updatePositionMutate, perUnitRateInBase],
   );
 
   /** Single-field shim — delegates to the batched implementation. */
@@ -3427,9 +3454,9 @@ export function BOQEditorPage() {
       res.metadata = { ...resMeta, custom_fields: { ...cf, [fieldName]: value } };
       resources[resourceIndex] = res;
       const newMeta = { ...pos.metadata, resources };
-      updateMutation.mutate({ id: positionId, data: { metadata: newMeta } });
+      updatePositionMutate({ id: positionId, data: { metadata: newMeta } });
     },
-    [boq?.positions, updateMutation],
+    [boq?.positions, updatePositionMutate],
   );
 
   /** Save a resource from a position to the user's catalog. */
@@ -3904,13 +3931,13 @@ export function BOQEditorPage() {
       // Convert each resource subtotal into the project base before summing
       // (the new resource may carry a foreign currency) — never blend.
       const computedRate = perUnitRateInBase(merged);
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { unit_rate: computedRate, metadata: { ...pos.metadata, resources: merged } },
       });
       addToast({ type: 'success', title: t('boq.resource_added', { defaultValue: 'Resource added' }) });
     },
-    [boq?.positions, updateMutation, addToast, t, perUnitRateInBase],
+    [boq?.positions, updatePositionMutate, addToast, t, perUnitRateInBase],
   );
 
   /** Issue #133 — project-wide resource-code lookup for the manual
@@ -3937,12 +3964,20 @@ export function BOQEditorPage() {
       if (!boqId) return;
       const pos = boq?.positions.find((p) => p.id === positionId);
       if (!pos) return;
-      const siblings = boq?.positions.filter((p) => p.parent_id === pos.parent_id) ?? [];
-      const lastSibOrdinal = siblings.length > 0 ? siblings[siblings.length - 1]!.ordinal : pos.ordinal;
-      const parts = lastSibOrdinal.split('.');
-      const lastNum = parseInt(parts[parts.length - 1] || '0', 10) + 1;
-      parts[parts.length - 1] = String(lastNum).padStart(2, '0');
-      const newOrdinal = parts.join('.');
+      // Use collision-safe ordinal computation instead of simple +1
+      const allPositions = boq?.positions ?? [];
+      const used = new Set(allPositions.map((p) => p.ordinal));
+      const parts = pos.ordinal.split('.');
+      const lastNum = parseInt(parts[parts.length - 1] || '0', 10);
+      let nextNum = lastNum + 1;
+      let candidate: string;
+      do {
+        const newParts = [...parts];
+        newParts[newParts.length - 1] = String(nextNum).padStart(parts[parts.length - 1]!.length, '0');
+        candidate = newParts.join('.');
+        nextNum++;
+      } while (used.has(candidate));
+      const newOrdinal = candidate;
       addMutation.mutate({
         boq_id: boqId,
         ordinal: newOrdinal,
@@ -4075,7 +4110,7 @@ export function BOQEditorPage() {
               action: {
                 label: t('boq.apply_rate', { defaultValue: 'Apply' }),
                 onClick: () => {
-                  updateMutation.mutate({
+                  updatePositionMutate({
                     id: positionId,
                     data: { unit_rate: result.suggested_rate },
                   });
@@ -4101,7 +4136,7 @@ export function BOQEditorPage() {
         });
       }
     },
-    [boq?.positions, project?.region, currencySymbol, fmt, updateMutation, addToast, t, ensureVectorDB],
+    [boq?.positions, project?.region, currencySymbol, fmt, updatePositionMutate, addToast, t, ensureVectorDB],
   );
 
   const handleClassify = useCallback(
@@ -4131,7 +4166,7 @@ export function BOQEditorPage() {
             title: t('boq.ai_classification', { defaultValue: 'AI Classification' }),
             message: `${top.standard.toUpperCase()}: ${top.code} - ${top.label} (${Math.round(top.confidence * 100)}%)`,
           });
-          updateMutation.mutate({
+          updatePositionMutate({
             id: positionId,
             data: { classification },
           });
@@ -4151,7 +4186,7 @@ export function BOQEditorPage() {
         });
       }
     },
-    [boq?.positions, updateMutation, addToast, t, ensureVectorDB],
+    [boq?.positions, updatePositionMutate, addToast, t, ensureVectorDB],
   );
 
   const [isCheckingAnomalies, setIsCheckingAnomalies] = useState(false);
@@ -4249,7 +4284,7 @@ export function BOQEditorPage() {
 
   const handleApplyAnomalySuggestion = useCallback(
     (positionId: string, suggestedRate: number) => {
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { unit_rate: suggestedRate },
       });
@@ -4264,7 +4299,7 @@ export function BOQEditorPage() {
         message: fmtWithCurrency(suggestedRate, locale, currencyCode),
       });
     },
-    [updateMutation, addToast, t, locale, currencyCode],
+    [updatePositionMutate, addToast, t, locale, currencyCode],
   );
 
   const handleIgnoreAnomaly = useCallback((positionId: string) => {
@@ -4301,28 +4336,33 @@ export function BOQEditorPage() {
 
   const importInputRef = useRef<HTMLInputElement>(null);
   const [isImporting, setIsImporting] = useState(false);
+  // Progress of a native exchange file the server imports as a background job.
+  const [importJobProgress, setImportJobProgress] = useState<ImportProgress | null>(null);
   const [showImportPreview, setShowImportPreview] = useState(false);
 
+  // The handler, for its own "Import again" (a callback cannot name itself).
+  const importFileRef = useRef<((file: File, force?: boolean) => Promise<void>) | null>(null);
   const handleImportFile = useCallback(
-    async (file: File) => {
+    async (file: File, force = false): Promise<void> => {
       if (!boqId) return;
+      // Which route reads the file is decided by name, see ``toolbarImportRoute``.
+      const route = toolbarImportRoute(file.name);
+      // An X31 measurement or an X89 invoice is read against this bill, not
+      // imported into it: hand it to the dialog that proposes and checks.
+      if (route === 'site') {
+        setGaebSiteFile(file);
+        setGaebSiteOpen(true);
+        return;
+      }
       setIsImporting(true);
       const token = useAuthStore.getState().accessToken;
       const form = new FormData();
       form.append('file', file);
 
-      // GAEB DA XML files (.x81/.x83/.x84/.xml) have a dedicated parser on
-      // the backend (``/import/gaeb/``) that understands the GAEB-specific
-      // structure — namespace-agnostic, X81/X83/X84 schema-aware. Smart
-      // import doesn't recognise these, so the file would be silently
-      // rejected. Route by extension before posting.
-      const ext = (file.name.split('.').pop() ?? '').toLowerCase();
-      const isGaeb = ['x81', 'x83', 'x84'].includes(ext) ||
-        (ext === 'xml' && /\.(x8[134]|gaeb)\.xml$/i.test(file.name));
-      const endpoint = isGaeb
-        ? `/api/v1/boq/boqs/${boqId}/import/gaeb/`
-        : `/api/v1/boq/boqs/${boqId}/import/smart/`;
-
+      const isGaeb = route === 'gaeb';
+      // The auto route imports in the background: it answers at once with a
+      // job to follow, and the same file posted again while that job runs
+      // gets the job back instead of importing the bill a second time.
       // Tell the user *immediately* that the import is in flight — the server
       // can take 30+ seconds for large XLSX/PDF/CAD files, and without this
       // toast the UI looks frozen (Bug 2).
@@ -4342,11 +4382,24 @@ export function BOQEditorPage() {
       // the fetch hangs and the user thinks the page froze (Bug 2).
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 90_000);
+      let again = false;
 
       try {
-        const res = await fetch(endpoint, {
+        const lang = activeLanguageTag();
+        // A raw fetch gets no Accept-Language from the api client, and the
+        // refusal it may bring back (a locked bill's 409) is worded by the
+        // server, so name the UI language or it comes in the browser's.
+        const headers = {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(lang ? { 'Accept-Language': lang } : {}),
+        };
+        const res = await fetch(isGaeb
+          ? `/api/v1/boq/boqs/${boqId}/import/gaeb/`
+          : route === 'auto'
+            ? `/api/v1/boq/boqs/${boqId}/import/auto/${force ? '?background=true&force=true' : '?background=true'}`
+            : `/api/v1/boq/boqs/${boqId}/import/smart/`, {
           method: 'POST',
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          headers,
           body: form,
           signal: controller.signal,
         });
@@ -4354,45 +4407,39 @@ export function BOQEditorPage() {
 
         if (!res.ok) {
           const body = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(extractErrorMessageFromBody(body) ?? 'Import failed');
+          const failed = t('boq.import_failed', { defaultValue: 'Import failed' });
+          const done = alreadyImported(res.status, body);
+          if (done) {
+            // Posted again on purpose, not an automatic retry: say so and let
+            // the person decide.
+            again = await confirm({
+              title: t('boq.import_again_title', { defaultValue: 'Import this file again?' }),
+              message: importFailureText(done, t, failed),
+              confirmLabel: t('boq.import_again', { defaultValue: 'Import again' }),
+              variant: 'warning',
+            });
+            return;
+          }
+          throw new Error(importFailureFromBody(body, t, failed) ?? extractErrorMessageFromBody(body) ?? failed);
         }
 
-        const result: {
-          imported: number;
-          errors: { item?: string; error: string }[];
-          total_items?: number;
-          method?: string;
-          model_used?: string | null;
-          cad_format?: string;
-          cad_elements?: number;
-          // GAEB-specific
-          skipped?: number;
-          sections?: unknown[];
-          source_format?: string;
-          currency?: string;
-        } = await res.json();
-
-        let methodLabel: string;
-        if (isGaeb || result.source_format === 'gaeb') {
-          const sectionCount = Array.isArray(result.sections) ? result.sections.length : 0;
-          methodLabel = ` (GAEB XML, ${sectionCount} section${sectionCount === 1 ? '' : 's'}${result.currency ? `, ${result.currency}` : ''})`;
-        } else if (result.method === 'cad_ai') {
-          methodLabel = ` (CAD + ${result.model_used ?? 'AI'}, ${result.cad_elements ?? 0} elements)`;
-        } else if (result.method === 'ai') {
-          methodLabel = ` (AI: ${result.model_used ?? 'auto'})`;
-        } else {
-          methodLabel = ' (direct)';
+        const answer: unknown = await res.json();
+        let result = answer as ImportToastResult;
+        if (isImportJob(answer)) {
+          setImportJobProgress({ percent: answer.progress_percent, phase: null });
+          result = await waitForImportJob<ImportToastResult>({
+            boqId,
+            jobId: answer.job_id,
+            headers,
+            t,
+            onProgress: setImportJobProgress,
+          });
         }
-        // GAEB returns ``skipped`` instead of ``total_items`` — derive a
-        // reasonable denominator so the toast reads cleanly for both shapes.
-        const denominator = result.total_items ?? (result.imported + (result.skipped ?? 0));
+        const toast = importToastText(result, isGaeb, t);
         addToast({
-          type: result.imported > 0 ? 'success' : 'warning',
-          title: `Imported ${result.imported} of ${denominator} items${methodLabel}`,
-          message:
-            result.errors.length > 0
-              ? `${result.errors.length} error(s) occurred`
-              : undefined,
+          type: importLanded(result) ? 'success' : 'warning',
+          title: toast.title,
+          message: toast.message,
         });
 
         invalidateAll();
@@ -4410,10 +4457,15 @@ export function BOQEditorPage() {
         });
       } finally {
         setIsImporting(false);
+        setImportJobProgress(null);
+        // In ``finally``: the 409 branch above leaves the ``try`` with ``return``.
+        if (again) await importFileRef.current?.(file, true);
       }
     },
-    [boqId, addToast, queryClient, t],
+    [boqId, addToast, queryClient, t, confirm],
   );
+
+  importFileRef.current = handleImportFile;
 
   const handleImportInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -4465,10 +4517,11 @@ export function BOQEditorPage() {
       const components = item.components || [];
       const resources = components.map((c) => ({
         name: c.name, code: c.code || '', type: c.type || 'other',
-        unit: c.unit, quantity: c.quantity, unit_rate: c.unit_rate,
-        total: c.cost || c.quantity * c.unit_rate,
+        unit: c.unit, ...catalogComponentAmounts(c),
       }));
-      const newMeta: Record<string, unknown> = { ...pos.metadata, cost_item_code: item.code, source: 'cost_database' };
+      // Picked from another item, the old link and price-list block go; the
+      // server copies the new item's block from the link.
+      const newMeta = repointedMetadata(pos.metadata, item);
       if (resources.length > 0) newMeta.resources = resources;
       // Carry through the scope-of-work bullets from the catalog so the
       // BOQ grid can surface them as a readable (i) hint next to the
@@ -4485,12 +4538,12 @@ export function BOQEditorPage() {
         computedRate = resources.reduce((s, r) => s + (r.total || r.quantity * r.unit_rate), 0);
         computedRate = Math.round(computedRate * 100) / 100;
       }
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { description: item.description, unit: item.unit, unit_rate: computedRate, classification: item.classification || {}, metadata: newMeta },
       });
     },
-    [boq?.positions, updateMutation],
+    [boq?.positions, updatePositionMutate],
   );
 
   /** Handle save position to database from AG Grid actions */
@@ -4592,12 +4645,12 @@ export function BOQEditorPage() {
       } else {
         delete nextMeta.formula;
       }
-      updateMutation.mutate({
+      updatePositionMutate({
         id: positionId,
         data: { metadata: nextMeta },
       });
     },
-    [boq?.positions, updateMutation],
+    [boq?.positions, updatePositionMutate],
   );
 
   /** Price-analysis drawer state (unit-rate build-up of one position) */
@@ -4716,6 +4769,35 @@ export function BOQEditorPage() {
     [boq?.positions, updateMutation],
   );
 
+  /* ── Stable props for BOQGrid ──────────────────────────────────────
+     These used to be written inline in the JSX below, so every render of
+     this page handed the grid new objects and functions. The display
+     currency feeds the grid's column defs, where a new object rebuilt every
+     column on every render of the page. */
+  const gridDisplayCurrencyCode = displayCurrencyMeta?.currency;
+  const gridDisplayCurrencyRate = displayCurrencyMeta?.rate;
+  const gridDisplayCurrency = useMemo(
+    () =>
+      gridDisplayCurrencyCode !== undefined && gridDisplayCurrencyRate !== undefined
+        ? { code: gridDisplayCurrencyCode, rate: gridDisplayCurrencyRate }
+        : null,
+    [gridDisplayCurrencyCode, gridDisplayCurrencyRate],
+  );
+  const fxSettingsProjectId = boq?.project_id;
+  const handleOpenFxRateSettings = useCallback(() => {
+    if (fxSettingsProjectId) navigate(`/projects/${fxSettingsProjectId}/settings#fx-rates`);
+  }, [navigate, fxSettingsProjectId]);
+  const handleAddChildPosition = useCallback(
+    (parentId: string) => handleAddPosition(parentId),
+    [handleAddPosition],
+  );
+  const handleHighlightBIMElements = useCallback(
+    (elementIds: string[]) => {
+      setBOQLinkSelection(null, elementIds);
+    },
+    [setBOQLinkSelection],
+  );
+
   /* ── Loading state ─────────────────────────────────────────────────── */
 
   if (isLoading) {
@@ -4734,6 +4816,14 @@ export function BOQEditorPage() {
             ))}
           </div>
         </div>
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <div className="w-full py-16 text-center">
+        <p className="text-content-secondary">{t('boq.load_error', { defaultValue: 'Failed to load BOQ. Please try again.' })}</p>
       </div>
     );
   }
@@ -4830,6 +4920,46 @@ export function BOQEditorPage() {
             <p className="text-sm text-content-secondary truncate flex-1">{boq.description}</p>
           )}
           <div className="flex items-center gap-2 flex-shrink-0">
+            {!boq.is_locked && boq.status === 'draft' && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await apiPatch(`/v1/boq/boqs/${boqId}`, { status: 'final' });
+                    queryClient.invalidateQueries({ queryKey: ['boq', boqId] });
+                    addToast({ type: 'success', title: t('boq.submitted_for_review', { defaultValue: 'Submitted for review' }) });
+                  } catch (err) {
+                    addToast({ type: 'error', title: t('boq.submit_review_failed', { defaultValue: 'Could not submit for review' }), message: err instanceof Error ? err.message : '' });
+                  }
+                }}
+                title={t('boq.submit_review_tooltip', { defaultValue: 'Submit this estimate for review and approval' })}
+              >
+                <CheckCircle size={14} className="mr-1" />
+                {t('boq.submit_for_review', { defaultValue: 'Submit for Review' })}
+              </Button>
+            )}
+            {!boq.is_locked && boq.status === 'final' && !isManager && (
+              <Badge variant="blue" size="sm">{t('boq.in_review', { defaultValue: 'In Review' })}</Badge>
+            )}
+            {!boq.is_locked && boq.status === 'final' && isManager && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await apiPatch(`/v1/boq/boqs/${boqId}`, { status: 'draft' });
+                    queryClient.invalidateQueries({ queryKey: ['boq', boqId] });
+                    addToast({ type: 'info', title: t('boq.returned_to_draft', { defaultValue: 'Returned to draft for changes' }) });
+                  } catch (err) {
+                    addToast({ type: 'error', title: t('boq.request_changes_failed', { defaultValue: 'Could not return the estimate to draft' }), message: err instanceof Error ? err.message : '' });
+                  }
+                }}
+              >
+                <ArrowLeft size={14} className="mr-1" />
+                {t('boq.request_changes', { defaultValue: 'Request Changes' })}
+              </Button>
+            )}
             {!boq.is_locked && isManager && (
               <Button variant="secondary" size="sm" onClick={handleLock} disabled={lockMutation.isPending} title={t('boq.lock_tooltip', { defaultValue: 'Lock prevents edits. Create a revision to make changes to a locked estimate.' })}>
                 <Lock size={14} className="mr-1" />
@@ -4859,6 +4989,41 @@ export function BOQEditorPage() {
               <RefreshCw size={14} className="mr-1" />
               {t('boq.model_review_btn', { defaultValue: 'Model sync' })}
             </Button>
+            {/* Quantity rules scoped to this bill: the rules page opens with
+                this project, BOQ and model preselected. A locked bill cannot
+                take the positions a rule writes, so the action says why
+                instead of disappearing. Hidden for a role without bim.create
+                and with BIM Hub off (see offerModelEntryPoints). */}
+            {offerModelEntryPoints && (
+            <span
+              title={
+                boq.is_locked
+                  ? t('boq.qty_from_model_locked', {
+                      defaultValue: 'This estimate is locked. Unlock it or create a revision to add quantities from the model.',
+                    })
+                  : t('bim_rules.what_a_rule_does', {
+                      defaultValue:
+                        'A quantity rule picks model elements by category and properties, such as walls built in a given phase, and writes their total area, volume, length or count into a BOQ position.',
+                    })
+              }
+            >
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={boq.is_locked}
+                data-testid="boq-quantities-from-model"
+                onClick={() =>
+                  navigate(
+                    buildQuantityRulesUrl({ projectId: boq.project_id, boqId: boq.id, modelId: bimModelId }),
+                  )
+                }
+              >
+                <SlidersHorizontal size={14} className="mr-1" />
+                {t('boq.qty_from_model_btn', { defaultValue: 'Quantities from the model' })}
+              </Button>
+            </span>
+            )}
+            {boqId && <ChangeReviewButton boqId={boqId} onClick={() => setChangeReviewOpen(true)} />}
             {/* Deep link OUT to the Validation dashboard, carrying this BOQ and
                 its project so the target lands pre-selected (2 clicks to a
                 result). The dashboard persists a server-side report; the
@@ -4876,6 +5041,25 @@ export function BOQEditorPage() {
               <ShieldCheck size={14} className="mr-1" />
               {t('boq.validate_dashboard_btn', { defaultValue: 'Validate' })}
             </Button>
+            {/* A Russian local estimate opens its resource-index breakdown:
+                each resource group times its regional quarterly index, then
+                NR and SP on the wage fund. Read-only over this BOQ. */}
+            {((project?.region ?? '').toUpperCase().startsWith('RU') ||
+              (project?.classification_standard ?? '').toLowerCase() === 'gesn') && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() =>
+                  navigate(`/price-index/resource-index?boq=${boq.id}&project=${boq.project_id}`)
+                }
+                title={t('boq.resource_index_btn_hint', {
+                  defaultValue: 'Price this estimate by the resource-index method, with every multiplication shown',
+                })}
+              >
+                <Percent size={14} className="mr-1" />
+                {t('boq.resource_index_btn', { defaultValue: 'Resource-index' })}
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -4902,6 +5086,19 @@ export function BOQEditorPage() {
               <FlaskConical size={14} className="mr-1" />
               {t('boq.scenario_btn', { defaultValue: 'What-if' })}
             </Button>
+            {showCostPlan && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setCostPlanOpen(true)}
+                title={t('cost_plan.open_hint', {
+                  defaultValue: 'Roll this bill up into an NRM 1 elemental cost plan with cost per m2 GIFA',
+                })}
+              >
+                <LayoutList size={14} className="mr-1" />
+                {t('cost_plan.open_button', { defaultValue: 'Cost plan' })}
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -4939,7 +5136,39 @@ export function BOQEditorPage() {
           </div>
         </div>
 
+        {boq.is_locked && (
+          <div
+            role="status"
+            data-testid="boq-locked-banner"
+            className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3
+                       text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-100"
+          >
+            <Lock size={16} className="shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold">
+                {t('boq.locked_banner_title', { defaultValue: 'This estimate is locked' })}
+              </p>
+              <p className="text-xs">
+                {t('boq.locked_banner_body', {
+                  defaultValue:
+                    'Positions cannot be added, edited or deleted. Create a revision to change it, or ask a manager to unlock it.',
+                })}
+              </p>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={handleCreateRevision}
+              disabled={createRevisionMutation.isPending}
+            >
+              <Copy size={14} className="mr-1" />
+              {t('boq.create_revision', { defaultValue: 'Create Revision' })}
+            </Button>
+          </div>
+        )}
+
         <BOQToolbar
+          readOnly={Boolean(boq.is_locked)}
           t={t}
           projectId={boq.project_id}
           boqId={boq.id}
@@ -4956,6 +5185,10 @@ export function BOQEditorPage() {
           isImporting={isImporting}
           importInputRef={importInputRef}
           onImportInputChange={handleImportInputChange}
+          onOpenGaebSiteExchange={() => {
+            setGaebSiteFile(null);
+            setGaebSiteOpen(true);
+          }}
           onPasteFromExcel={() => setExcelPasteOpen(true)}
           onExport={handleExport}
           onCarbonFootprint={() =>
@@ -5018,6 +5251,17 @@ export function BOQEditorPage() {
             displayRate: displayCurrencyMeta?.rate ?? null,
           } : null}
         />
+        {importJobProgress && (
+          <div className="mt-2 flex items-center gap-3 text-xs text-content-secondary" role="status" aria-live="polite">
+            <span className="shrink-0">{importProgressText(importJobProgress, t)}</span>
+            <div className="h-1.5 flex-1 max-w-xs rounded-full bg-surface-secondary overflow-hidden">
+              <div
+                className="h-full bg-oe-blue transition-all"
+                style={{ width: `${Math.max(0, Math.min(100, importJobProgress.percent))}%` }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ── Tips panel (collapsed by default, compact) ──────────────── */}
@@ -5058,6 +5302,7 @@ export function BOQEditorPage() {
           onUpdatePosition={trackedUpdate}
           onDeletePosition={trackedDelete}
           onAddPosition={handleAddPosition}
+          readOnly={Boolean(boq.is_locked)}
           onSelectSuggestion={handleGridSelectSuggestion}
           onSaveToDatabase={handleGridSaveToDatabase}
           onAddComment={handleAddComment}
@@ -5076,17 +5321,9 @@ export function BOQEditorPage() {
           currencyCode={currencyCode}
           fxRates={fxRates}
           onUpsertProjectFxRate={handleUpsertProjectFxRate}
-          displayCurrency={
-            displayCurrencyMeta
-              ? { code: displayCurrencyMeta.currency, rate: displayCurrencyMeta.rate }
-              : null
-          }
+          displayCurrency={gridDisplayCurrency}
           sectionTotalBasis={directCost}
-          onOpenFxRateSettings={
-            boq?.project_id
-              ? () => navigate(`/projects/${boq.project_id}/settings#fx-rates`)
-              : undefined
-          }
+          onOpenFxRateSettings={boq?.project_id ? handleOpenFxRateSettings : undefined}
           locale={locale}
           footerRows={boqFooterRows}
           onSelectionChanged={handleSelectionChanged}
@@ -5104,6 +5341,7 @@ export function BOQEditorPage() {
           onPriceAnalysis={setPriceAnalysisPositionId}
           onShowPositionActuals={setActualsPositionId}
           onShowMeasurement={setMeasurementPositionId}
+          classificationStandard={project?.classification_standard}
           onTraceLine={variationRequestId ? setTracePositionId : undefined}
           variationTraces={variationTraceBadges}
           variationUntracedBadge={variationUntracedBadge}
@@ -5113,12 +5351,13 @@ export function BOQEditorPage() {
           onLookupResourceByCode={handleLookupResourceByCode}
           onDuplicatePosition={handleDuplicatePosition}
           onReuseCode={handleReuseCode}
-          onAddChildPosition={(parentId) => handleAddPosition(parentId)}
+          onAddChildPosition={handleAddChildPosition}
           onAddSubSection={handleAddSubSection}
           maxNestingDepth={maxNestingDepth}
           onShowLinks={handleShowLinks}
           onUnlinkPosition={handleUnlinkPosition}
           onModelLink={handleModelLink}
+          onLinkFromModel={boq.is_locked || !offerModelEntryPoints ? undefined : handleLinkFromModel}
           onSuggestRate={handleSuggestRate}
           onClassify={handleClassify}
           onCheckAnomalies={handleCheckAnomalies}
@@ -5131,11 +5370,9 @@ export function BOQEditorPage() {
           showResourceSplitPill={showResourceSplitPill}
           boqVariables={boqVariables}
           bimModelId={bimModelId}
-          onHighlightBIMElements={(elementIds) => {
-            setBOQLinkSelection(null, elementIds);
-          }}
+          onHighlightBIMElements={handleHighlightBIMElements}
         /></div>
-      ) : (
+      ) : boq.is_locked ? null : (
         <div className="rounded-xl border border-border-light bg-surface-elevated shadow-xs overflow-hidden p-8">
           <EmptyBOQOnboarding
             onAddSection={handleAddSection}
@@ -5205,10 +5442,14 @@ export function BOQEditorPage() {
       {boqId && hasPositions && deferredReady && <div className="mt-6"><EstimateClassification boqId={boqId} /></div>}
 
       {/* ── Sensitivity Analysis (Tornado Chart) ──────────────────────── */}
-      {boqId && hasPositions && <div className="mt-6"><SensitivityChart boqId={boqId} locale={locale} /></div>}
+      {boqId && hasPositions && (positions?.some((p) => p.unit_rate > 0) ?? false) && (
+        <div className="mt-6"><SensitivityChart boqId={boqId} locale={locale} /></div>
+      )}
 
       {/* ── Monte Carlo Cost Risk ─────────────────────────────────────── */}
-      {boqId && hasPositions && <div className="mt-6"><CostRiskPanel boqId={boqId} locale={locale} /></div>}
+      {boqId && hasPositions && (positions?.some((p) => p.unit_rate > 0) ?? false) && (
+        <div className="mt-6"><CostRiskPanel boqId={boqId} locale={locale} /></div>
+      )}
 
       {/* ── Activity Log Panel ────────────────────────────────────────── */}
       <ActivityPanel
@@ -5338,25 +5579,29 @@ export function BOQEditorPage() {
       />
 
       {/* ── Quick Add FAB ─────────────────────────────────────────────── */}
-      <QuickAddFAB
-        onAddPosition={() => handleAddPosition()}
-        onAddSection={handleAddSection}
-        onImportFromCosts={() => setCostDbModalOpen(true)}
-        sidePanelOpen={aiChatOpen || costFinderOpen || smartPanelOpen}
-        t={t}
-      />
+      {!boq.is_locked && (
+        <QuickAddFAB
+          onAddPosition={() => handleAddPosition()}
+          onAddSection={handleAddSection}
+          onImportFromCosts={() => setCostDbModalOpen(true)}
+          sidePanelOpen={aiChatOpen || costFinderOpen || smartPanelOpen}
+          t={t}
+        />
+      )}
 
       {/* ── Batch Action Bar ──────────────────────────────────────── */}
-      <BatchActionBar
-        selectedIds={selectedPositionIds}
-        onBatchDelete={handleBatchDelete}
-        onBatchChangeUnit={handleBatchChangeUnit}
-        onClearSelection={handleClearSelection}
-        onBatchFactor={handleBatchFactor}
-        onBatchSetClassification={handleBatchSetClassification}
-        onBatchFindReplace={handleBatchFindReplace}
-        onBatchSetValue={handleBatchSetValue}
-      />
+      {!boq.is_locked && (
+        <BatchActionBar
+          selectedIds={selectedPositionIds}
+          onBatchDelete={handleBatchDelete}
+          onBatchChangeUnit={handleBatchChangeUnit}
+          onClearSelection={handleClearSelection}
+          onBatchFactor={handleBatchFactor}
+          onBatchSetClassification={handleBatchSetClassification}
+          onBatchFindReplace={handleBatchFindReplace}
+          onBatchSetValue={handleBatchSetValue}
+        />
+      )}
 
       {/* ── Export Quality Warning Dialog ──────────────────────────── */}
       {exportWarning && (
@@ -5423,7 +5668,9 @@ export function BOQEditorPage() {
           >
             <div className="flex items-center justify-between mb-4">
               <h3 id="boq-gaeb-export-title" className="text-sm font-semibold text-content-primary">
-                {t('boq.gaeb_export_title', { defaultValue: 'Export GAEB XML (X83)' })}
+                {gaebExportFormat === 'gaeb_x84'
+                  ? t('boq.gaeb_export_title_x84', { defaultValue: 'Export GAEB XML (X84) - with prices' })
+                  : t('boq.gaeb_export_title', { defaultValue: 'Export GAEB XML (X83)' })}
               </h3>
               <button
                 onClick={() => setGaebPreviewOpen(false)}
@@ -5504,6 +5751,20 @@ export function BOQEditorPage() {
         />
       )}
 
+      {/* ── Change review: revised drawings, new model versions ─────── */}
+      {boqId && (
+        <ChangeReviewPanel
+          boqId={boqId}
+          locale={locale}
+          currencyCode={currencyCode}
+          isOpen={changeReviewOpen}
+          isLocked={!!boq?.is_locked}
+          onClose={() => setChangeReviewOpen(false)}
+          onApplied={() => invalidateAll()}
+          onJumpToPosition={handleOutlineJump}
+        />
+      )}
+
       {/* ── Feature 2: Estimate baseline / line-level compare ───────── */}
       {boqId && boq?.project_id && (
         <BOQCompareDrawer
@@ -5526,6 +5787,16 @@ export function BOQEditorPage() {
         />
       )}
 
+      {/* ── NRM 1 elemental cost plan (read-only view of this bill) ─ */}
+      {boqId && (
+        <CostPlanDialog
+          boqId={boqId}
+          boqName={boq?.name ?? ''}
+          open={costPlanOpen}
+          onClose={() => setCostPlanOpen(false)}
+        />
+      )}
+
       {/* ── Send to tender dialog ─────────────────────────────────── */}
       {boqId && boq?.project_id && (
         <SendToTenderDialog
@@ -5533,6 +5804,7 @@ export function BOQEditorPage() {
           projectId={boq.project_id}
           baseName={boq?.name ?? ''}
           sectionIds={selectedSectionIds}
+          scopeRows={tenderScopeRows}
           isOpen={tenderOpen}
           onClose={() => setTenderOpen(false)}
           onCreated={handleTenderCreated}
@@ -5748,7 +6020,13 @@ export function BOQEditorPage() {
                   quantity,
                   metadata: {
                     ...pos.metadata,
-                    measurement: { unit: pos.unit, lines },
+                    // Spread first so a rule the sheet carries (row_decimals)
+                    // survives an edit in the drawer, which does not edit it.
+                    measurement: {
+                      ...(pos.metadata?.measurement as Record<string, unknown> | undefined),
+                      unit: pos.unit,
+                      lines,
+                    },
                   },
                 },
               });
@@ -5960,6 +6238,20 @@ export function BOQEditorPage() {
         boqId={boqId!}
         onImported={invalidateAll}
       />
+      {boqId && gaebSiteOpen && (
+        <GaebSiteExchangeDialog
+          open={gaebSiteOpen}
+          boqId={boqId}
+          boqName={boq?.name ?? 'boq'}
+          initialFile={gaebSiteFile}
+          readOnly={Boolean(boq?.is_locked)}
+          onClose={() => {
+            setGaebSiteOpen(false);
+            setGaebSiteFile(null);
+          }}
+          onApplied={invalidateAll}
+        />
+      )}
     </div>
   );
 }

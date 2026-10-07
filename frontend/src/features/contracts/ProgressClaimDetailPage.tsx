@@ -9,7 +9,9 @@
 // table, the "Populate from progress observations" action (Gap I bridge), and
 // the lifecycle transition buttons (Submit → Approve → Certify → Mark paid /
 // Reject) gated by status + role. Certify and Mark-paid are MANAGER-gated on
-// the backend, so the affordances are hidden for editors/viewers.
+// the backend, so the affordances are hidden for editors/viewers. While the
+// claim is editable, the submission check (ClaimValidationPanel) sits under
+// the header.
 
 import { useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
@@ -36,13 +38,14 @@ import {
   SkeletonTable,
 } from '@/shared/ui';
 import { MoneyDisplay } from '@/shared/ui/MoneyDisplay';
-import { DateDisplay } from '@/shared/ui/DateDisplay';
 import { useToastStore } from '@/stores/useToastStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { getErrorMessage } from '@/shared/lib/api';
 import {
+  getContract,
   getProgressClaim,
   listClaimLines,
+  listContractLines,
   submitClaim,
   approveClaim,
   certifyClaim,
@@ -51,9 +54,15 @@ import {
   type ProgressClaimItem,
   type ClaimStatus,
 } from './api';
+import { ClaimValidationPanel, claimValidationKey } from './ClaimValidationPanel';
+import { ClaimPeriod } from './ClaimPeriod';
+import { invalidateClaimAfterLineWrite } from './claimQueries';
+import { contractsTabHref } from './contractsTabs';
 import { PopulatePreviewModal } from './PopulatePreviewModal';
 import { ProgressClaimLineTable } from './ProgressClaimLineTable';
 import { AIAApplicationPanel } from './AIAApplicationPanel';
+import { GaebInvoicePanel } from './GaebInvoicePanel';
+import { SubRollupPanel } from './SubRollupPanel';
 import { ClaimInvoicePreview } from '@/features/finance';
 import { projectsApi } from '@/features/projects/api';
 
@@ -90,7 +99,8 @@ function toNum(v: number | string | null | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-/** Lines are only editable while the claim is draft or submitted. */
+/** The claim is still being decided: draft or out for approval, not settled.
+ *  Its lines are a narrower question, see `linesEditable` below. */
 function isEditable(status: ClaimStatus): boolean {
   return status === 'draft' || status === 'submitted';
 }
@@ -118,6 +128,26 @@ export function ProgressClaimDetailPage() {
     enabled: !!claimId,
   });
 
+  // The contract's schedule of values. The line table names a line by its
+  // description rather than the head of a UUID, and a line can only be billed
+  // by hand if the screen knows what there is to bill. Same key the register
+  // uses, so the two share one cached read.
+  const sovQ = useQuery({
+    queryKey: ['contracts', 'lines', claimQ.data?.contract_id],
+    queryFn: () => listContractLines(claimQ.data?.contract_id as string),
+    enabled: !!claimQ.data?.contract_id,
+  });
+
+  // The contract says which way the claim is billed: a client claim is a
+  // receivable, a subcontractor's claim is a payable.
+  const contractQ = useQuery({
+    queryKey: ['contracts', 'detail', claimQ.data?.contract_id],
+    queryFn: () => getContract(claimQ.data?.contract_id as string),
+    enabled: !!claimQ.data?.contract_id,
+  });
+  const invoiceDirection =
+    contractQ.data?.counterparty_type === 'subcontractor' ? 'payable' : 'receivable';
+
   // Load the project so we can country-gate the AIA G702/G703 panel. The flag
   // is computed server-side (US/CA/AU only); the panel renders only when true,
   // and the AIA endpoints independently 404 elsewhere.
@@ -130,11 +160,9 @@ export function ProgressClaimDetailPage() {
   const claim = claimQ.data;
   const aiaEligible = projectQ.data?.is_aia_eligible === true;
 
-  const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ['contracts', 'claim', claimId] });
-    qc.invalidateQueries({ queryKey: ['contracts', 'claim-lines', claimId] });
-    qc.invalidateQueries({ queryKey: ['contracts', 'claims'] });
-  };
+  // Everything the claim's lines feed, the stored totals among them. Named in
+  // one place so a screen that writes a line cannot keep figures from before it.
+  const invalidate = () => invalidateClaimAfterLineWrite(qc, claimId as string);
 
   const transitionMut = (
     fn: (id: string) => Promise<ProgressClaimItem>,
@@ -146,7 +174,12 @@ export function ProgressClaimDetailPage() {
         invalidate();
         addToast({ type: 'success', title: okMsg });
       },
-      onError: (err) => addToast({ type: 'error', title: getErrorMessage(err) }),
+      onError: (err) => {
+        // A refused Submit is when the report matters most, and the claim may
+        // have changed since the panel last read it.
+        qc.invalidateQueries({ queryKey: claimValidationKey(claimId as string) });
+        addToast({ type: 'error', title: getErrorMessage(err) });
+      },
     });
 
   const submit = transitionMut(
@@ -173,6 +206,9 @@ export function ProgressClaimDetailPage() {
   const contractsHref = projectId
     ? `/projects/${projectId}/contracts`
     : '/contracts';
+  // Back and the breadcrumb return to the list the claim was opened from. The
+  // bare register opens on its Contracts tab, one more click from the claims.
+  const claimsHref = contractsTabHref('claims', projectId);
 
   if (claimQ.isLoading) {
     return (
@@ -189,6 +225,9 @@ export function ProgressClaimDetailPage() {
   }
 
   const editable = isEditable(claim.status);
+  // Lines are a draft's to change. Once the claim is out for approval its
+  // breakdown is what was billed on, and the server refuses a write to it.
+  const linesEditable = claim.status === 'draft';
 
   return (
     <div className="space-y-5" data-testid="progress-claim-detail">
@@ -197,7 +236,7 @@ export function ProgressClaimDetailPage() {
           ...(projectQ.data
             ? [{ label: projectQ.data.name, to: `/projects/${projectQ.data.id}` }]
             : []),
-          { label: t('nav.contracts', { defaultValue: 'Contracts' }), to: contractsHref },
+          { label: t('nav.contracts', { defaultValue: 'Contracts' }), to: claimsHref },
           { label: claim.claim_number || t('contracts.claim', { defaultValue: 'Claim' }) },
         ]}
       />
@@ -206,7 +245,7 @@ export function ProgressClaimDetailPage() {
         <div>
           <div className="flex items-center gap-3">
             <Link
-              to={contractsHref}
+              to={claimsHref}
               className="text-content-tertiary hover:text-oe-blue"
               aria-label={t('common.back', { defaultValue: 'Back' })}
             >
@@ -222,15 +261,14 @@ export function ProgressClaimDetailPage() {
               {claimStatusLabel(t, claim.status)}
             </Badge>
           </div>
-          <p className="mt-1 text-sm text-content-secondary">
-            {claim.period_start ? <DateDisplay value={claim.period_start} /> : '—'}
-            {' → '}
-            {claim.period_end ? <DateDisplay value={claim.period_end} /> : '—'}
+          <p className="mt-1 text-sm text-content-secondary" data-testid="claim-period">
+            {/* The same component the claims list uses, so the two agree. */}
+            <ClaimPeriod claim={claim} />
           </p>
         </div>
 
         <div className="flex flex-wrap gap-2">
-          {editable && (
+          {linesEditable && (
             <Button
               variant="primary"
               icon={<Download size={14} />}
@@ -294,6 +332,14 @@ export function ProgressClaimDetailPage() {
         </div>
       </div>
 
+      {editable && (
+        <ClaimValidationPanel
+          claimId={claimId as string}
+          awaitingSubmit={claim.status === 'draft'}
+          aiaEligible={aiaEligible}
+        />
+      )}
+
       <DismissibleInfo
         storageKey="contracts-claim"
         title={t('contracts_claim.intro_title', {
@@ -317,8 +363,26 @@ export function ProgressClaimDetailPage() {
       >
         {t('contracts_claim.intro_body', {
           defaultValue:
-            'Enter the percent or value complete against each schedule-of-values line, or pull it straight from progress observations, and the claim totals gross, retention and net due for you. Walk it through Submit, Approve, Certify and Mark paid, and the certified amount flows back to the contract and into Finance as a payable.',
+            'Enter the percent or value complete against each schedule-of-values line, or pull it straight from progress observations, and the claim totals gross, retention and net due for you. Walk it through Submit, Approve, Certify and Mark paid, and the certified amount flows back to the contract and into Finance.',
         })}
+        {/* Which side of the books the certified amount lands on follows the
+            contract, the same field the invoice card below is raised by: a
+            client contract bills a receivable, a subcontract a payable. Said
+            only once the contract is known, never guessed. */}
+        {contractQ.data && (
+          <span data-testid="claim-intro-direction">
+            {' '}
+            {invoiceDirection === 'payable'
+              ? t('contracts_claim.intro_direction_payable', {
+                  defaultValue:
+                    'This is a subcontract, so the certified amount is a payable: money you owe the subcontractor.',
+                })
+              : t('contracts_claim.intro_direction_receivable', {
+                  defaultValue:
+                    'This contract bills your client, so the certified amount is a receivable: money owed to you.',
+                })}
+          </span>
+        )}
       </DismissibleInfo>
 
       {/* Totals */}
@@ -369,14 +433,40 @@ export function ProgressClaimDetailPage() {
             ({(linesQ.data ?? []).length})
           </span>
         </p>
+        {!linesEditable && (
+          <p className="mb-2 text-xs text-content-tertiary" data-testid="claim-lines-locked">
+            {t('contracts.claim_lines_locked', {
+              defaultValue: "Only a draft claim's lines can be changed.",
+            })}
+            {/* Only while Reject is on this screen. An approved, certified,
+                rejected or paid claim cannot be sent back from here, and an
+                instruction nobody can follow is worse than none. */}
+            {claim.status === 'submitted' && (
+              <>
+                {' '}
+                {t('contracts.claim_lines_locked_reopen', {
+                  defaultValue: 'Reject it and raise a new draft claim for the corrected figures.',
+                })}
+              </>
+            )}
+          </p>
+        )}
         <ProgressClaimLineTable
           claimId={claimId as string}
           lines={linesQ.data ?? []}
           currency={claim.currency}
-          editable={editable}
+          editable={linesEditable}
           isLoading={linesQ.isLoading}
+          contractLines={sovQ.data ?? []}
         />
       </Card>
+
+      <SubRollupPanel
+        claimId={claimId as string}
+        contractId={claim.contract_id}
+        currency={claim.currency}
+        editable={editable}
+      />
 
       {/* The receivable invoice this claim spawns. The component names this
           panel as its home ("drops into the contracts claim detail panel");
@@ -387,12 +477,18 @@ export function ProgressClaimDetailPage() {
       <ClaimInvoicePreview
         claimId={claimId as string}
         certified={claim.status === 'certified' || claim.status === 'paid'}
+        direction={invoiceDirection}
         onInvoiced={() =>
           addToast({
             type: 'success',
-            title: t('finance.claimInvoice.raisedToast', {
-              defaultValue: 'Receivable invoice raised from this claim',
-            }),
+            title:
+              invoiceDirection === 'payable'
+                ? t('finance.claimInvoice.raisedToastPayable', {
+                    defaultValue: 'Payable invoice raised from this claim',
+                  })
+                : t('finance.claimInvoice.raisedToast', {
+                    defaultValue: 'Receivable invoice raised from this claim',
+                  }),
           })
         }
       />
@@ -401,6 +497,9 @@ export function ProgressClaimDetailPage() {
       {aiaEligible && (
         <AIAApplicationPanel claimId={claimId as string} currency={claim.currency} />
       )}
+
+      {/* GAEB X89 invoice, collapsed until opened. */}
+      <GaebInvoicePanel claimId={claimId as string} claimNumber={claim.claim_number} />
 
       {populateOpen && (
         <PopulatePreviewModal

@@ -14,9 +14,20 @@ import {
 import { Button, Card, CardHeader, CardContent, Badge, Breadcrumb, CountryFlag, DismissibleInfo, IntroRichText } from '@/shared/ui';
 import { PageHeader } from '@/shared/ui/PageHeader';
 import { useToastStore } from '@/stores/useToastStore';
+import { useAuthStore } from '@/stores/useAuthStore';
 import { apiGet, apiPost } from '@/shared/lib/api';
 import { reportBackgroundIndexFailure } from '@/features/costs/vectorIndex';
-import { useBaseCatalog, flattenVariants, type BaseVariant } from '@/features/costs/baseCatalog';
+import {
+  useBaseCatalog,
+  flattenVariants,
+  getActiveMarkets,
+  languageName,
+  loadBaseMarket,
+  textLanguageFallback,
+  canPriceMarkets as roleCanPriceMarkets,
+  type BaseMarketResult,
+  type BaseVariant,
+} from '@/features/costs/baseCatalog';
 import { BaseCatalogBrowser } from '@/features/costs/BaseCatalogBrowser';
 import { BaseCatalogError } from '@/features/costs/BaseCatalogError';
 import { getNumberLocale } from '@/stores/usePreferencesStore';
@@ -217,7 +228,9 @@ function DemoCard({
 // ── Main Page ───────────────────────────────────────────────────────────────
 
 export function DatabaseSetupPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  // Pricing a base into a market rewrites the shared catalogue (costs.update).
+  const canPriceMarkets = roleCanPriceMarkets(useAuthStore((s) => s.userRole));
   const navigate = useNavigate();
   const addToast = useToastStore((s) => s.addToast);
   const queryClient = useQueryClient();
@@ -341,24 +354,38 @@ export function DatabaseSetupPage() {
     async (variant: BaseVariant) => {
       // Local alias so the load / progress / toast body below reads naturally.
       const db = { id: variant.region, name: variant.market };
-      setLoading(db.id);
+      const isMarket = variant.market_catalog !== '';
+      // A national market card shares its base's region, so the spinner keys on
+      // the card, not the region, or it lands on the home card.
+      setLoading(variant.variant_id);
 
       try {
         // Run both imports in parallel. Catalog import is treated as
         // best-effort: not every region ships a priced catalogue file
         // and we still want the costs layer to count as success.
+        //
+        // A market card goes through the market load, which also switches the
+        // text to the card's language. load-cwicr on its region would install
+        // the plain home base in the home language.
         const [costsData, catalogData] = await Promise.all([
-          apiPost<Record<string, unknown>>(`/v1/costs/load-cwicr/${db.id}`),
-          apiPost<{ imported: number; skipped: number; region: string }>(
-            `/v1/catalog/import/${db.id}`,
-          ).catch((e: unknown) => {
-            // eslint-disable-next-line no-console
-            console.warn(`[setup] catalog import for ${db.id} failed:`, e);
-            return null;
-          }),
+          variant.market_catalog
+            ? loadBaseMarket(variant)
+            : apiPost<BaseMarketResult>(`/v1/costs/load-cwicr/${db.id}`),
+          // The resource catalogue import is the HOME catalogue, in the home
+          // language and currency. Next to a market load it would contradict
+          // the prices just set, and the import page does not run it either.
+          isMarket
+            ? Promise.resolve(null)
+            : apiPost<{ imported: number; skipped: number; region: string }>(
+                `/v1/catalog/import/${db.id}`,
+              ).catch((e: unknown) => {
+                // eslint-disable-next-line no-console
+                console.warn(`[setup] catalog import for ${db.id} failed:`, e);
+                return null;
+              }),
         ]);
 
-        const imported = (costsData.imported as number) ?? 0;
+        const imported = ((costsData.imported ?? costsData.items_repriced) as number) ?? 0;
         const totalItems = (costsData.total_items as number) ?? imported;
         const status = costsData.status as string | undefined;
         const catalogImported = catalogData?.imported ?? 0;
@@ -382,18 +409,58 @@ export function DatabaseSetupPage() {
             `${catalogImported.toLocaleString(getNumberLocale())} ${t('setup.catalog_resources', { defaultValue: 'catalog resources' })}`,
           );
         }
-        addToast(
-          {
-            type: status === 'already_loaded' ? 'info' : 'success',
-            // The database name is a variable, not a prefix: several languages
-            // do not open the sentence with it.
-            title: status === 'already_loaded'
-              ? t('setup.db_already_loaded', { name: db.name, defaultValue: '{{name}} already loaded' })
-              : t('setup.db_loaded', { name: db.name, defaultValue: 'Loaded {{name}}' }),
-            message: lines.join(' - '),
-          },
-          { duration: 8000 },
-        );
+        // The language the text is really in, when it is not the one asked for.
+        // A market card asked for a language no file holds (Turkiye has no
+        // English text), or a fresh base could not switch to its own language.
+        const fellBackTo = textLanguageFallback(costsData);
+        if (isMarket) {
+          addToast(
+            {
+              type: fellBackTo ? 'warning' : 'success',
+              title: t('costs.market_priced_title', { defaultValue: 'Priced into {{market}}', market: db.name }),
+              message: fellBackTo
+                ? t('costs.market_text_fallback', {
+                    defaultValue: 'The work items are in {{language}}: this base has no {{requested}} version.',
+                    language: languageName(fellBackTo, i18n.language),
+                    requested: languageName(variant.lang_code, i18n.language),
+                  })
+                : t('costs.market_priced_msg', {
+                    defaultValue: '{{items}} items repriced into {{market}} ({{currency}})',
+                    items: imported.toLocaleString(getNumberLocale()),
+                    market: db.name,
+                    currency: variant.currency,
+                  }),
+            },
+            { duration: fellBackTo ? 10000 : 8000 },
+          );
+        } else {
+          addToast(
+            {
+              type: status === 'already_loaded' ? 'info' : 'success',
+              // The database name is a variable, not a prefix: several languages
+              // do not open the sentence with it.
+              title: status === 'already_loaded'
+                ? t('setup.db_already_loaded', { name: db.name, defaultValue: '{{name}} already loaded' })
+                : t('setup.db_loaded', { name: db.name, defaultValue: 'Loaded {{name}}' }),
+              message: lines.join(' - '),
+            },
+            { duration: 8000 },
+          );
+          if (fellBackTo) {
+            addToast(
+              {
+                type: 'warning',
+                title: db.name,
+                message: t('costs.base_text_swap_failed', {
+                  defaultValue: 'The work items stayed in {{language}}: the {{requested}} text could not be loaded.',
+                  language: languageName(fellBackTo, i18n.language),
+                  requested: languageName(String(costsData.text_language_requested), i18n.language),
+                }),
+              },
+              { duration: 10000 },
+            );
+          }
+        }
 
         // Partial success: the rates (load-cwicr) landed but the parallel
         // resource catalogue (catalog/import) returned nothing - usually the
@@ -401,7 +468,7 @@ export function DatabaseSetupPage() {
         // success above mislead the user into thinking everything arrived.
         // Surface a separate, non-blocking notice with a one-click retry that
         // re-runs the whole region load (rates re-detect as already loaded).
-        if (!catalogData) {
+        if (!isMarket && !catalogData) {
           addToast(
             {
               type: 'warning',
@@ -459,10 +526,12 @@ export function DatabaseSetupPage() {
           });
         addToast({
           type: 'error',
-          title: t('setup.load_failed_title', {
-            defaultValue: 'Could not load {{name}}',
-            name: db.name,
-          }),
+          title: isMarket
+            ? t('costs.market_failed_title', { defaultValue: 'Could not price into {{market}}', market: db.name })
+            : t('setup.load_failed_title', {
+                defaultValue: 'Could not load {{name}}',
+                name: db.name,
+              }),
           message,
           action: {
             label: t('setup.load_failed_retry', { defaultValue: 'Retry' }),
@@ -475,7 +544,7 @@ export function DatabaseSetupPage() {
         setLoading(null);
       }
     },
-    [addToast, t, queryClient],
+    [addToast, t, i18n, queryClient],
   );
 
   // ── Load All bases sequentially ──
@@ -672,6 +741,8 @@ export function DatabaseSetupPage() {
               loadingRegion={loading}
               activeRegion={activeDb}
               onLoad={handleLoadRegion}
+              onReprice={canPriceMarkets ? handleLoadRegion : undefined}
+              activeMarkets={getActiveMarkets()}
               onSetActive={handleSetActive}
               elapsedSeconds={elapsed}
             />

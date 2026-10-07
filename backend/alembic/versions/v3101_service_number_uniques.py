@@ -89,5 +89,19 @@ def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     for table, _cols, name in _UNIQUES:
-        if _has_index(inspector, table, name):
+        if table not in inspector.get_table_names():
+            continue
+        # Which object carries this name depends on how the schema was built.
+        # ``upgrade()`` above makes a plain unique INDEX, because SQLite has no
+        # ``ALTER TABLE ADD CONSTRAINT``. The models declare the same names as
+        # ``UniqueConstraint``, so a database built by
+        # ``Base.metadata.create_all`` has a real UNIQUE CONSTRAINT instead, and
+        # the index of that name is the one backing it. PostgreSQL refuses to
+        # drop a backing index on its own - "cannot drop index ... because
+        # constraint ... requires it" (DependentObjectsStillExist) - so the
+        # constraint has to go first where there is one. Same shape as v3099.
+        constraints = {c["name"] for c in inspector.get_unique_constraints(table)}
+        if name in constraints:
+            op.drop_constraint(name, table, type_="unique")
+        elif _has_index(inspector, table, name):
             op.drop_index(name, table_name=table)

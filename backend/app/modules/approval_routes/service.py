@@ -62,7 +62,7 @@ from app.modules.approval_routes.schemas import (
     RouteUpdate,
     StepCreate,
 )
-from app.modules.approval_routes.simulate import step_cleared
+from app.modules.approval_routes.simulate import min_approvals_to_clear, named_approver_quorum_conflict, step_cleared
 from app.modules.approval_routes.timeline import compute_timeline
 
 logger = logging.getLogger(__name__)
@@ -87,10 +87,53 @@ def delegation_views_from_rows(rows: list[Delegation]) -> list[DelegationView]:
     ]
 
 
+def step_holder(
+    instance: Instance,
+    step: Step,
+    delegations: list[DelegationView],
+    *,
+    now: datetime,
+    project_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Resolve who is expected to act on ``step`` right now.
+
+    This is the notification question, not the entitlement question, and the
+    two are not interchangeable: entitlement may legitimately name nobody (a
+    role step, which the engine never expands to members) while a nudge has to
+    reach someone. In order of precedence: the per-instance assignee override,
+    the named step approver resolved through any active out-of-office
+    delegation, and finally the user who started the instance.
+
+    Shared by the SLA monitor's breach reminder and the escalation reader so
+    the person nudged and the person reported as holding the step cannot
+    disagree.
+
+    Args:
+        instance: The pending instance.
+        step: Its current step.
+        delegations: Active delegation views; the caller batches the load.
+        now: Evaluation time, for the delegation window.
+        project_id: The route's project, for project-scoped delegations.
+
+    Returns:
+        The user expected to act, or ``None`` when nothing names one.
+    """
+    if instance.current_assignee_user_id is not None:
+        return instance.current_assignee_user_id
+    if step.approver_user_id is not None:
+        return delegation_engine.resolve_delegate(
+            step.approver_user_id,
+            delegations,
+            now=now,
+            project_id=project_id,
+        )
+    return instance.started_by
+
+
 def _validate_target_kind(kind: str) -> None:
     if kind not in TARGET_KINDS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Unknown target_kind: {kind!r}",
         )
 
@@ -98,9 +141,21 @@ def _validate_target_kind(kind: str) -> None:
 def _validate_step_mode(mode: str) -> None:
     if mode not in STEP_MODES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Unknown step mode: {mode!r}",
         )
+
+
+def _validate_step_quorum(step: StepCreate) -> None:
+    """Refuse a named approver asked for more than one approval.
+
+    Checked here rather than on :class:`StepCreate` because ``clone_route``
+    rebuilds that schema from stored rows, and a validation error raised
+    there would surface as a 500 instead of this 422.
+    """
+    conflict = named_approver_quorum_conflict(step)
+    if conflict is not None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=conflict)
 
 
 def _safe_publish(name: str, data: dict[str, object]) -> None:
@@ -201,6 +256,7 @@ class ApprovalRouteService:
         _validate_target_kind(payload.target_kind)
         for step in payload.steps:
             _validate_step_mode(step.mode)
+            _validate_step_quorum(step)
 
         route = Route(
             project_id=payload.project_id,
@@ -313,6 +369,7 @@ class ApprovalRouteService:
         if payload.steps is not None:
             for step in payload.steps:
                 _validate_step_mode(step.mode)
+                _validate_step_quorum(step)
             existing = await self.repo.list_instances(route_id=route_id, limit=1)
             if existing:
                 raise HTTPException(
@@ -593,7 +650,7 @@ class ApprovalRouteService:
             _validate_target_kind(target_kind)
         if instance_status is not None and instance_status not in INSTANCE_STATUSES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Unknown status: {instance_status!r}",
             )
         return await self.repo.list_instances(
@@ -623,19 +680,19 @@ class ApprovalRouteService:
         route = await self.get_route(payload.route_id)
         if not route.is_active:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Route is not active",
             )
         if route.target_kind != payload.target_kind:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=(f"Route target_kind {route.target_kind!r} does not match requested {payload.target_kind!r}"),
             )
 
         steps = await self.repo.list_steps(route.id)
         if not steps:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Route has no steps",
             )
 
@@ -731,6 +788,12 @@ class ApprovalRouteService:
             6. On advance, if there is no next step, complete the
                instance as ``approved``. Otherwise bump
                ``current_step_ordinal`` and stay pending.
+
+        Who may decide is resolved once, by :meth:`entitled_deciders`, and the
+        same answer drives both the 403 above and the step-cleared check below.
+        A reassignment or an out-of-office delegation therefore moves the right
+        to decide and the power to clear the step together, instead of handing
+        the step to a stand-in whose approval the engine would then ignore.
         """
         # Lock the instance row so two approvers can't race the
         # advance/complete computation. ``nowait=False`` is the default -
@@ -749,7 +812,7 @@ class ApprovalRouteService:
         step = await self.repo.get_step(payload.step_id)
         if step is None or step.route_id != instance.route_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Step does not belong to this instance's route",
             )
         if step.ordinal != instance.current_step_ordinal:
@@ -760,36 +823,21 @@ class ApprovalRouteService:
 
         now = datetime.now(UTC)
 
-        # Determine who may decide the current step.
-        override = instance.current_assignee_user_id
-        if override is not None:
-            # A one-tap reassignment pins a specific stand-in: they become the
-            # sole eligible decider for this instance's current step and the
-            # template's approver / role no longer applies here.
-            if approver_id != override:
+        # Determine who may decide the current step. The resolved set is passed
+        # on to ``_maybe_advance`` so the rule that clears the step is the same
+        # one that just let this caller through: an approval this gate accepts
+        # must be an approval the advance check counts, or the instance sits
+        # pending with nobody left who is allowed to rescue it.
+        entitled = await self.entitled_deciders(instance, step, now=now)
+        if entitled is not None:
+            if approver_id not in entitled:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Not the assigned approver for this step",
-                )
-        elif step.approver_user_id is not None:
-            # User-pinned step: the named approver, or their active
-            # out-of-office delegate, may decide. We resolve the delegation
-            # chain lazily so a hand-off created after the step became active
-            # still routes correctly, without storing a stale override.
-            eligible = {step.approver_user_id}
-            delegations = await self.repo.list_active_delegations()
-            if delegations:
-                route = await self.get_route(instance.route_id)
-                eligible = delegation_engine.eligible_deciders(
-                    step.approver_user_id,
-                    delegation_views_from_rows(delegations),
-                    now=now,
-                    project_id=route.project_id,
-                )
-            if approver_id not in eligible:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Not the named approver for this step",
+                    detail=(
+                        "Not the assigned approver for this step"
+                        if instance.current_assignee_user_id is not None
+                        else "Not the named approver for this step"
+                    ),
                 )
         elif step.approver_role and not _caller_role_satisfies(caller_role, step.approver_role):
             # Role-based step: the caller must actually hold the required role.
@@ -851,7 +899,7 @@ class ApprovalRouteService:
             instance.current_assignee_user_id = None
             events_to_fire.append(("approval_routes.instance.rejected", {**base_event, "status": "rejected"}))
         else:
-            advanced = await self._maybe_advance(instance, step)
+            advanced = await self._maybe_advance(instance, step, entitled_deciders=entitled)
             if advanced is None:
                 # Step still pending - need more approvals. The override (if
                 # any) still applies to this same step, so leave it in place.
@@ -960,12 +1008,52 @@ class ApprovalRouteService:
         sole eligible decider for the instance's current step, without editing
         the shared route template. Notifies the new assignee and records an
         ``approval.reassigned`` timeline event.
+
+        Because the hand-off names exactly one decider, a step that needs
+        several distinct approvals is refused rather than pinned: pinning it
+        would let one stand-in clear a gate the route author declared for
+        several, which is a quorum the template never granted.
+
+        Args:
+            instance_id: The pending instance to hand off.
+            to_user_id: The stand-in who becomes the sole eligible decider.
+            actor_id: Who performed the hand-off, for the audit row.
+            reason: Optional free-text reason, recorded on the audit row.
+
+        Returns:
+            The updated :class:`Instance`.
+
+        Raises:
+            HTTPException: 409 when the instance is not pending, 422 when the
+                current step needs more than one approval or the stand-in has
+                no access to the route's project.
         """
         instance = await self._lock_instance(instance_id)
         if instance.status != "pending":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Instance is {instance.status}, cannot reassign",
+            )
+
+        # A stand-in is one person, so a hand-off only makes sense for a step
+        # that one approval can clear. Pinning a gate that demands several
+        # distinct approvers would collapse its quorum to whoever was named,
+        # which is a weaker gate than the route author declared, so the
+        # reassignment is refused instead. The demanded count comes from
+        # ``simulate.min_approvals_to_clear`` - the same rule the dry run
+        # shows the author - rather than a second reading of mode and quorum
+        # here. An instance pointing at an ordinal with no step has nothing to
+        # judge and is left to the existing behaviour.
+        steps = await self.repo.list_steps(instance.route_id)
+        current_step = next((s for s in steps if s.ordinal == instance.current_step_ordinal), None)
+        needed = min_approvals_to_clear(current_step) if current_step is not None else 1
+        if needed > 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"Step {instance.current_step_ordinal} needs {needed} approvals, so it "
+                    f"cannot be reassigned to a single stand-in"
+                ),
             )
 
         # The chosen stand-in must actually belong to the route's project, or the
@@ -977,7 +1065,7 @@ class ApprovalRouteService:
         route = await self.get_route(instance.route_id)
         if route.project_id is not None and not await self._user_can_access_project(route.project_id, to_user_id):
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Assignee does not have access to this route's project",
             )
 
@@ -1065,7 +1153,7 @@ class ApprovalRouteService:
         """Create an out-of-office hand-off of ``delegator_id``'s approvals."""
         if delegator_id == delegate_id:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Cannot delegate approvals to yourself",
             )
         delegation = Delegation(
@@ -1083,7 +1171,7 @@ class ApprovalRouteService:
         except IntegrityError as exc:
             await self.session.rollback()
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Unknown delegate user or project",
             ) from exc
         await log_activity(
@@ -1137,6 +1225,67 @@ class ApprovalRouteService:
         )
         return delegation
 
+    async def entitled_deciders(
+        self,
+        instance: Instance,
+        step: Step,
+        *,
+        now: datetime,
+    ) -> set[uuid.UUID] | None:
+        """Resolve who is allowed to decide ``step`` on ``instance`` right now.
+
+        This is the single definition of "who may decide this step". It is
+        consulted twice inside one decision: :meth:`submit_decision` rejects
+        anyone outside the returned set with a 403, and :meth:`_maybe_advance`
+        judges the step cleared from the very same set. Resolving it once per
+        request also keeps the two answers identical when a delegation window
+        would close between them.
+
+        The escalation reader asks the same question for a different purpose:
+        it keeps everyone in this set out of the escalation chain, because
+        handing a step to someone who may already decide it is not an
+        escalation. Who should be *told* about the step is a separate
+        question - a nudge must reach someone even where entitlement names
+        nobody - and is answered by :func:`step_holder`.
+
+        Args:
+            instance: The running instance. A non-null
+                ``current_assignee_user_id`` (a one-tap reassignment) outranks
+                the template.
+            step: The step being decided - already checked to be the current one.
+            now: Reference time used to resolve delegation windows.
+
+        Returns:
+            The set of user ids entitled to decide, or ``None`` when the step is
+            role-based with no runtime override. A role cannot be expanded to
+            its members here (that is a consumer concern), so entitlement in
+            that case is a role check on the caller rather than a user set.
+        """
+        override = instance.current_assignee_user_id
+        if override is not None:
+            # A one-tap reassignment pins a specific stand-in: they become the
+            # sole eligible decider for this instance's current step and the
+            # template's approver / role no longer applies here.
+            return {override}
+
+        if step.approver_user_id is not None:
+            # User-pinned step: the named approver, or their active
+            # out-of-office delegate, may decide. We resolve the delegation
+            # chain lazily so a hand-off created after the step became active
+            # still routes correctly, without storing a stale override.
+            delegations = await self.repo.list_active_delegations()
+            if not delegations:
+                return {step.approver_user_id}
+            route = await self.get_route(instance.route_id)
+            return delegation_engine.eligible_deciders(
+                step.approver_user_id,
+                delegation_views_from_rows(delegations),
+                now=now,
+                project_id=route.project_id,
+            )
+
+        return None
+
     # ── Internal helpers ──────────────────────────────────────────────
 
     async def _user_can_access_project(self, project_id: uuid.UUID, user_id: uuid.UUID) -> bool:
@@ -1188,8 +1337,21 @@ class ApprovalRouteService:
             )
         return row
 
-    async def _maybe_advance(self, instance: Instance, step: Step) -> bool | None:
+    async def _maybe_advance(
+        self,
+        instance: Instance,
+        step: Step,
+        *,
+        entitled_deciders: set[uuid.UUID] | None,
+    ) -> bool | None:
         """Decide whether the current step is cleared.
+
+        Args:
+            instance: The instance whose current step was just decided.
+            step: The decided step.
+            entitled_deciders: Who was allowed to decide this step, as resolved
+                by :meth:`entitled_deciders` for this same request, or ``None``
+                for a role-based step with no runtime override.
 
         Returns:
             ``True``  - every step has been cleared; complete the instance.
@@ -1219,10 +1381,20 @@ class ApprovalRouteService:
         approver_ids: set[uuid.UUID | None] = {s.approver_user_id for s in approvals}
         rejections = [s for s in states if s.decision == "rejected"]
         total_acted = len([s for s in states if s.decision != "pending"])
+        # ``user_pinned`` here means "this step has a concrete set of eligible
+        # deciders", which is what ``step_cleared`` tests - not "the template
+        # names a user". A reassignment or an out-of-office delegation moves
+        # that set off the template's ``approver_user_id`` at runtime, and the
+        # simulator, which only ever sees a template, has no such set. Reading
+        # the template column here instead of the entitled set is what left a
+        # reassigned step unclearable: the stand-in's approval was accepted and
+        # then ignored, while the named approver was already locked out by the
+        # 403 above.
+        entitled: set[uuid.UUID] = entitled_deciders or set()
         cleared = step_cleared(
             mode=step.mode,
-            user_pinned=step.approver_user_id is not None,
-            pinned_user_approved=step.approver_user_id in approver_ids,
+            user_pinned=entitled_deciders is not None,
+            pinned_user_approved=bool(entitled & approver_ids),
             approvals=len(approvals),
             distinct_approvers=len(approver_ids),
             rejections=len(rejections),

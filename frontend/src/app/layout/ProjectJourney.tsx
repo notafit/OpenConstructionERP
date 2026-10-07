@@ -219,7 +219,7 @@ function ProjectJourneyPanel({
   // a high z-index. A body-level portal escapes all of them, so the map always
   // paints on top of everything.
   return createPortal(
-    <div className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto p-3 sm:p-6">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-3 sm:p-6">
       <div
         className="fixed inset-0 bg-black/60 backdrop-blur-sm animate-fade-in"
         onClick={onClose}
@@ -229,10 +229,10 @@ function ProjectJourneyPanel({
         role="dialog"
         aria-modal="true"
         aria-label={t('journey.title', { defaultValue: 'Your project journey' })}
-        className="relative my-2 w-full max-w-6xl rounded-2xl border border-border-light bg-surface-elevated shadow-2xl animate-scale-in"
+        className="relative my-2 flex max-h-[calc(100vh-1.5rem)] w-full max-w-6xl flex-col rounded-2xl border border-border-light bg-surface-elevated shadow-2xl animate-scale-in sm:max-h-[calc(100vh-3rem)]"
       >
         {/* ── Header ─────────────────────────────────────────────────── */}
-        <div className="sticky top-0 z-10 flex items-start justify-between gap-3 rounded-t-2xl border-b border-border-light bg-surface-elevated/95 px-5 py-4 backdrop-blur">
+        <div className="z-10 flex shrink-0 items-start justify-between gap-3 rounded-t-2xl border-b border-border-light bg-surface-elevated px-5 py-4">
           <div className="flex items-start gap-3 min-w-0">
             <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-oe-blue/10 text-oe-blue">
               <RouteIcon size={18} strokeWidth={1.75} />
@@ -281,7 +281,7 @@ function ProjectJourneyPanel({
         </div>
 
         {/* ── Arcs and phases ────────────────────────────────────────── */}
-        <div className="space-y-6 px-5 py-5">
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5">
           {JOURNEY_ARCS.map((arc) => {
             const accent = ARC_ACCENT[arc.key];
             const phases = JOURNEY_PHASES.filter((p) => p.arc === arc.key);

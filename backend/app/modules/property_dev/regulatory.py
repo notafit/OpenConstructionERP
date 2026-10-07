@@ -30,6 +30,7 @@ Escrow data is read live from :class:`EscrowAccount` +
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -45,6 +46,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.pdf_branding import branded_doc_metadata, branded_header_logo, branded_letterhead
 from app.core.pdf_fonts import BODY_FONT, BOLD_FONT, register_pdf_fonts
 from app.modules.property_dev.models import (
     Buyer,
@@ -388,6 +390,7 @@ def _render_pdf(
         topMargin=1.5 * cm,
         bottomMargin=1.5 * cm,
         title=title,
+        **branded_doc_metadata(),
     )
     styles = getSampleStyleSheet()
     styles["Title"].fontName = BOLD_FONT
@@ -489,7 +492,18 @@ def _render_pdf(
         )
     )
 
-    doc.build(story)
+    # The developer's letterhead, when the company profile has one. The frame
+    # pads 6pt on each side, so this is the width a flowable can use.
+    letterhead = branded_letterhead(doc.width - 12)
+    if letterhead is not None:
+        story.insert(0, letterhead)
+
+    def _first_page(canvas: Any, page_doc: Any) -> None:
+        # A letterhead already carries the logo; the header copy would print it twice.
+        if letterhead is None:
+            branded_header_logo(canvas, page_doc)
+
+    doc.build(story, onFirstPage=_first_page, onLaterPages=branded_header_logo)
     pdf = buf.getvalue()
     buf.close()
     return pdf
@@ -569,7 +583,10 @@ async def generate_regulator_report_rera(
         ),
     ]
     qr_payload = f"RERA|{dev_meta['rera_number'] or dev_meta['code']}|{quarter}"
-    pdf_bytes = _render_pdf(
+    # Laying out the PDF is pure CPU, so it runs in a worker thread and the
+    # event loop keeps serving requests.
+    pdf_bytes = await asyncio.to_thread(
+        _render_pdf,
         title="RERA Quarterly Project Disclosure",
         subtitle=f"{dev_meta['name']} ({dev_meta['code']}) - {quarter}",
         sections=sections,
@@ -685,7 +702,10 @@ async def generate_regulator_report_maharera(
         ),
     ]
     qr_payload = f"MAHARERA|{dev_meta['maharera_number'] or dev_meta['code']}|{quarter}"
-    pdf_bytes = _render_pdf(
+    # Laying out the PDF is pure CPU, so it runs in a worker thread and the
+    # event loop keeps serving requests.
+    pdf_bytes = await asyncio.to_thread(
+        _render_pdf,
         title="MAHARERA Form 5 - Quarterly Progress Report",
         subtitle=f"{dev_meta['name']} ({dev_meta['code']}) - {quarter}",
         sections=sections,
@@ -821,7 +841,10 @@ async def generate_regulator_report_214fz(
         ),
     ]
     qr_payload = f"214FZ|{dev_meta['fz214_project_id'] or dev_meta['code']}|{quarter}"
-    pdf_bytes = _render_pdf(
+    # Laying out the PDF is pure CPU, so it runs in a worker thread and the
+    # event loop keeps serving requests.
+    pdf_bytes = await asyncio.to_thread(
+        _render_pdf,
         title="214-FZ - Quarterly Developer Report",
         subtitle=f"{dev_meta['name']} ({dev_meta['code']}) - {quarter}",
         sections=sections,
@@ -962,7 +985,10 @@ async def generate_regulator_report_cma(
         ),
     ]
     qr_payload = f"CMA|{dev_meta['cma_licence_no'] or dev_meta['code']}|{quarter}"
-    pdf_bytes = _render_pdf(
+    # Laying out the PDF is pure CPU, so it runs in a worker thread and the
+    # event loop keeps serving requests.
+    pdf_bytes = await asyncio.to_thread(
+        _render_pdf,
         title="CMA / Wafi - Quarterly Off-plan Disclosure",
         subtitle=f"{dev_meta['name']} ({dev_meta['code']}) - {quarter}",
         sections=sections,

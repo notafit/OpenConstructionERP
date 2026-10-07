@@ -2,12 +2,13 @@
 // Copyright (c) 2026 Artem Boiko / DataDrivenConstruction
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { useAuthStore } from './useAuthStore';
+import { COMPANY_TYPE_STORAGE_KEY } from '@/app/layout/useCompanyWorkspace';
 
 describe('useAuthStore', () => {
   beforeEach(() => {
     localStorage.clear();
     sessionStorage.clear();
-    useAuthStore.setState({ accessToken: null, isAuthenticated: false, userEmail: null });
+    useAuthStore.setState({ accessToken: null, isAuthenticated: false, userEmail: null, userId: null });
   });
 
   it('should start unauthenticated', () => {
@@ -68,6 +69,42 @@ describe('useAuthStore', () => {
     useAuthStore.getState().loadFromStorage();
     const state = useAuthStore.getState();
     expect(state.isAuthenticated).toBe(false);
+  });
+
+  describe('on a browser two people share', () => {
+    const tokenFor = (userId: string) => `header.${btoa(JSON.stringify({ sub: userId }))}.signature`;
+
+    it('reads the user id from the token and keeps it across a refresh and a reload', () => {
+      useAuthStore.getState().setTokens(tokenFor('user-a'), 'refresh-1', true, 'a@example.com');
+      expect(useAuthStore.getState().userId).toBe('user-a');
+      useAuthStore.getState().setTokens(tokenFor('user-a'), 'refresh-2', true, 'a@example.com');
+      expect(useAuthStore.getState().userId).toBe('user-a');
+      useAuthStore.getState().loadFromStorage();
+      expect(useAuthStore.getState().userId).toBe('user-a');
+      useAuthStore.getState().logout();
+      expect(useAuthStore.getState().userId).toBeNull();
+    });
+
+    it('has no user id for a token that carries none', () => {
+      useAuthStore.getState().setTokens('access123', 'refresh456', true, 'test@example.com');
+      expect(useAuthStore.getState().userId).toBeNull();
+    });
+
+    it('forgets the cached company profile on logout', () => {
+      useAuthStore.getState().setTokens(tokenFor('user-a'), 'refresh-1', true, 'a@example.com');
+      localStorage.setItem(COMPANY_TYPE_STORAGE_KEY, 'general_contractor');
+      useAuthStore.getState().logout();
+      expect(localStorage.getItem(COMPANY_TYPE_STORAGE_KEY)).toBeNull();
+    });
+
+    it('forgets it when another account signs in, and keeps it on a token refresh', () => {
+      useAuthStore.getState().setTokens(tokenFor('user-a'), 'refresh-1', true, 'a@example.com');
+      localStorage.setItem(COMPANY_TYPE_STORAGE_KEY, 'general_contractor');
+      useAuthStore.getState().setTokens(tokenFor('user-a'), 'refresh-2', true, 'a@example.com');
+      expect(localStorage.getItem(COMPANY_TYPE_STORAGE_KEY)).toBe('general_contractor');
+      useAuthStore.getState().setTokens(tokenFor('user-b'), 'refresh-3', true, 'b@example.com');
+      expect(localStorage.getItem(COMPANY_TYPE_STORAGE_KEY)).toBeNull();
+    });
   });
 
   describe('refreshAccessToken', () => {

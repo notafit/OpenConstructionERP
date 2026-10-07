@@ -7,8 +7,9 @@
 // ConstructionControlPage.
 //
 // i18n: every key carries its inline English default and is read via
-// t(key, { defaultValue }). These keys are NOT added to en.ts or any locale
-// file; the inline defaults are the single source of truth.
+// t(key, { defaultValue }). The keys are not in en.ts, the inline defaults
+// are the English source; their translations live in the other locale files,
+// so a changed default needs its translations redone too.
 //
 // Spotlight selectors point at the page's five pillar tabs. The TabBar is
 // rendered with testIdPrefix="cc", so each tab exposes a stable

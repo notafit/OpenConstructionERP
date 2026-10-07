@@ -25,6 +25,10 @@ CREDENTIAL_TYPES: tuple[str, ...] = (
     "registration",  # a register entry (trade card, roster)
     "training",  # a completed training / course record
     "accreditation",  # firm-level accreditation
+    "wsl_clearance",  # CA workers safety letter clearance
+    "wsib_clearance",  # CA ON Workplace Safety and Insurance Board
+    "wcb_clearance",  # CA provincial Workers Compensation Board
+    "attestation_revenu_quebec",  # CA QC tax compliance attestation
     "other",
 )
 

@@ -371,6 +371,17 @@ class PrequalificationResponse(BaseModel):
 
 # ── Certificate ──────────────────────────────────────────────────────────
 
+# The certificate types a subcontractor can file. The last three are the
+# generic names for clearances a national pack may require before a sub is paid
+# (a construction tax exemption, a social-security clearance, an employers'
+# liability clearance). They are named by what they prove, never by one
+# country's form, so the country's own label comes from the pack and the
+# locales while the stored value stays the same everywhere.
+_CERT_TYPE_PATTERN = (
+    r"^(insurance|license|iso|safety|bond|wsl_clearance|wsib_clearance|wcb_clearance|attestation_revenu_quebec"
+    r"|construction_tax_exemption|social_security_clearance|employers_liability_clearance)$"
+)
+
 
 class CertificateCreate(BaseModel):
     """Create payload for Certificate."""
@@ -378,7 +389,10 @@ class CertificateCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     subcontractor_id: UUID
-    cert_type: str = Field(..., pattern=r"^(insurance|license|iso|safety|bond)$")
+    cert_type: str = Field(
+        ...,
+        pattern=_CERT_TYPE_PATTERN,
+    )
     issued_by: str | None = Field(default=None, max_length=255)
     issue_date: date | None = None
     valid_until: date | None = None
@@ -412,7 +426,10 @@ class CertificateUpdate(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    cert_type: str | None = Field(default=None, pattern=r"^(insurance|license|iso|safety|bond)$")
+    cert_type: str | None = Field(
+        default=None,
+        pattern=_CERT_TYPE_PATTERN,
+    )
     issued_by: str | None = Field(default=None, max_length=255)
     issue_date: date | None = None
     valid_until: date | None = None
@@ -468,15 +485,55 @@ class AgreementCreate(BaseModel):
     currency: str = Field(default="", max_length=3)
     start_date: date | None = None
     end_date: date | None = None
-    retention_percent: Decimal = Field(default=Decimal("5.0"), ge=0, le=100)
+    # Left out, it starts from the usual retention of the project's country,
+    # the same figure a contract there starts from (contracts.country_defaults).
+    retention_percent: Decimal | None = Field(default=None, ge=0, le=100)
     retention_release_event: str | None = Field(default=None, max_length=120)
     requires_lien_waiver: bool = False
+    prime_contract_id: UUID | None = None
+    contract_id: UUID | None = None
     notes: str | None = None
 
     @field_validator("currency")
     @classmethod
     def _currency_iso(cls, value: str) -> str:
         return _validate_currency(value) or ""
+
+
+class UnlinkedTwinResponse(BaseModel):
+    """An agreement and a contract on one project that look like one subcontract."""
+
+    agreement_id: UUID
+    agreement_title: str
+    contract_id: UUID
+    contract_code: str
+    contract_title: str
+    currency: str
+    agreement_value: Decimal
+    contract_value: Decimal
+    #: ``counterparty`` when the same subcontractor or contact is named,
+    #: ``name`` when only the normalised company names agree.
+    matched_on: str
+    #: Values within 1% of each other; a supporting signal, not the reason.
+    value_close: bool
+
+
+class UnlinkedTwinListResponse(BaseModel):
+    """Every likely twin pair on the project, plus how many there are.
+
+    Not paged: the banner has to raise every pair, so ``total`` equals the
+    length of ``items``. Declared after :class:`UnlinkedTwinResponse` because
+    ``from __future__ import annotations`` makes the field a string.
+    """
+
+    items: list[UnlinkedTwinResponse]
+    total: int
+
+
+class DismissTwinRequest(BaseModel):
+    """Say an agreement and a contract are different subcontracts."""
+
+    contract_id: UUID
 
 
 class AgreementUpdate(BaseModel):
@@ -492,6 +549,8 @@ class AgreementUpdate(BaseModel):
     retention_percent: Decimal | None = Field(default=None, ge=0, le=100)
     retention_release_event: str | None = Field(default=None, max_length=120)
     requires_lien_waiver: bool | None = None
+    prime_contract_id: UUID | None = None
+    contract_id: UUID | None = None
     status: str | None = Field(
         default=None,
         pattern=r"^(draft|active|completed|terminated)$",
@@ -520,6 +579,8 @@ class AgreementResponse(BaseModel):
     retention_percent: Decimal = Decimal("5.0")
     retention_release_event: str | None = None
     requires_lien_waiver: bool = False
+    prime_contract_id: UUID | None = None
+    contract_id: UUID | None = None
     status: str = "draft"
     notes: str | None = None
     created_by: str | None = None
@@ -545,6 +606,7 @@ class WorkPackageCreate(BaseModel):
         default="planned",
         pattern=r"^(planned|in_progress|completed)$",
     )
+    contract_line_id: UUID | None = None
 
 
 class WorkPackageUpdate(BaseModel):
@@ -560,6 +622,9 @@ class WorkPackageUpdate(BaseModel):
         default=None,
         pattern=r"^(planned|in_progress|completed)$",
     )
+    # Sending ``null`` explicitly clears the mapping; leaving the key out
+    # keeps it. The service reads ``exclude_unset``, so the two differ.
+    contract_line_id: UUID | None = None
 
 
 class WorkPackageResponse(BaseModel):
@@ -574,6 +639,7 @@ class WorkPackageResponse(BaseModel):
     planned_value: Decimal = Decimal("0")
     completion_percent: Decimal = Decimal("0")
     status: str = "planned"
+    contract_line_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -590,6 +656,42 @@ class PaymentApplicationLineCreate(BaseModel):
     claimed_amount: Decimal = Field(default=Decimal("0"), ge=0, le=_MONEY_MAX)
     certified_amount: Decimal = Field(default=Decimal("0"), ge=0, le=_MONEY_MAX)
     approved_amount: Decimal = Field(default=Decimal("0"), ge=0, le=_MONEY_MAX)
+    claimed_qty: Decimal = Field(default=Decimal("0"))
+    assessed_qty: Decimal = Field(default=Decimal("0"))
+    certified_qty: Decimal = Field(default=Decimal("0"))
+    # Optional override of the work package's GC schedule-of-values line.
+    contract_line_id: UUID | None = None
+
+
+class PaymentApplicationLineUpdate(BaseModel):
+    """Re-map one pay-application line to a GC schedule-of-values line.
+
+    Only the mapping is editable here. The amounts belong to the pay
+    application's approval chain and are not reopened by a mapping change.
+    ``null`` clears the override, so the line falls back to its work package.
+    """
+
+    contract_line_id: UUID | None = None
+
+
+class ApprovedLineAmount(BaseModel):
+    """What finance approves on one line of the pay application it approves."""
+
+    line_id: UUID
+    approved_amount: Decimal = Field(ge=0, le=_MONEY_MAX)
+
+
+class PaymentApplicationFinanceApproval(BaseModel):
+    """Optional body of the finance approval: the approved amount per line.
+
+    A line named here gets exactly that amount, at most what was claimed on
+    it. A line left out keeps an approved amount it already has, and one still
+    at zero is approved at its claimed amount, because approving the pay
+    application approves its gross, which the claims make up. So an approval
+    without a body, or with no lines, approves every line as claimed.
+    """
+
+    lines: list[ApprovedLineAmount] = Field(default_factory=list)
 
 
 class PaymentApplicationLineResponse(BaseModel):
@@ -603,6 +705,29 @@ class PaymentApplicationLineResponse(BaseModel):
     claimed_amount: Decimal = Decimal("0")
     certified_amount: Decimal = Decimal("0")
     approved_amount: Decimal = Decimal("0")
+    claimed_qty: Decimal = Decimal("0")
+    assessed_qty: Decimal = Decimal("0")
+    certified_qty: Decimal = Decimal("0")
+    contract_line_id: UUID | None = None
+
+
+class PaymentApplicationLineListResponse(BaseModel):
+    """One page of a pay application's lines plus how many it has.
+
+    ``total`` counts the pay application's lines, not the rows on the page, so
+    a reader holding fewer than ``total`` knows there are more. Declared after
+    :class:`PaymentApplicationLineResponse` on purpose: ``from __future__
+    import annotations`` turns the field into a string, so naming the row
+    class before it exists parses here and fails when Pydantic builds
+    the model.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    items: list[PaymentApplicationLineResponse]
+    total: int
+    offset: int = 0
+    limit: int = 50
 
 
 class PaymentApplicationCreate(BaseModel):
@@ -666,8 +791,16 @@ class PaymentApplicationResponse(BaseModel):
     foreman_approved_by: str | None = None
     finance_approved_at: datetime | None = None
     finance_approved_by: str | None = None
+    # The payable side, set at finance approval and read-only here. Empty
+    # before it, and on a pay application approved before these existed,
+    # which was paid as claimed.
+    approved_gross_amount: Decimal | None = None
+    approved_retention_amount: Decimal | None = None
+    approved_net_amount: Decimal | None = None
     paid_at: datetime | None = None
     rejection_reason: str | None = None
+    # Read-only here: only the claim rollup's include / exclude routes write it.
+    progress_claim_id: UUID | None = None
     created_by: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_")
     created_at: datetime
@@ -692,6 +825,9 @@ class RetentionLedgerEntryResponse(BaseModel):
     notes: str | None = None
     created_at: datetime
     updated_at: datetime
+    # Set only on the response to a release: codes for what the release went
+    # ahead without, e.g. ``no_final_lien_waiver``. A warning, not a refusal.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RetentionReleasePayload(BaseModel):
@@ -1005,6 +1141,7 @@ class LienWaiverResponse(BaseModel):
     mime_type: str | None = None
     file_size: int | None = None
     signed_date: date | None = None
+    through_date: date | None = None
     amount: Decimal = Decimal("0")
     currency: str = ""
     notes: str | None = None
@@ -1026,6 +1163,7 @@ class LienWaiverFormFields(BaseModel):
     waiver_type: str
     payment_application_id: UUID | None = None
     signed_date: date | None = None
+    through_date: date | None = None
     amount: Decimal = Decimal("0")
     currency: str = ""
     notes: str | None = None
@@ -1048,3 +1186,269 @@ class LienWaiverFormFields(BaseModel):
     @classmethod
     def _strip_notes(cls, v: str | None) -> str | None:
         return _strip_crlf(v)
+
+
+# ── GC claim rollup (subcontractor pay applications -> prime progress claim) ──
+#
+# Read-only shapes for ``GET /progress-claims/{claim_id}/rollup`` and its
+# siblings. Money is Decimal and serialises as a string; every figure is in the
+# claim's currency, and a pay application in another currency is counted as
+# skipped rather than converted or blended.
+
+
+class IncludePaymentApplicationsRequest(BaseModel):
+    """Pay applications a person has chosen to roll into one GC progress claim."""
+
+    payment_application_ids: list[UUID] = Field(..., min_length=1, max_length=200)
+
+
+class SubWaiverState(BaseModel):
+    """What the lien waivers on file for one pay application amount to.
+
+    ``state`` is the strongest payment waiver present: ``unconditional`` beats
+    ``conditional`` beats ``none``. Tax forms (W-9 / W-8) never count.
+    ``covers_net`` mirrors the payment gate: the largest waiver amount is at
+    least the pay application's net. ``through_date`` is the latest day any
+    waiver of that state releases, read from the waiver's own through-date and
+    falling back to its signing date for waivers filed before the through-date
+    existed (``through_date_basis`` says which).
+    """
+
+    state: str = "none"
+    amount_covered: Decimal = Decimal("0")
+    covers_net: bool = False
+    through_date: date | None = None
+    through_date_basis: str | None = None
+
+
+class SubWithholdingTerms(BaseModel):
+    """What a withholding scheme takes from a payment no certificate covers."""
+
+    scheme: str
+    rate_pct: str
+    vat_included: bool = True
+    # Small-amount limit per payee and calendar year, when the scheme has one.
+    annual_limit: Decimal | None = None
+    currency: str = ""
+    reference: str | None = None
+
+
+class SubPaymentDateFinding(BaseModel):
+    """A certificate the law reads on the payment day, judged for one pay application.
+
+    ``state`` is ``missing``, ``expired`` or ``revoked`` for a paid pay
+    application the certificate did not cover on ``judged_on``; ``undated``
+    for one marked paid without a payment date; and, while it is unpaid,
+    ``pending`` (the certificate on file runs until ``valid_until``),
+    ``pending_open`` (it has no end date) or ``pending_invalid`` (nothing on
+    file could cover a payment made after the period end). Nothing is
+    deducted: ``withholding`` states what the law takes, a person acts on it.
+    """
+
+    document_type: str
+    state: str
+    judged_on: date | None = None
+    lapsed_on: date | None = None
+    valid_until: date | None = None
+    withholding: SubWithholdingTerms | None = None
+
+
+class SubRollupPayApp(BaseModel):
+    """One subcontractor pay application as the GC's claim sees it."""
+
+    payment_application_id: UUID
+    application_number: str
+    agreement_id: UUID
+    agreement_title: str = ""
+    subcontractor_id: UUID
+    subcontractor_name: str = ""
+    status: str
+    period_start: date | None = None
+    period_end: date | None = None
+    currency: str = ""
+    gross_amount: Decimal = Decimal("0")
+    net_amount: Decimal = Decimal("0")
+    claimed_amount: Decimal = Decimal("0")
+    certified_amount: Decimal = Decimal("0")
+    approved_amount: Decimal = Decimal("0")
+    # Lines the pay application carries. With none it bills nothing on the
+    # claim, even though approving it approves its gross for payment.
+    line_count: int = 0
+    progress_claim_id: UUID | None = None
+    # ``True`` / ``False`` when the claim has a period to compare against;
+    # ``None`` when it has none yet, so nothing is asserted either way.
+    in_period: bool | None = None
+    requires_lien_waiver: bool = False
+    waiver: SubWaiverState = Field(default_factory=SubWaiverState)
+    # ``None`` when the claim has no period end to judge the certificates on.
+    certificates_ok: bool | None = None
+    certificate_findings: list[ComplianceDetail] = Field(default_factory=list)
+    foreign_currency: bool = False
+    # Set only when the national pack reads a certificate on the payment day.
+    # ``paid_on`` is the UTC day the pay application was marked paid.
+    paid_on: date | None = None
+    payment_date_findings: list[SubPaymentDateFinding] | None = None
+    certificates_pending_payment: bool | None = None
+
+
+class SubRollupRow(BaseModel):
+    """One pay application's contribution to one GC schedule-of-values line."""
+
+    payment_application_id: UUID
+    application_number: str
+    agreement_id: UUID
+    subcontractor_id: UUID
+    subcontractor_name: str = ""
+    status: str
+    claimed_amount: Decimal = Decimal("0")
+    certified_amount: Decimal = Decimal("0")
+    approved_amount: Decimal = Decimal("0")
+    waiver_state: str = "none"
+    waiver_covers_net: bool = False
+    certificates_ok: bool | None = None
+    # ``True`` while a certificate read on the payment day waits for that day.
+    certificates_pending_payment: bool | None = None
+
+
+class SubRollupLine(BaseModel):
+    """One GC schedule-of-values line with the subcontract billing under it."""
+
+    contract_line_id: UUID
+    code: str = ""
+    description: str = ""
+    scheduled_value: Decimal = Decimal("0")
+    gc_period_value: Decimal = Decimal("0")
+    sub_period_approved: Decimal = Decimal("0")
+    sub_approved_to_date: Decimal = Decimal("0")
+    # GC figure minus the subs' approved figure for this period. Positive means
+    # the GC bills more on the line than its subs were approved for.
+    variance: Decimal = Decimal("0")
+    exceeds_scheduled_value: bool = False
+    subs: list[SubRollupRow] = Field(default_factory=list)
+
+
+class SubRollupUnmappedLine(BaseModel):
+    """A pay-application line that resolves to no billable GC line."""
+
+    payment_application_id: UUID
+    application_number: str
+    line_id: UUID
+    work_package_id: UUID
+    work_package_name: str = ""
+    approved_amount: Decimal = Decimal("0")
+    claimed_amount: Decimal = Decimal("0")
+    # ``none`` (nothing mapped), ``foreign_line`` (mapped to a line that is not
+    # on this contract's schedule of values) or ``parent_line`` (mapped to a
+    # roll-up line, which is never billed directly).
+    reason: str = "none"
+    contract_line_id: UUID | None = None
+
+
+class SubRollupAgreement(BaseModel):
+    """How one subcontract agreement on the project resolves to a prime contract."""
+
+    agreement_id: UUID
+    title: str = ""
+    subcontractor_id: UUID
+    subcontractor_name: str = ""
+    prime_contract_id: UUID | None = None
+    # ``explicit`` (the agreement names it), ``single_active_client`` (the one
+    # active client contract on the project), ``ambiguous`` (several, and the
+    # agreement names none) or ``none`` (no active client contract at all).
+    resolution: str = "none"
+
+
+class SubPaymentRequirementsResponse(BaseModel):
+    """What a subcontractor must hold before being paid, and where that came from."""
+
+    certificate_types: list[str] = Field(default_factory=list)
+    lien_waiver_required: bool = False
+    # ``pack`` when a national regional pack answered, ``fallback`` when the
+    # module's built-in list applied because no pack did.
+    source: str = "fallback"
+    reference: str | None = None
+    # The certificate types read on the payment day rather than the period end.
+    payment_date_types: list[str] = Field(default_factory=list)
+
+
+class ClaimSubRollupResponse(BaseModel):
+    """Everything the subcontractors billed under one GC progress claim."""
+
+    claim_id: UUID
+    contract_id: UUID
+    project_id: UUID
+    claim_status: str
+    currency: str = ""
+    period_from: date | None = None
+    period_to: date | None = None
+    # ``dates`` when the claim carries typed period dates, ``parsed`` when they
+    # were read from its period strings, ``explicit_only`` when neither exists
+    # and only pay applications a person included are considered.
+    period_matching: str = "explicit_only"
+    as_of: date | None = None
+    lines: list[SubRollupLine] = Field(default_factory=list)
+    included: list[SubRollupPayApp] = Field(default_factory=list)
+    candidates: list[SubRollupPayApp] = Field(default_factory=list)
+    unmapped_lines: list[SubRollupUnmappedLine] = Field(default_factory=list)
+    agreements: list[SubRollupAgreement] = Field(default_factory=list)
+    requirements: SubPaymentRequirementsResponse = Field(default_factory=SubPaymentRequirementsResponse)
+    skipped_foreign_currency: int = 0
+    sub_period_approved_total: Decimal = Decimal("0")
+    gc_period_total: Decimal = Decimal("0")
+
+
+class SuggestedClaimLineItem(BaseModel):
+    """One claim line suggested from the subcontractors' approved amounts.
+
+    Same fields as the contracts module's progress preview item, so the claim
+    page can show both through one preview and commit both through the one
+    existing commit route. ``observed_pct`` is the cumulative percent complete
+    that the subs' approved-to-date amount represents on the line, clamped to
+    0-100 because the commit route refuses anything above 100.
+
+    ``origin`` says where the row came from: ``subcontract`` for a suggestion,
+    ``existing`` for a line already on the claim that no subcontractor covers.
+    The commit route replaces every line on the claim, so an existing line left
+    out of the preview would be deleted by committing it; carrying it unchanged
+    is what keeps the GC's own work on the bill.
+    """
+
+    contract_line_id: UUID
+    contract_line_code: str = ""
+    contract_line_description: str = ""
+    boq_position_id: UUID | None = None
+    unit: str | None = None
+    contract_quantity: Decimal = Decimal("0")
+    contract_line_value: Decimal = Decimal("0")
+    observed_pct: Decimal = Decimal("0")
+    period_label: str | None = None
+    recorded_at: datetime | None = None
+    period_completed_qty: Decimal = Decimal("0")
+    period_completed_value: Decimal = Decimal("0")
+    cumulative_completed_value: Decimal = Decimal("0")
+    origin: str = "subcontract"
+    # What the claim carries on this line today, so a reviewer can see what a
+    # suggestion would replace. ``None`` when the claim has no line there yet.
+    current_period_value: Decimal | None = None
+
+
+class SuggestedClaimLinesResponse(BaseModel):
+    """Preview payload for ``GET /progress-claims/{claim_id}/rollup/suggested-lines``.
+
+    ``skipped_unlinked`` counts subcontract lines that map to no billable GC
+    line, ``skipped_foreign_currency`` those in a currency other than the
+    claim's. ``skipped_no_progress`` is always zero here and exists only so the
+    shape matches the progress preview.
+    """
+
+    claim_id: UUID
+    contract_id: UUID
+    currency: str = ""
+    items: list[SuggestedClaimLineItem] = Field(default_factory=list)
+    skipped_unlinked: int = 0
+    skipped_no_progress: int = 0
+    skipped_foreign_currency: int = 0
+    gross: Decimal = Decimal("0")
+    retention: Decimal = Decimal("0")
+    prior_claims_total: Decimal = Decimal("0")
+    net_due: Decimal = Decimal("0")

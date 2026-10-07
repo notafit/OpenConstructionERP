@@ -148,9 +148,21 @@ def test_permission_registry_matches_constant():
 # ── Ticket FSM ───────────────────────────────────────────────────────────
 
 
-def test_ticket_terminal_states_have_no_outgoing_transitions():
-    for terminal in ("closed", "cancelled"):
-        assert allowed_ticket_transitions(terminal) == set(), f"ticket status '{terminal}' must be terminal"
+def test_ticket_cancelled_is_terminal_and_closed_only_reopens():
+    """Cancelled is the end of the line; closed has exactly one way out.
+
+    ``closed`` used to be terminal too. It now carries a single reopen edge to
+    ``in_progress``, gated by the 30-day window in ``reopen_ticket()`` - the
+    graph itself only says the edge exists. Asserting an empty set here would
+    be asserting the ticket can never be reopened, which is no longer the
+    product's answer, so assert the shape instead: one edge, and none of the
+    paths that would let a closed ticket re-enter the queue or rewrite its own
+    SLA history.
+    """
+    assert allowed_ticket_transitions("cancelled") == set()
+    assert allowed_ticket_transitions("closed") == {"in_progress"}
+    for forbidden in ("new", "assigned", "resolved", "closed"):
+        assert forbidden not in allowed_ticket_transitions("closed")
 
 
 def test_ticket_assigned_can_go_back_to_new_for_dispatcher_unassign():
@@ -174,14 +186,25 @@ def test_ticket_invalid_transition_raises_409_with_legal_set():
 # ── Work-order FSM ───────────────────────────────────────────────────────
 
 
-def test_work_order_terminal_states():
-    for terminal in ("billed", "cancelled"):
-        assert allowed_work_order_transitions(terminal) == set()
+def test_work_order_closed_is_the_only_terminal_state():
+    """Closed ends the work order; billed and cancelled each keep one edge.
+
+    Billed is no longer the end: a billed work order still has to be closed.
+    Cancelled can be rescheduled, which is the one way back into the flow.
+    """
+    assert allowed_work_order_transitions("closed") == set()
+    assert allowed_work_order_transitions("billed") == {"closed"}
+    assert allowed_work_order_transitions("cancelled") == {"scheduled"}
 
 
-def test_work_order_completed_only_goes_to_billed():
-    """The finance hand-off is the only forward path from completed."""
-    assert allowed_work_order_transitions("completed") == {"billed"}
+def test_work_order_completed_goes_to_verified_or_billed():
+    """Supervisor sign-off sits between completion and the finance hand-off.
+
+    ``verified`` is the sign-off step; ``billed`` stays reachable directly for
+    callers written before it existed. Both are forward paths and neither
+    skips completion, which is what the next test guards.
+    """
+    assert allowed_work_order_transitions("completed") == {"verified", "billed"}
 
 
 def test_work_order_cannot_skip_completed_to_billed():

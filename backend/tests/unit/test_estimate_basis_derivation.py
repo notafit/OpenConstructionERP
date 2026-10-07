@@ -29,6 +29,9 @@ to_decimal = derivation.to_decimal
 fmt_decimal = derivation.fmt_decimal
 fmt_pct = derivation.fmt_pct
 normalize_din276_main_group = derivation.normalize_din276_main_group
+normalize_masterformat_group = derivation.normalize_masterformat_group
+normalize_nrm_group = derivation.normalize_nrm_group
+resolve_trade_group = derivation.resolve_trade_group
 derive_trades = derivation.derive_trades
 draft_basis = derivation.draft_basis
 derive_provenance = derivation.derive_provenance
@@ -43,14 +46,26 @@ suggest_estimate_class = derivation.suggest_estimate_class
 def _pos(
     *,
     din276: str | None = None,
+    masterformat: str | None = None,
+    nrm: str | None = None,
+    classification: dict | None = None,
     description: str = "",
     quantity: str = "1",
     unit_rate: str = "100",
     total: str = "100",
 ) -> dict:
-    classification = {"din276": din276} if din276 is not None else {}
+    if classification is not None:
+        cls = classification
+    else:
+        cls: dict[str, str] = {}
+        if din276 is not None:
+            cls["din276"] = din276
+        if masterformat is not None:
+            cls["masterformat"] = masterformat
+        if nrm is not None:
+            cls["nrm"] = nrm
     return {
-        "classification": classification,
+        "classification": cls,
         "description": description,
         "quantity": quantity,
         "unit_rate": unit_rate,
@@ -92,6 +107,57 @@ def test_normalize_din276_main_group() -> None:
     assert normalize_din276_main_group("030") == ""  # KG 0xx is not a main group
 
 
+# ── MasterFormat normalisation ─────────────────────────────────────────────
+
+
+def test_normalize_masterformat_group() -> None:
+    # Standard spaced form.
+    assert normalize_masterformat_group("03 30 00") == "300"  # Concrete -> building construction
+    assert normalize_masterformat_group("23 00 00") == "400"  # HVAC -> technical systems
+    assert normalize_masterformat_group("32 10 00") == "500"  # Exterior Improvements -> external
+    assert normalize_masterformat_group("12 00 00") == "600"  # Furnishings -> FFE
+    assert normalize_masterformat_group("02 40 00") == "200"  # Site prep
+    # Dashed and compact forms.
+    assert normalize_masterformat_group("03-30-00") == "300"
+    assert normalize_masterformat_group("033000") == "300"
+    # Division 01 (General Requirements) has no mapping -> empty.
+    assert normalize_masterformat_group("01 00 00") == ""
+    # Junk.
+    assert normalize_masterformat_group("") == ""
+    assert normalize_masterformat_group(None) == ""
+    assert normalize_masterformat_group("abc") == ""
+
+
+# ── NRM normalisation ─────────────────────────────────────────────────────
+
+
+def test_normalize_nrm_group() -> None:
+    assert normalize_nrm_group("2.5") == "300"  # Superstructure -> building construction
+    assert normalize_nrm_group("2.5.1") == "300"
+    assert normalize_nrm_group("5.8") == "400"  # Services -> technical systems
+    assert normalize_nrm_group("8.1") == "500"  # External works
+    assert normalize_nrm_group("0.1") == "200"  # Facilitating works -> site prep
+    assert normalize_nrm_group("") == ""
+    assert normalize_nrm_group(None) == ""
+
+
+# ── resolve_trade_group (cross-standard) ──────────────────────────────────
+
+
+def test_resolve_trade_group_prefers_din276_then_masterformat_then_nrm() -> None:
+    # DIN 276 present -> use it.
+    assert resolve_trade_group({"din276": "330"}) == "300"
+    # MasterFormat only.
+    assert resolve_trade_group({"masterformat": "03 30 00"}) == "300"
+    # NRM only.
+    assert resolve_trade_group({"nrm": "2.5"}) == "300"
+    # Both present, DIN 276 wins (it is tried first).
+    assert resolve_trade_group({"din276": "420", "masterformat": "03 30 00"}) == "400"
+    # Empty dict or junk.
+    assert resolve_trade_group({}) == ""
+    assert resolve_trade_group(None) == ""
+
+
 # ── derive_trades ────────────────────────────────────────────────────────────
 
 
@@ -123,6 +189,53 @@ def test_absent_core_trade_becomes_available_for_exclusion() -> None:
     # Both core trades present -> nothing expected-but-absent.
     both = derive_trades([_pos(din276="330"), _pos(din276="410")])
     assert both.absent_core == []
+
+
+def test_masterformat_positions_are_classified() -> None:
+    """A US project with MasterFormat codes must show classified positions."""
+    positions = [
+        _pos(masterformat="03 30 00", total="500"),  # Concrete -> 300
+        _pos(masterformat="05 10 00", total="300"),  # Metals -> 300
+        _pos(masterformat="23 00 00", total="800"),  # HVAC -> 400
+        _pos(masterformat="26 00 00", total="400"),  # Electrical -> 400
+    ]
+    coverage = derive_trades(positions)
+
+    present = {p.code: p for p in coverage.present}
+    assert "300" in present
+    assert "400" in present
+    assert present["300"].position_count == 2
+    assert present["400"].position_count == 2
+    assert coverage.classified_positions == 4
+    assert coverage.unclassified_positions == 0
+
+
+def test_nrm_positions_are_classified() -> None:
+    """A UK project with NRM codes must show classified positions."""
+    positions = [
+        _pos(nrm="2.5", total="600"),  # Superstructure -> 300
+        _pos(nrm="5.8", total="400"),  # Services -> 400
+    ]
+    coverage = derive_trades(positions)
+
+    present = {p.code: p for p in coverage.present}
+    assert "300" in present
+    assert "400" in present
+    assert coverage.classified_positions == 2
+    assert coverage.unclassified_positions == 0
+
+
+def test_mixed_standards_all_count_as_classified() -> None:
+    """Positions with different standards in the same BOQ all resolve."""
+    positions = [
+        _pos(din276="330", total="100"),
+        _pos(masterformat="23 00 00", total="200"),
+        _pos(nrm="2.5", total="300"),
+    ]
+    coverage = derive_trades(positions)
+
+    assert coverage.classified_positions == 3
+    assert coverage.unclassified_positions == 0
 
 
 def test_keyword_fallback_classifies_unclassified_positions() -> None:

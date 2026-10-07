@@ -5,9 +5,9 @@
 //
 // Co-located with the feature so the copy lives next to the screen it
 // describes. Every key carries an inline English default and is consumed
-// through t(key, { defaultValue }); none of these keys go into en.ts or any
-// locale file (inline defaults only, per the ModuleGuide integration
-// contract). The sections explain the core concepts first, then walk the
+// through t(key, { defaultValue }); the keys are not in en.ts, the inline
+// defaults are the English source; their translations live in the other
+// locale files, so a changed default needs its translations redone too. The sections explain the core concepts first, then walk the
 // user through actually creating a project and filling in its key fields.
 
 import type { ModuleGuideContent } from '@/shared/ui';

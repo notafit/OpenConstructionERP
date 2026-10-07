@@ -87,4 +87,4 @@ async def _on_document_deleted(event: Event) -> None:
         )
 
 
-event_bus.subscribe("documents.document.deleted", _on_document_deleted)
+event_bus.subscribe_once("documents.document.deleted", _on_document_deleted)

@@ -38,10 +38,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.events import event_bus
 from app.database import async_session_factory
-from app.modules.approval_routes import delegation_engine, escalation_service, sla_engine
+from app.modules.approval_routes import escalation_service, sla_engine
 from app.modules.approval_routes.delegation_engine import DelegationView
 from app.modules.approval_routes.models import Delegation, Instance, Route, Step, StepState
-from app.modules.approval_routes.service import delegation_views_from_rows
+from app.modules.approval_routes.service import delegation_views_from_rows, step_holder
 from app.modules.notifications.models import Notification
 from app.modules.notifications.service import NotificationService
 
@@ -133,25 +133,15 @@ async def _raise_breach(
 ) -> None:
     """Notify the responsible approver and publish the timeline event.
 
-    The recipient is, in order of precedence: the per-instance assignee
-    override (a one-tap reassignment), the named step approver resolved through
-    any active out-of-office delegation, or - for a role-based step the engine
-    cannot expand to members - the user who started the instance. This keeps a
-    breach nudge actionable rather than a silent miss.
+    The recipient comes from :func:`service.step_holder` - the assignee
+    override, then the named approver resolved through any active
+    out-of-office delegation, then the user who started the instance - so a
+    breach nudge stays actionable rather than a silent miss, and the escalation
+    reader reports the same holder this reminder reaches.
     """
     overdue = round(status.hours_overdue, 1)
     ordinal = instance.current_step_ordinal
-    if instance.current_assignee_user_id is not None:
-        recipient = instance.current_assignee_user_id
-    elif step.approver_user_id is not None:
-        recipient = delegation_engine.resolve_delegate(
-            step.approver_user_id,
-            delegations,
-            now=now,
-            project_id=route.project_id,
-        )
-    else:
-        recipient = instance.started_by
+    recipient = step_holder(instance, step, delegations, now=now, project_id=route.project_id)
 
     if recipient is not None:
         await NotificationService(session).create(

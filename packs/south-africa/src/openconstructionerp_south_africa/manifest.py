@@ -5,8 +5,8 @@ triggering the package ``__init__`` side-effects.
 
 This is DataDrivenConstruction's first African market pack. It is built
 entirely from public South African standards and regulations. The idea and
-a reference implementation were contributed by Aidan Koetaan
-(akoetaan@cut.ac.za); the implementation here is our own.
+a reference implementation were contributed by Aidan Koetaan.
+The implementation here is our own.
 """
 
 from __future__ import annotations
@@ -56,6 +56,14 @@ MANIFEST = PartnerPackManifest(
         "pppfa_preferential_procurement",
         "ipdm_procurement_gates",
     ],
+    # The documents above are reference text the engine never executes. This
+    # is the list that switches rules on. ASAQS measurement is in the NRM
+    # lineage, which is what the classification registry and the ZA country
+    # row give a South African project. The Johannesburg demo this pack
+    # installs is coded in MasterFormat, and that is safe: project creation
+    # records nrm as the pack's, and the BOQ router drops it for a project
+    # that names another standard, exactly as it drops the country row's.
+    validation_rule_sets=["nrm"],
     default_modules=[],  # empty = show all
     hidden_modules=[],
     # No bundled SA demo project yet: an empty list keeps the default
@@ -121,7 +129,7 @@ MANIFEST = PartnerPackManifest(
         # Credit for the proposal and reference implementation. The shipped pack
         # is written from the public standards (see CONTRIBUTORS.md).
         "acknowledgements": [
-            "Proposed by Aidan Koetaan (akoetaan@cut.ac.za)",
+            "Proposed by Aidan Koetaan",
         ],
     },
 )

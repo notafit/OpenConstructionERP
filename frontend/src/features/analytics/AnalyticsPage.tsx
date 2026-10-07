@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
-import { apiGet } from '@/shared/lib/api';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { apiGet, ApiError } from '@/shared/lib/api';
+import { useToastStore } from '@/stores/useToastStore';
 import { fmtCurrency, fmtNumber, fmtPercent } from '@/shared/lib/formatters';
 import {
   FolderOpen,
@@ -69,6 +70,9 @@ interface ProjectAnalytics {
   variance_pct: number | null;
   boq_count: number;
   status: 'on_budget' | 'over_budget';
+  gross_floor_area?: number | null;
+  cost_per_sqm?: number | null;
+  phase?: string | null;
 }
 
 interface CurrencyTotal {
@@ -90,7 +94,7 @@ interface AnalyticsOverview {
   projects: ProjectAnalytics[];
 }
 
-type SortField = 'name' | 'budget' | 'actual' | 'variance' | 'variance_pct';
+type SortField = 'name' | 'budget' | 'actual' | 'variance' | 'variance_pct' | 'cost_per_sqm';
 type SortDir = 'asc' | 'desc';
 
 /* ── Component ────────────────────────────────────────────────────────── */
@@ -108,6 +112,33 @@ export function AnalyticsPage() {
   // the user pauses for 300ms instead of on every keystroke.
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [page, setPage] = useState(0);
+  const queryClient = useQueryClient();
+  const addToast = useToastStore((s) => s.addToast);
+
+  // A row can outlive its project: another tab or another user may have
+  // deleted it since this list was fetched. Ask first, and on a 404 refresh
+  // the list and say what happened instead of opening "Project not found".
+  const openProject = useCallback(
+    async (projectId: string, suffix = '') => {
+      try {
+        await apiGet(`/v1/projects/${projectId}`);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          void queryClient.invalidateQueries({ queryKey: ['analytics'] });
+          addToast({
+            type: 'info',
+            title: t('analytics.project_deleted_title', { defaultValue: 'Project was deleted' }),
+            message: t('analytics.project_deleted_message', {
+              defaultValue: 'This project no longer exists. The analytics list has been refreshed.',
+            }),
+          });
+          return;
+        }
+      }
+      navigate(`/projects/${projectId}${suffix}`);
+    },
+    [addToast, navigate, queryClient, t],
+  );
 
   const { data, isLoading, isError, refetch, isFetching } = useQuery<AnalyticsOverview>({
     queryKey: ['analytics', 'overview'],
@@ -180,6 +211,7 @@ export function AnalyticsPage() {
       t('analytics.col_actual', { defaultValue: 'Actual' }),
       t('analytics.col_variance', { defaultValue: 'Variance' }),
       t('analytics.col_variance_pct', { defaultValue: 'Var. %' }),
+      t('analytics.col_cost_per_sqm', { defaultValue: 'Cost/m²' }),
       t('analytics.col_status', { defaultValue: 'Status' }),
     ];
     const rows = sortedProjects.map(p => [
@@ -190,6 +222,7 @@ export function AnalyticsPage() {
       Number(p.actual).toFixed(0),
       Number(p.variance).toFixed(0),
       p.variance_pct == null ? '' : fmtPercent(Number(p.variance_pct)),
+      p.cost_per_sqm != null ? Number(p.cost_per_sqm).toFixed(0) : '',
       p.status,
     ].join(','));
     const csv = [headers.join(','), ...rows].join('\n');
@@ -611,6 +644,14 @@ export function AnalyticsPage() {
                     onClick={handleSort}
                     align="right"
                   />
+                  <SortHeader
+                    field="cost_per_sqm"
+                    label={t('analytics.col_cost_per_sqm', { defaultValue: 'Cost/m²' })}
+                    current={sortField}
+                    dir={sortDir}
+                    onClick={handleSort}
+                    align="right"
+                  />
                   <th className="px-4 py-3 text-center text-xs font-medium text-content-tertiary uppercase tracking-wider">
                     {t('analytics.col_status', { defaultValue: 'Status' })}
                   </th>
@@ -629,11 +670,11 @@ export function AnalyticsPage() {
                       name: p.name,
                     })}
                     className="hover:bg-surface-secondary/30 transition-colors cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-oe-blue"
-                    onClick={() => navigate(`/projects/${p.id}`)}
+                    onClick={() => void openProject(p.id)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
-                        navigate(`/projects/${p.id}`);
+                        void openProject(p.id);
                       }
                     }}
                   >
@@ -675,6 +716,13 @@ export function AnalyticsPage() {
                         </>
                       )}
                     </td>
+                    <td className="px-4 py-3 text-right tabular-nums whitespace-nowrap text-content-secondary">
+                      {p.cost_per_sqm != null ? (
+                        <>{fmtNumber(p.cost_per_sqm, 0)} {p.currency}/m²</>
+                      ) : (
+                        <span className="text-content-tertiary">—</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-center">
                       <Badge
                         variant={p.status === 'on_budget' ? 'success' : 'error'}
@@ -694,7 +742,7 @@ export function AnalyticsPage() {
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          navigate(`/projects/${p.id}/finance`);
+                          void openProject(p.id, '/finance');
                         }}
                         title={t('analytics.open_finance', { defaultValue: 'Open Finance' })}
                         aria-label={t('analytics.open_finance_for', {

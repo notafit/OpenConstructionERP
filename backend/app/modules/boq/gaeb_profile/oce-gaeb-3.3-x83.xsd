@@ -53,27 +53,6 @@
     </xs:restriction>
   </xs:simpleType>
 
-  <xs:simpleType name="UnitPrice">
-    <xs:restriction base="xs:decimal">
-      <xs:totalDigits value="13"/>
-      <xs:fractionDigits value="3"/>
-    </xs:restriction>
-  </xs:simpleType>
-
-  <xs:simpleType name="Money">
-    <xs:restriction base="xs:decimal">
-      <xs:totalDigits value="13"/>
-      <xs:fractionDigits value="2"/>
-    </xs:restriction>
-  </xs:simpleType>
-
-  <xs:simpleType name="Percent">
-    <xs:restriction base="xs:decimal">
-      <xs:totalDigits value="9"/>
-      <xs:fractionDigits value="6"/>
-    </xs:restriction>
-  </xs:simpleType>
-
   <xs:simpleType name="ShortText">
     <xs:restriction base="xs:string">
       <xs:maxLength value="255"/>
@@ -180,15 +159,14 @@
 
   <!-- ==== Bill of quantities ========================================== -->
 
+  <!-- X83 Position: unpriced tender request. UP, IT and BidComm are
+       forbidden - pricing lives only in the X84 (Angebotsabgabe). -->
   <xs:complexType name="Position">
     <xs:sequence>
       <xs:element name="Provis" type="ProvisionalKind" minOccurs="0"/>
       <xs:element name="Qty" type="Quantity" minOccurs="0"/>
       <xs:element name="QU" type="UnitOfMeasure" minOccurs="0"/>
-      <xs:element name="UP" type="UnitPrice" minOccurs="0"/>
-      <xs:element name="IT" type="Money" minOccurs="0"/>
       <xs:element name="Description" type="DescriptionBlock" minOccurs="0"/>
-      <xs:element name="BidComm" type="RichText" minOccurs="0"/>
     </xs:sequence>
     <!-- @ID is an opaque handle. It is never the OZ: an xs:ID may not
          start with a digit and most OZ values do. -->
@@ -197,34 +175,12 @@
     <xs:attribute name="RNoIndex" type="OrdinalIndex"/>
   </xs:complexType>
 
-  <!-- A Zuschlagsposition. The percentage applies to ITMarkup, which is
-       the sum of the surcharged positions only and not the whole bill, so
-       IT is the figure that must be carried through unchanged. -->
-  <xs:complexType name="SurchargePosition">
-    <xs:sequence>
-      <xs:element name="ITMarkup" type="Money" minOccurs="0"/>
-      <xs:element name="Markup" type="Percent" minOccurs="0"/>
-      <xs:element name="IT" type="Money" minOccurs="0"/>
-      <xs:element name="Description" type="DescriptionBlock" minOccurs="0"/>
-    </xs:sequence>
-    <xs:attribute name="ID" type="xs:ID" use="required"/>
-    <xs:attribute name="RNoPart" type="OrdinalSegment" use="required"/>
-    <xs:attribute name="RNoIndex" type="OrdinalIndex"/>
-  </xs:complexType>
-
+  <!-- X83 PositionList: only Item elements (no MarkupItem). Surcharge
+       positions (Zuschlagspositionen) are a priced-phase concept and
+       belong exclusively in the X84. -->
   <xs:complexType name="PositionList">
     <xs:sequence>
-      <xs:choice minOccurs="0" maxOccurs="unbounded">
-        <xs:element name="Item" type="Position"/>
-        <xs:element name="MarkupItem" type="SurchargePosition"/>
-      </xs:choice>
-    </xs:sequence>
-  </xs:complexType>
-
-  <xs:complexType name="Totals">
-    <xs:sequence>
-      <xs:element name="Total" type="Money" minOccurs="0"/>
-      <xs:element name="TotalNet" type="Money" minOccurs="0"/>
+      <xs:element name="Item" type="Position" minOccurs="0" maxOccurs="unbounded"/>
     </xs:sequence>
   </xs:complexType>
 
@@ -235,11 +191,11 @@
     </xs:sequence>
   </xs:complexType>
 
+  <!-- X83 Category: no Totals (unpriced). -->
   <xs:complexType name="Category">
     <xs:sequence>
       <xs:element name="LblTx" type="RichText" minOccurs="0"/>
       <xs:element name="BoQBody" type="Body"/>
-      <xs:element name="Totals" type="Totals" minOccurs="0"/>
     </xs:sequence>
     <xs:attribute name="ID" type="xs:ID" use="required"/>
     <xs:attribute name="RNoPart" type="OrdinalSegment" use="required"/>
@@ -256,6 +212,7 @@
     </xs:sequence>
   </xs:complexType>
 
+  <!-- X83 BillInfo: no Totals (unpriced phase). -->
   <xs:complexType name="BillInfo">
     <xs:sequence>
       <xs:element name="Name" type="ShortText" minOccurs="0"/>
@@ -263,7 +220,6 @@
       <xs:element name="Date" type="xs:date" minOccurs="0"/>
       <xs:element name="OutlCompl" type="xs:string" minOccurs="0"/>
       <xs:element name="BoQBkdn" type="BreakdownPart" minOccurs="0" maxOccurs="unbounded"/>
-      <xs:element name="Totals" type="Totals" minOccurs="0"/>
     </xs:sequence>
   </xs:complexType>
 

@@ -127,9 +127,9 @@ hidden_imports += ["torch", "transformers"]
 #
 # The layers below are the ones the module loader reaches for by name rather
 # than by import statement, so they have to be declared here. Not every module
-# has every layer: 192 module packages carry 189 manifests, 188 routers, 173
-# services, 171 schemas, 150 models, 110 repositories, 57 event modules, 40
-# validator modules, 2 repair modules, one schema package and a single
+# has every layer: 195 module packages carry 193 manifests, 192 routers, 175
+# services, 175 schemas, 152 models, 114 repositories, 58 event modules, 44
+# validator modules, 3 repair modules, one schema package and a single
 # pipeline_nodes. Naming every layer for every module regardless produced 167
 # lines of
 #
@@ -164,11 +164,11 @@ hidden_imports += ["torch", "transformers"]
 # with no error to read.
 #
 # ``repairs`` is also why the criterion cannot be "a filename common enough to
-# look like a layer". Two modules carry ``repairs.py`` today against 189
+# look like a layer". Three modules carry ``repairs.py`` today against 193
 # manifests, so any rule keyed on how many modules have the file would rank it
 # with the one-off helpers. Discovery is what makes a layer, not frequency.
 #
-# ``schema`` is the thinnest of the ten and it earns its place the same way.
+# ``schema`` is the thinnest of the eleven and it earns its place the same way.
 # ``module_builder`` drops a module's table by importing
 # ``app.modules.<key>.schema``, and exactly one package in the tree answers to
 # that name: ``eac/schema/``, which holds the canonical EacRuleDefinition JSON
@@ -280,7 +280,7 @@ datas.append((str(ROOT / "data" / "match"), "data/match"))
 # directory sitting NEXT TO the app package, which in a frozen bundle is
 # ``sys._MEIPASS/packs``, so shipping backend/app does not carry them and no
 # desktop build had ever contained one. The wheel force-includes the same
-# fifteen paths at the same destinations (backend/pyproject.toml), and
+# forty-four paths at the same destinations (backend/pyproject.toml), and
 # backend/tests/unit/test_desktop_spec_ships_wheel_data.py checks the two
 # lists against each other.
 #
@@ -289,24 +289,51 @@ datas.append((str(ROOT / "data" / "match"), "data/match"))
 # the point of the gate is that two independently maintained lists have to be
 # brought into line by hand when a pack is added.
 #
-# Which packs, and why not all nineteen, is a licensing decision recorded next
-# to the wheel map: the deprecated pack and the three carrying a third party's
-# name are held back from community artefacts.
+# Which packs, and why not all forty-eight, is a licensing decision recorded
+# next to the wheel map: the deprecated pack and the three carrying a third
+# party's name are held back from community artefacts.
 _COMMUNITY_PACKS = (
     "aus",
+    "austria-at",
+    "belgium-be",
     "brazil-sinapi",
+    "canada-ca",
     "china-gbt50500",
+    "croatia-hr",
+    "czechia-cz",
+    "denmark-dk",
+    "france-fr",
+    "germany-de",
+    "greece-gr",
     "hungary-hu",
-    "russia-gesn",
     "india-cpwd",
+    "indonesia-id",
+    "ireland-ie",
+    "italy-it",
+    "japan-jp",
+    "korea-kr",
     "mexico-mx",
     "modular-prefab",
+    "netherlands-nl",
+    "nigeria-ng",
+    "norway-no",
     "nzs",
+    "poland-pl",
+    "portugal-pt",
     "renewables-epc",
     "retail-grocery-dach",
+    "romania-ro",
+    "russia-gesn",
     "saudi-vision2030",
+    "singapore-sg",
     "south-africa",
+    "spain-es",
+    "sweden-se",
+    "switzerland-ch",
+    "turkey-tr",
+    "uae-ae",
     "uk-jct",
+    "ukraine-ua",
     "us-california",
     "us-costdata",
     "us-texas",

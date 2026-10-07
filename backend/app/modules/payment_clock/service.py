@@ -29,6 +29,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.payment_clock.clock import (
@@ -39,7 +40,7 @@ from app.modules.payment_clock.clock import (
     parse_date,
     parse_money,
 )
-from app.modules.payment_clock.data import seed_payment_regimes
+from app.modules.payment_clock.data import REGIME_CODES, seed_payment_regimes
 from app.modules.payment_clock.models import (
     PaymentClockEvent,
     PaymentNotice,
@@ -60,15 +61,15 @@ from app.modules.payment_clock.repository import (
 from app.modules.payment_clock.repository import add_application as _repo_add_application
 from app.modules.payment_clock.repository import add_event as _repo_add_event
 from app.modules.payment_clock.repository import add_notice as _repo_add_notice
-from app.modules.payment_clock.repository import count_regimes as _repo_count_regimes
 from app.modules.payment_clock.repository import delete_stale_events as _repo_delete_stale_events
 from app.modules.payment_clock.repository import flush_application as _repo_flush_application
 from app.modules.payment_clock.repository import flush_events as _repo_flush_events
 from app.modules.payment_clock.repository import list_events_for_application as _repo_list_events_for_application
+from app.modules.payment_clock.repository import regime_codes as _repo_regime_codes
 from app.modules.payment_clock.repository import remove_application as _repo_remove_application
 from app.modules.payment_clock.repository import remove_notice as _repo_remove_notice
 from app.modules.payment_clock.schemas import ApplicationCreate, ApplicationUpdate, NoticeCreate
-from app.modules.payment_clock.validators import RULE_EVENT_TYPES
+from app.modules.payment_clock.validators import RULE_EVENT_TYPES, evaluate_clock
 
 logger = logging.getLogger(__name__)
 
@@ -99,18 +100,37 @@ def regime_spec(regime: PaymentRegime) -> dict[str, Any]:
 
 
 async def ensure_regimes(session: AsyncSession, *, refresh: bool = False) -> dict[str, int]:
-    """Seed the statutory catalogue if it is empty (or refresh it on request).
+    """Seed the shipped regimes the table does not have yet (or refresh them on request).
 
     Reference data, so it is loaded on demand rather than by a migration: the
     statutory values belong in :mod:`app.modules.payment_clock.data` where they
     can be read and corrected, and a migration that carried them would freeze a
     2026 reading of six statutes into the schema history.
+
+    The shortcut checks for missing codes, not for an empty table. It used to
+    skip the seeder whenever any row existed, so a deployment seeded once never
+    received a regime added to the catalogue afterwards, and the only way to
+    reach one was a refresh that also overwrites every row an operator had
+    corrected. The seeder without ``refresh`` only inserts, so running it when a
+    shipped code is absent adds that row and leaves the rest alone.
+
+    That insert runs on the read path, so the first requests after an upgrade
+    that ships a regime all try it. The loser of that race would otherwise fail
+    on the unique code at its commit, a 500 on a plain read. The insert is
+    flushed inside a savepoint instead, and a conflict there means another
+    request seeded the same rows first, which is the outcome this wanted.
     """
-    if not refresh:
-        count = await _repo_count_regimes(session)
-        if count:
-            return {"created": 0, "updated": 0, "unchanged": count}
-    return await seed_payment_regimes(session, refresh=refresh)
+    if refresh:
+        return await seed_payment_regimes(session, refresh=True)
+    present = await _repo_regime_codes(session)
+    if present.issuperset(REGIME_CODES):
+        return {"created": 0, "updated": 0, "unchanged": len(present)}
+    try:
+        async with session.begin_nested():
+            return await seed_payment_regimes(session)
+    except IntegrityError:
+        logger.info("Payment regimes were seeded by a concurrent request; keeping its rows")
+        return {"created": 0, "updated": 0, "unchanged": len(await _repo_regime_codes(session))}
 
 
 # ── The schedule ─────────────────────────────────────────────────────────────
@@ -597,6 +617,51 @@ async def record_clock_events(
     return written
 
 
+async def sync_clock_register(
+    session: AsyncSession,
+    *,
+    application: StatutoryPaymentApplication,
+    regime: PaymentRegime,
+) -> list[PaymentClockEvent]:
+    """File the breaches one clock shows today into the register.
+
+    The register is written here and only here, never by a read. It is always
+    evaluated as of today: a reader asking what the clock looked like on some
+    other date is asking a question, and the answer must not replace what was
+    filed, least of all by deleting a breach that had not happened yet on the
+    date they picked.
+    """
+    notices = await list_notices(session, application_id=application.id)
+    snapshot = clock_snapshot(application, regime, notices, as_of=date.today())
+    findings = await evaluate_clock(snapshot, application_id=str(application.id))
+    return await record_clock_events(session, application=application, findings=findings)
+
+
+async def sync_project_register(session: AsyncSession, *, project_id: Any) -> int:
+    """Bring the register of every clock on one project up to today.
+
+    The explicit counterpart of the reads: deadlines pass with nobody touching
+    a clock, so somebody (a person pressing the button, or a scheduled job)
+    has to ask for the register to be brought level. Returns how many clocks
+    were evaluated.
+    """
+    regimes = {regime.id: regime for regime in await list_regimes(session)}
+    count = 0
+    offset = 0
+    page = 500
+    while True:
+        rows = await list_applications(session, project_id=project_id, limit=page, offset=offset)
+        for application in rows:
+            regime = regimes.get(application.regime_id)
+            if regime is None:
+                continue
+            await sync_clock_register(session, application=application, regime=regime)
+            count += 1
+        if len(rows) < page:
+            return count
+        offset += page
+
+
 def regime_summary(regime: PaymentRegime) -> str:
     """The interest clause of a regime as one sentence, for a response body."""
     return interest_description(regime_spec(regime))
@@ -627,5 +692,7 @@ __all__ = [
     "recompute_schedule",
     "regime_spec",
     "regime_summary",
+    "sync_clock_register",
+    "sync_project_register",
     "update_application",
 ]

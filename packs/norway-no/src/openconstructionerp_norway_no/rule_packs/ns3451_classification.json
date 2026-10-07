@@ -1,0 +1,17 @@
+{
+  "rule_pack_id": "ns3451_classification",
+  "name": "NS 3451 — Bygningsdelstabell (Building Element Table)",
+  "standard": "NS 3451:2009",
+  "jurisdiction": "NO",
+  "regulator": "Standard Norge",
+  "publication_year": 2009,
+  "applies_to": [
+    "boq",
+    "estimate",
+    "validation"
+  ],
+  "description": "Reference document for NS 3451, the Norwegian building element table a priced bill is classified against, and for its relation to the NS 3453 cost breakdown. The table asks that every priced line carries an element code, that the code has the shape the table defines, that the group hierarchy is consistent and that the cost breakdown follows NS 3453. None of that is implemented as a rule. This document enables no automated check; see why_no_rules.",
+  "review_status": "Regulatory references are drawn from public sources and are pending review by a Norwegian quantity surveyor or cost consultant before they are relied on for a public submission. The published code tables and description texts behind this standard are commercial products with their own terms; no codes, titles or rates from them are reproduced here.",
+  "why_no_rules": "This document ships as reference and enables no engine rules. It previously declared five ids under the ns3451 prefix (element_code_required, valid_code_format, hierarchy_consistent, cost_breakdown_ns3453, no_orphan_positions), and the engine defines none of them and registers no rule set by that name. The classification rules the engine does implement are written for DIN 276, GAEB and MasterFormat and read those code shapes, so enabling one of them against NS 3451 codes would report a correctly coded Norwegian bill as wrong. The universal BOQ hygiene checks run on every project regardless of this document and are not claimed here.",
+  "enables_rule_ids": []
+}

@@ -449,12 +449,16 @@ async def test_cancel_via_armed_token_short_circuits_runner(
 async def test_list_runs_pagination(client: AsyncClient, auth_headers: dict) -> None:
     ruleset_id, _ = await _create_ruleset_with_rule_via_http(client, auth_headers)
 
-    # Create 3 runs.
-    for _ in range(3):
+    # Create 3 runs. Each needs its own Idempotency-Key: the endpoint dedups a
+    # repeat of the same ruleset and the same elements onto the first run and
+    # replays it verbatim, and ``_walls()`` hands back an identical payload
+    # every time - so posting three times without a key produced ONE run and
+    # left this pagination test paging over a single row.
+    for i in range(3):
         resp = await client.post(
             f"/api/v1/eac/rulesets/{ruleset_id}:run",
             json={"elements": _walls()},
-            headers=auth_headers,
+            headers={**auth_headers, "Idempotency-Key": f"pagination-run-{i}"},
         )
         assert resp.status_code == 201, resp.text
 

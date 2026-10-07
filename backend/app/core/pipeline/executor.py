@@ -22,7 +22,7 @@ like ``boq.events`` / ``costs.events`` register theirs.
 
 Three hard rules from §3.2 are enforced by convention here: node runners
 return small envelopes (IDs + previews, never the element universe),
-which protects the 2 GB-RAM / SQLite deploy target; Pydantic validates
+which protects the 3 GB-RAM deploy target; Pydantic validates
 node params at the boundary; dicts go on the wire.
 """
 
@@ -50,7 +50,7 @@ PIPELINE_JOB_KIND = "pipeline.run"
 # A user-authored DAG runs in-process; without an upper bound a buggy /
 # malicious graph could spin a worker forever or balloon node-state JSON.
 # Both caps are env-tunable so a self-host with bigger boxes can raise
-# them, but the defaults keep the SQLite / 2 GB-RAM deploy safe.
+# them, but the defaults keep the 3 GB-RAM deploy safe.
 DEFAULT_MAX_NODES_PER_RUN = int(os.environ.get("PIPELINE_MAX_NODES", "256"))
 DEFAULT_NODE_TIMEOUT_S = float(os.environ.get("PIPELINE_NODE_TIMEOUT_S", "300"))
 

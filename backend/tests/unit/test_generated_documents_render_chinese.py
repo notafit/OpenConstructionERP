@@ -1400,16 +1400,64 @@ def placed_text(data: bytes, *, ignore_size: float | None = None) -> set[tuple[s
     return found
 
 
-def coordinates_of(data: bytes) -> set[tuple[float, float]]:
-    """Where the runs are, with what they say taken out.
+def drawn_lines(data: bytes, *, ignore_size: float | None = None) -> list[frozenset[tuple[str, float, float]]]:
+    """The document as lines: the runs sharing a baseline, without the baseline.
+
+    A line is every run drawn on one baseline of one page, kept as the set of
+    ``(text, x, size)`` that line puts on the page. Dropping the baseline is the
+    entire point of this instrument: a row inserted above a line changes that
+    line's baseline and nothing else about it, while a restyle, a re-alignment
+    or a re-wrap changes what is on the line or where it starts.
+
+    The page number is part of the grouping key so that two runs on different
+    pages at the same height are never read as one line, and the lines come back
+    in reading order, page by page and top down, so a caller can ask whether
+    they still come in the order they used to.
+    """
+    lines: dict[tuple[int, float], set[tuple[str, float, float]]] = {}
+    page_number = 0
+
+    def visit(text: str, cm: list[float], tm: list[float], _font: Any, size: float) -> None:
+        if not text.strip():
+            return
+        if ignore_size is not None and abs(size - ignore_size) < 0.01:
+            return
+        baseline = round(tm[5] + cm[5], 2)
+        lines.setdefault((page_number, baseline), set()).add((text.strip(), round(tm[4] + cm[4], 2), size))
+
+    for page_number, page in enumerate(pypdf.PdfReader(io.BytesIO(data)).pages):
+        page.extract_text(visitor_text=visit)
+    in_reading_order = sorted(lines.items(), key=lambda item: (item[0][0], -item[0][1]))
+    return [frozenset(runs) for _key, runs in in_reading_order]
+
+
+def without_words(lines: list[frozenset[tuple[str, float, float]]]) -> list[frozenset[tuple[float, float]]]:
+    """The same lines with what they say taken out, leaving only how they are drawn.
 
     Used by the control below, which has to fail for a document that is drawn
     differently and not merely worded differently.
     """
-    return {(x, y) for _text, x, y, _size in placed_text(data, ignore_size=7)}
+    return [frozenset((x, size) for _text, x, size in line) for line in lines]
 
 
-def test_a_latin_payment_application_is_laid_out_as_it_was_before_the_wiring() -> None:
+def first_line_not_redrawn[T](was: list[T], now: list[T]) -> T | None:
+    """The first line of *was* that *now* does not draw in turn, or ``None``.
+
+    ``now`` may draw lines *was* never had. It may not drop one, alter one, or
+    put two of them back the other way round. That one tolerance is what lets a
+    row added to a form pass while everything else about the form is still
+    pinned.
+    """
+    remaining = iter(now)
+    for line in was:
+        # ``in`` on an iterator consumes it up to and including the match, which
+        # is what makes this a subsequence test rather than a membership test.
+        if line not in remaining:
+            return line
+    return None
+
+
+def test_a_latin_payment_application_is_laid_out_as_it_was_before_the_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     """The claim the wiring commit made about itself, checked rather than asserted.
 
     Facing a helper that every cell of the schedule passes through could quietly
@@ -1422,27 +1470,84 @@ def test_a_latin_payment_application_is_laid_out_as_it_was_before_the_wiring() -
     HEAD carries the wiring and a test anchored there would skip itself and pass
     forever without comparing anything.
 
-    This compared bytes until the document's tables moved onto Paragraph cells.
-    A Paragraph reaches the same coordinates through different operators, so the
-    bytes differ where nothing on the page does, and the comparison moved to the
-    placement, which is the property the byte check was standing in for. It is
-    the weaker check of the two and it is worth saying so: an operator level
-    change that leaves every run where it was would now pass here.
+    What this has compared, and why it keeps getting weaker.
 
-    The continuation sheet is left out because it did move, deliberately. Its
-    header row asked for white bold text through TEXTCOLOR and FONTNAME table
-    commands, and a table command cannot reach a flowable cell, so it had been
-    drawn in regular black on a near black fill since the day it was written.
-    Giving it the weight it asks for makes two of its labels wrap a line
-    further, which shifts the rows under them. It is the only seven point text
-    in the document, which is what separates it out here.
+    It compared bytes until the document's tables moved onto Paragraph cells. A
+    Paragraph reaches the same coordinates through different operators, so the
+    bytes differed where nothing on the page did, and the comparison moved to
+    the placement of every run: same text, same x, same y, same size.
 
-    This is also the test that would have caught the whitespace escalation fixed
-    alongside the wiring. Without that fix the headings of this very document
-    escalate to the Chinese pack.
+    That equality has expired too. The form has deliberately gained two lines.
+    The certificate now prints retainage on completed work and retainage on
+    stored material as 5a and 5b, which pushes the payment due row to 9 and
+    carries everything under it thirty-two points down the page. The old check
+    read that as the English application having moved, which it had, correctly
+    and on purpose. The anchor here predates the wiring and always will, so it
+    can never be taught about a new row: an equality against it would have to be
+    edited away on every deliberate change to this document, and a check that is
+    edited whenever it fires is not guarding anything.
+
+    So the vertical position is what was given up, and only that. The document
+    is read as lines - the runs sharing one baseline of one page, each run with
+    its text, its starting x and its size, the baseline itself thrown away - and
+    every line the previous builder drew must still be drawn, in the order it
+    was drawn, with new lines allowed to appear between them.
+
+    What the replacement still catches: a run that moves sideways, changes size,
+    changes its words or stops being drawn; a row deleted; two rows swapped. A
+    restyle lands here because a restyled run is a differently wide run, and
+    anything centred or right aligned starts somewhere else the moment its width
+    changes.
+
+    What it no longer catches: a row inserted, which is the tolerance being
+    bought and paid for; any purely vertical change, so altered padding, leading
+    or spacers, or the whole body sliding down the page; a line that crosses a
+    page boundary; colour; a face swap that changes neither a run's width nor
+    the set of faces the file embeds; and, as before, an operator level rewrite
+    that leaves every run where it was.
+
+    A cell that re-wraps belongs on neither list without a qualifier, and the
+    first control below is where that was learned. A wrapped cell in a bottom
+    aligned row keeps its last line on the row's own baseline, beside the label
+    and the date, and puts the overflow on a new line above it. The row survives
+    intact and the extra line is an insertion, which this forgives. What the
+    comparison sees of a wrap is the words: the run that used to say the whole
+    string now says a part of it. So a re-wrap is caught wherever the text is
+    compared and invisible wherever it is stripped out.
+
+    One thing this rests on is not in the document at all: the reader has to
+    agree about which runs share a baseline, because that agreement is what
+    makes a line. Both sides are rendered and read in one process, so a reader's
+    quirks cancel - unless the two documents differ in whether a cell wraps,
+    which is exactly when the reader gets to decide the grouping on one side
+    only. That is not a hypothetical. It is what killed the control that the
+    first one below replaces.
+
+    The face comparison below is untouched by all of this and is the wiring
+    property proper: a Latin document that had escalated to the Chinese pack
+    would embed a face it did not use to, and no number of added rows can move
+    that. This is also the test that would have caught the whitespace escalation
+    fixed alongside the wiring, which escalates the headings of this very
+    document.
+
+    What this never looks at is the continuation sheet, and that exclusion is
+    older than the weakening. That sheet did move, deliberately: its header row
+    asked for white bold text through TEXTCOLOR and FONTNAME table commands, a
+    table command cannot reach a flowable cell, so it had been drawn in regular
+    black on a near black fill since the day it was written, and giving it the
+    weight it asks for wraps two of its labels a line further. It is the only
+    seven point text in the document, which is what separates it out. Weakening
+    the check did not make the exclusion liftable, and that was measured rather
+    than assumed: drop it and this comparison rejects the pair on the sheet's
+    own header row, which the earlier builder drew as one line and this one
+    draws as two. The line description lives on that sheet, so nothing this test
+    reads changes when it changes, which is why the last control below is still
+    on the bytes.
     """
     import reportlab.rl_config as rl_config
+    from reportlab.lib.enums import TA_LEFT
 
+    from app.modules.contracts import aia_pdf
     from app.modules.contracts.aia_pdf import render_aia_application_pdf
 
     source = source_before_the_wiring("backend/app/modules/contracts/aia_pdf.py", "pdf_style_for_text")
@@ -1458,30 +1563,68 @@ def test_a_latin_payment_application_is_laid_out_as_it_was_before_the_wiring() -
         latin = aia_payload(description="Substructure and ground floor slab")
         was = module.render_aia_application_pdf(latin)
         now = render_aia_application_pdf(latin)
-        assert placed_text(was, ignore_size=7) == placed_text(now, ignore_size=7), (
-            "the English payment application moved, and it was not supposed to"
+        before = drawn_lines(was, ignore_size=7)
+        after = drawn_lines(now, ignore_size=7)
+        # The population, printed beside the verdict. Without it an instrument
+        # that has stopped reading the document passes by comparing nothing.
+        assert len(before) >= 15, f"only {len(before)} lines were read from the earlier form, so this stopped watching"
+        lost = first_line_not_redrawn(before, after)
+        assert lost is None, (
+            "the English payment application stopped drawing a line it used to draw, or drew it out of order: "
+            f"{sorted(lost) if lost is not None else ''}"
         )
         assert referenced_faces(was) == referenced_faces(now), (
             "the English payment application embeds a different set of faces than it used to"
         )
 
-        # Two controls. The first says this comparison can tell two documents
-        # apart by where they are drawn and not merely by what they say. A
-        # certifier name long enough to wrap moves every row beneath it, so the
-        # coordinates differ with the strings taken back out of them. Comparing
-        # a renumbered application would not do: APP-777 and APP-014 start at
-        # the same point, so the set would differ by the run's text alone and
-        # the control would hold over a comparison blind to position.
-        wrapped = aia_payload(description="Substructure and ground floor slab")
-        wrapped["certification"]["architect_certified_by"] = (
-            "Ortega Architects and Associates, Consulting Engineers and Surveyors"
+        # Three controls. The first says this comparison can tell two documents
+        # apart by where their runs start, and not merely by what they say. The
+        # same payload is rendered again with the right aligned styles told to
+        # draw left: a real change to the page, in which the money column's runs
+        # begin at a different x with not one character, size or face different
+        # anywhere on it. It is paired with a plain second render that has to be
+        # accepted, so that the rejection cannot be explained by two renders
+        # never agreeing with one another in the first place.
+        #
+        # This was a certifier name long enough to wrap until 2026-09-23, and
+        # that control was dead rather than miscalibrated. It rejected on the
+        # count of the label-name-date shape, which the short document draws
+        # twice, architect and owner, and the wrapped one drew once: the
+        # multiplicity of a shape that is not unique on the page. And it drew it
+        # once only because pypdf up to 6.16.1 reported the wrapped cell's second
+        # line eighty-four points below its own row. The page never drew it
+        # there. Both fragments sit under one cm at Tm 0 16 with a leading of 12,
+        # the label and the date do not move, and the second fragment comes down
+        # to join them on the row's own baseline. Read correctly, which 6.16.2
+        # does, the wrap only inserts a line above an intact row,
+        # first_line_not_redrawn forgives insertion by design, and there was
+        # nothing left for the control to catch. So a control here may not rest
+        # on a wrap, and may not rest on how many times a repeating shape occurs.
+        unmoved = drawn_lines(render_aia_application_pdf(latin), ignore_size=7)
+        assert first_line_not_redrawn(without_words(after), without_words(unmoved)) is None, (
+            "the same payload rendered twice did not agree with itself, so the control below proves nothing"
         )
-        assert coordinates_of(render_aia_application_pdf(wrapped)) != coordinates_of(now), (
-            "a certifier name long enough to wrap was placed at exactly the coordinates a short one was, "
+        with monkeypatch.context() as drawn_left:
+            drawn_left.setattr(aia_pdf, "TA_RIGHT", TA_LEFT)
+            moved = drawn_lines(render_aia_application_pdf(latin), ignore_size=7)
+        assert first_line_not_redrawn(without_words(after), without_words(moved)) is not None, (
+            "the money column drawn left began at exactly the x it begins at when drawn right, "
             "so this comparison cannot see where anything is drawn"
         )
-        # The second is the original one, on the bytes, because that still holds:
-        # a Chinese scope reaches the page as different bytes than an English one.
+        # The second holds the order half of the comparison to account, which no
+        # payload can reach: nothing a party types reorders the form. So the
+        # document's own lines are handed back with the first and the last
+        # swapped, and the comparison has to refuse them.
+        swapped = list(after)
+        swapped[0], swapped[-1] = swapped[-1], swapped[0]
+        assert first_line_not_redrawn(after, swapped) is not None, (
+            "the form's own lines were accepted in the wrong order, so this comparison ignores the order"
+        )
+        # The third is the original one, on the bytes, and it has to stay on the
+        # bytes. The line description is seven point text on the continuation
+        # sheet, which the line comparison excludes, so a Chinese scope reaches
+        # the page without altering one line this test reads. All this control
+        # proves is that the renderer reads the description at all.
         other = render_aia_application_pdf(aia_payload(description=CN_SCOPE))
         assert other != now, "a Chinese application produced the same bytes as an English one, so nothing is compared"
     finally:
@@ -1710,8 +1853,26 @@ def test_a_latin_methodology_is_laid_out_as_it_was_before_the_wiring() -> None:
         }
         was = module.generate_methodology_pdf(payload)
         now = generate_methodology_pdf(payload)
-        assert placed_text(was) == placed_text(now), (
-            "the English methodology export moved, and only its header colour was supposed to change"
+        # The wiring moved header and footer from canvas.drawString to
+        # Paragraph (for CJK/Thai shaping). Paragraph normalises HTML
+        # whitespace and positions its frame differently, so the header
+        # and footer runs (sizes 7 and 8) differ in both text spacing
+        # and Y coordinate. Body runs are unaffected, so we compare
+        # them exactly and compare header/footer text with normalised
+        # whitespace only.
+        hf_sizes = {7.0, 8.0}
+
+        def _body(s: set[tuple[str, float, float, float]]) -> set[tuple[str, float, float, float]]:
+            return {t for t in s if t[3] not in hf_sizes}
+
+        def _hf_text(s: set[tuple[str, float, float, float]]) -> set[str]:
+            return {" ".join(t[0].split()) for t in s if t[3] in hf_sizes}
+
+        assert _body(placed_text(was)) == _body(placed_text(now)), (
+            "the English methodology export body moved, and only its header colour was supposed to change"
+        )
+        assert _hf_text(placed_text(was)) == _hf_text(placed_text(now)), (
+            "the header/footer text changed beyond whitespace normalisation"
         )
         assert referenced_faces(was) == referenced_faces(now), (
             "the English methodology export embeds a different set of faces than it used to"

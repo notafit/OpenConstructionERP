@@ -25,7 +25,6 @@ from app.core.demo_projects import DemoTemplate, _generate_module_data
 from app.modules.change_intelligence.time_bar import (
     GENERIC_PERIODS,
     NOTICE_PERIODS,
-    NOTICE_PERIODS_HELD,
     STANDARD_UNKNOWN,
     normalize_standard,
     period_for,
@@ -50,24 +49,23 @@ def _declared_form(template: DemoTemplate) -> str:
     return str(template.project_metadata.get("general_contractor_form") or "").strip()
 
 
-def test_the_packs_still_declare_both_a_standard_with_periods_and_one_without() -> None:
-    """Without both, every other test in this file passes without discriminating.
+def test_the_packs_still_declare_a_standard_with_periods() -> None:
+    """Every declared form must resolve to a family with real periods.
 
-    The engine has three answers for a declared form, not two: a family with its
-    own periods, a family it recognises and holds no periods for, and a form it
-    does not recognise at all. The two branches this file needs to stay
-    populated are periods and no periods, so that is what is asserted here
-    rather than recognition, which no longer decides whether a deadline exists.
+    All shipped packs that name a contract form now resolve to a family with
+    sourced notice periods (FIDIC, CCDC, etc.). The engine has three answers
+    for a declared form: a family with its own periods, a family it recognises
+    and holds no periods for, and a form it does not recognise at all. This
+    test asserts the first branch is populated so the seam tests below are not
+    sweeping an empty set.
     """
     declared = {t.demo_id: _declared_form(t) for t in PACK_TEMPLATES if _declared_form(t)}
     assert declared, "no pack declares a form of contract; the rest of this file proves nothing"
 
     resolved = {demo_id: normalize_standard(form) for demo_id, form in declared.items()}
     with_periods = {d for d, s in resolved.items() if s in NOTICE_PERIODS}
-    without_periods = {d for d, s in resolved.items() if s not in NOTICE_PERIODS}
 
     assert with_periods, f"no pack declares a standard the engine holds periods for: {resolved}"
-    assert without_periods, f"no pack declares a standard the engine has no periods for: {resolved}"
 
 
 def test_a_declared_standard_is_stored_where_the_resolver_looks() -> None:
@@ -149,36 +147,32 @@ def test_the_supported_standard_differs_from_the_generic_fallback_where_it_shoul
     assert swept >= 1, "no pack declares a supported standard; this test swept nothing"
 
 
-def test_a_pack_naming_a_standard_the_engine_holds_no_periods_for_gets_no_deadline() -> None:
-    """Not a gap, and it must not be answered with a number from somewhere else.
+def test_a_pack_naming_ccdc_gets_ccdc_periods_not_the_generic_fallback() -> None:
+    """The Canadian packs declare CCDC, which now has its own sourced periods.
 
-    The Canadian packs declare CCDC, which the engine recognises and holds no
-    periods for. Two wrong answers are available to it and this pins the refusal
-    of both: inventing CCDC day counts would be a fabricated deadline wearing a
-    standard's name, and handing back the standard-neutral window would be the
-    same fabrication with the name still on the row to read it by. The generic
-    table stays the right answer for a form the engine cannot place at all,
-    which is a different case and is pinned in
-    ``test_ccdc_notice_periods_are_held_not_guessed.py`` - no shipped pack
-    declares such a form for this file to sweep.
+    CCDC claim and EOT are 10 working days (GC 6.5/6.6), materially different
+    from the generic 28 calendar-day fallback. This pins that a Canadian pack
+    resolves to CCDC and gets the contract's own windows, not the neutral ones.
     """
     swept = 0
     for template in PACK_TEMPLATES:
         form = _declared_form(template)
         expected = normalize_standard(form)
-        if not form or expected not in NOTICE_PERIODS_HELD:
+        if not form or expected != "CCDC":
             continue
         head = _head_contract(template)
         assert head is not None, f"{template.demo_id} generates no head contract"
         resolved = _standard_from_terms(head.get("terms") or {})
         assert resolved == expected, f"{template.demo_id} declares {form!r}, expected {expected}"
         assert resolved != STANDARD_UNKNOWN, f"{template.demo_id} declares {form!r} and lost the name of it"
-        # One assertion refuses both wrong answers, because an invented count and
-        # a borrowed generic one are both a number where there must be none.
         for notice_type in GENERIC_PERIODS:
-            assert period_for(resolved, notice_type) is None
+            actual = period_for(resolved, notice_type)
+            assert actual is not None, f"{notice_type} period is None for {resolved}"
+            assert actual != GENERIC_PERIODS[notice_type], (
+                f"{notice_type}: CCDC period equals the generic fallback ({actual})"
+            )
         swept += 1
-    assert swept >= 1, "no pack declares a held standard; the control swept nothing"
+    assert swept >= 1, "no pack declares CCDC; the control swept nothing"
 
 
 def test_a_pack_declaring_no_form_carries_no_contract_standard() -> None:

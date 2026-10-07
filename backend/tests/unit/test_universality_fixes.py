@@ -49,7 +49,7 @@ from app.core.match_service.boosts.region import (
         ("LT", ("LT_",)),  # Lithuania — Vilnius
         ("ID", ("ID_",)),  # Indonesia — Jakarta
         ("TH", ("TH_",)),  # Thailand — Bangkok
-        ("VN", ("VN_",)),  # Vietnam — Hanoi
+        ("VN", ("VN_", "VI_")),  # Vietnam — the published catalogue id is VI_HANOI
         ("KR", ("KR_",)),  # Korea — Seoul
         ("SA", ("SA_",)),  # Saudi Arabia
         ("HI", ("HI_",)),  # India / Hindi catalogue prefix
@@ -302,9 +302,10 @@ def test_classifier_hint_dict_includes_all_present_standards():
         ("RU", "gesn"),
         ("RU_STPETERSBURG", "gesn"),
         ("RU_MOSCOW", "gesn"),
-        ("UA", "gesn"),
         ("BY", "gesn"),
         ("KZ", "gesn"),
+        # ── Ukraine — its own 2021 cost rules, mapped onto DIN 276 ──
+        ("UA", "din276"),
         # ── Asia-Pacific single countries — native standards ────────
         ("JP", "sekisan"),
         ("CN", "gb50500"),
@@ -324,7 +325,7 @@ def test_classifier_hint_dict_includes_all_present_standards():
         # ── Romance — native standards ──────────────────────────────
         ("FR", "untec"),  # France — UNTEC
         ("IT", "voci"),  # Italy — VOCI
-        ("NL", "din276"),  # Benelux clusters to DACH/DIN-276
+        ("NL", "nlsfb"),  # Netherlands — native NL/SfB
         ("BE", "din276"),
         ("BENELUX", "din276"),
         # ── Latin America extras ────────────────────────────────────
@@ -337,6 +338,7 @@ def test_classifier_hint_dict_includes_all_present_standards():
         ("CZ", "din276"),
         ("BG", "din276"),
         ("RO", "din276"),
+        ("GR", "din276"),
         ("HR", "din276"),
         # ── Nordic ──────────────────────────────────────────────────
         ("SE", "din276"),

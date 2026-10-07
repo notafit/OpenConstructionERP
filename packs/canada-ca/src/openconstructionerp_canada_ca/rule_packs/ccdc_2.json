@@ -1,0 +1,20 @@
+{
+  "rule_pack_id": "ccdc_2",
+  "name": "CCDC 2 — Stipulated Price Contract (2020)",
+  "name_fr-CA": "CCDC 2 — Contrat à prix forfaitaire (2020)",
+  "standard": "CCDC 2-2020",
+  "jurisdiction": "CA",
+  "regulator": "Canadian Construction Documents Committee",
+  "publication_year": 2020,
+  "applies_to": [
+    "projects",
+    "boq",
+    "tendering",
+    "validation"
+  ],
+  "description": "Reference document for the CCDC 2-2020 stipulated price (lump sum) contract. What the form requires a project's commercial structure to settle: Agreement Articles A-1..A-6 present, Definitions complete, General Conditions GC 1..12 referenced, Supplementary Conditions documented, Ready-for-Takeover milestone defined, prompt-payment schedule, holdback percentage per provincial Construction Act, change-order workflow (GC 6) and bonding requirements (GC 11.1 / 11.2) all populated before tender release. This document enables no automated check; see why_no_rules.",
+  "description_fr-CA": "Document de référence sur le contrat CCDC 2-2020 à prix forfaitaire. Ce que la formule exige de la structure commerciale du projet : Articles A-1..A-6 présents, Définitions complètes, Conditions générales CG 1..12 référencées, Conditions supplémentaires documentées, jalon Prêt-pour-prise-en-charge défini, échéancier de paiement rapide, pourcentage de retenue selon la Loi sur la construction provinciale, processus d'avenant (CG 6) et exigences de cautionnement (CG 11.1 / 11.2) renseignés avant la mise en appel d'offres. Ce document n'active aucun contrôle automatisé ; voir why_no_rules.",
+  "severity_overrides": {},
+  "why_no_rules": "This document ships as reference and enables no engine rules. The checks that would belong here read a contract's own configured terms, the way the platform's UK rules read a named contract form, a payment regime and a retention setting. No Canadian equivalent is registered. Naming ids for the ones that ought to exist would tell an estimator the stipulated price terms were being checked while nothing read them.",
+  "enables_rule_ids": []
+}

@@ -1,0 +1,49 @@
+{
+  "common": {
+    "ok": "通过"
+  },
+  "funding": {
+    "measure_starts_after_application": {
+      "fail": "该受资助项目于 {start} 开工，早于申请提交日期 {filed}。项目一旦开工，大多数资助计划将完全不予资助",
+      "unevidenced": "该受资助项目于 {start} 提前开工，档案记录主管机构已予许可，但未注明任何书面许可",
+      "evidence": "请记录提前开工书面许可的文号，使档案本身即可作为依据",
+      "suggestion": "在继续支出前，请先核对资助计划的条款。如果提前开工已获书面许可，请予以记录；如果没有，请在申请继续推进之前先询问主管机构"
+    },
+    "costs_fall_in_the_award_period": {
+      "before": "拨付申请 {draw} 包含 {period_start} 之前发生的成本，而资助期自该日开始",
+      "after": "拨付申请 {draw} 包含 {period_end} 之后发生的成本，而资助期于该日结束",
+      "spans": "拨付申请 {draw} 在两端都超出了资助期（{period_start} 至 {period_end}）",
+      "suggestion": "请将资助期以外的成本单独列入一笔拨付申请，并与主管机构协商处理，而不要让同一笔申请同时包含两者"
+    },
+    "own_share_is_covered": {
+      "fail": "该资助计划要求自筹比例为 {rate}%，即 {required}，但申请中记录的是 {recorded}",
+      "suggestion": "提交前请说明其余自筹资金的来源，因为资助计划按可计入成本基数而非项目总额计算自筹部分"
+    },
+    "cumulation_within_aid_intensity": {
+      "fail": "本项目的 {count} 份申请合计资助强度达到可计入成本的 {intensity}%，超过了其中最严格的资助计划所规定的 {cap}% 上限",
+      "suggestion": "公共资金会在不同资助计划和不同层级政府之间累计。请削减其中一项申请金额，或询问能否将各受资助项目拆分开，使其各自承担自身的成本"
+    },
+    "proof_of_use_is_on_time": {
+      "missing": "资助期已于 {period_end} 结束，但尚未开始编写最终使用情况说明",
+      "late": "最终使用情况说明应于 {due} 提交，实际于 {submitted} 才提交",
+      "overdue": "最终使用情况说明应于 {due} 提交，至今尚未提交",
+      "suggestion": "请提交现有材料，而不要等到齐全再交。大多数主管机构会应申请延长期限，但不会为已经过去的期限延期"
+    },
+    "errors": {
+      "application_not_found": "未找到申请",
+      "programme_code_taken": "该国家已存在使用此编号的资助计划",
+      "programme_not_found": "未找到资助计划",
+      "programme_has_applications": "该资助计划已有申请，无法删除。请改为将其状态设为“已关闭”。",
+      "application_code_taken": "该项目中已存在使用此编号的申请",
+      "approved_application_not_deletable": "已批准的申请无法删除。请改为将其状态设为“已撤回”或“已关闭”。",
+      "approval_needs_period_end": "记录批复需要资助期的结束日期，因为之后的每个期限都从该日期起算",
+      "draw_needs_approval": "只能针对已批准的申请拨付资金",
+      "draw_not_found": "未找到拨付申请",
+      "paid_draw_not_deletable": "已支付的拨付申请无法删除",
+      "proof_not_found": "未找到使用情况说明",
+      "obligation_not_found": "未找到义务",
+      "eligible_exceeds_amount": "可计入金额不能超过总金额",
+      "allocation_not_found": "未找到成本分配项"
+    }
+  }
+}

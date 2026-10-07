@@ -120,6 +120,42 @@ def _near_miss_rule_set(slug: str, known: set[str]) -> str | None:
     return None
 
 
+def _rule_set_for_classification(name: str, known: set[str]) -> str | None:
+    """The registered rule set that checks ``name``, when ``name`` is a classification.
+
+    A classification key and the rule set that reads it are usually the same
+    word (``nrm``, ``birimfiyat``, ``sekisan``), and the exceptions are where a
+    pack goes wrong without a sound: the Hungarian classification is
+    ``tetelrend`` and its rule set is ``hungary``, the Chinese one is
+    ``gb50500`` and its rule set is ``gbt50500``, the Polish catalogue key is
+    ``knr`` and its rule set is ``poland``. A pack that writes the
+    classification into ``validation_rule_sets`` names a set the registry has
+    never heard of, and :func:`_near_miss_rule_set` cannot see the pairing,
+    because the two words share no spelling.
+
+    The table that pairs them is the BOQ router's, the one the Validate button
+    reads, so the hint and the product cannot disagree. It is imported lazily
+    and only on the refusal path; when it cannot be imported the refusal still
+    happens, it just carries no hint.
+
+    Args:
+        name: The declared entry the registry did not know.
+        known: The registered rule-set identifiers.
+
+    Returns:
+        The rule set to write instead, or ``None`` when ``name`` is not a
+        classification with a registered rule set of another name.
+    """
+    try:
+        from app.modules.boq.router import _STANDARD_RULE_SETS
+    except Exception:  # noqa: BLE001 - a hint is optional, the refusal is not
+        return None
+    target = _STANDARD_RULE_SETS.get(name.strip().lower())
+    if target and target != name and target in known:
+        return target
+    return None
+
+
 def _rule_set_severities(names: Sequence[str]) -> dict[str, dict[str, int]]:
     """How many rules of each severity each named rule set holds.
 
@@ -209,6 +245,13 @@ def resolve_declared_rule_sets(m: PartnerPackManifest, *, strict: bool = False) 
     if unknown and strict:
         hints = []
         for name in unknown:
+            checked_by = _rule_set_for_classification(name, known)
+            if checked_by:
+                hints.append(
+                    f"{name!r} (a classification standard, not a rule set; the rule set that "
+                    f"checks it is {checked_by!r})"
+                )
+                continue
             neighbour = _near_miss_rule_set(name, known)
             hints.append(f"{name!r}" + (f" (did you mean {neighbour!r}?)" if neighbour else ""))
         raise UnknownRuleSetError(
@@ -226,6 +269,15 @@ def resolve_declared_rule_sets(m: PartnerPackManifest, *, strict: bool = False) 
             ", ".join(unknown),
         )
     return [name for name in declared if name in known]
+
+
+#: The project metadata key that records which of a project's rule sets the
+#: pack active at creation appended, as opposed to the ones the caller asked
+#: for. The BOQ router reads it to treat a pack-added "code required" set the
+#: way it treats the country row's: dropped while the project names another
+#: standard. Without the record the two are indistinguishable on the row, and
+#: a set someone asked for on purpose (a dual-coded bill) would go with it.
+PACK_RULE_SETS_METADATA_KEY = "pack_rule_sets"
 
 
 def inherited_rule_sets(
@@ -249,7 +301,30 @@ def inherited_rule_sets(
     Returns:
         The de-duplicated union, never empty.
     """
+    return split_inherited_rule_sets(declared, pack)[0]
+
+
+def split_inherited_rule_sets(
+    declared: Sequence[str] | None,
+    pack: PartnerPackManifest | None,
+) -> tuple[list[str], list[str]]:
+    """:func:`inherited_rule_sets`, plus the names the pack itself appended.
+
+    The second list is what project creation records under
+    :data:`PACK_RULE_SETS_METADATA_KEY`. A name the caller asked for is never
+    in it, even when the pack declares the same name, and neither is the
+    ``boq_quality`` baseline seeded for an empty request.
+
+    Args:
+        declared: The rule sets the caller asked for.
+        pack: The pack active at creation time, or ``None``.
+
+    Returns:
+        ``(all_sets, pack_added)``: the de-duplicated union, never empty, and
+        the subset of it that only the pack contributed, in the same order.
+    """
     out: list[str] = []
+    added: list[str] = []
     seen: set[str] = set()
     for name in declared or []:
         cleaned = str(name).strip()
@@ -270,7 +345,8 @@ def inherited_rule_sets(
             if name not in seen:
                 seen.add(name)
                 out.append(name)
-    return out
+                added.append(name)
+    return out, added
 
 
 def _module_exists(name: str) -> bool:
@@ -384,10 +460,13 @@ def _plan(m: PartnerPackManifest, *, strict_rule_sets: bool = True) -> dict[str,
             f"Estimating methodology '{m.default_methodology}' will be activated on the pack's demo "
             "project and seeded on new projects created while the pack is active."
         )
-    if m.cwicr_regions:
-        warnings.append(
-            f"CWICR regions {', '.join(m.cwicr_regions)} are recorded; cost data is not downloaded automatically."
-        )
+    # What each declared cost region would load. This replaced a warning that
+    # said "cost data is not downloaded automatically", which was true of the
+    # bare ``/apply`` and false in the one screen that showed it: the Modules
+    # page activates through the streamed full install, and that downloads.
+    from app.core.partner_pack.full_install import describe_cost_bases
+
+    cost_bases = describe_cost_bases(list(m.cwicr_regions or []))
 
     return {
         "branding": {
@@ -409,6 +488,7 @@ def _plan(m: PartnerPackManifest, *, strict_rule_sets: bool = True) -> dict[str,
         "rule_sets_enabled": rule_sets,
         "rule_sets_severities": _rule_set_severities(rule_sets),
         "cwicr_regions": list(m.cwicr_regions or []),
+        "cost_bases": cost_bases,
         "default_tax_template": m.default_tax_template,
         "default_methodology": m.default_methodology,
         "demo_project": _pack_demo_info(m.slug),
@@ -697,7 +777,9 @@ def get_applied_info() -> dict[str, Any]:
     """Current applied-pack status + whether an update is available."""
     state = load_applied_state()
     if not state:
-        env = os.environ.get("OE_PARTNER_PACK", "").strip()
+        # Same precedence as discovery: OE_PACK is the documented name and
+        # wins, OE_PARTNER_PACK is the older alias.
+        env = os.environ.get("OE_PACK", "").strip() or os.environ.get("OE_PARTNER_PACK", "").strip()
         return {
             "applied": bool(env),
             "source": "env" if env else None,

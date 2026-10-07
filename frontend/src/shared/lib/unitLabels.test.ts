@@ -41,10 +41,34 @@ describe('localizedUnitCode', () => {
     expect(localizedUnitCode('pcs', 'en')).toBe('pcs');
   });
 
+  // P-56: Croatian trade spellings. The server stores the running metre m'
+  // as the canonical "lm"; it has to read back as m', not "l.m".
+  it('shows the Croatian trade codes under hr', () => {
+    expect(localizedUnitCode('lm', 'hr')).toBe("m'");
+    expect(localizedUnitCode('lsum', 'hr')).toBe('pauš.');
+    expect(localizedUnitCode('pcs', 'hr')).toBe('kom');
+    expect(localizedUnitCode('m2', 'hr')).toBe('m²');
+    expect(localizedUnitCode('lm', 'en')).toBe('l.m');
+  });
+
   it('localizes the unit part of compound trade units (DACH cost bases)', () => {
     expect(localizedUnitCode('100 m2', 'de')).toBe('100 m²');
     expect(localizedUnitCode('100 m3', 'de')).toBe('100 m³');
     expect(localizedUnitCode('10 lsum', 'de')).toBe('10 psch');
+  });
+
+  it('abbreviates time tokens the way each language does', () => {
+    expect(localizedUnitCode('month', 'de')).toBe('Mon.');
+    expect(localizedUnitCode('hr', 'de')).toBe('Std.');
+    expect(localizedUnitCode('month', 'ru')).toBe('мес.');
+    expect(localizedUnitCode('week', 'fr')).toBe('sem.');
+    expect(localizedUnitCode('month', 'en')).toBe('mth');
+    expect(localizedUnitCode('MONTHS', 'de-AT')).toBe('Mon.');
+  });
+
+  it('never spells a number into a time unit and leaves the SI hour alone', () => {
+    expect(localizedUnitCode('year', 'ar')).not.toMatch(/\s/);
+    expect(localizedUnitCode('h', 'de')).toBe('h');
   });
 
   it('never modifies unknown tokens', () => {

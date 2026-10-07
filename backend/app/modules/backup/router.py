@@ -20,6 +20,7 @@ streams into a ``tempfile.SpooledTemporaryFile``) and exposes a typed
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 
@@ -90,7 +91,9 @@ async def export_backup(
         include_files=body.include_files,
         compression_level=body.compression_level,
     )
-    path = spool_to_disk(spool)
+    # A plain file copy, and past the 16 MiB rollover a disk-to-disk one: off
+    # the event loop like the build itself.
+    path = await asyncio.to_thread(spool_to_disk, spool)
 
     timestamp = manifest["created_at"].replace("-", "").replace(":", "")[:15]
     filename = f"openconstructionerp_backup_{timestamp}.zip"
@@ -141,7 +144,10 @@ async def restore_backup(
     if mode not in ("replace", "merge"):
         raise HTTPException(status_code=400, detail="mode must be 'replace' or 'merge'")
 
-    raw = await file.read()
+    _MAX_BACKUP_BYTES = 500 * 1024 * 1024  # 500 MB
+    raw = await file.read(_MAX_BACKUP_BYTES + 1)
+    if len(raw) > _MAX_BACKUP_BYTES:
+        raise HTTPException(status_code=413, detail="Backup file exceeds 500 MB limit")
 
     try:
         manifest, data = parse_backup_zip(raw)
@@ -236,7 +242,10 @@ async def validate_backup(
     file: UploadFile = File(...),
 ) -> ValidateResponse:
     """Validate a backup ZIP without importing any data."""
-    raw = await file.read()
+    _MAX_BACKUP_BYTES = 500 * 1024 * 1024  # 500 MB
+    raw = await file.read(_MAX_BACKUP_BYTES + 1)
+    if len(raw) > _MAX_BACKUP_BYTES:
+        raise HTTPException(status_code=413, detail="Backup file exceeds 500 MB limit")
 
     try:
         manifest, data = parse_backup_zip(raw)

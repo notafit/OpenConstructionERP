@@ -145,6 +145,10 @@
     "base_date_readable": {
       "fail": "Das Basisdatum '{base_date}' ist kein Datum, daher wird das LV mit dem heutigen Steuersatz statt mit seinem eigenen besteuert",
       "suggestion": "Die Preisbasis als Tag, Monat, Quartal oder Jahr angeben ({shapes})"
+    },
+    "tax_date_readable": {
+      "fail": "Der Steuerstichtag '{tax_date}' ist kein Datum, daher wird das LV mit dem heutigen Steuersatz statt mit seinem eigenen besteuert",
+      "suggestion": "Den Steuerstichtag als Tag, Monat, Quartal oder Jahr angeben ({shapes}) oder leeren, damit das LV nach seinem Basisdatum besteuert wird"
     }
   },
   "din276": {
@@ -329,14 +333,67 @@
       "suggestion": "Jeder Position eine eigene Projekt-Positionsnummer geben, bevor das LV herausgeht"
     }
   },
+  "prezzario": {
+    "voce_code_format_valid": {
+      "fail": "Der Code '{code}' in Zeile {ordinal} lässt nicht erkennen, aus welchem Preisverzeichnis er stammt",
+      "suggestion": "Ein amtlicher Positionscode beginnt mit der Region und dem Ausgabejahr seines Preisverzeichnisses, zum Beispiel TOS25_01.A03.001.001 (Toskana 2025). Den Code genau so übernehmen, wie das regionale Verzeichnis ihn druckt, die Zeile aus dem Verzeichnis importieren oder einen neuen Preis als NP.01 nummerieren"
+    },
+    "voce_reference_present": {
+      "fail": "Position {ordinal} verweist auf keine Position des Preisverzeichnisses",
+      "suggestion": "Die Zeile aus einem importierten regionalen Preisverzeichnis übernehmen oder als neuen Preis (NP) mit Preisanalyse kennzeichnen"
+    },
+    "costi_sicurezza_separated": {
+      "fail": "Das Leistungsverzeichnis enthält keine eigene Zeile für die Sicherheitskosten, die nicht dem Angebotsnachlass unterliegen",
+      "suggestion": "Die oneri della sicurezza als eigenen Abschnitt oder Zuschlag ausweisen, bepreist aus dem Sicherheitskapitel des Verzeichnisses oder dem Sicherheitsplan"
+    },
+    "incidenza_manodopera_documented": {
+      "fail": "Position {ordinal} ({code}) weist keinen Lohnanteil aus",
+      "suggestion": "Den Lohnanteil (incidenza della manodopera) aus dem Preisverzeichnis übernehmen oder eine Lohnressource anlegen, damit die Lohnkosten in der Ausschreibung getrennt ausgewiesen werden können"
+    },
+    "overheads_not_applied_twice": {
+      "fail": "Die Preise regionaler Preisverzeichnisse enthalten bereits Gemeinkosten (13-17 %) und Gewinn (10 %). Sie erneut aufzuschlagen erhöht die Summe um etwa {percent} %.",
+      "suggestion": "Die Zuschläge für Gemeinkosten und Gewinn aus diesem Leistungsverzeichnis entfernen oder nur auf Zeilen mit eigener Preisanalyse (NP) anwenden."
+    }
+  },
+  "romania": {
+    "deviz_chapter_required": {
+      "fail": "Position {ordinal} nennt kein Kapitel des deviz general",
+      "suggestion": "Die Position ihrem Kapitel und Unterkapitel nach HG 907/2016 zuordnen, etwa 4.1 für Bau- und Installationsarbeiten oder 5.1 für die Baustelleneinrichtung"
+    },
+    "deviz_chapter_recognised": {
+      "fail": "Der Deviz-Code '{code}' in Position {ordinal} ist kein Kapitel oder Unterkapitel des deviz general",
+      "suggestion": "Einen Code aus den Kapiteln 1 bis 6 des deviz general nach HG 907/2016 verwenden, etwa 1.2, 2, 3.5, 4.1, 5.1 oder 6.2"
+    }
+  },
+  "greece": {
+    "net_article_required": {
+      "fail": "Position {ordinal} trägt keinen Artikel der einheitlichen Preislisten (ΝΕΤ)",
+      "suggestion": "Den ΝΕΤ-Artikel angeben, nach dem die Position bepreist ist, etwa ΟΙΚ 32.01.06, oder ΝΑΟΙΚ für einen neuen Artikel"
+    },
+    "net_article_valid": {
+      "invalid": "Der Artikel '{code}' in Position {ordinal} hat nicht die Form eines ΝΕΤ-Artikels",
+      "chapter": "Der Artikel '{code}' in Position {ordinal} beginnt mit Kapitel {chapter}, das die Preisliste für Hochbauarbeiten nicht kennt",
+      "suggestion": "Präfix der Preisliste und Artikelnummer angeben, etwa ΟΙΚ 38.20.02, ΟΔΟ Α-2 oder ΑΤΗΕ 8151.1"
+    }
+  },
+  "ukraine": {
+    "zkr_chapter_required": {
+      "fail": "Position {ordinal} nennt kein Kapitel der zusammenfassenden Kostenberechnung",
+      "suggestion": "Die Position ihrem Kapitel des зведений кошторисний розрахунок zuordnen, 1 bis 12; Bauarbeiten am Hauptobjekt gehören in Kapitel 2"
+    },
+    "zkr_chapter_recognised": {
+      "fail": "Kapitel {chapter} in Position {ordinal} ist keines der zwölf Kapitel der zusammenfassenden Kostenberechnung",
+      "suggestion": "Eine Kapitelnummer von 1 bis 12 verwenden"
+    }
+  },
   "birimfiyat": {
     "code_required": {
       "fail": "Position {ordinal} hat keine birim-fiyat-Positionsnummer",
       "suggestion": "Bayındırlık-Positionsnummer zuweisen (z.B. 04.013/1)"
     },
     "valid_poz": {
-      "fail": "Poz '{code}' entspricht nicht dem Format XX.XXX/X",
-      "suggestion": "Format verwenden: NN.NNN oder NN.NNN/N (z.B. 04.013/1)"
+      "fail": "Poz '{code}' ist weder eine aktuelle Nummer des Einheitspreisbuchs (XX.XXX.XXXX) noch eine ältere (XX.XXX/X)",
+      "suggestion": "Die Nummer aus dem Buch verwenden, z. B. 15.140.1002, oder 04.013/1 bei älteren Verträgen; eigene kalkulierte Positionen als ÖZEL-1 nummerieren"
     }
   },
   "sekisan": {
@@ -509,6 +566,18 @@
     "po_line_cost_coded": {
       "fail": "Position {line} hat weder WBS noch Kostenart noch Kostenzeile und erscheint damit nicht in der Kostenaufstellung",
       "suggestion": "Vergeben Sie einen Kostencode, damit die Verpflichtung einem Budget zugeordnet wird"
+    },
+    "invoice_within_order": {
+      "fail": "Rechnung {invoice} übersteigt den offenen Betrag von {remaining} auf Bestellung {po} um {excess}",
+      "suggestion": "Rechnung mit der Bestellung abgleichen; wurde die Mehrleistung vereinbart, zuerst die Bestellung ändern und dann freigeben"
+    },
+    "invoice_quantity_received": {
+      "fail": "Position {line} würde insgesamt mit {invoiced} berechnet, eingegangen sind aber nur {received}",
+      "suggestion": "Lieferschein abwarten oder den Wareneingang bestätigen, bevor diese Menge freigegeben wird"
+    },
+    "invoice_value_received": {
+      "fail": "Auf Bestellung {po} ergäben die Rechnungen insgesamt {invoiced}, der Wareneingang ist zu Bestellpreisen aber nur {received} wert",
+      "suggestion": "Lieferschein abwarten oder den Wareneingang bestätigen, bevor dieser Betrag freigegeben wird"
     }
   },
   "subcontract": {
@@ -543,6 +612,10 @@
     "insurance_valid_at_start": {
       "fail": "Die Versicherung des Nachunternehmers lief am {expiry} ab, also vor Arbeitsbeginn am {reference}",
       "suggestion": "Holen Sie einen aktuellen Nachweis ein, bevor der Nachunternehmer die Baustelle betritt"
+    },
+    "unlinked_contract_twin": {
+      "fail": "Der Nachunternehmervertrag {agreement} und der Vertrag {contract} scheinen derselbe Nachunternehmerauftrag zu sein, daher könnten die Finanzen ihn doppelt zählen",
+      "suggestion": "Verknüpfen Sie beide, wenn es derselbe Auftrag ist, oder markieren Sie sie als verschieden"
     }
   },
   "submittal": {
@@ -626,10 +699,13 @@
     "boq_not_found": "Leistungsverzeichnis nicht gefunden",
     "session_not_found": "Sitzung nicht gefunden",
     "document_not_found": "Dokument nicht gefunden",
+    "documents_batch_delete_referenced": "Andere Datensätze verweisen noch auf Dokumente in dieser Auswahl. Prüfen Sie, was das Löschen trennt, und bestätigen Sie mit acknowledge_references.",
     "invitation_not_found": "Einladung nicht gefunden",
     "agreement_not_found": "Vereinbarung nicht gefunden",
     "rejection_not_found": "Ablehnung nicht gefunden",
     "claim_not_found": "Abschlagsrechnung nicht gefunden",
+    "gaeb_x89_final_account_unsupported": "Eine Schlussrechnung oder Teilschlussrechnung kann noch nicht als GAEB X89 exportiert werden. Sie muss die gesamte Leistung abzüglich früherer Zahlungen abrechnen, aus einer Abrechnung wird nur eine Abschlagsrechnung eines Zeitraums erstellt. Exportieren Sie die Abrechnung als Abschlagsrechnung.",
+    "xpwe_native_file_refused": "Dies ist die eigene Projektdatei eines Kalkulationsprogramms, die nur dieses Programm öffnen kann. Exportieren Sie die Kalkulation in Ihrem Kalkulationsprogramm als XPWE und laden Sie die .xpwe-Datei hoch.",
     "plot_not_found": "Grundstück nicht gefunden",
     "survey_not_found": "Drohnenvermessung nicht gefunden",
     "diary_video_not_found": "Bautagebuch-Video nicht gefunden",
@@ -648,7 +724,10 @@
     "estimate_job_not_found": "Kalkulationsauftrag nicht gefunden",
     "escrow_not_found": "Treuhand-Transaktion nicht gefunden",
     "commission_accrual_not_found": "Provisions-Abgrenzung nicht gefunden",
-    "baseline_not_found": "Baseline nicht gefunden"
+    "baseline_not_found": "Baseline nicht gefunden",
+    "fx_rate_set_locked": "Die EZB-Kurse vom {date} sind gesperrt, deshalb hat diese Aktualisierung sie nicht überschrieben. Entsperren Sie den Kurssatz zuerst, wenn er die neue Veröffentlichung übernehmen soll.",
+    "boq_locked": "Das Leistungsverzeichnis ist gesperrt und kann nicht geändert werden. Legen Sie eine Revision an, um Änderungen vorzunehmen.",
+    "boq_link_owner_locked": "Der Code '{code}' ist durch eine Position im gesperrten Leistungsverzeichnis '{bill}' definiert, und eine Verknüpfung würde dieses Leistungsverzeichnis ändern. Entsperren Sie es zuerst oder erfassen Sie die Position unter einem neuen Code."
   },
   "variations": {
     "boq_lines_are_traced": {
@@ -774,6 +853,16 @@
       "norm_collapsed": "Position {ordinal}: die Ressourcenzeilen haben ihren Katalogansatz verloren und tragen stattdessen die Positionsmenge, daher wurde der Einheitspreis nicht aus ihnen neu abgeleitet",
       "whole_position_quantities": "Position {ordinal}: die Ressourcenzeilen tragen Gesamtmengen der Position statt Ansätzen je Einheit, daher wurde der Einheitspreis nicht aus ihnen neu abgeleitet",
       "suggestion": "Aufbau prüfen - die Position über die Ressourcenansatz-Prüfung aus ihrer Katalogposition neu ableiten oder die Zeilen von Hand korrigieren"
+    }
+  },
+  "poland": {
+    "knr_reference_required": {
+      "fail": "Position {ordinal} nennt keine KNR-Katalogtabelle",
+      "suggestion": "In der Spalte podstawa die Katalogtabelle der Normen angeben, etwa KNR 2-02 0201-01, oder kalkulacja indywidualna für eine eigen kalkulierte Position schreiben"
+    },
+    "knr_reference_recognised": {
+      "fail": "Der Verweis '{code}' in Position {ordinal} nennt keine KNR-Katalogfamilie",
+      "suggestion": "Den Verweis mit seiner Katalogfamilie beginnen, etwa KNR, KNNR, KNR-W oder KSNR, oder die Position als kalkulacja indywidualna kennzeichnen"
     }
   }
 }

@@ -291,7 +291,7 @@ def register_integration_notification_bridge() -> None:
     event_name = "notifications.notification.created"
     if _on_notification_created in event_bus._handlers.get(event_name, []):
         return
-    event_bus.subscribe(event_name, _on_notification_created)
+    event_bus.subscribe_once(event_name, _on_notification_created)
     logger.info("Integrations: chat-connector notification bridge wired")
 
 

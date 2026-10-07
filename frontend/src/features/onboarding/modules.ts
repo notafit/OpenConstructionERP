@@ -113,6 +113,7 @@ export const ALL_MODULES: ModuleDef[] = [
 
   // ── Finance ──────────────────────────────────────────────────────────
   { key: 'finance', labelKey: 'finance.title', descriptionKey: 'onboarding.mod_finance_desc', group: 'finance' },
+  { key: 'funding', labelKey: 'funding.title', descriptionKey: 'onboarding.mod_funding_desc', group: 'finance' },
   { key: 'procurement', labelKey: 'procurement.title', descriptionKey: 'onboarding.mod_procurement_desc', group: 'finance' },
   { key: 'tendering', labelKey: 'tendering.title', descriptionKey: 'onboarding.mod_tendering_desc', group: 'finance' },
   { key: 'changeorders', labelKey: 'nav.change_orders', descriptionKey: 'onboarding.mod_changeorders_desc', group: 'finance' },
